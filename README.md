@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, and Kimi Code sessions -- queryable by your agent, browsable by you.
+Past Claude Code, Codex, Kimi Code, and Pi sessions -- queryable by your agent, browsable by you.
 
 </div>
 
@@ -25,7 +25,7 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 **App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
 
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions`, and Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`).
+Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions`, Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), and standard Pi v3 sessions from `~/.pi/agent/sessions`. Pi also honors `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, and the global Pi `settings.json` `sessionDir` setting.
 
 ## Multi-provider support
 
@@ -38,7 +38,12 @@ Kimi session directories become one Obelisk session each. Main and child-agent
 subagents tables. Undo/clear is handled as a full session replay, so retracted
 wire records do not remain in the index.
 
-For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, and `~/.kimi-code/sessions`. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
+Pi tree sessions are replayed as canonical messages, tools, summaries, and
+sidechains. This first Pi provider indexes only standard top-level files shaped
+`<project-dir>/<session>.jsonl`; deeper nested subagent run `session.jsonl`
+transcripts are intentionally excluded.
+
+For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.kimi-code/sessions`, and the resolved Pi sessions directory. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
 
 ## Skill: agent-first retrieval
 
@@ -61,7 +66,7 @@ You can use obelisk like:
 #### Let your agent install it (recommended)
 
 The shortest path is to give the bootstrap guide directly to a coding agent
-with shell access. Paste this as a prompt into Claude Code, Codex, or another
+with shell access. Paste this as a prompt into Claude Code, Codex, Kimi Code, Pi, or another
 agent — not into your terminal:
 
 ```text
@@ -98,7 +103,7 @@ obelisk install
 `obelisk install` delegates to the standard skills installer for
 `tommy0103/obelisk-skill`.
 
-Then in any Claude Code session:
+Then in any supported coding-agent session:
 
 ```
 /obelisk <your question>
@@ -157,9 +162,10 @@ npm run dev
 
 `electron-vite` starts the renderer dev server and launches Electron. On first
 run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available Claude
-Code and Codex transcripts, and then watches them for changes. The default
-sources are `~/.claude/projects` and `~/.codex/sessions`; use **Settings** to
-point the app at different directories. On Windows, Obelisk also checks common
+Code, Codex, Kimi Code, and Pi transcripts, and then watches them for changes.
+The default roots are `~/.claude/projects`, `~/.codex/sessions`,
+`~/.kimi-code/sessions`, and the resolved Pi sessions directory; use
+**Settings** to point the app at different directories. On Windows, Obelisk also checks common
 WSL distributions for the Claude Code directory.
 
 ### Debug the app
@@ -184,10 +190,10 @@ run `npm ci` again.
 
 | Layer | Source | What's captured |
 |-------|--------|----------------|
-| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` | Title, project, timestamps, git branch, source |
+| **Sessions** | Claude JSONL; Codex rollouts; Kimi session directories; top-level Pi v3 JSONL | Title, project, timestamps, git branch, source |
 | **Messages** | user + assistant turns | Full text, model, token usage, parent chain |
 | **Tool calls** | every tool invocation | Tool name, input, file paths |
-| **Subagents** | Claude `subagents/agent-<id>.jsonl`; Codex child threads | Agent type, description, full conversation |
+| **Subagents** | Claude subagent JSONL; Codex child threads; Kimi child agents | Agent type, description, full conversation (nested Pi runs excluded in v1) |
 | **Workflows** | Claude `workflows/wf_<runId>.json` | Script, result, agent count |
 | **Workflow agents** | Claude `subagents/workflows/wf_<runId>/` | Per-agent transcripts |
 | **Memories** | registered markdown files | Conclusions linked to source sessions |
@@ -203,7 +209,8 @@ packages/core/                # @obelisk/core npm workspace (TypeScript + ESM)
 │   │   ├── types.ts          # Provider + TranscriptRecord contract
 │   │   ├── claude.ts         # Claude Code adapter (line-incremental)
 │   │   ├── codex.ts          # Codex adapter (full-reparse)
-│   │   └── kimi.ts           # Kimi Code adapter (session projection)
+│   │   ├── kimi.ts           # Kimi Code adapter (session projection)
+│   │   └── pi.ts             # Pi v3 adapter (tree-aware full replay)
 │   ├── session-detail.ts     # Provider-independent transcript projection
 │   ├── persist.ts            # Binding-agnostic record writer (upsert/merge)
 │   ├── tx.ts                 # Write transaction + connection config

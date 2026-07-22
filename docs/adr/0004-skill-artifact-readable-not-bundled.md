@@ -1,6 +1,6 @@
 # The CLI ships readable compiled JS; the skill remains docs-only
 
-**Context.** Obelisk reads a user's entire local Claude Code and Codex history,
+**Context.** Obelisk reads a user's local Claude Code, Codex, Kimi Code, and Pi history,
 so auditability is the foundation of trust. Bundling/minifying Core into one
 opaque file would make the runtime harder to inspect. Shipping executable Core
 inside `.claude/skills` / `.agents/skills` would also blur the boundary between

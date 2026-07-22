@@ -1,7 +1,7 @@
 # Obelisk
 
 Obelisk is explicit memory infrastructure for coding agents: it indexes local
-Claude Code, Codex, and Kimi Code sessions into a queryable SQLite evidence layer, and a
+Claude Code, Codex, Kimi Code, and Pi sessions into a queryable SQLite evidence layer, and a
 CodeAct runtime lets an agent write a small query, run it, and answer from real
 session history. This glossary pins the terms that are specific to Obelisk; it is
 not a spec.
@@ -29,7 +29,7 @@ promoted to an external tool surface.
 ## Indexing
 
 **Provider adapter**:
-A pure per-source module (claude, codex, kimi, later pi, …) that owns its
+A pure per-source module (claude, codex, kimi, pi, …) that owns its
 descriptor, watch roots, discovery, parsing, cursor interpretation, and raw
 record lookup. It discovers `IndexUnit`s rather than assuming one transcript
 file per unit; Kimi uses a session directory containing multiple wire logs. It

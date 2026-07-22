@@ -1,8 +1,8 @@
 // Core provider contract (see docs/adr/0001).
 //
 // The indexing layer splits along two orthogonal axes:
-//   - Provider axis: pure per-source adapters (claude, codex, later opencode,
-//     pi, …) that discover their own work and parse it into records. A source is
+//   - Provider axis: pure per-source adapters (claude, codex, kimi, pi,
+//     later opencode, …) that discover their own work and parse it into records. A source is
 //     NOT assumed to be a single JSONL file — an adapter may read a SQLite store,
 //     a directory tree, etc. So discovery, change-detection, and resume cursoring
 //     are all adapter-owned and format-specific.

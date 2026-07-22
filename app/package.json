@@ -1,7 +1,7 @@
 {
   "name": "obelisk",
   "version": "0.2.1",
-  "description": "Memory management for Obelisk — let Claude Code search its own memory",
+  "description": "Browse and manage indexed Claude Code, Codex, Kimi Code, and Pi session memory",
   "homepage": "https://github.com/tommy0103/obelisk",
   "author": {
     "name": "Obelisk contributors",
