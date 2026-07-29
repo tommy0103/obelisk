@@ -6,6 +6,7 @@ import router from './router.js';
 import { commitInitialData, fetchInitialData } from './data.js';
 import { noteSessionUpdated, sessionLiveState } from './session-live.mjs';
 import { createGlobalDataRefreshCoordinator } from './session-global-refresh.mjs';
+import { installLocalMarkdownLinkHandlers } from './local-markdown-links.js';
 
 // Import shared renderer CSS globally
 import '../styles/base.css';
@@ -58,5 +59,7 @@ window.obelisk?.onSessionUpdated?.(({ sessionId } = {}) => {
   const currentSessionId = route.name === 'SessionDetail' ? String(route.params.id || '') : null;
   noteSessionUpdated(sessionLiveState, sessionId, currentSessionId);
 });
+
+installLocalMarkdownLinkHandlers();
 
 app.mount('#app');

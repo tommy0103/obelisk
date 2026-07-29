@@ -105,3 +105,18 @@ button, input, .row, .sidebar-item, .toolbar-btn,
 
 .app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; }
 .columns { flex: 1; display: grid; grid-template-columns: var(--col-sidebar) 1fr; min-height: 0; }
+
+.local-file-preview {
+  position: fixed; right: 16px; bottom: 16px; z-index: 600;
+  width: min(520px, calc(100vw - 32px)); max-height: min(360px, calc(100vh - 32px));
+  overflow: hidden; border: 1px solid var(--hairline-strong); border-radius: 8px;
+  background: var(--surface); box-shadow: 0 16px 42px rgba(0,0,0,0.24); pointer-events: none;
+}
+.local-file-preview-path {
+  padding: 8px 10px; border-bottom: 1px solid var(--hairline); color: var(--muted);
+  font: var(--text-xs)/1.35 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.local-file-preview pre {
+  max-height: 304px; overflow: hidden; padding: 10px; color: var(--fg-2);
+  font: var(--text-xs)/1.55 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}

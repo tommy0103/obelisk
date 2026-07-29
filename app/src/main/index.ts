@@ -9,6 +9,7 @@ import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
+import { previewLocalMarkdownLink, resolveExistingLocalMarkdownFile } from './local-markdown-link.mjs';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
@@ -325,6 +326,10 @@ function createWindow() {
     }
   });
 
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url.startsWith('file:')) event.preventDefault();
+  });
+
   if (isDev) {
     win.loadURL(process.env.ELECTRON_RENDERER_URL || process.env.OBELISK_DEV_SERVER_URL || 'http://localhost:5173');
     if (shouldOpenDevTools) {
@@ -587,6 +592,26 @@ ipcMain.handle('db:readMemoryFile', (_, filePath) => {
     if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf-8');
     return null;
   } catch { return null; }
+});
+
+ipcMain.handle('local-link:preview', (_, href) => previewLocalMarkdownLink(href));
+
+ipcMain.handle('local-link:open', async (event, href) => {
+  const filePath = resolveExistingLocalMarkdownFile(href);
+  if (!filePath) return { exists: false };
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return { exists: true, opened: false };
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question',
+    buttons: ['Cancel', 'Open'],
+    defaultId: 1,
+    cancelId: 0,
+    message: '是否用默认应用打开此文件？',
+    detail: filePath,
+  });
+  if (response !== 1) return { exists: true, opened: false };
+  const error = await shell.openPath(filePath);
+  return { exists: true, opened: !error, error: error || undefined };
 });
 
 ipcMain.handle('db:archiveMemory', (_, id, reason) => {
