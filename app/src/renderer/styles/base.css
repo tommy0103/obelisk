@@ -109,14 +109,15 @@ button, input, .row, .sidebar-item, .toolbar-btn,
 .local-file-preview {
   position: fixed; right: 16px; bottom: 16px; z-index: 600;
   width: min(520px, calc(100vw - 32px)); max-height: min(360px, calc(100vh - 32px));
-  overflow: hidden; border: 1px solid var(--hairline-strong); border-radius: 8px;
-  background: var(--surface); box-shadow: 0 16px 42px rgba(0,0,0,0.24); pointer-events: none;
+  overflow: hidden; border: 1px solid rgba(255,255,255,0.16); border-radius: 8px;
+  background: #181923; box-shadow: 0 18px 48px rgba(0,0,0,0.52); pointer-events: none;
 }
 .local-file-preview-path {
-  padding: 8px 10px; border-bottom: 1px solid var(--hairline); color: var(--muted);
+  padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.10); color: rgba(255,255,255,0.62);
+  background: #20212d;
   font: var(--text-xs)/1.35 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .local-file-preview pre {
-  max-height: 304px; overflow: hidden; padding: 10px; color: var(--fg-2);
+  max-height: 304px; overflow: hidden; padding: 10px; color: rgba(255,255,255,0.78);
   font: var(--text-xs)/1.55 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere;
 }
