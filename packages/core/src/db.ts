@@ -49,5 +49,17 @@ function rebuildMemoryFts(db: SqliteDb): void {
   db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
 }
 
+/**
+ * Repopulate the failed-tool-result index. This is a full refresh rather than
+ * incremental bookkeeping: only `is_error` rows are indexed (a few thousand on a
+ * large history), and `tool_results` is written with INSERT OR REPLACE, whose
+ * implicit deletes do not fire DELETE triggers unless recursive_triggers is on.
+ */
+function rebuildToolErrorsFts(db: SqliteDb): void {
+  db.exec('DELETE FROM tool_errors_fts');
+  db.exec(`INSERT INTO tool_errors_fts (tool_use_id, session_id, content)
+    SELECT tool_use_id, session_id, content FROM tool_results WHERE is_error = 1`);
+}
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines, fs, path, os };
+
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, rebuildToolErrorsFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines, fs, path, os };

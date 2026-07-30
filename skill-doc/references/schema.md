@@ -120,6 +120,28 @@ One row per tool result.
 
 `tool_results` does not have timestamps. Join through `messages`.
 
+### `tool_errors_fts`
+
+FTS5 index over failed tool results only (`is_error = 1`). `search()` covers
+`messages.text` and nothing else, so error text that the assistant never quoted
+is unreachable through it — match here instead when the user is looking for a
+past failure by its message.
+
+| Column | Meaning |
+| --- | --- |
+| `tool_use_id` | FK to `tool_calls.id` (UNINDEXED) |
+| `session_id` | Session the failure happened in (UNINDEXED) |
+| `content` | Indexed error text |
+
+```sql
+SELECT session_id, tool_use_id, content
+FROM tool_errors_fts WHERE tool_errors_fts MATCH '"ENOENT"' LIMIT 10
+```
+
+Quote the MATCH argument: bare hyphens and punctuation are FTS5 operators.
+Successful tool output is not indexed anywhere — filter `tool_results` with
+`LIKE` instead, scoped to a `session_id` once you have one.
+
 ### `summaries`
 
 Session summary rows.

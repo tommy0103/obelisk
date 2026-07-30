@@ -124,6 +124,11 @@ function refreshSessionProjectPaths(db) {
 function rebuildFts(db) {
   db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
   db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
+  // tool_errors_fts holds only is_error rows, so it is refreshed wholesale
+  // rather than by trigger. See packages/core/src/schema.sql for why.
+  db.exec('DELETE FROM tool_errors_fts');
+  db.exec(`INSERT INTO tool_errors_fts (tool_use_id, session_id, content)
+    SELECT tool_use_id, session_id, content FROM tool_results WHERE is_error = 1`);
 }
 
 // PASSIVE by default: it checkpoints what it can without blocking concurrent

@@ -50,6 +50,19 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
   INSERT INTO messages_fts(rowid, uuid, session_id, text)
   VALUES (new.rowid, new.uuid, new.session_id, new.text);
 END;
+-- Failed tool results are searchable on their own. Their text -- exit messages,
+-- stack traces, error codes -- is what "how did I fix this last time" actually
+-- looks for, and it is not in messages_fts: measured against a 380k-message
+-- index, ~37% of failed tool calls leave no trace in messages.text at all,
+-- because the model fixes the error instead of quoting it. Only is_error rows
+-- are indexed; they are 0.6% of tool_results by size.
+--
+-- Deliberately not maintained by triggers: tool_results is written with
+-- INSERT OR REPLACE, and REPLACE does not fire DELETE triggers unless
+-- recursive_triggers is on, so a trigger pair would leak stale rows. The
+-- indexer repopulates this table wholesale in finalize instead.
+CREATE VIRTUAL TABLE IF NOT EXISTS tool_errors_fts USING fts5(
+  tool_use_id UNINDEXED, session_id UNINDEXED, content);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(session_id, timestamp);

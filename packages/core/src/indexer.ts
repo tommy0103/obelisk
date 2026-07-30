@@ -1,5 +1,5 @@
 // Passive-pull indexing orchestration for the Core package.
-import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts } from './db.ts';
+import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, rebuildToolErrorsFts } from './db.ts';
 import { fs, inferProjectPath } from './parsing.ts';
 import {
   createProviderIndexPlan,
@@ -145,6 +145,7 @@ function buildIndex({ force = false }: { force?: boolean } = {}) {
           refreshSessionProjectPaths(db);
           db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
           rebuildMemoryFts(db);
+          rebuildToolErrorsFts(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
           writeProviderIndexMarkers(db, providerPlan, providerResult);
         }, { label: 'finalize' });
