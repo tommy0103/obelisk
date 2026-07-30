@@ -11,7 +11,7 @@ import {
   writeProviderIndexMarkers,
 } from '../../../packages/core/src/provider-indexing.ts';
 import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapter } from '../../../packages/core/src/tx.ts';
-import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
+import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
 import {
@@ -38,6 +38,7 @@ function resolveSchemaPath() {
 function installSchema(db, schemaPath = resolveSchemaPath()) {
   db.exec(fs.readFileSync(schemaPath, 'utf8'));
   migrateCoreSchemaColumns(db);
+  migrateFtsTokenizer(db, resolveFtsTokenizer());
 }
 
 function openIndexDb({ dbPath = DEFAULT_DB_PATH, schemaPath = resolveSchemaPath(), DatabaseImpl = Database }: { dbPath?: string; schemaPath?: string; DatabaseImpl?: new (dbPath: string) => any } = {}) {

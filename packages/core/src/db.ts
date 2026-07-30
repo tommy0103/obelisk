@@ -2,7 +2,7 @@
 import { createRequire } from 'node:module';
 import { CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines } from './parsing.ts';
 import { configureConnection } from './tx.ts';
-import { migrateCoreSchemaColumns } from './schema-migrations.ts';
+import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from './schema-migrations.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 const require = createRequire(import.meta.url);
 const fs = require('node:fs');
@@ -30,6 +30,7 @@ function openDb(): NodeSqliteDb {
   migrateCoreSchemaColumns(db);
   db.exec(SCHEMA);
   migrateCoreSchemaColumns(db);
+  migrateFtsTokenizer(db, resolveFtsTokenizer());
   return db;
 }
 
