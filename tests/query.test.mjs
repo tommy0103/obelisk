@@ -65,6 +65,63 @@ function searchDb() {
   return db;
 }
 
+// Two untitled sessions, as produced by current Claude Code versions: the
+// current one whose own prompt repeats the search terms, and an older one
+// holding the actual evidence.
+function untitledDb() {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, message_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertSession.run('sid-current', null, 'quiet-zero', '/tmp/quiet-zero-test', '2026-06-12T10:00:00Z', '2026-06-12T11:00:00Z', 3);
+  insertSession.run('sid-past', null, 'quiet-zero', '/tmp/quiet-zero-test', '2026-06-11T10:00:00Z', '2026-06-11T11:00:00Z', 2);
+  const insert = db.prepare(`
+    INSERT INTO messages (uuid, session_id, text, role, timestamp, content_type, is_meta)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run('cur-cmd', 'sid-current', '<command-message>obelisk</command-message>', 'user', '2026-06-12T10:00:00Z', 'text', 0);
+  insert.run('cur-prompt', 'sid-current', 'find the retry needle discussion', 'user', '2026-06-12T10:00:10Z', 'text', 0);
+  insert.run('past-prompt', 'sid-past', 'why does the retry path drop it', 'user', '2026-06-11T10:00:10Z', 'text', 0);
+  insert.run('past-answer', 'sid-past', 'the needle fix landed in the retry path', 'assistant', '2026-06-11T10:05:00Z', 'text', 0);
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  return db;
+}
+
+test('search excludes the caller session in SQL so limit is spent on other sessions', () => {
+  const db = untitledDb();
+  const api = createQueryApi(db);
+
+  const all = api.search('needle', { limit: 5 }).map(r => r.message.uuid);
+  assert.deepEqual(all.sort(), ['cur-prompt', 'past-answer']);
+
+  // limit 1 would otherwise be consumed by the caller's own prompt.
+  const others = api.search('needle', { excludeSession: 'sid-current', limit: 1 });
+  assert.deepEqual(others.map(r => r.message.uuid), ['past-answer']);
+
+  assert.deepEqual(
+    api.search('needle', { excludeSession: ['sid-current', 'sid-past'], limit: 5 }),
+    [],
+  );
+  db.close();
+});
+
+test('untitled sessions fall back to the opening user message as a title', () => {
+  const db = untitledDb();
+  const api = createQueryApi(db);
+
+  // The command envelope is skipped; the first real prompt becomes the label.
+  assert.equal(api.search('needle', { excludeSession: 'sid-current' })[0].session.title, 'why does the retry path drop it');
+  assert.equal(api.sessions({ sessionId: 'sid-current' })[0].title, 'find the retry needle discussion');
+
+  // A session with no user text at all keeps a null title rather than inventing one.
+  db.prepare(`INSERT INTO sessions (id, title, project, started_at) VALUES (?, ?, ?, ?)`)
+    .run('sid-empty', null, 'quiet-zero', '2026-06-13T10:00:00Z');
+  assert.equal(api.sessions({ sessionId: 'sid-empty' })[0].title, null);
+  db.close();
+});
+
 test('search falls back to safe tokenization for FTS-special input instead of throwing', () => {
   const db = searchDb();
   const api = createQueryApi(db);
