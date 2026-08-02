@@ -419,6 +419,26 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
     assert.match(queries.at(-1).sql, /COALESCE\(source, 'claude'\) = \?/);
     assert.ok(queries.at(-1).params.includes('codex'));
 
+    ipcHandlers.get('db:getSessions')(null, {
+      source: 'all',
+      ids: ['codex:session-a', 'claude-session-b', 'codex:session-a'],
+      limit: 50,
+    });
+    assert.match(queries.at(-1).sql, /id IN \(\?,\?\)/);
+    assert.deepEqual(
+      queries.at(-1).params,
+      ['codex:session-a', 'claude-session-b', 2],
+      'exact session lookup deduplicates IDs and limits the query to the requested set',
+    );
+
+    const queryCount = queries.length;
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessions')(null, { source: 'all', ids: [] }),
+      [],
+      'an explicit empty ID set never falls back to the full session catalogue',
+    );
+    assert.equal(queries.length, queryCount);
+
     await ipcHandlers.get('settings:get')();
     assert.ok(
       queries.some(q => /GROUP BY COALESCE\(source, 'claude'\)/.test(q.sql)),

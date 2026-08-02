@@ -22,6 +22,7 @@
     "test:electron": "electron-vite build && electron --no-sandbox tests/electron-concurrency.mjs",
     "test:electron:timeline": "electron-vite build && electron --no-sandbox tests/electron-session-virtualization.mjs",
     "test:electron:reader-state": "electron-vite build && electron --no-sandbox tests/electron-session-reader-state.mjs",
+    "test:electron:memory-links": "electron-vite build && electron --no-sandbox tests/electron-memory-session-links.mjs",
     "test:electron:file-refs": "electron-vite build && electron --no-sandbox tests/electron-file-references.mjs"
   },
   "build": {

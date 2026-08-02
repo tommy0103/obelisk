@@ -272,6 +272,10 @@
   color: var(--fg-2); font-style: italic;
 }
 .markdown-body a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 2px; }
+.markdown-body .markdown-session-link {
+  vertical-align: baseline; font-family: var(--font-mono); font-size: 0.9em;
+}
+.markdown-body .markdown-session-link svg { flex-shrink: 0; }
 .markdown-body hr { border: 0; border-top: 1px solid var(--hairline); margin: 1.5em 0; }
 .markdown-body table { border-collapse: collapse; margin: 0.8em 0; font-size: 12.5px; }
 .markdown-body th, .markdown-body td { border: 1px solid var(--hairline); padding: 6px 10px; text-align: left; }

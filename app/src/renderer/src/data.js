@@ -228,6 +228,16 @@ export async function loadMemoryMarkdown(memoryPath) {
   }
 }
 
+export async function loadSessionsByIds(sessionIds) {
+  const ids = [...new Set((sessionIds || []).filter(id => typeof id === 'string' && id))].slice(0, 100);
+  if (!ids.length) return [];
+  try {
+    return await window.obelisk.getSessions({ source: 'all', ids, limit: ids.length });
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Archive a memory by id. Updates state after successful IPC call.
  */

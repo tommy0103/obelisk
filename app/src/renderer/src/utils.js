@@ -3,6 +3,10 @@
 
 import { state } from './store.js';
 import { markFileReferences, mayContainFileReference } from './file-references.mjs';
+import {
+  collectInlineSessionCandidates,
+  decorateResolvedInlineSessions,
+} from './memory-session-links.mjs';
 
 // --- Time / formatting ---
 
@@ -103,6 +107,9 @@ export function renderMarkdown(text, opts = {}) {
   const container = document.createElement('div');
   container.className = cls;
   container.innerHTML = html;
+  if (opts.sessionReferences) {
+    decorateResolvedInlineSessions(container, opts.sessionReferences);
+  }
   // Without a cwd or session to resolve against, a reference could never be opened — leaving it
   // unmarked keeps it from looking actionable.
   if ((opts.cwd || opts.sessionId) && mayContainFileReference(html)) {
@@ -110,6 +117,13 @@ export function renderMarkdown(text, opts = {}) {
   }
   if (opts.query) highlightTextNodes(container, opts.query.trim());
   return container.outerHTML;
+}
+
+export function markdownSessionCandidates(text) {
+  if (text == null) return [];
+  const container = document.createElement('div');
+  container.innerHTML = sanitizeMarkdown(window.marked.parse(text));
+  return collectInlineSessionCandidates(container);
 }
 
 // --- Duration / tokens / tooltip ---
