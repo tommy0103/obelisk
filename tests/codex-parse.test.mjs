@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
+import { READ_BUFFER_SIZE, TEXT_LIMIT } from '../packages/core/src/parsing.ts';
 
 function writeFixture(lines) {
   const dir = mkdtempSync(join(tmpdir(), 'obelisk-codex-parse-'));
@@ -70,6 +71,34 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].countMode, 'total');
   assert.equal(sessions[0].message_count, 3);
   assert.equal(sessions[0].git_branch, 'main');
+});
+
+test('codex parse() preserves UTF-8 text split across its 64 KiB JSONL read buffer', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'obelisk-codex-utf8-boundary-'));
+  const path = join(dir, 'rollout.jsonl');
+  const metaLine = `${JSON.stringify({ type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META })}\n`;
+  // Real Codex payloads carry the text in message (event_msg) / output_text
+  // (response_item); pad the message itself so 中 lands exactly on the last
+  // byte of a 64 KiB read chunk.
+  const record = { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'agent_message', message: '中' } };
+  const pad = READ_BUFFER_SIZE - 1 - Buffer.byteLength(metaLine) - Buffer.byteLength(JSON.stringify(record).split('中')[0]);
+  const agentText = 'x'.repeat(pad) + '中';
+  record.payload.message = agentText;
+  // Self-calibrate: 中's first byte must sit on the chunk boundary, otherwise
+  // this test silently stops covering the bug when READ_BUFFER_SIZE changes.
+  const boundaryOffset = Buffer.byteLength(metaLine) + Buffer.byteLength(JSON.stringify(record).split('中')[0]);
+  assert.equal(boundaryOffset % READ_BUFFER_SIZE, READ_BUFFER_SIZE - 1);
+  const duplicate = `${JSON.stringify({ type: 'response_item', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: agentText }] } })}\n`;
+  writeFileSync(path, Buffer.concat([Buffer.from(metaLine), Buffer.from(`${JSON.stringify(record)}\n`), Buffer.from(duplicate)]));
+
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  const assistantMessages = values.filter(record => record.kind === 'message' && record.role === 'assistant');
+
+  // The matching response_item must be deduped. A broken boundary decode makes
+  // the two long texts differ, so both messages survive — that is the bug this
+  // test exists to catch.
+  assert.equal(assistantMessages.length, 1, 'long agent_message deduped against its response_item');
+  assert.equal(assistantMessages[0].text, agentText.slice(0, TEXT_LIMIT));
 });
 
 test('codex parse() retracts a guardian thread via delete-session and emits nothing else', () => {
