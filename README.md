@@ -192,7 +192,10 @@ run `npm ci` again.
 | **Workflow agents** | Claude `subagents/workflows/wf_<runId>/` | Per-agent transcripts |
 | **Memories** | registered markdown files | Conclusions linked to source sessions |
 
-Full-text search via FTS5 covers all layers.
+Full-text search via FTS5 covers messages, memories, and failed tool results.
+Successful tool output is stored and queryable with SQL, but not full-text
+indexed — it is by far the largest layer, and scoping a `LIKE` to a session is
+already fast once retrieval has found one.
 
 ## Structure
 

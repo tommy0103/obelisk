@@ -516,6 +516,31 @@ return {
 };
 ```
 
+## Finding A Past Failure By Its Error Text
+
+`search()` only covers `messages.text`. When the user remembers the error but not
+the task ("that ENOENT during the deploy"), `search()` often misses it outright —
+the model usually fixes an error rather than quoting it, so the text exists only
+in `tool_results`. Match `tool_errors_fts`, then pivot to the session.
+
+```js
+const failures = sql(`
+  SELECT tef.session_id, tef.tool_use_id, tc.name AS tool_name, s.title, s.project
+  FROM tool_errors_fts tef
+  JOIN tool_calls tc ON tc.id = tef.tool_use_id
+  LEFT JOIN sessions s ON s.id = tef.session_id
+  WHERE tool_errors_fts MATCH ?
+  LIMIT 10
+`, '"ENOENT"');
+
+// Then read what happened around it, in the session it belongs to.
+const nearby = failures[0] ? thread(failures[0].session_id) : [];
+```
+
+Quote the MATCH argument (`'"ENOENT"'`): bare hyphens and punctuation are FTS5
+operators. Only failed results are indexed; for successful tool output, scope a
+`LIKE` to a known `session_id` (indexed, fast) rather than scanning every row.
+
 ## Failed Tool Counts
 
 For precise counts, aggregate in SQL. Do not hand-count long result rows in the
