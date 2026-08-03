@@ -10,6 +10,7 @@ interface QueryOptions extends Record<string, any> {
   limit?: number;
   sessionId?: string;
   sessions?: string[];
+  excludeSession?: string | string[];
   project?: string;
   after?: string;
   before?: string;
@@ -71,6 +72,22 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
   return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
 }
 
+// Most sessions carry no title: current Claude Code versions stopped writing
+// `ai-title` transcript rows and dropped `title` from history.jsonl, so the two
+// upstream title sources are usually absent (96% null on a real index). Derive a
+// navigable label from the opening user message instead of returning null.
+// Command envelopes (`<command-message>…`) are skipped: they name the slash
+// command, not the task.
+function titleExpr(alias: string): string {
+  return `COALESCE(NULLIF(${alias}.title, ''), (
+    SELECT substr(replace(replace(m_t.text, char(10), ' '), char(13), ' '), 1, 80)
+    FROM messages m_t
+    WHERE m_t.session_id = ${alias}.id AND m_t.role = 'user' AND m_t.content_type = 'text'
+      AND COALESCE(m_t.is_meta, 0) = 0 AND m_t.text IS NOT NULL AND m_t.text <> ''
+      AND m_t.text NOT LIKE '<command-%'
+    ORDER BY m_t.timestamp LIMIT 1))`;
+}
+
 const BASH_EXIT_PAT = 'Exit code %';
 
 function assertReadOnlySql(sql: unknown): void {
@@ -119,10 +136,18 @@ function createQueryApi(
   };
 
   const search = (text: string, opts: QueryOptions = {}) => {
-    const { limit = 20, sessionId, project, after, before, cwd, source, includeMeta = false } = opts;
+    const { limit = 20, sessionId, excludeSession, project, after, before, cwd, source, includeMeta = false } = opts;
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
+    // Searching history from inside a session almost always hits that session's
+    // own prompt, because the query terms came from it. Excluding in SQL keeps
+    // `limit` spent on other sessions; a post-filter in the script would not.
+    const excluded = typeof excludeSession === 'string' ? [excludeSession] : (excludeSession ?? []);
+    if (excluded.length) {
+      where += ` AND mf.session_id NOT IN (${excluded.map(() => '?').join(',')})`;
+      filterParams.push(...excluded);
+    }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
@@ -131,7 +156,7 @@ function createQueryApi(
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
     const stmt = db.prepare(`
       SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,m.source as m_source,
-             s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
+             s.id as s_id,${titleExpr('s')} as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source,
              rank
       FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
@@ -266,7 +291,7 @@ function createQueryApi(
     const { limit = 50 } = opts;
     const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
-    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params);
+    return db.prepare(`SELECT s.*, ${titleExpr('s')} AS title FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params);
   };
 
   const recent = (n = 10) => sessions({ limit: n });
@@ -396,7 +421,7 @@ function createQueryApi(
     if (currentProject?.project) {
       const sessionTotal = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE project = ?').get(currentProject.project)?.c || 0;
       const sessionsForProject = db.prepare(`
-        SELECT id, title, project, project_path, started_at, ended_at, git_branch, message_count, COALESCE(source, 'claude') AS source
+        SELECT id, ${titleExpr('sessions')} AS title, project, project_path, started_at, ended_at, git_branch, message_count, COALESCE(source, 'claude') AS source
         FROM sessions
         WHERE project = ?
         ORDER BY COALESCE(ended_at, started_at) DESC

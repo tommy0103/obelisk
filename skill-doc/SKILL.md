@@ -173,7 +173,11 @@ be treated as the user's request by default. `search()` and `thread()` omit meta
 messages unless `includeMeta: true` is passed; `context()` and `trace()` preserve
 the original chain and expose `is_meta` on rows.
 
-Opts: `{ limit, sessionId, project, after, before, cwd, source, includeMeta }`.
+Opts: `{ limit, sessionId, excludeSession, project, after, before, cwd, source, includeMeta }`.
+
+`excludeSession` takes one session ID or an array of them and filters in SQL,
+before `limit` applies. Use it for the current session; see Exclude Yourself in
+the Retrieval Contract.
 
 `project` is a SQL `LIKE` filter over `sessions.project`, not an exact project
 identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
@@ -225,6 +229,7 @@ filters or return fields.
 
 - `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
 - `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern.
+- Session `title` is often not stored — recent Claude Code versions rarely write one. `overview()`, `sessions()`, and `search()` therefore fall back to the first 80 characters of the opening user message. Read it as a navigation label, not as a curated title; it is `null` only when the session has no user text.
 - `recent(n?)` -- shorthand for recent sessions.
 - `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, session_title, project }`; here `source` is the summary kind, not the transcript provider.
 - `subagents(opts?)` -- subagent metadata plus `messageCount`.
@@ -247,6 +252,7 @@ Keep queries scoped, bounded, and structural.
 - Plan Before Probe: for conclusion, broad history, failure investigation, or file evolution, write a bounded retrieval script instead of spending turns on intermediate results.
 - Structure Before Text: compute counts, joins, grouping, dedupe, and projection in SQL or JS; keep runtime JSON compact, ideally under 10k-12k chars for synthesis tasks.
 - Evidence Before Conclusion: return compact evidence with stable IDs (`session_id`, `uuid`, `tool_call_id`, `run_id`, `agent_id`) and short snippets, then synthesize in the final answer.
+- Exclude Yourself: when searching history from inside a session, pass that session's ID as `excludeSession`. Your own prompt contains the search terms — they came from it — so it is a guaranteed hit that carries no prior knowledge. Excluding it in SQL keeps `limit` spent on other sessions; filtering the returned array does not.
 - Exclude Meta By Default: `is_meta=1` rows are injected/control-plane transcript material. Helpers hide them by default; raw SQL for ordinary conversation evidence should include `COALESCE(m.is_meta,0)=0` unless meta rows are the investigation target.
 - Persist Durable Conclusions: after answering, if retrieval produced a durable conclusion that future sessions are likely to reuse and `memories()` does not already cover it, explicitly offer to write a memory. Keep the offer brief. Do not write the markdown file or run `--attune` until the user approves.
 

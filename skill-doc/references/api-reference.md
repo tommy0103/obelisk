@@ -53,12 +53,17 @@ Full-text search across all indexed message text using FTS5.
 | `text` | `string` | FTS5 query string |
 | `opts.limit` | `number` | Max results, default 20 |
 | `opts.sessionId` | `string` | Restrict to one session |
+| `opts.excludeSession` | `string \| string[]` | Drop hits from these sessions, filtered in SQL before `limit` |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
 | `opts.source` | `string` | `"claude"`, `"codex"`, or omitted/all |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
+
+Pass the current session ID as `excludeSession` when searching history: the query
+terms usually come from the current prompt, so that prompt is a near-guaranteed
+self-hit. Filtering in the script instead wastes part of `limit` on it.
 
 Returns:
 
@@ -200,6 +205,12 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.sessions` | `string[]` | Restrict to session IDs |
 
 Returns `Array<session_row>`.
+
+`title` is derived when the transcript has none: current Claude Code versions
+rarely emit a session title, so `sessions()`, `overview()`, and `search()` fall
+back to the first 80 characters of the opening user message (command envelopes
+skipped). It stays `null` only when the session has no user text at all. Treat a
+derived title as a navigation label, not as a stored fact.
 
 #### `recent(n?)`
 
