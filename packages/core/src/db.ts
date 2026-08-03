@@ -1,30 +1,28 @@
 // node:sqlite lifecycle and migrations for the Core package.
-import { createRequire } from 'node:module';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines } from './parsing.ts';
 import { configureConnection } from './tx.ts';
 import { migrateCoreSchemaColumns } from './schema-migrations.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
-const require = createRequire(import.meta.url);
-const fs = require('node:fs');
-const path = require('node:path');
-const os = require('node:os');
-const { DatabaseSync } = require('node:sqlite');
 
-const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
-const LEGACY_DB_PATH = path.join(CLAUDE_DIR, 'obelisk.sqlite');
-const DB_PATH = path.join(OBELISK_DIR, 'obelisk.sqlite');
-const SCHEMA = fs.readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
+const OBELISK_DIR = join(homedir(), '.obelisk');
+const LEGACY_DB_PATH = join(CLAUDE_DIR, 'obelisk.sqlite');
+const DB_PATH = join(OBELISK_DIR, 'obelisk.sqlite');
+const SCHEMA = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 
 function migrateLegacyDbIfNeeded() {
-  if (fs.existsSync(DB_PATH)) return;
-  if (!fs.existsSync(LEGACY_DB_PATH)) return;
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  fs.copyFileSync(LEGACY_DB_PATH, DB_PATH);
+  if (existsSync(DB_PATH)) return;
+  if (!existsSync(LEGACY_DB_PATH)) return;
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  copyFileSync(LEGACY_DB_PATH, DB_PATH);
 }
 
 function openDb(): NodeSqliteDb {
   migrateLegacyDbIfNeeded();
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  mkdirSync(dirname(DB_PATH), { recursive: true });
   const db = new DatabaseSync(DB_PATH);
   configureConnection(db, { busyTimeoutMs: 250 });
   migrateCoreSchemaColumns(db);
@@ -50,4 +48,4 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines, fs, path, os };
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
