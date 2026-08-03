@@ -388,6 +388,12 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: {
+          whenReady: () => Promise.resolve(),
+          on() {},
+          quit() {},
+          getVersion: () => '9.8.7-test',
+        },
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -419,7 +425,8 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
     assert.match(queries.at(-1).sql, /COALESCE\(source, 'claude'\) = \?/);
     assert.ok(queries.at(-1).params.includes('codex'));
 
-    await ipcHandlers.get('settings:get')();
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.equal(settings.version, '9.8.7-test');
     assert.ok(
       queries.some(q => /GROUP BY COALESCE\(source, 'claude'\)/.test(q.sql)),
     );

@@ -109,7 +109,10 @@ function registerHandlers() {
   ipcMain.handle('db:getMemories', () => []);
   ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', count: 1 }]);
   ipcMain.handle('db:getStats', () => ({}));
-  ipcMain.handle('settings:get', () => ({}));
+  ipcMain.handle('settings:get', () => ({
+    editorScheme: 'vscode',
+    version: '9.8.7-test',
+  }));
   ipcMain.handle('file-ref:open', (_event, ref) => {
     openCalls.push(ref);
     return { opened: false };
@@ -187,6 +190,34 @@ async function run() {
   assert(openCalls[0]?.cwd === cwd, 'click sends the message cwd');
   assert(openCalls[0]?.sessionId === sessionId, 'click sends the session id');
   assert(navigatedAway.length === 0, 'clicking a reference never navigates the window');
+
+  await win.webContents.executeJavaScript(`window.location.hash = '#/settings'`, true);
+  await waitFor(
+    win.webContents,
+    `document.body.textContent.includes('Editor URL scheme')`,
+    'settings editor control',
+  );
+
+  const settingsState = await win.webContents.executeJavaScript(`(() => {
+    const select = document.querySelector('select.select-field');
+    const style = select ? getComputedStyle(select) : null;
+    return {
+      exists: Boolean(select),
+      appearance: style?.appearance || style?.webkitAppearance || null,
+      backgroundColor: style?.backgroundColor || null,
+      color: style?.color || null,
+      version: document.querySelector('.version-text')?.textContent?.trim() || null,
+    };
+  })()`, true);
+
+  assert(settingsState.exists, 'Settings renders the themed editor selector');
+  assert(settingsState.appearance === 'none', `editor selector disables native appearance (${settingsState.appearance})`);
+  assert(
+    settingsState.backgroundColor !== 'rgb(255, 255, 255)',
+    `editor selector keeps the dark Settings surface (${settingsState.backgroundColor})`,
+  );
+  assert(settingsState.color !== 'rgb(0, 0, 0)', `editor selector keeps themed text (${settingsState.color})`);
+  assert(settingsState.version === 'Obelisk 9.8.7-test', `Settings renders the IPC app version (${settingsState.version})`);
 
   win.destroy();
 }

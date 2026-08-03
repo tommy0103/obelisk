@@ -885,6 +885,7 @@ ipcMain.handle('settings:get', () => {
   const connected = sources.some((source) => source.status !== 'error');
 
   return {
+    version: app.getVersion(),
     providerRoots,
     claudeDir,
     codexDir,

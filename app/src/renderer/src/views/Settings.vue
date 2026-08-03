@@ -11,7 +11,7 @@ const editorScheme = ref('vscode');
 const editorSchemes = ['vscode', 'vscode-insiders', 'cursor', 'windsurf', 'zed'];
 const memoryCount = ref(0);
 const rebuilding = ref(false);
-const version = ref('0.1.0');
+const version = ref('');
 
 onMounted(async () => {
   await loadSettings();
@@ -26,6 +26,7 @@ async function loadSettings() {
   autoRefresh.value = s.autoRefresh !== false;
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
+  version.value = s.version || '';
 }
 
 async function saveEditorScheme(value) {
@@ -187,8 +188,8 @@ function fmtRelative(iso) {
             <div class="form-label">Editor URL scheme</div>
             <div class="form-label-hint">Clicking <code>src/app.ts:42</code> jumps to that line.</div>
           </div>
-          <div class="form-control">
-            <select class="form-input" :value="editorScheme" @change="saveEditorScheme($event.target.value)">
+          <div class="form-control select-control">
+            <select class="path-field select-field" :value="editorScheme" @change="saveEditorScheme($event.target.value)">
               <option v-for="opt in editorSchemes" :key="opt" :value="opt">{{ opt }}</option>
             </select>
           </div>
@@ -339,6 +340,19 @@ function fmtRelative(iso) {
 .path-field:focus { outline: 0; border-color: var(--accent); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 2px rgba(167,139,250,0.12); }
 .path-field.error { border-color: rgba(248,113,113,0.4); }
 .path-field.error:focus { border-color: #f87171; box-shadow: 0 0 0 2px rgba(248,113,113,0.12); }
+.select-control { position: relative; }
+.select-control::after {
+  content: ''; position: absolute; right: 11px; top: 9px;
+  width: 6px; height: 6px; pointer-events: none;
+  border-right: 1px solid var(--muted); border-bottom: 1px solid var(--muted);
+  transform: rotate(45deg);
+}
+.select-field {
+  width: 100%; padding-right: 30px; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+}
+.select-field:hover { border-color: var(--hairline-vivid); }
+.select-field option { background: var(--surface-strong); color: var(--fg); }
 .tz-field { max-width: 240px; }
 
 .btn {
