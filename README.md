@@ -289,6 +289,29 @@ not a second executable runtime.
 
 20K lines of scattered JSONL → something the agent can search() and sql() against in milliseconds.
 
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening
+a PR — it is short, and it is written from what actually blocked past PRs rather
+than from generic style rules.
+
+The parts worth knowing up front:
+
+- **Run every claim in your PR description end to end.** The most common reason a
+  PR stalls here is a capability that is advertised but unreachable — including
+  inputs shown in screenshots.
+- **Assert the requirement, not the implementation.** Copy the sentence from the
+  issue into your test name.
+- **Transcript content is attacker-controlled.** Obelisk indexes third-party
+  agent logs; anything reaching `shell.*`, `fs.*`, `innerHTML`, or DDL is
+  deny-by-default.
+- **Re-run verification after merging main.** A merge voids every result above
+  it, including your own noted limitations.
+
+`CONTRIBUTING.md` also carries hard constraints per area — renderer/Electron,
+provider adapters, schema migrations, main process, and indexing/daemon
+ownership. The PR template mirrors them as per-area checklists.
+
 ---
 
 ## Star History
