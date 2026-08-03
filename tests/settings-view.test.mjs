@@ -13,7 +13,10 @@ test('Settings reads the displayed version from the settings payload', () => {
 });
 
 test('Editor selector uses the themed Settings control vocabulary', () => {
-  assert.match(source, /<select class="path-field select-field"/);
-  assert.match(source, /\.select-field\s*\{[^}]*appearance:\s*none/s);
-  assert.match(source, /\.select-control::after\s*\{/);
+  assert.doesNotMatch(source, /<select\b/);
+  assert.match(source, /<button[^>]*class="editor-picker-trigger"/);
+  assert.match(source, /class="editor-picker-menu"/);
+  assert.match(source, /\.editor-picker\s*\{[^}]*width:\s*180px/s);
+  assert.match(source, /aria-haspopup="listbox"/);
+  assert.match(source, /role="option"/);
 });

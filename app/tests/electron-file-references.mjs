@@ -25,11 +25,13 @@ const channels = [
   'db:getProjects',
   'db:getStats',
   'settings:get',
+  'settings:set',
   'file-ref:open',
 ];
 
 let failures = 0;
 const openCalls = [];
+const settingCalls = [];
 
 const messageText = [
   'Absolute link: [roadmap.md](/tmp/obelisk-file-ref-fixture/docs/roadmap.md:162)',
@@ -113,6 +115,10 @@ function registerHandlers() {
     editorScheme: 'vscode',
     version: '9.8.7-test',
   }));
+  ipcMain.handle('settings:set', (_event, key, value) => {
+    settingCalls.push({ key, value });
+    return true;
+  });
   ipcMain.handle('file-ref:open', (_event, ref) => {
     openCalls.push(ref);
     return { opened: false };
@@ -199,25 +205,61 @@ async function run() {
   );
 
   const settingsState = await win.webContents.executeJavaScript(`(() => {
-    const select = document.querySelector('select.select-field');
-    const style = select ? getComputedStyle(select) : null;
+    const trigger = document.querySelector('.editor-picker-trigger');
+    const style = trigger ? getComputedStyle(trigger) : null;
     return {
-      exists: Boolean(select),
-      appearance: style?.appearance || style?.webkitAppearance || null,
+      exists: Boolean(trigger),
+      width: trigger?.getBoundingClientRect().width || null,
       backgroundColor: style?.backgroundColor || null,
       color: style?.color || null,
+      expanded: trigger?.getAttribute('aria-expanded') || null,
+      label: trigger?.textContent?.trim() || null,
+      nativeSelects: document.querySelectorAll('select').length,
       version: document.querySelector('.version-text')?.textContent?.trim() || null,
     };
   })()`, true);
 
   assert(settingsState.exists, 'Settings renders the themed editor selector');
-  assert(settingsState.appearance === 'none', `editor selector disables native appearance (${settingsState.appearance})`);
+  assert(settingsState.width === 180, `editor picker stays compact (${settingsState.width}px)`);
   assert(
     settingsState.backgroundColor !== 'rgb(255, 255, 255)',
-    `editor selector keeps the dark Settings surface (${settingsState.backgroundColor})`,
+    `editor picker keeps the dark Settings surface (${settingsState.backgroundColor})`,
   );
-  assert(settingsState.color !== 'rgb(0, 0, 0)', `editor selector keeps themed text (${settingsState.color})`);
+  assert(settingsState.color !== 'rgb(0, 0, 0)', `editor picker keeps themed text (${settingsState.color})`);
+  assert(settingsState.expanded === 'false', 'editor picker starts collapsed');
+  assert(settingsState.label.includes('VS Code'), `editor picker uses a readable label (${settingsState.label})`);
+  assert(settingsState.nativeSelects === 0, 'Settings does not fall back to a native select');
   assert(settingsState.version === 'Obelisk 9.8.7-test', `Settings renders the IPC app version (${settingsState.version})`);
+
+  await win.webContents.executeJavaScript(
+    `document.querySelector('.editor-picker-trigger').click()`, true,
+  );
+  await waitFor(
+    win.webContents,
+    `document.querySelector('.editor-picker-menu.show [role="option"]')`,
+    'editor picker menu',
+  );
+  const openPicker = await win.webContents.executeJavaScript(`(() => ({
+    expanded: document.querySelector('.editor-picker-trigger')?.getAttribute('aria-expanded'),
+    menuWidth: document.querySelector('.editor-picker-menu')?.getBoundingClientRect().width,
+    options: [...document.querySelectorAll('.editor-picker-option')].map(option => ({
+      label: option.textContent.trim(),
+      selected: option.getAttribute('aria-selected'),
+    })),
+  }))()`, true);
+  assert(openPicker.expanded === 'true', 'editor picker exposes its expanded state');
+  assert(openPicker.menuWidth === 180, `editor picker menu matches trigger width (${openPicker.menuWidth}px)`);
+  assert(openPicker.options.length === 5, `editor picker exposes five editors (${openPicker.options.length})`);
+  assert(openPicker.options.some(option => option.label.includes('VS Code') && option.selected === 'true'), 'current editor is marked selected');
+
+  await win.webContents.executeJavaScript(
+    `[...document.querySelectorAll('.editor-picker-option')].find(option => option.textContent.includes('Cursor')).click()`, true,
+  );
+  await delay(100);
+  assert(
+    settingCalls.some(call => call.key === 'editorScheme' && call.value === 'cursor'),
+    `editor picker persists the selected scheme (${JSON.stringify(settingCalls)})`,
+  );
 
   win.destroy();
 }
