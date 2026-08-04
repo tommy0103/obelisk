@@ -80,7 +80,7 @@ Core evidence table.
 | `text` | Extracted text, truncated to 10k chars |
 | `content_type` | `text`, `thinking`, `tool_use`, `tool_result`, or `unknown` |
 | `is_meta` | 1 for injected/control-plane messages |
-| `visibility` | `visible` for current evidence, `inactive` for provider-attested superseded history, `hidden` for display-suppressed or transport-only material |
+| `visibility` | `visible` for current evidence, `inactive` for provider-attested superseded history, `hidden` for display-suppressed or transport-only material. Only Pi emits `inactive` |
 | `model` | Assistant model name |
 | `is_sidechain` | Retry/branch marker |
 | `agent_id` | Subagent/workflow agent ID |

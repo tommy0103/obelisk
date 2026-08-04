@@ -173,7 +173,10 @@ messages unless `includeMeta: true` is passed; `context()` and `trace()` preserv
 the current causal chain and expose `is_meta` on returned rows.
 
 Pi can preserve a branch that was tried and later superseded as
-`visibility='inactive'`. Default helpers return only `visible` evidence. Pass
+`visibility='inactive'`. Only Pi populates it: other sources either do not
+record supersession in their transcripts or discard it while indexing, so an
+empty inactive result never means nothing was abandoned -- only that this
+source cannot say. Default helpers return only `visible` evidence. Pass
 `includeInactive: true` to `search()`, `context()`, `trace()`, `thread()`,
 `summaries()`, `raw()`, `fileHistory()`, or `failures()` only when the abandoned
 path matters. Every returned message or evidence row is labeled with
