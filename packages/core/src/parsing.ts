@@ -2,7 +2,7 @@
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
 // typed seam while remaining limited to node:fs/path/os.
-import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
 
@@ -101,6 +101,71 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 }
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
+
+export interface LineBufferSegment {
+  /** Ephemeral view: consume or copy it before requesting the next segment. */
+  bytes: Buffer;
+  lineStart: boolean;
+  lineEnd: boolean;
+}
+
+export interface LineReadOptions {
+  /** Optional upper byte boundary for multi-pass parsers. */
+  maxBytes?: number;
+}
+
+function* iterateLineSegments(
+  filePath: string,
+  { maxBytes }: LineReadOptions = {},
+): Generator<LineBufferSegment> {
+  const fd = openSync(filePath, 'r');
+  const bufSize = 64 * 1024;
+  // A refresh observes one immutable byte range even if the producer keeps
+  // appending while the source is being scanned. The next refresh picks up
+  // bytes beyond this boundary.
+  const openedBytes = fstatSync(fd).size;
+  const snapshotBytes = maxBytes === undefined
+    ? openedBytes
+    : Math.min(openedBytes, Math.max(0, maxBytes));
+  const buffer = Buffer.allocUnsafe(bufSize);
+  let position = 0;
+  let continuingLine = false;
+  try {
+    while (position < snapshotBytes) {
+      const bytesToRead = Math.min(buffer.length, snapshotBytes - position);
+      const bytesRead = readSync(fd, buffer, 0, bytesToRead, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      const chunk = buffer.subarray(0, bytesRead);
+      const finalChunk = position >= snapshotBytes;
+      let start = 0;
+
+      while (start < chunk.length) {
+        const newline = chunk.indexOf(0x0a, start);
+        if (newline !== -1) {
+          const bytes = chunk.subarray(start, newline);
+          // Empty physical lines remain omitted. An empty terminating segment
+          // still closes a line that began in the previous read buffer.
+          if (bytes.length > 0 || continuingLine) {
+            yield { bytes, lineStart: !continuingLine, lineEnd: true };
+          }
+          continuingLine = false;
+          start = newline + 1;
+          continue;
+        }
+
+        const bytes = chunk.subarray(start);
+        if (bytes.length > 0) {
+          yield { bytes, lineStart: !continuingLine, lineEnd: finalChunk };
+          continuingLine = !finalChunk;
+        }
+        start = chunk.length;
+      }
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
 
 function readLines(filePath: string, callback: (line: string) => boolean | void): void {
   const fd = openSync(filePath, 'r');
@@ -367,7 +432,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 
 export {
   CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
-  trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
+  trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, iterateLineSegments, readLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,

@@ -72,6 +72,41 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].git_branch, 'main');
 });
 
+test('codex streaming parse preserves legacy UTF-8 chunk-boundary output', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'obelisk-codex-boundary-'));
+  const path = join(dir, 'rollout.jsonl');
+  const metaLine = JSON.stringify({
+    type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META,
+  });
+  const text = 'a你b';
+  const event = {
+    type: 'event_msg',
+    timestamp: '2026-06-10T10:00:01Z',
+    payload: { type: 'user_message', message: text },
+  };
+  const eventLine = JSON.stringify(event);
+  const eventPrefixBytes = Buffer.byteLength(eventLine.slice(0, eventLine.indexOf('你')));
+  const paddingPrefix = '{"type":"noop","padding":"';
+  const paddingSuffix = '"}';
+  const fixedBytes = Buffer.byteLength(`${metaLine}\n${paddingPrefix}${paddingSuffix}\n`) + eventPrefixBytes;
+  const paddingBytes = (64 * 1024 - 1 - (fixedBytes % (64 * 1024)) + 64 * 1024) % (64 * 1024);
+  const responseLine = JSON.stringify({
+    type: 'response_item',
+    timestamp: '2026-06-10T10:00:02Z',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  });
+  writeFileSync(path, `${metaLine}\n${paddingPrefix}${'x'.repeat(paddingBytes)}${paddingSuffix}\n${eventLine}\n${responseLine}\n`);
+
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  const messages = values.filter(record => record.kind === 'message');
+
+  // The original reader decodes each 64 KiB read independently. The optimized
+  // parser intentionally mirrors that established output until a separate,
+  // explicitly semantic migration changes it.
+  assert.equal(messages.length, 2);
+  assert.notEqual(messages[0].text, messages[1].text);
+});
+
 test('codex parse() retracts a guardian thread via delete-session and emits nothing else', () => {
   const path = writeFixture([
     { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: { ...META, source: { subagent: { other: 'guardian' } } } },
@@ -83,6 +118,46 @@ test('codex parse() retracts a guardian thread via delete-session and emits noth
   assert.equal(values.length, 1);
   assert.equal(values[0].kind, 'delete-session');
   assert.match(values[0].sessionId, /^codex:/);
+});
+
+test('codex parse() skips large control records without changing canonical output', () => {
+  const ignored = 'x'.repeat(3 * 1024 * 1024);
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'original evidence' } },
+    { type: 'world_state', timestamp: '2026-06-10T10:00:02Z', payload: { instructions: ignored } },
+    {
+      type: 'compacted',
+      timestamp: '2026-06-10T10:00:03Z',
+      payload: {
+        message: 'legacy adapter ignores this summary',
+        replacement_history: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text: ignored }] }],
+      },
+    },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:04Z', payload: { type: 'agent_message', message: 'new evidence' } },
+  ]);
+
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message').map(message => message.text),
+    ['original evidence', 'new evidence'],
+  );
+  assert.equal(values.filter(record => record.kind === 'summary').length, 0);
+});
+
+test('codex parse() keeps the first session_meta as the canonical identity', () => {
+  const replayedMeta = { ...META, id: '019e8951-3e7d-7343-a3e3-05bff48a3999', cwd: '/other' };
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'before replay' } },
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:02Z', payload: replayedMeta },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:03Z', payload: { type: 'agent_message', message: 'after replay' } },
+  ]);
+
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  const session = values.find(record => record.kind === 'session');
+  assert.equal(session.id, `codex:${META.id}`);
+  assert.equal(session.jsonl_path, path);
 });
 
 test('codex provider folds session_index metadata into its canonical session record', () => {

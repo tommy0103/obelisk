@@ -15,6 +15,7 @@
     "lint": "eslint .",
     "build:core": "npm run build --workspace @obelisk/core",
     "build:cli": "npm run build --workspace @obelisk-apps/cli",
+    "bench:codex": "node --expose-gc benchmarks/codex-parser.mjs",
     "build:skill": "node packaging/build-skill.mjs",
     "publish:skill": "npm run build:skill && packaging/publish-skill.sh"
   },
