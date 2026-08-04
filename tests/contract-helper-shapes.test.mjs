@@ -99,7 +99,7 @@ test('search() hit shape matches api-reference.md', () => {
   const hit = createQueryApi(db).search('needle', { limit: 1 })[0];
 
   exactKeys(hit, ['message', 'session', 'rank', 'context'], 'search() hit');
-  exactKeys(hit.message, ['uuid', 'text', 'content_type', 'is_meta', 'role', 'timestamp', 'model', 'cwd', 'source'], 'search() hit.message');
+  exactKeys(hit.message, ['uuid', 'text', 'content_type', 'is_meta', 'role', 'timestamp', 'model', 'cwd', 'visibility', 'source'], 'search() hit.message');
   exactKeys(hit.session, ['id', 'title', 'project', 'started_at', 'source'], 'search() hit.session');
   assert.ok(Array.isArray(hit.context), 'search() hit.context is an array');
   db.close();
@@ -119,7 +119,7 @@ test('fileHistory() row shape matches api-reference.md', () => {
   const db = fixture();
   const row = createQueryApi(db).fileHistory('/x/file.ts')[0];
 
-  exactKeys(row, ['toolCall', 'session', 'timestamp'], 'fileHistory() row');
+  exactKeys(row, ['toolCall', 'session', 'timestamp', 'visibility'], 'fileHistory() row');
   exactKeys(row.toolCall, ['id', 'message_uuid', 'name', 'input_json'], 'fileHistory() row.toolCall');
   exactKeys(row.session, ['id', 'title', 'project'], 'fileHistory() row.session');
   db.close();
@@ -129,7 +129,7 @@ test('failures() row shape matches api-reference.md', () => {
   const db = fixture();
   const row = createQueryApi(db).failures()[0];
 
-  exactKeys(row, ['toolCall', 'result', 'session', 'nextMessages'], 'failures() row');
+  exactKeys(row, ['toolCall', 'result', 'session', 'nextMessages', 'visibility'], 'failures() row');
   assert.ok(Array.isArray(row.nextMessages), 'failures() row.nextMessages is an array');
   assert.equal(row.nextMessages[0].uuid, 'm-after');
   db.close();
@@ -196,7 +196,7 @@ test('raw() shape matches api-reference.md', () => {
     VALUES (?, ?, ?, ?, ?, ?, ?)`).run('m-raw', 'sid-raw', 'user', 'user', 'raw line body', 'text', 'claude');
 
   const result = createQueryApi(db).raw('m-raw');
-  exactKeys(result, ['text', 'totalLength', 'offset', 'limit', 'hasMore'], 'raw()');
+  exactKeys(result, ['text', 'totalLength', 'offset', 'limit', 'hasMore', 'visibility'], 'raw()');
   assert.equal(result.text, line);
   assert.equal(result.totalLength, line.length);
   db.close();

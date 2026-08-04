@@ -32,7 +32,27 @@ async function main() {
   }
   if (args[0] === '--build') {
     try {
-      buildIndex({ force: true });
+      const result = buildIndex({ force: true });
+      if (!('complete' in result) || result.complete !== true) {
+        const reason = 'reason' in result && typeof result.reason === 'string'
+          ? result.reason
+          : 'incomplete_snapshot';
+        const issue = 'inventoryIssues' in result && Array.isArray(result.inventoryIssues)
+          ? result.inventoryIssues[0] as { provider?: unknown; path?: unknown; error?: unknown } | undefined
+          : undefined;
+        let detail = '';
+        if ('error' in result && typeof result.error === 'string') {
+          detail = ` (${result.error})`;
+        } else if (
+          issue
+          && typeof issue.provider === 'string'
+          && typeof issue.path === 'string'
+          && typeof issue.error === 'string'
+        ) {
+          detail = ` (${issue.provider} at ${issue.path}: ${issue.error})`;
+        }
+        throw new Error(`Index rebuild was not published: ${reason}${detail}`);
+      }
       process.stdout.write(JSON.stringify({ ok: true, db: DB_PATH }) + '\n');
     } catch (error) { fail(error); }
     return;

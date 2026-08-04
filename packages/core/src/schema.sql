@@ -30,10 +30,11 @@ CREATE TABLE IF NOT EXISTS workflow_agents (
   phase TEXT, label TEXT, model TEXT, state TEXT,
   duration_ms INTEGER, tokens INTEGER, tool_calls INTEGER);
 CREATE TABLE IF NOT EXISTS index_state (
-  jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER);
+  jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER, cursor TEXT);
 CREATE TABLE IF NOT EXISTS summaries (
   id TEXT PRIMARY KEY, session_id TEXT, timestamp TEXT,
-  source TEXT, content TEXT);
+  source TEXT, content TEXT, visibility TEXT DEFAULT 'visible',
+  input_tokens INTEGER, output_tokens INTEGER);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   uuid UNINDEXED, session_id UNINDEXED, text, content=messages, content_rowid=rowid);
 CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN

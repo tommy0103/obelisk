@@ -5,15 +5,22 @@ import { inferProjectPath } from './parsing.ts';
 import {
   createProviderIndexPlan,
   indexProviderPlan,
+  indexProviderPlanStrict,
+  ProviderIndexFailure,
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
 import { acquireWriterLease, writerLockPathFor } from './writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from './write-coordinator.ts';
-import { createBuiltinProviderRegistry } from './providers/builtins.ts';
+import {
+  createConfiguredBuiltinProviderRuntime,
+  readPersistedProviderSettings,
+} from './provider-settings.ts';
+import type { ProviderRegistry } from './providers/registry.ts';
 import type { NodeSqliteDb, SqliteRow } from './sqlite-types.ts';
 
 interface SkippedFile {
+  provider: string;
   path: string;
   error: string;
   diagnostics?: unknown;
@@ -22,6 +29,11 @@ interface SkippedFile {
 interface BuildCheckOptions {
   now?: number;
   ignoreRecentBuild?: boolean;
+}
+
+interface BuildIndexOptions {
+  force?: boolean;
+  providerRegistry?: ProviderRegistry;
 }
 
 function errorMessage(error: unknown): string {
@@ -82,7 +94,7 @@ function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
   }
 }
 
-function buildIndex({ force = false }: { force?: boolean } = {}) {
+function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {}) {
   const ownership = inspectBuildOwnership({ force });
   if (ownership.skip) return ownership;
   const lease = acquireWriterLease({
@@ -94,34 +106,100 @@ function buildIndex({ force = false }: { force?: boolean } = {}) {
     // Ownership may change between the first read and lease acquisition.
     const ownershipAfterLease = inspectBuildOwnership({ force });
     if (ownershipAfterLease.skip) return ownershipAfterLease;
+    let registry = providerRegistry;
+    if (registry === undefined) {
+      const settings = readPersistedProviderSettings();
+      if (!settings.ok) {
+        return { skip: true, reason: 'settings_unavailable', error: settings.error };
+      }
+      registry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
+    }
 
     const db = openDb();
     const txDb = nodeSqliteTransactionAdapter(db);
     const skippedFiles: SkippedFile[] = [];
     try {
-      try {
-        if (force) {
+      const providerPlan = createProviderIndexPlan(db, registry, { force });
+      const incompleteProviders = [...providerPlan.incompleteProviders].sort();
+      const inventoryIssues = [...providerPlan.inventoryIssues];
+      if (force && incompleteProviders.length > 0) {
+        return {
+          skip: false,
+          complete: false,
+          reason: 'incomplete_snapshot',
+          incompleteProviders,
+          inventoryIssues,
+          skipped: 0,
+          skippedFiles,
+        };
+      }
+
+      if (force) {
+        try {
           runRetryableWriteTransaction(txDb, () => {
-            db.prepare("DELETE FROM index_state WHERE jsonl_path != '__last_build__'").run();
-            // Clearing index_state alone re-indexes existing files but leaves rows for
-            // files that no longer exist on disk (stale sessions accumulate). A force
-            // build is a clean rebuild: drop every derived table, then re-index from the
-            // current files. `memories` is the durable, human-approved layer and is never
-            // cleared; messages_fts is repopulated by the 'rebuild' command in finalize.
+            // A force build publishes one complete source snapshot or nothing.
+            // The provider contract reserves no key prefix. A force snapshot
+            // recreates every unit cursor, provider marker, and system marker.
+            db.prepare('DELETE FROM index_state').run();
             for (const table of ['messages', 'tool_calls', 'tool_results', 'sessions', 'summaries', 'subagents', 'workflows', 'workflow_agents']) {
               db.prepare(`DELETE FROM ${table}`).run();
             }
-          }, { label: 'force-cleanup' });
+            const providerResult = indexProviderPlanStrict({
+              db,
+              plan: providerPlan,
+            });
+            refreshSessionProjectPaths(db);
+            db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+            rebuildMemoryFts(db);
+            db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
+            writeProviderIndexMarkers(db, providerPlan, providerResult);
+          }, { label: 'force-rebuild' });
+        } catch (error) {
+          if (isBeginBusyFailure(error)) {
+            return {
+              skip: true,
+              complete: false,
+              reason: 'database_busy',
+              incompleteProviders,
+              inventoryIssues,
+              skipped: 0,
+              skippedFiles,
+            };
+          }
+          if (error instanceof ProviderIndexFailure) {
+            const skippedFile = {
+              provider: error.item.provider.name,
+              path: error.item.unit.key,
+              error: errorMessage(error.sourceError),
+              diagnostics: (error as { obelisk?: unknown }).obelisk
+                ?? (error.sourceError as { obelisk?: unknown } | null)?.obelisk,
+            };
+            skippedFiles.push(skippedFile);
+            process.stderr.write(
+              `Warning: failed to index ${error.item.provider.name} unit ${skippedFile.path}: ${skippedFile.error}\n`,
+            );
+            return {
+              skip: false,
+              complete: false,
+              reason: 'provider_failure',
+              incompleteProviders,
+              inventoryIssues,
+              skipped: skippedFiles.length,
+              skippedFiles,
+            };
+          }
+          throw error;
         }
-      } catch (error) {
-        if (isBeginBusyFailure(error)) {
-          return { skip: true, reason: 'database_busy', skipped: skippedFiles.length, skippedFiles };
-        }
-        throw error;
+        return {
+          skip: false,
+          complete: true,
+          incompleteProviders,
+          inventoryIssues,
+          skipped: 0,
+          skippedFiles,
+        };
       }
 
-      const registry = createBuiltinProviderRegistry();
-      const providerPlan = createProviderIndexPlan(db, registry, { force });
       const providerResult = indexProviderPlan({
         db,
         plan: providerPlan,
@@ -131,13 +209,26 @@ function buildIndex({ force = false }: { force?: boolean } = {}) {
           if (hasUnusableTransaction(error)) throw error;
           const detail = error as { message?: unknown; obelisk?: unknown } | null;
           const message = errorMessage(error);
-          skippedFiles.push({ path: unit.key, error: message, diagnostics: detail?.obelisk });
+          skippedFiles.push({
+            provider: provider.name,
+            path: unit.key,
+            error: message,
+            diagnostics: detail?.obelisk,
+          });
           process.stderr.write(`Warning: failed to index ${provider.name} unit ${unit.key}: ${message}\n`);
           return 'skip';
         },
       });
       if (providerResult.stopped) {
-        return { skip: true, reason: 'database_busy', skipped: skippedFiles.length, skippedFiles };
+        return {
+          skip: true,
+          complete: false,
+          reason: 'database_busy',
+          incompleteProviders,
+          inventoryIssues,
+          skipped: skippedFiles.length,
+          skippedFiles,
+        };
       }
       // Finalize is one transaction and is NOT swallowed: a finalize failure fails
       // the build (a half-finalized index would be inconsistent).
@@ -151,11 +242,26 @@ function buildIndex({ force = false }: { force?: boolean } = {}) {
         }, { label: 'finalize' });
       } catch (error) {
         if (isBeginBusyFailure(error)) {
-          return { skip: true, reason: 'database_busy', skipped: skippedFiles.length, skippedFiles };
+          return {
+            skip: true,
+            complete: false,
+            reason: 'database_busy',
+            incompleteProviders,
+            inventoryIssues,
+            skipped: skippedFiles.length,
+            skippedFiles,
+          };
         }
         throw error;
       }
-      return { skip: false, skipped: skippedFiles.length, skippedFiles };
+      return {
+        skip: false,
+        complete: providerResult.complete,
+        incompleteProviders,
+        inventoryIssues,
+        skipped: skippedFiles.length,
+        skippedFiles,
+      };
     } finally {
       db.close();
     }

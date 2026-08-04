@@ -20,14 +20,18 @@ const editorMenuOpen = ref(false);
 const memoryCount = ref(0);
 const rebuilding = ref(false);
 const version = ref('');
+let stopIndexUpdates = null;
 
 onMounted(async () => {
+  stopIndexUpdates = window.obelisk?.onIndexUpdated?.(() => loadSettings()) ?? null;
   document.addEventListener('pointerdown', closeEditorMenuOutside);
   document.addEventListener('keydown', closeEditorMenuOnEscape);
   await loadSettings();
 });
 
 onBeforeUnmount(() => {
+  stopIndexUpdates?.();
+  stopIndexUpdates = null;
   document.removeEventListener('pointerdown', closeEditorMenuOutside);
   document.removeEventListener('keydown', closeEditorMenuOnEscape);
 });
@@ -364,7 +368,7 @@ function fmtRelative(iso) {
 .source-card-name .vendor { font-size: 11.5px; color: var(--muted); font-weight: 400; }
 .source-card-status {
   font-family: var(--font-mono); font-size: 10.5px; color: var(--muted);
-  margin-top: 3px; display: flex; align-items: center; gap: 8px;
+  margin-top: 3px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
 }
 .source-card-status .stat-dot { width: 6px; height: 6px; border-radius: 50%; position: relative; }
 .source-card-status .stat-dot.ok { background: #34d399; box-shadow: 0 0 5px rgba(52,211,153,0.5); }
@@ -375,7 +379,7 @@ function fmtRelative(iso) {
   border: 1px solid #34d399; opacity: 0.5; animation: src-pulse 1.6s ease-out infinite;
 }
 @keyframes src-pulse { 0% { transform: scale(0.8); opacity: 0.5; } 100% { transform: scale(1.8); opacity: 0; } }
-.source-card-status .stat-text { color: var(--fg-2); }
+.source-card-status .stat-text { color: var(--fg-2); min-width: 0; overflow-wrap: anywhere; }
 .source-card-status .stat-text.ok { color: #34d399; }
 .source-card-status .stat-text.warn { color: #fbbf24; }
 .source-card-status .stat-text.error { color: #f87171; }

@@ -31,6 +31,44 @@ test('runtime query scripts cannot call attune helpers', () => {
   });
 });
 
+test('malformed Obelisk settings skip refresh without disabling provider-backed queries', () => {
+  const home = tempHome();
+  const projectDir = join(home, '.claude', 'projects', '-tmp-settings-recovery');
+  const transcriptPath = join(projectDir, 'settings-recovery.jsonl');
+  const scriptPath = join(home, 'query.mjs');
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(transcriptPath, `${JSON.stringify({
+    uuid: 'settings-recovery-user',
+    type: 'user',
+    timestamp: '2026-08-04T10:00:00.000Z',
+    cwd: '/tmp/settings-recovery',
+    message: { role: 'user', content: 'settings recovery evidence' },
+  })}\n`);
+  writeFileSync(scriptPath, `
+    const hit = search('settings recovery evidence', { limit: 1 })[0];
+    return {
+      uuid: hit?.message.uuid ?? null,
+      raw: hit ? raw(hit.message.uuid)?.text ?? null : null
+    };
+  `);
+
+  const indexed = runRuntime(['--query', scriptPath], { home });
+  assert.equal(indexed.status, 0, indexed.stderr || indexed.stdout);
+  assert.equal(JSON.parse(indexed.stdout).uuid, 'settings-recovery-user');
+
+  writeFileSync(join(home, '.obelisk', 'settings.json'), '{broken');
+  const recovered = runRuntime(['--query', scriptPath], { home });
+  assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+  assert.match(recovered.stderr, /index refresh skipped/);
+  assert.equal(JSON.parse(recovered.stdout).uuid, 'settings-recovery-user');
+  assert.match(JSON.parse(recovered.stdout).raw, /settings recovery evidence/);
+
+  const rebuild = runRuntime(['--build'], { home });
+  assert.equal(rebuild.status, 1);
+  assert.match(JSON.parse(rebuild.stdout).error, /settings_unavailable/);
+  assert.match(JSON.parse(rebuild.stdout).error, /Unable to read Obelisk settings/);
+});
+
 test('runtime attune scripts expose only memory mutation helpers', () => {
   const home = tempHome();
   const memoryPath = join(home, 'memory.md');
@@ -206,6 +244,76 @@ test('runtime indexes Codex root sessions into the shared query helpers', () => 
   assert.equal(payload.toolResult.message_uuid, `codex:${codexId}:000005`);
   assert.equal(payload.toolResult.content, '/tmp/obelisk-runtime');
   assert.ok(payload.overviewSources.some(s => s.source === 'codex' && s.session_count === 1));
+});
+
+test('runtime raw lookup uses the configured Codex root for child sessions', () => {
+  const home = tempHome();
+  const codexDir = join(home, 'custom-codex');
+  const codexSessionDir = join(codexDir, 'sessions', '2026', '08', '04');
+  const parentId = '019ec6ee-cebd-7431-9c93-ceec89a98a5f';
+  const childId = '019ec739-9f75-7a02-ba2a-371986e23823';
+  mkdirSync(codexSessionDir, { recursive: true });
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({
+    providerRoots: { codex: codexDir },
+  }));
+  writeFileSync(join(codexSessionDir, `a-parent-${parentId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-08-04T10:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: parentId,
+        timestamp: '2026-08-04T10:00:00.000Z',
+        cwd: '/tmp/custom-codex-runtime',
+        source: 'cli',
+      },
+    }),
+    '',
+  ].join('\n'));
+  writeFileSync(join(codexSessionDir, `b-child-${childId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-08-04T10:00:01.000Z',
+      type: 'session_meta',
+      payload: {
+        id: childId,
+        timestamp: '2026-08-04T10:00:01.000Z',
+        cwd: '/tmp/custom-codex-runtime',
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: parentId,
+              agent_nickname: 'Plato',
+              agent_role: 'worker',
+            },
+          },
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-08-04T10:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: 'custom Codex child raw sentinel',
+        images: [],
+        local_images: [],
+        text_elements: [],
+      },
+    }),
+    '',
+  ].join('\n'));
+  const scriptPath = join(home, 'query.mjs');
+  writeFileSync(
+    scriptPath,
+    `return raw(${JSON.stringify(`codex:${childId}:000002`)}, { limit: 1000 });`,
+  );
+
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const raw = JSON.parse(result.stdout);
+  assert.match(raw.text, /custom Codex child raw sentinel/);
+  assert.equal(raw.visibility, 'visible');
 });
 
 test('runtime skips Codex guardian review threads', () => {

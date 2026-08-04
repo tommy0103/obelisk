@@ -349,6 +349,7 @@ for (const { facet, terms } of learnedFacets) {
     JOIN sessions s ON s.id = m.session_id
     WHERE m.session_id IN (${sessionIds.map(() => '?').join(',')})
       AND m.text IS NOT NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
       AND (${clauses})
     ORDER BY m.timestamp
     LIMIT 3
@@ -448,6 +449,7 @@ const before = sql(
   `SELECT uuid, role, timestamp, substr(text,1,200) AS snippet
    FROM messages
    WHERE session_id=? AND timestamp<?
+     AND COALESCE(visibility, 'visible') = 'visible'
    ORDER BY timestamp DESC LIMIT 3`,
   s.session_id,
   s.timestamp
@@ -456,6 +458,7 @@ const after = sql(
   `SELECT uuid, role, timestamp, substr(text,1,200) AS snippet
    FROM messages
    WHERE session_id=? AND timestamp>?
+     AND COALESCE(visibility, 'visible') = 'visible'
    ORDER BY timestamp ASC LIMIT 3`,
   s.session_id,
   s.timestamp
@@ -532,6 +535,7 @@ const counts = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   GROUP BY tc.name
   ORDER BY failure_count DESC, last_failure_at DESC
@@ -551,6 +555,7 @@ const examples = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   ORDER BY m.timestamp DESC
   LIMIT 8
@@ -580,6 +585,7 @@ const groups = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   GROUP BY s.id
   ORDER BY last_failure_at DESC
@@ -598,6 +604,7 @@ const examples = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   ORDER BY m.timestamp DESC
   LIMIT 12
@@ -694,6 +701,7 @@ const row = sql(`
   SELECT uuid, length(text) AS indexed_len
   FROM messages
   WHERE length(text) >= 10000
+    AND COALESCE(visibility, 'visible') = 'visible'
   LIMIT 1
 `)[0];
 if (!row) return null;

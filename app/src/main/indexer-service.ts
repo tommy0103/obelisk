@@ -21,10 +21,17 @@ interface Timers {
 
 interface Watcher {
   close(): unknown;
+  refreshMissingRoots?(): boolean;
 }
 
 interface IndexerBuildResult {
   deferred?: boolean;
+  complete?: boolean;
+  inventoryIssues?: Array<{
+    provider: string;
+    path: string;
+    error: string;
+  }>;
 }
 
 type IndexerBuild = (args: {
@@ -42,7 +49,7 @@ interface IndexerServiceOptions {
   deferredRetryMs?: number;
   buildIndex?: IndexerBuild;
   writeHeartbeat?: () => unknown;
-  watchProjects?: (onChange: (changedPath: string) => void) => Watcher | null;
+  watchProjects?: (onChange: (changedPath?: string) => void) => Watcher | null;
   chokidar?: any;
   timers?: Timers;
   logger?: { warn?: (msg: string) => void };
@@ -71,10 +78,11 @@ function createIndexerService({
   if (typeof buildIndex !== 'function') throw new Error('createIndexerService() requires buildIndex');
   const watch = watchProjects || ((onChange) => {
     const roots = [...new Set((Array.isArray(watchDirs) ? watchDirs : [watchDirs]).filter(Boolean))];
-    const existingRoots = roots.filter(root => fs.existsSync(root));
-    if (!existingRoots.length) return null;
+    if (!roots.length) return null;
     const watchers: any[] = [];
-    for (const root of existingRoots) {
+    const watchedRoots = new Set<string>();
+    const addRoot = (root: string) => {
+      if (watchedRoots.has(root) || !fs.existsSync(root)) return false;
       const onFileChange = (filename) => {
         const name = filename ? String(filename) : '';
         if (!name || name.endsWith('.jsonl') || name.endsWith('.json')) {
@@ -102,10 +110,24 @@ function createIndexerService({
           logger.warn?.(`Obelisk watcher failed: ${(error as Error).message}`);
         });
       watchers.push(watcher);
-    }
+      watchedRoots.add(root);
+      return true;
+    };
+    const refreshMissingRoots = (notify: boolean) => {
+      let added = false;
+      for (const root of roots) {
+        if (addRoot(root)) added = true;
+      }
+      if (added && notify) onChange();
+      return watchedRoots.size === roots.length;
+    };
+    refreshMissingRoots(false);
     return {
       close() {
         return Promise.all(watchers.map(w => Promise.resolve(w.close?.())));
+      },
+      refreshMissingRoots() {
+        return refreshMissingRoots(true);
       },
     };
   });
@@ -121,7 +143,13 @@ function createIndexerService({
   let pending = false;
   let lastReason: string | null = null;
   let changedPaths = new Set<string>();
+  let fullInventoryPending = false;
   let idlePromise = Promise.resolve();
+
+  const requestFullInventory = () => {
+    fullInventoryPending = true;
+    changedPaths.clear();
+  };
 
   const addChangedPath = (changedPath?: string | string[]) => {
     if (Array.isArray(changedPath)) {
@@ -129,10 +157,15 @@ function createIndexerService({
       return;
     }
     const name = changedPath ? String(changedPath) : '';
-    if (name) changedPaths.add(name);
+    if (name && !fullInventoryPending) changedPaths.add(name);
   };
 
   const takeChangedPaths = () => {
+    if (fullInventoryPending) {
+      fullInventoryPending = false;
+      changedPaths.clear();
+      return undefined;
+    }
     if (!changedPaths.size) return undefined;
     const paths = [...changedPaths];
     changedPaths = new Set();
@@ -160,8 +193,16 @@ function createIndexerService({
     const buildChangedPaths = takeChangedPaths();
     idlePromise = (async () => {
       const result = await buildIndex({ reason, changedPaths: buildChangedPaths });
+      if (result?.complete === false) {
+        for (const issue of result.inventoryIssues ?? []) {
+          logger.warn?.(
+            `Obelisk indexed a partial ${issue.provider} inventory at ${issue.path}: ${issue.error}`,
+          );
+        }
+      }
       if (result?.deferred) {
-        addChangedPath(buildChangedPaths);
+        if (buildChangedPaths === undefined) requestFullInventory();
+        else addChangedPath(buildChangedPaths);
         if (!stopped && !deferredRetryTimer) {
           deferredRetryTimer = timers.setTimeout(() => {
             deferredRetryTimer = null;
@@ -189,7 +230,8 @@ function createIndexerService({
 
   const scheduleBuild = (reason = "change", changedPath: string | undefined = undefined) => {
     if (stopped) return;
-    addChangedPath(changedPath);
+    if (changedPath === undefined) requestFullInventory();
+    else addChangedPath(changedPath);
     lastReason = reason;
     if (running) pending = true;
     if (deferredRetryTimer) timers.clearTimeout(deferredRetryTimer);
@@ -209,14 +251,25 @@ function createIndexerService({
     }, debounceMs);
   };
 
+  const scheduleWatchRetry = () => {
+    if (stopped || watchRetryTimer) return;
+    watchRetryTimer = timers.setTimeout(() => {
+      watchRetryTimer = null;
+      if (!watcher) {
+        startWatching();
+        return;
+      }
+      if (watcher.refreshMissingRoots?.() === false) scheduleWatchRetry();
+    }, watchRetryMs);
+  };
+
   const startWatching = () => {
     if (stopped || watcher) return;
     watcher = watch((changedPath) => scheduleBuild('watch', changedPath));
     if (!watcher) {
-      watchRetryTimer = timers.setTimeout(() => {
-        watchRetryTimer = null;
-        startWatching();
-      }, watchRetryMs);
+      scheduleWatchRetry();
+    } else if (watcher.refreshMissingRoots?.() === false) {
+      scheduleWatchRetry();
     }
   };
 

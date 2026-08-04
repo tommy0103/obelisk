@@ -1,6 +1,6 @@
 // Regression tests for the write-transaction runner (docs/adr/0006):
 //  - a transient BUSY (auto-rolled-back txn) is retried and recovers;
-//  - a persistent BUSY exhausts retries, and that file is SKIPPED, not fatal;
+//  - a persistent BUSY exhausts retries without publishing a partial force rebuild;
 //  - the guarded rollback never masks the real error ("cannot rollback ...").
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -180,7 +180,7 @@ test('a transient BUSY during a file transaction is retried and recovers', () =>
   assert.equal(result.skipped, 0);
 });
 
-test('a persistent BUSY exhausts retries and skips just that file, not the build', () => {
+test('a persistent BUSY rolls back the complete force rebuild', () => {
   const { home, dbPath, projectsDir } = twoFileHome('POISON alpha', 'hello beta');
   // Always poison writes that carry alpha's marker text; beta is untouched.
   const Db = makeDbClass((args) => args.some(a => typeof a === 'string' && a.includes('POISON')));
@@ -191,7 +191,8 @@ test('a persistent BUSY exhausts retries and skips just that file, not the build
   const check = new DatabaseSync(dbPath);
   const sessions = check.prepare('SELECT id FROM sessions ORDER BY id').all().map(r => r.id);
   check.close();
-  assert.deepEqual(sessions, ['beta'], 'the persistently-failing file is skipped; the other indexes');
+  assert.deepEqual(sessions, [], 'no partial force snapshot is published');
+  assert.equal(result.complete, false);
   assert.equal(result.skipped, 1, 'the skipped file is reported in the build result');
   assert.equal(result.skippedFiles[0].diagnostics?.phase, 'work', 'diagnostics record the failing phase');
 });

@@ -11,6 +11,7 @@ import { join } from 'node:path';
 
 import { parse } from '../packages/core/src/providers/claude.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { storedProviderCursor } from '../packages/core/src/provider-indexing.ts';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -47,6 +48,10 @@ test('persist writes all record kinds from one claude parse', () => {
   assert.equal(db.prepare('SELECT COUNT(*) c FROM tool_calls').get().c, 1);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM tool_results').get().c, 1);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM summaries').get().c, 1);
+  assert.deepEqual(
+    { ...db.prepare('SELECT visibility,input_tokens,output_tokens FROM summaries').get() },
+    { visibility: 'visible', input_tokens: null, output_tokens: null },
+  );
 
   const ses = db.prepare('SELECT * FROM sessions WHERE id=?').get('sid-p');
   assert.equal(ses.title, 'Persist Session');
@@ -60,9 +65,12 @@ test('persist writes all record kinds from one claude parse', () => {
   assert.equal(usage.input_tokens, 60);
   assert.equal(usage.output_tokens, 5);
 
-  // Cursor persisted into index_state (mtime:lines → two columns).
-  const state = db.prepare('SELECT lines_processed FROM index_state WHERE jsonl_path=?').get(unit.key);
+  // The legacy numeric columns remain queryable, while the opaque token
+  // round-trips byte-for-byte for snapshot providers.
+  const state = db.prepare('SELECT lines_processed,cursor FROM index_state WHERE jsonl_path=?').get(unit.key);
   assert.equal(state.lines_processed, 6);
+  assert.equal(state.cursor, cursor);
+  assert.equal(storedProviderCursor(db, unit.key), cursor);
   assert.equal(cursor.split(':')[1], '6');
 });
 

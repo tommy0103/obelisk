@@ -22,6 +22,7 @@ import { sourceLabel } from './source-catalog.mjs';
 const router = useRouter();
 const route = useRoute();
 let searchTimer = null;
+let stopSourceUpdates = null;
 
 const routeSession = computed(() => {
   return getSessionSummary(route.params.id);
@@ -193,9 +194,14 @@ function handleGlobalKeydown(event) {
   }
 }
 
-onMounted(() => window.addEventListener('keydown', handleGlobalKeydown));
+onMounted(() => {
+  window.addEventListener('keydown', handleGlobalKeydown);
+  stopSourceUpdates = window.obelisk?.onIndexUpdated?.(() => loadSourceDots()) ?? null;
+});
 onUnmounted(() => {
   window.removeEventListener('keydown', handleGlobalKeydown);
+  stopSourceUpdates?.();
+  stopSourceUpdates = null;
   clearTimeout(searchTimer);
 });
 

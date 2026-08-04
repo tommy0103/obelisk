@@ -7,7 +7,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 
-import { filePath, projectSlugFromPath, trunc, truncJson } from '../parsing.ts';
+import { filePath, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import type {
   Cursor,
   DiscoverContext,
@@ -17,6 +17,7 @@ import type {
   ProviderAdapter,
   RawLookup,
   RawRecord,
+  InventoryIssue,
   SubagentRecord,
   SummaryRecord,
   ToolCallRecord,
@@ -572,14 +573,31 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
   };
 }
 
-function sessionDirectories(rootDir: string): string[] {
+function sessionDirectories(
+  rootDir: string,
+  reportIssue?: (issue: InventoryIssue) => void,
+): string[] {
   const sessionsDir = join(rootDir, 'sessions');
   if (!existsSync(sessionsDir)) return [];
   const result: string[] = [];
-  for (const workspace of readdirSync(sessionsDir, { withFileTypes: true })) {
+  let workspaces;
+  try {
+    workspaces = readdirSync(sessionsDir, { withFileTypes: true });
+  } catch (error) {
+    reportIssue?.(sourceInventoryIssue(sessionsDir, error));
+    return result;
+  }
+  for (const workspace of workspaces) {
     if (!workspace.isDirectory()) continue;
     const workspaceDir = join(sessionsDir, workspace.name);
-    for (const session of readdirSync(workspaceDir, { withFileTypes: true })) {
+    let sessions;
+    try {
+      sessions = readdirSync(workspaceDir, { withFileTypes: true });
+    } catch (error) {
+      reportIssue?.(sourceInventoryIssue(workspaceDir, error));
+      continue;
+    }
+    for (const session of sessions) {
       if (session.isDirectory()) result.push(join(workspaceDir, session.name));
     }
   }
@@ -649,10 +667,14 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
     watchRoots: (configuredRoot) => [join(configuredRoot, 'sessions'), join(configuredRoot, 'session_index.jsonl')],
     discover(ctx: DiscoverContext): IndexUnit[] {
       const units: IndexUnit[] = [];
+      const sessionsDir = join(rootDir, 'sessions');
+      if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
+        ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+      }
       const changedSessions = ctx.changedPaths === undefined
         ? null
         : changedSessionDirectories(rootDir, ctx.changedPaths);
-      for (const sessionDir of sessionDirectories(rootDir)) {
+      for (const sessionDir of sessionDirectories(rootDir, ctx.reportIncompleteInventory)) {
         if (changedSessions !== null && !changedSessions.has(sessionDir)) continue;
         const statePath = join(sessionDir, 'state.json');
         const wireFiles = listWireFiles(sessionDir);

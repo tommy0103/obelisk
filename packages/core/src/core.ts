@@ -12,12 +12,53 @@ import { createContext, runInNewContext } from 'node:vm';
 
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import { buildIndex, shouldSkipBuild } from './indexer.ts';
+import {
+  createConfiguredBuiltinProviderRuntime,
+  readPersistedProviderSettings,
+} from './provider-settings.ts';
+import type { ProviderRegistry } from './providers/registry.ts';
 import { createQueryApi, createAttuneApi } from './query.ts';
 import { acquireWriterLease, writerLockPathFor } from './writer-lease.ts';
 
 export { buildIndex, DB_PATH };
 
 type SandboxApi = Record<string, unknown>;
+
+interface InventoryIssue {
+  provider?: unknown;
+  path?: unknown;
+  error?: unknown;
+}
+
+function reportIncompleteInventory(build: unknown): void {
+  if (build === null || typeof build !== 'object' || !('inventoryIssues' in build)) return;
+  const issues = (build as { inventoryIssues?: unknown }).inventoryIssues;
+  if (!Array.isArray(issues)) return;
+  for (const value of issues) {
+    const issue = value as InventoryIssue | null;
+    if (
+      issue !== null
+      && typeof issue.provider === 'string'
+      && typeof issue.path === 'string'
+      && typeof issue.error === 'string'
+    ) {
+      process.stderr.write(
+        `Warning: incomplete ${issue.provider} source inventory at ${issue.path}: ${issue.error}\n`,
+      );
+    }
+  }
+}
+
+function refreshQueryIndex(): ProviderRegistry {
+  const settings = readPersistedProviderSettings();
+  const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
+  if (!settings.ok) {
+    process.stderr.write(`Warning: ${settings.error}; index refresh skipped\n`);
+    return providerRegistry;
+  }
+  reportIncompleteInventory(buildIndex({ providerRegistry }));
+  return providerRegistry;
+}
 
 // Run a user-supplied CodeAct script inside the query/attune sandbox. The script
 // body runs as an async IIFE with a 30s timeout; its `return` value is resolved.
@@ -32,10 +73,10 @@ function runInSandbox(api: SandboxApi, scriptContent: string): Promise<unknown> 
 
 // FTS search over indexed message text. Refreshes the index, then queries.
 export function searchText(text: string, opts?: Record<string, unknown>): unknown {
-  buildIndex();
+  const providerRegistry = refreshQueryIndex();
   const db = openReadDb();
   try {
-    return createQueryApi(db).search(text, opts);
+    return createQueryApi(db, { providerRegistry }).search(text, opts);
   } finally {
     db.close();
   }
@@ -43,10 +84,10 @@ export function searchText(text: string, opts?: Record<string, unknown>): unknow
 
 // Execute a read-only CodeAct query script and resolve its returned value.
 export async function executeQuery(scriptContent: string): Promise<unknown> {
-  buildIndex();
+  const providerRegistry = refreshQueryIndex();
   const db = openReadDb();
   try {
-    return await runInSandbox(createQueryApi(db), scriptContent);
+    return await runInSandbox(createQueryApi(db, { providerRegistry }), scriptContent);
   } finally {
     db.close();
   }
@@ -55,6 +96,7 @@ export async function executeQuery(scriptContent: string): Promise<unknown> {
 // Execute a memory-mutation CodeAct script (remember/forget only).
 export async function executeAttune(scriptContent: string): Promise<unknown> {
   const build = buildIndex() as { reason?: string } | undefined;
+  reportIncompleteInventory(build);
   if (build?.reason === 'daemon_active') {
     throw new Error('Obelisk daemon owns index writes; attune is read-only until the daemon stops');
   }

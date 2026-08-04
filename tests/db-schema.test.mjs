@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 
 import { extractContentType, extractMessageIsMeta } from '../packages/core/src/db.ts';
+import { migrateCoreSchemaColumns } from '../packages/core/src/schema-migrations.ts';
 
 async function readExecutableSchema() {
   return readFile(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -48,6 +49,42 @@ test('messages schema stores the raw content block type', async () => {
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages/);
+});
+
+test('summaries preserve usage from provider-owned summary model calls', async () => {
+  const source = await readExecutableSchema();
+
+  assert.match(source, /summaries \([\s\S]*visibility TEXT DEFAULT 'visible'[\s\S]*input_tokens INTEGER, output_tokens INTEGER/);
+  assert.match(source, /index_state \([\s\S]*cursor TEXT/);
+});
+
+test('additive migrations preserve old index state and summary rows while adding canonical fields', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`
+      CREATE TABLE index_state (
+        jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER
+      );
+      CREATE TABLE summaries (
+        id TEXT PRIMARY KEY, session_id TEXT, timestamp TEXT,
+        source TEXT, content TEXT
+      );
+      INSERT INTO index_state VALUES ('unit', 12, 3);
+      INSERT INTO summaries VALUES ('summary', 'session', NULL, 'legacy', 'kept');
+    `);
+
+    migrateCoreSchemaColumns(db);
+    assert.equal(
+      db.prepare("SELECT cursor FROM index_state WHERE jsonl_path='unit'").get().cursor,
+      null,
+    );
+    assert.deepEqual(
+      { ...db.prepare("SELECT content,visibility FROM summaries WHERE id='summary'").get() },
+      { content: 'kept', visibility: 'visible' },
+    );
+  } finally {
+    db.close();
+  }
 });
 
 test('tool results schema indexes live session patch lookups', async () => {
@@ -125,10 +162,18 @@ test('schema reference stays focused on raw SQL structure', async () => {
 
   assert.ok(ref.split('\n').length < 420, 'schema.md should remain a quick SQL reference');
   assert.match(ref, /Raw SQL Quick Reference/i);
+  assert.match(ref, /Claude Code, Codex, and Kimi Code/);
+  assert.equal(
+    ref.match(/Provider ID: `claude`, `codex`, or `kimi`/g)?.length,
+    2,
+    'session and message source fields should document every provider',
+  );
   assert.match(ref, /references\/api-reference\.md/);
   assert.match(ref, /sessions\.id\s+<--\s+messages\.session_id/);
   assert.match(ref, /tool_calls.*does not have timestamps/i);
   assert.match(ref, /COALESCE\(m\.is_meta, 0\) = 0/);
+  assert.match(ref, /provider-attested superseded history/);
+  assert.match(ref, /Exact opaque provider cursor/);
   assert.doesNotMatch(ref, /#### `summaries\(opts\?\)`/);
   assert.doesNotMatch(ref, /#### `raw\(uuid, opts\?\)`/);
 });
@@ -137,8 +182,10 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
+  assert.match(ref, /'claude' \| 'codex' \| 'kimi'/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
+  assert.match(ref, /Inactive summaries describe work that was tried and[\s\S]*then superseded/);
   assert.match(ref, /session_title/);
   assert.match(ref, /opts\.branch/);
   assert.match(ref, /#### `raw\(uuid, opts\?\)`/);
@@ -154,6 +201,8 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
+  assert.match(skill, /Claude Code, Codex, and Kimi Code/);
+  assert.match(skill, /'claude'.*'codex'.*'kimi'/s);
   assert.match(skill, /Reference Map/);
   assert.match(skill, /references\/schema\.md.*raw SQL/i);
   assert.match(skill, /references\/api-reference\.md.*helper/i);

@@ -14,9 +14,13 @@ import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/sr
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
+  createConfiguredBuiltinProviderRuntime,
+  readPersistedProviderSettings,
+} from '../../../packages/core/src/provider-settings.ts';
+import {
   buildSourceCatalog,
-  resolveProviderRoots,
   setPersistedSetting,
+  type ProviderSourceIssue,
 } from './provider-settings.ts';
 import type {
   SessionPatchCursor,
@@ -66,6 +70,8 @@ const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');
 let db;
 let indexerService;
 let indexerWorker;
+let latestSourceIssues: ProviderSourceIssue[] = [];
+let latestSettingsError: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
 
@@ -78,16 +84,19 @@ function acquireAppWriterLease(dbPath: string, waitMs = 0) {
 }
 
 function getRuntimePaths(persisted = loadPersistedSettings()) {
-  const defaultRegistry = createBuiltinProviderRegistry({
-    claude: DEFAULT_CLAUDE_DIR,
-    codex: DEFAULT_CODEX_DIR,
+  const runtime = createConfiguredBuiltinProviderRuntime(persisted, {
+    baseRoots: {
+      claude: DEFAULT_CLAUDE_DIR,
+      codex: DEFAULT_CODEX_DIR,
+    },
   });
-  const providerRoots = resolveProviderRoots(defaultRegistry, persisted);
-  const providerRegistry = createBuiltinProviderRegistry(providerRoots);
+  const providerRoots = runtime.roots;
+  const providerRegistry = runtime.registry;
   const claudeDir = providerRoots['claude'] ?? DEFAULT_CLAUDE_DIR;
   const codexDir = providerRoots['codex'] ?? DEFAULT_CODEX_DIR;
   return {
     providerRoots,
+    providerSettings: persisted,
     providerRegistry,
     claudeDir,
     codexDir,
@@ -209,11 +218,37 @@ function runAppDbWrite(work: () => void): boolean {
   }
 }
 
-function notifyIndexUpdated(result: { affectedSessionIds?: unknown } = {}) {
+function notifyIndexUpdated(result: {
+  affectedSessionIds?: unknown;
+  inventoryIssues?: unknown;
+  skippedFiles?: unknown;
+} = {}) {
   const affectedSessionIds = Array.isArray(result.affectedSessionIds)
     ? [...new Set(result.affectedSessionIds.filter(Boolean))]
     : [];
-  const payload = { affectedSessionIds };
+  const issueLists = [result.inventoryIssues, result.skippedFiles]
+    .filter(Array.isArray)
+    .flat();
+  if (Array.isArray(result.inventoryIssues) || Array.isArray(result.skippedFiles)) {
+    const unique = new Map<string, ProviderSourceIssue>();
+    for (const value of issueLists) {
+      const issue = value as Partial<ProviderSourceIssue> | null;
+      if (
+        issue !== null
+        && typeof issue.provider === 'string'
+        && typeof issue.path === 'string'
+        && typeof issue.error === 'string'
+      ) {
+        unique.set(`${issue.provider}\0${issue.path}\0${issue.error}`, {
+          provider: issue.provider,
+          path: issue.path,
+          error: issue.error,
+        });
+      }
+    }
+    latestSourceIssues = [...unique.values()];
+  }
+  const payload = { affectedSessionIds, sourceIssues: latestSourceIssues };
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('obelisk:index-updated', payload);
     for (const sessionId of affectedSessionIds) {
@@ -235,6 +270,7 @@ function appendWhere(sql, params, clause) {
 
 function startIndexerService({ buildOnStart = false } = {}) {
   const paths = getRuntimePaths();
+  if (latestSettingsError !== null) return null;
   migrateLegacyDbIfNeeded(paths);
   indexerService = createIndexerService({
     projectsDir: paths.projectsDir,
@@ -244,13 +280,18 @@ function startIndexerService({ buildOnStart = false } = {}) {
         reason,
         changedPaths,
         providerRoots: paths.providerRoots,
+        providerSettings: paths.providerSettings,
         claudeDir: paths.claudeDir,
         codexDir: paths.codexDir,
         projectsDir: paths.projectsDir,
         dbPath: paths.dbPath,
       });
       if (result?.deferred) {
-        if (Array.isArray(result.affectedSessionIds) && result.affectedSessionIds.length) {
+        if (
+          (Array.isArray(result.affectedSessionIds) && result.affectedSessionIds.length)
+          || (Array.isArray(result.inventoryIssues) && result.inventoryIssues.length)
+          || (Array.isArray(result.skippedFiles) && result.skippedFiles.length)
+        ) {
           notifyIndexUpdated(result);
         }
       } else {
@@ -268,11 +309,11 @@ function startIndexerService({ buildOnStart = false } = {}) {
 function startBackgroundResources({ runStartupBuild = false } = {}) {
   if (!indexerWorker) indexerWorker = createWorkerBuildIndex();
   const paths = getRuntimePaths();
-  migrateLegacyDbIfNeeded(paths);
+  if (latestSettingsError === null) migrateLegacyDbIfNeeded(paths);
   openDb(paths.dbPath);
-  if (!indexerService) {
+  if (!indexerService && latestSettingsError === null) {
     const service = startIndexerService({ buildOnStart: false });
-    if (runStartupBuild) service.runBuildNow('startup');
+    if (runStartupBuild) service?.runBuildNow('startup');
   }
   if (!obeliskWatcher) startObeliskWatcher();
 }
@@ -440,18 +481,29 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
     SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
-    FROM messages m WHERE m.session_id = ? AND m.agent_id IS NULL ORDER BY m.timestamp, m.uuid
+    FROM messages m
+    WHERE m.session_id = ? AND m.agent_id IS NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY m.timestamp, m.uuid
   `).all(sessionId) as SessionMessageRow[];
 }
 
 function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   if (!db) return [];
-  return db.prepare(`SELECT * FROM tool_calls WHERE session_id = ?`).all(sessionId) as SessionToolCallRow[];
+  return db.prepare(`
+    SELECT tc.* FROM tool_calls tc
+    JOIN messages m ON m.uuid = tc.message_uuid
+    WHERE tc.session_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+  `).all(sessionId) as SessionToolCallRow[];
 }
 
 function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   if (!db) return [];
-  return db.prepare(`SELECT * FROM tool_results WHERE session_id = ?`).all(sessionId) as SessionToolResultRow[];
+  return db.prepare(`
+    SELECT tr.* FROM tool_results tr
+    JOIN messages m ON m.uuid = tr.message_uuid
+    WHERE tr.session_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+  `).all(sessionId) as SessionToolResultRow[];
 }
 
 function querySessionSubagents(sessionId: string): SessionSubagentRow[] {
@@ -470,7 +522,10 @@ function querySessionWorkflows(sessionId: string): SessionWorkflowRow[] {
 
 function querySessionSummaries(sessionId: string): SessionSummaryRow[] {
   if (!db) return [];
-  return db.prepare(`SELECT * FROM summaries WHERE session_id = ?`).all(sessionId) as SessionSummaryRow[];
+  return db.prepare(`
+    SELECT * FROM summaries
+    WHERE session_id = ? AND COALESCE(visibility, 'visible') = 'visible'
+  `).all(sessionId) as SessionSummaryRow[];
 }
 
 function querySessionSnapshot(sessionId: string): SessionDetailAssemblyInput {
@@ -569,7 +624,9 @@ ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
     SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
-    FROM messages m WHERE m.agent_id = ? ORDER BY m.timestamp, m.uuid
+    FROM messages m
+    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY m.timestamp, m.uuid
   `).all(agentId);
 });
 
@@ -578,7 +635,7 @@ ipcMain.handle('db:getSubagentToolCalls', (_, agentId) => {
   return db.prepare(`
     SELECT tc.* FROM tool_calls tc
     JOIN messages m ON m.uuid = tc.message_uuid
-    WHERE m.agent_id = ?
+    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
   `).all(agentId);
 });
 
@@ -587,7 +644,7 @@ ipcMain.handle('db:getSubagentToolResults', (_, agentId) => {
   return db.prepare(`
     SELECT tr.* FROM tool_results tr
     JOIN messages m ON m.uuid = tr.message_uuid
-    WHERE m.agent_id = ?
+    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
   `).all(agentId);
 });
 
@@ -606,7 +663,7 @@ ipcMain.handle('db:getMemories', () => {
 ipcMain.handle('db:getMessageFullText', (_, uuid) => {
   if (!db) return null;
   const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-  if (!msg) return null;
+  if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
   const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
   const subagent = msg.agent_id
     ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
@@ -614,12 +671,16 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
   const workflowAgent = msg.agent_id
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
+  const cursorRow = typeof session?.jsonl_path === 'string'
+    ? db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path)
+    : undefined;
   const paths = getRuntimePaths();
   const raw = paths.providerRegistry.raw({
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
     agentId: msg.agent_id || null,
+    cursor: typeof cursorRow?.cursor === 'string' ? cursorRow.cursor : null,
     subagent,
     workflowAgent,
   });
@@ -641,7 +702,9 @@ function querySessionFileRoots(sessionId: unknown): string[] {
   const roots: string[] = [];
   try {
     const rows = db.prepare(
-      `SELECT DISTINCT cwd FROM messages WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''`
+      `SELECT DISTINCT cwd FROM messages
+       WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
+         AND COALESCE(visibility, 'visible') = 'visible'`
     ).all(sessionId);
     for (const row of rows) roots.push(row.cwd);
     const session = db.prepare(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
@@ -659,7 +722,12 @@ ipcMain.handle('file-ref:open', async (_, ref) => {
   if (!filePath) return { opened: false };
   const { editorScheme } = loadPersistedSettings();
   try {
-    await shell.openExternal(buildEditorUrl({ scheme: editorScheme, filePath, line, column }));
+    await shell.openExternal(buildEditorUrl({
+      scheme: typeof editorScheme === 'string' ? editorScheme : undefined,
+      filePath,
+      line,
+      column,
+    }));
     return { opened: true, path: filePath };
   } catch {
     return { opened: false, path: filePath };
@@ -705,11 +773,25 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   if (!db) return { daily: [], totalTokens: 0, peakDay: null, longestTurn: null };
   const sourceFilter = sourceWhereClause(opts, 'source');
   const sourceSql = sourceFilter.sql ? `AND ${sourceFilter.sql}` : '';
+  const usageEvents = `
+    WITH usage_events AS (
+      SELECT timestamp, input_tokens, output_tokens, COALESCE(source, 'claude') AS source
+      FROM messages
+      UNION ALL
+      SELECT su.timestamp, su.input_tokens, su.output_tokens,
+             COALESCE(s.source, 'claude') AS source
+      FROM summaries su
+      LEFT JOIN sessions s ON s.id = su.session_id
+    )
+  `;
+  // Visibility controls evidence display, not accounting. Abandoned model calls
+  // still consumed tokens, so aggregate usage intentionally includes them.
 
   const daily = db.prepare(`
+    ${usageEvents}
     SELECT DATE(timestamp) as day,
            SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
-    FROM messages
+    FROM usage_events
     WHERE timestamp IS NOT NULL AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
       ${sourceSql}
     GROUP BY DATE(timestamp)
@@ -717,15 +799,17 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   `).all(...sourceFilter.params);
 
   const totalTokens = db.prepare(`
+    ${usageEvents}
     SELECT SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as total
-    FROM messages
+    FROM usage_events
     ${sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : ''}
   `).get(...sourceFilter.params)?.total || 0;
 
   const peakDay = db.prepare(`
+    ${usageEvents}
     SELECT DATE(timestamp) as day,
            SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
-    FROM messages
+    FROM usage_events
     WHERE timestamp IS NOT NULL AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
       ${sourceSql}
     GROUP BY DATE(timestamp)
@@ -837,15 +921,25 @@ ipcMain.handle('recap:read', (_, filename) => {
 const SETTINGS_PATH = path.join(OBELISK_DIR, 'settings.json');
 
 function loadPersistedSettings() {
-  try {
-    if (fs.existsSync(SETTINGS_PATH)) return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8'));
-  } catch {}
-  return {};
+  const result = readPersistedProviderSettings(SETTINGS_PATH);
+  latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
+  if (latestSettingsError !== null) console.warn(latestSettingsError);
+  return result.settings;
 }
 
 function savePersistedSettings(settings) {
   if (!fs.existsSync(OBELISK_DIR)) fs.mkdirSync(OBELISK_DIR, { recursive: true });
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
+    fs.renameSync(temporaryPath, SETTINGS_PATH);
+    latestSettingsError = null;
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch {}
+    throw error;
+  }
 }
 
 ipcMain.handle('settings:get', () => {
@@ -878,11 +972,13 @@ ipcMain.handle('settings:get', () => {
     registry: providerRegistry,
     roots: providerRoots,
     stats: sourceStats,
+    sourceIssues: latestSourceIssues,
     pathExists: fs.existsSync,
   });
   const sessionCount = sources.reduce((sum, source) => sum + source.sessionCount, 0);
   const lastIndexed = sources.map((source) => source.lastIndexed).filter(Boolean).sort().at(-1) || '';
-  const connected = sources.some((source) => source.status !== 'error');
+  const connected = latestSettingsError === null
+    && sources.some((source) => source.status !== 'error');
 
   return {
     version: app.getVersion(),
@@ -898,7 +994,7 @@ ipcMain.handle('settings:get', () => {
     sessionCount,
     lastIndexed,
     status: connected ? 'ok' : 'error',
-    statusText: connected ? 'Connected' : 'No source folders found',
+    statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
   };
 });
 
@@ -910,8 +1006,8 @@ ipcMain.handle('settings:set', async (_, key, value) => {
   if (key === 'autoRefresh') {
     if (value === false && indexerService) {
       await stopIndexerServiceAndWait();
-    } else if (value !== false && indexerService) {
-      await stopIndexerServiceAndWait();
+    } else if (value !== false) {
+      if (indexerService) await stopIndexerServiceAndWait();
       startIndexerService({ buildOnStart: false });
     }
   }
@@ -928,7 +1024,7 @@ ipcMain.handle('settings:set', async (_, key, value) => {
     if (persisted.autoRefresh !== false) {
       startIndexerService({ buildOnStart: true });
     }
-    notifyIndexUpdated();
+    notifyIndexUpdated({ inventoryIssues: [] });
   }
   return true;
 });
@@ -951,6 +1047,7 @@ ipcMain.handle('settings:revealPath', (_, p) => {
 ipcMain.handle('settings:rebuildIndex', async () => {
   if (!indexerWorker) return null;
   const persisted = loadPersistedSettings();
+  if (latestSettingsError !== null) throw new Error(latestSettingsError);
   const paths = getRuntimePaths(persisted);
   const tempDbPath = rebuildTempDbPath(paths.dbPath);
   const shouldRestartWatcher = persisted.autoRefresh !== false;
@@ -977,6 +1074,9 @@ ipcMain.handle('settings:rebuildIndex', async () => {
         skipped: 0,
         skippedFiles: [],
         deferred: true,
+        complete: false,
+        incompleteProviders: [],
+        inventoryIssues: [],
         reason: 'writer_busy',
       };
     }
@@ -985,6 +1085,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       reason: 'manual-rebuild',
       force: true,
       providerRoots: paths.providerRoots,
+      providerSettings: paths.providerSettings,
       claudeDir: paths.claudeDir,
       codexDir: paths.codexDir,
       projectsDir: paths.projectsDir,
@@ -993,7 +1094,10 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });
-    if (result?.deferred) return result;
+    if (result?.deferred || result?.complete !== true) {
+      notifyIndexUpdated(result);
+      return result;
+    }
     closeDb();
     replaceDbWithTemp(tempDbPath, paths.dbPath);
     openDb(paths.dbPath, { writerLeaseMode: 'caller-held' });

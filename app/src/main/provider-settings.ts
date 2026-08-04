@@ -1,4 +1,5 @@
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
+export { resolveProviderRoots } from '../../../packages/core/src/provider-settings.ts';
 
 type PersistedSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -9,28 +10,18 @@ interface SourceStats {
   lastIndexed: string;
 }
 
+export interface ProviderSourceIssue {
+  readonly provider: string;
+  readonly path: string;
+  readonly error: string;
+}
+
 interface BuildSourceCatalogOptions {
   registry: ProviderRegistry;
   roots: Readonly<Record<string, string>>;
   stats?: ReadonlyMap<string, SourceStats>;
+  sourceIssues?: readonly ProviderSourceIssue[];
   pathExists?: (path: string) => boolean;
-}
-
-function configuredPath(value: unknown): string | null {
-  return typeof value === 'string' && value.trim().length > 0 ? value : null;
-}
-
-export function resolveProviderRoots(
-  registry: ProviderRegistry,
-  persisted: PersistedSettings = {},
-): Record<string, string> {
-  const configured = persisted.providerRoots ?? {};
-  return Object.fromEntries(registry.catalog().map((descriptor) => {
-    const root = configuredPath(configured[descriptor.id])
-      ?? configuredPath(persisted[`${descriptor.id}Dir`])
-      ?? descriptor.defaultRoot;
-    return [descriptor.id, root];
-  }));
 }
 
 export function setPersistedSetting(
@@ -46,7 +37,9 @@ export function setPersistedSetting(
   }
 
   const providerId = providerMatch[1]!;
-  const roots = persisted.providerRoots && typeof persisted.providerRoots === 'object'
+  const roots = persisted.providerRoots
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
     ? persisted.providerRoots
     : {};
   if (value === null) delete roots[providerId];
@@ -60,13 +53,23 @@ export function buildSourceCatalog({
   registry,
   roots,
   stats = new Map(),
+  sourceIssues = [],
   pathExists = () => false,
 }: BuildSourceCatalogOptions) {
   return registry.catalog().map((descriptor) => {
     const path = roots[descriptor.id] ?? descriptor.defaultRoot;
     const exists = pathExists(path);
+    const needsRoot = descriptor.requiresExplicitRoot === true;
     const sourceStats = stats.get(descriptor.id) ?? { sessionCount: 0, lastIndexed: '' };
-    const status = !exists ? 'error' : sourceStats.sessionCount > 0 ? 'ok' : 'warn';
+    const issue = sourceIssues.find((candidate) => candidate.provider === descriptor.id);
+    const status = needsRoot || !exists
+      ? 'error'
+      : issue !== undefined || sourceStats.sessionCount === 0
+        ? 'warn'
+        : 'ok';
+    const partialStatus = issue === undefined
+      ? null
+      : `Index issue: ${issue.path} — ${issue.error}`;
     return {
       id: descriptor.id,
       name: descriptor.name,
@@ -78,11 +81,11 @@ export function buildSourceCatalog({
       sessionCount: sourceStats.sessionCount,
       lastIndexed: sourceStats.lastIndexed,
       status,
-      statusText: !exists
+      statusText: needsRoot
+        ? descriptor.rootResolutionReason ?? 'Select a session folder'
+        : !exists
         ? 'Folder not found'
-        : sourceStats.sessionCount > 0
-          ? 'Connected'
-          : 'No sessions found',
+        : partialStatus ?? (sourceStats.sessionCount > 0 ? 'Connected' : 'No sessions found'),
     };
   });
 }

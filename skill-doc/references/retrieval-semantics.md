@@ -37,7 +37,7 @@ Project-like fields are distinct:
 - `memories.project`: stored project slug copied onto registered memory records.
 - `sessions.project_path`: absolute session path derived from message `cwd` when available; slug decoding is only a fallback.
 - `messages.cwd`: working directory at message time.
-- `sessions.source` / `messages.source`: transcript provider, currently `claude` or `codex`.
+- `sessions.source` / `messages.source`: transcript provider: `claude`, `codex`, or `kimi`.
 - helper `project`: SQL `LIKE` over `sessions.project`, not exact membership.
 - helper `source`: optional provider filter. Omit it unless provenance matters.
 
@@ -85,6 +85,9 @@ Ordering and context are semantic:
 - `fileHistory()` is oldest first.
 - `search().context` is temporal neighbors in one session, not causal context.
 - `context(uuid)` and `trace(uuid)` are for parent-chain/causal expansion.
+  They return only current evidence by default. Use `includeInactive: true` for
+  a path that was tried and then superseded; hidden records remain
+  unavailable.
 
 ### Evidence Before Conclusion
 

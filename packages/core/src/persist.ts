@@ -33,7 +33,7 @@ function statements(db: SqliteDb) {
         cwd=excluded.cwd, skill=excluded.skill, source=excluded.source`),
     tc: db.prepare('INSERT OR REPLACE INTO tool_calls (id,message_uuid,session_id,name,presentation,input_json,file_path) VALUES (?,?,?,?,?,?,?)'),
     tr: db.prepare('INSERT OR REPLACE INTO tool_results (tool_use_id,message_uuid,session_id,content,file_path,is_error) VALUES (?,?,?,?,?,?)'),
-    sum: db.prepare('INSERT OR REPLACE INTO summaries (id,session_id,timestamp,source,content) VALUES (?,?,?,?,?)'),
+    sum: db.prepare('INSERT OR REPLACE INTO summaries (id,session_id,timestamp,source,content,visibility,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?)'),
     ses: db.prepare('INSERT OR REPLACE INTO sessions (id,title,project,project_path,started_at,ended_at,git_branch,version,message_count,jsonl_path,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)'),
     sub: db.prepare(`
       INSERT INTO subagents (agent_id,session_id,parent_tool_use_id,agent_type,description,duration_ms,total_tokens)
@@ -65,7 +65,7 @@ function statements(db: SqliteDb) {
         tokens=COALESCE(excluded.tokens, workflow_agents.tokens),
         tool_calls=COALESCE(excluded.tool_calls, workflow_agents.tool_calls)`),
     turn: db.prepare('UPDATE messages SET turn_duration_ms=? WHERE uuid=?'),
-    idx: db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path,mtime,lines_processed) VALUES (?,?,?)'),
+    idx: db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,?,?,?)'),
     getSession: db.prepare('SELECT * FROM sessions WHERE id=?'),
   };
 }
@@ -99,7 +99,16 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
         st.tr.run(r.tool_use_id, r.message_uuid, r.session_id, r.content, r.file_path, r.is_error);
         break;
       case 'summary':
-        st.sum.run(r.id, r.session_id, r.timestamp, r.source, r.content);
+        st.sum.run(
+          r.id,
+          r.session_id,
+          r.timestamp,
+          r.source,
+          r.content,
+          r.visibility ?? 'visible',
+          r.input_tokens ?? null,
+          r.output_tokens ?? null,
+        );
         break;
       case 'subagent':
         st.sub.run(r.agent_id, r.session_id, r.parent_tool_use_id ?? null, r.agent_type ?? null, r.description ?? null, r.duration_ms ?? null, r.total_tokens ?? null);
@@ -147,7 +156,7 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
 
   if (cursor != null) {
     const [mtime, lines] = cursor.split(':');
-    st.idx.run(unit.key, Number(mtime), Number(lines));
+    st.idx.run(unit.key, Number(mtime), Number(lines), cursor);
   }
   return cursor;
 }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -101,6 +101,33 @@ test('indexer service reschedules a writer-lease deferral without publishing a h
   assert.equal(heartbeats, 1);
 });
 
+test('a deferred full-inventory build stays full when retried', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => {
+      calls.push(args);
+      return calls.length === 1 ? { deferred: true } : { deferred: false };
+    },
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+  });
+
+  service.scheduleBuild('root-appeared');
+  timers.flush();
+  await service.idle();
+  service.scheduleBuild('ordinary-change', '/tmp/later.jsonl');
+  timers.flush();
+  await service.idle();
+
+  assert.deepEqual(calls, [
+    { reason: 'root-appeared', changedPaths: undefined },
+    { reason: 'ordinary-change', changedPaths: undefined },
+  ]);
+});
+
 test('indexer service does not log a build cancelled by a service stop', async () => {
   const timers = manualTimers();
   const warnings = [];
@@ -141,6 +168,59 @@ test('indexer service logs a build that fails while running', async () => {
 
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /Obelisk index build failed: disk on fire/);
+});
+
+test('indexer service reports partial inventory paths on ordinary builds', async () => {
+  const warnings = [];
+  const service = createIndexerService({
+    buildIndex: async () => ({
+      deferred: false,
+      complete: false,
+      inventoryIssues: [{
+        provider: 'pi',
+        path: '/tmp/pi/locked',
+        error: 'EACCES: permission denied',
+      }],
+    }),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    logger: { warn: (msg) => warnings.push(msg) },
+    stabilityMs: 0,
+  });
+
+  await service.runBuildNow('startup');
+
+  assert.deepEqual(warnings, [
+    'Obelisk indexed a partial pi inventory at /tmp/pi/locked: EACCES: permission denied',
+  ]);
+});
+
+test('indexer service reports partial inventory paths before a deferred retry', async () => {
+  const timers = manualTimers();
+  const warnings = [];
+  const service = createIndexerService({
+    buildIndex: async () => ({
+      deferred: true,
+      complete: false,
+      inventoryIssues: [{
+        provider: 'pi',
+        path: '/tmp/pi/locked',
+        error: 'EACCES: permission denied',
+      }],
+    }),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    logger: { warn: (msg) => warnings.push(msg) },
+    timers,
+    stabilityMs: 0,
+  });
+
+  await service.runBuildNow('startup');
+  service.stop();
+
+  assert.deepEqual(warnings, [
+    'Obelisk indexed a partial pi inventory at /tmp/pi/locked: EACCES: permission denied',
+  ]);
 });
 
 test('indexer service waits for a stability window before building', async () => {
@@ -344,4 +424,54 @@ test('indexer service watches Claude projects and Codex sessions for app-side in
   assert.deepEqual(calls[0].changedPaths, [
     join(codexSessionsDir, '2026/06/15/rollout-2026-06-15T00-00-00-codex.jsonl'),
   ]);
+});
+
+test('indexer service starts watching a configured root that appears after startup', async () => {
+  const existingRoot = mkdtempSync(join(tmpdir(), 'obelisk-watch-existing-'));
+  const parent = mkdtempSync(join(tmpdir(), 'obelisk-watch-late-parent-'));
+  const lateRoot = join(parent, 'nested', 'sessions');
+  const timers = manualTimers();
+  const calls = [];
+  const watchArgs = [];
+  const chokidar = {
+    watch(root) {
+      watchArgs.push(root);
+      const watcher = {
+        on() {
+          return watcher;
+        },
+        close() {},
+      };
+      return watcher;
+    },
+  };
+  const service = createIndexerService({
+    watchDirs: [existingRoot, lateRoot],
+    buildIndex: async (args) => calls.push(args),
+    chokidar,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+    watchRetryMs: 0,
+  });
+
+  try {
+    service.start({ buildOnStart: false });
+    assert.deepEqual(watchArgs, [existingRoot]);
+
+    mkdirSync(lateRoot, { recursive: true });
+    writeFileSync(join(lateRoot, 'pre-existing.jsonl'), '{}\n');
+    timers.flush();
+    assert.deepEqual(watchArgs, [existingRoot, lateRoot]);
+
+    timers.flush();
+    await service.idle();
+    assert.deepEqual(calls, [{
+      reason: 'watch',
+      changedPaths: undefined,
+    }]);
+  } finally {
+    service.stop();
+  }
 });

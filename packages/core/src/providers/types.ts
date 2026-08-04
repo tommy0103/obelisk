@@ -37,6 +37,20 @@ export interface IndexUnit {
   agentId?: string;
   /** Adapter-private payload, opaque to the orchestration. */
   meta?: unknown;
+  /** Previously indexed sessions this unit atomically supersedes or retracts. */
+  retractSessionIds?: readonly string[];
+}
+
+/** Read-only source provenance exposed to one provider during discovery. */
+export interface IndexedSession {
+  sessionId: string;
+  jsonlPath: string;
+}
+
+/** One source location that prevented a provider from certifying its inventory. */
+export interface InventoryIssue {
+  readonly path: string;
+  readonly error: string;
 }
 
 /** Context the orchestration provides to discovery. */
@@ -45,6 +59,10 @@ export interface DiscoverContext {
   lastCursor(key: string): Cursor;
   /** When set (daemon changed-path mode), restrict discovery to these paths. */
   changedPaths?: string[];
+  /** Sessions already indexed for this provider, keyed by their canonical source path. */
+  indexedSessions?(): readonly IndexedSession[];
+  /** Report that the source inventory could not be enumerated completely. */
+  reportIncompleteInventory?(issue?: InventoryIssue): void;
 }
 
 /** Canonical language emitted by every provider adapter. Persist serializes it;
@@ -62,7 +80,7 @@ export type TranscriptRecord =
   | MessageTurnDurationRecord
   | DeleteSessionRecord;
 
-export type MessageVisibility = 'visible' | 'hidden';
+export type MessageVisibility = 'visible' | 'inactive' | 'hidden';
 
 export interface MessageRecord {
   kind: 'message';
@@ -75,7 +93,10 @@ export interface MessageRecord {
   text: string | null;
   content_type: string | null;
   is_meta: 0 | 1;
-  /** Provider-normalized display eligibility. Assemblers never infer this from text. */
+  /**
+   * Provider-attested evidence state. `inactive` requires an explicit source
+   * supersession signal; assemblers never infer it from text or tree shape.
+   */
   visibility: MessageVisibility;
   model: string | null;
   is_sidechain: 0 | 1;
@@ -116,6 +137,11 @@ export interface SummaryRecord {
   timestamp: string | null;
   source: string;
   content: string;
+  /** Provider-attested evidence state. Aggregate accounting may include non-visible usage. */
+  visibility?: MessageVisibility;
+  /** Provider-normalized total input, including provider-reported cached input. */
+  input_tokens?: number | null;
+  output_tokens?: number | null;
 }
 
 // One codex subagent. Like workflow_agent, a row can be contributed by more than
@@ -202,7 +228,8 @@ export interface DeleteSessionRecord {
 // a line-incremental adapter (claude) yields only new messages ('delta', persist
 // accumulates onto the existing row); a full-reparse adapter (codex) yields every
 // message each run ('total', persist replaces). A 'delta' parse from an empty
-// cursor is equivalent to 'total'.
+// cursor is equivalent to 'total'. The count describes the standard visible
+// transcript surface; records behind inactive/hidden visibility do not contribute.
 export interface SessionRecord {
   kind: 'session';
   id: string;
@@ -238,6 +265,10 @@ export interface ProviderDescriptor {
   readonly vendor: string;
   readonly defaultRoot: string;
   readonly color: string;
+  /** The automatic root is ambiguous; callers must preserve omission until the user chooses one. */
+  readonly requiresExplicitRoot?: boolean;
+  /** User-facing explanation for an unavailable automatic root. */
+  readonly rootResolutionReason?: string;
 }
 
 export interface RawLookup {
@@ -245,6 +276,8 @@ export interface RawLookup {
   readonly messageUuid: string;
   readonly session: Record<string, unknown> | null;
   readonly agentId: string | null;
+  /** Cursor committed for this session's source unit, when available. */
+  readonly cursor?: Cursor;
   readonly subagent?: Record<string, unknown> | null;
   readonly workflowAgent?: Record<string, unknown> | null;
 }

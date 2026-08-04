@@ -39,6 +39,7 @@ sql(`
   JOIN sessions s ON s.id = m.session_id
   WHERE s.project LIKE ?
     AND m.text LIKE ?
+    AND COALESCE(m.visibility, 'visible') = 'visible'
   ORDER BY m.timestamp DESC
   LIMIT 10
 `, '%quiet-zero%', '%workflow-script%')

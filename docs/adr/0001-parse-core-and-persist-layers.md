@@ -21,19 +21,35 @@ binding-agnostic and does not need a per-binding implementation.
 **Decision.** Split indexing along two orthogonal axes.
 
 - **Provider axis — a registry of pure adapters.** Each source (Claude Code,
-  Codex, Kimi Code, later Pi, …) is a provider adapter implementing one complete
+  Codex, Kimi Code, Pi, …) is a provider adapter implementing one complete
   boundary: serializable descriptor metadata, `watchRoots(root)`,
-  `discover(context) → IndexUnit[]`, `parse(unit, cursor) → Iterable<Record>`,
+  `discover(context) → IndexUnit[]`,
+  `parse(unit, cursor) → Iterable<Record>`,
   and `raw(lookup)`. An `IndexUnit` is deliberately not a file abstraction: Kimi
   uses one session directory containing state plus multiple agent wire logs. An
   adapter is *pure*: it emits normalized records and never touches a database.
+  Discovery receives a read-only view of the provider's already-indexed session
+  paths. A full-reparse adapter can therefore attach `retractSessionIds` to a
+  replacement or tombstone unit without querying SQLite itself. Retraction and
+  replacement records commit in the same unit transaction, so a failed parse
+  preserves the last complete snapshot.
+  Provider identity may therefore be richer than a wire-level ID. An adapter
+  can namespace a local ID with immutable source metadata while keeping paths
+  as provenance rather than identity.
   Adding a source means adding one adapter and registering it; nothing else
   changes. `parse` exposes an iterator as its common interface and streams when
   the provider semantics permit it. An adapter may buffer one complete
   `IndexUnit` when correctness requires whole-unit semantics — for example,
-  Codex duplicate reconciliation or Kimi `context.undo` / `context.clear`
-  replay. Each adapter maps its own resume/change semantics onto the existing
-  `mtime` and `lines_processed` cursor pair in `index_state`. The emitted
+  Codex duplicate reconciliation, Kimi `context.undo` / `context.clear`
+  replay, or tree projection. Each adapter maps its own resume/change
+  semantics onto an opaque cursor stored exactly in `index_state.cursor`;
+  `mtime` and `lines_processed` remain compatibility/index-inspection columns.
+  A provider-wide replay is a destructive snapshot boundary. Discovery reports
+  any source location it could not enumerate; destructive rebuilds fail closed
+  when such a report exists. Cleanup, parsing, persistence, FTS rebuild and
+  marker publication commit in one transaction, so a parse failure cannot
+  replace the last-good index.
+  The emitted
   `TranscriptRecord` stream is also the input to provider-independent session
   detail assembly; see ADR-0007.
 - **Persist axis — one shared orchestration.** A single provider-agnostic,
@@ -60,9 +76,11 @@ is disentangling the currently interleaved parse-and-write inside `indexJsonl` /
 
 The normalized `TranscriptRecord` union is the stable center of the design, and
 SQLite is one serialization adapter for it. Provider-only concepts are either
-projected lossily into that language or ignored. The registry,
-not provider switches, drives both indexers, watcher roots, persisted source
-roots, source catalog/UI labels and colors, and raw-record routing. Adding Pi
-therefore changes the Pi adapter, its registration, and its conformance tests;
-the shared schema, persist layer, indexers, settings, query API, and renderer do
-not acquire Pi-specific branches.
+projected lossily into that language or ignored. A genuinely shared concept may
+extend the canonical language by explicit decision: summary-generating model
+calls, for example, carry the same normalized input/output usage as ordinary
+messages. The registry, not provider switches, drives both indexers, watcher
+roots, persisted source roots, source catalog/UI labels and colors, and
+raw-record routing. Adding another provider therefore adds no
+provider-specific branch to the shared schema, persist layer, indexers,
+settings, query API, or renderer.

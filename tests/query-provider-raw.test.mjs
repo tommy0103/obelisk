@@ -31,6 +31,8 @@ test('raw query delegates source semantics to the registered provider', () => {
     .run('alpha:message', 'alpha:session', 'alpha:agent', 'alpha');
   db.prepare('INSERT INTO subagents (agent_id,session_id,description) VALUES (?,?,?)')
     .run('alpha:agent', 'alpha:session', 'agent metadata');
+  db.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,?,?,?)')
+    .run('/alpha/session.data', 10, 1, 'committed-alpha-cursor');
 
   const result = createQueryApi(db, { providerRegistry: registry }).raw('alpha:message', {
     offset: 2,
@@ -38,11 +40,12 @@ test('raw query delegates source semantics to the registered provider', () => {
   });
 
   assert.deepEqual(result, {
-    text: '2345', totalLength: 10, offset: 2, limit: 4, hasMore: true,
+    text: '2345', totalLength: 10, offset: 2, limit: 4, hasMore: true, visibility: 'visible',
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].source, 'alpha');
   assert.equal(calls[0].session.id, 'alpha:session');
+  assert.equal(calls[0].cursor, 'committed-alpha-cursor');
   assert.equal(calls[0].subagent.description, 'agent metadata');
   db.close();
 });

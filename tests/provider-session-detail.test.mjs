@@ -148,6 +148,10 @@ test('provider-classified hidden context never reaches session detail', () => {
     records.filter(record => record.kind === 'message' && record.visibility === 'hidden').length,
     2,
   );
+  assert.equal(
+    records.find(record => record.kind === 'session').message_count,
+    1,
+  );
 });
 
 test('provider normalization removes only structural image wrappers before deduplication', () => {

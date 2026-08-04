@@ -6,6 +6,8 @@ import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
 
+import type { InventoryIssue } from './providers/types.ts';
+
 const CLAUDE_DIR = join(homedir(), '.claude');
 const CODEX_DIR = join(homedir(), '.codex');
 const PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
@@ -14,6 +16,12 @@ const TEXT_LIMIT = 10000;
 
 type JsonRecord = Record<string, any>;
 type JsonValue = any;
+
+function sourceInventoryIssue(path: string, error: unknown): InventoryIssue {
+  return { path, error: error instanceof Error ? error.message : String(error) };
+}
+
+type DiscoveryIssueHandler = (issue: InventoryIssue) => void;
 
 export interface ClaudeJsonlFile {
   path: string;
@@ -153,16 +161,19 @@ function inferProjectPath(project: string | null | undefined, observedCwds: unkn
   return best?.path || legacyProjectPathFromSlug(project);
 }
 
-function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
+function discoverJsonlFiles(
+  projectsDir = PROJECTS_DIR,
+  reportIssue?: DiscoveryIssueHandler,
+): ClaudeJsonlFile[] {
   const files: ClaudeJsonlFile[] = [];
   if (!existsSync(projectsDir)) return files;
   let projects;
-  try { projects = readdirSync(projectsDir); } catch (e) { process.stderr.write(`Warning: cannot read projects dir: ${e instanceof Error ? e.message : String(e)}\n`); return files; }
+  try { projects = readdirSync(projectsDir); } catch (error) { reportIssue?.(sourceInventoryIssue(projectsDir, error)); return files; }
   for (const proj of projects) {
     const projPath = join(projectsDir, proj);
     if (!isDir(projPath)) continue;
     let entries;
-    try { entries = readdirSync(projPath); } catch { continue; }
+    try { entries = readdirSync(projPath); } catch (error) { reportIssue?.(sourceInventoryIssue(projPath, error)); continue; }
     for (const f of entries) {
       if (f.endsWith('.jsonl'))
         files.push({ path: join(projPath, f), sessionId: f.slice(0, -6), project: proj, isSubagent: false });
@@ -171,7 +182,7 @@ function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
       const saDir = join(projPath, sd, 'subagents');
       if (!isDir(saDir)) continue;
       let saEntries;
-      try { saEntries = readdirSync(saDir); } catch { continue; }
+      try { saEntries = readdirSync(saDir); } catch (error) { reportIssue?.(sourceInventoryIssue(saDir, error)); continue; }
       for (const sf of saEntries) {
         if (sf.endsWith('.jsonl'))
           files.push({ path: join(saDir, sf), sessionId: sd, project: proj, isSubagent: true, agentId: sf.slice(0, -6) });
@@ -179,12 +190,12 @@ function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
       const wfRoot = join(saDir, 'workflows');
       if (!isDir(wfRoot)) continue;
       let wfDirs;
-      try { wfDirs = readdirSync(wfRoot); } catch { continue; }
+      try { wfDirs = readdirSync(wfRoot); } catch (error) { reportIssue?.(sourceInventoryIssue(wfRoot, error)); continue; }
       for (const wfDir of wfDirs) {
         const wfPath = join(wfRoot, wfDir);
         if (!isDir(wfPath)) continue;
         let wfEntries;
-        try { wfEntries = readdirSync(wfPath); } catch { continue; }
+        try { wfEntries = readdirSync(wfPath); } catch (error) { reportIssue?.(sourceInventoryIssue(wfPath, error)); continue; }
         for (const wf of wfEntries) {
           if (wf.endsWith('.jsonl'))
             files.push({ path: join(wfPath, wf), sessionId: sd, project: proj, isSubagent: true, agentId: wf.slice(0, -6), workflowRunId: wfDir });
@@ -195,12 +206,15 @@ function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
   return files;
 }
 
-function discoverCodexJsonlFiles(sessionsDir = CODEX_SESSIONS_DIR): CodexJsonlFile[] {
+function discoverCodexJsonlFiles(
+  sessionsDir = CODEX_SESSIONS_DIR,
+  reportIssue?: DiscoveryIssueHandler,
+): CodexJsonlFile[] {
   const files: CodexJsonlFile[] = [];
   if (!existsSync(sessionsDir)) return files;
   const walk = (dir: string): void => {
     let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch (error) { reportIssue?.(sourceInventoryIssue(dir, error)); return; }
     for (const entry of entries) {
       const fp = join(dir, entry.name);
       if (entry.isDirectory()) {
@@ -369,7 +383,7 @@ export {
   CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
-  discoverJsonlFiles, discoverCodexJsonlFiles,
+  discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
   readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole, parseCodexJsonInput,
   codexUsage, codexEventText, codexMessagePayloadText, codexVisibleMessageKey, codexToolInput, codexToolOutput,

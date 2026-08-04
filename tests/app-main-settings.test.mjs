@@ -117,12 +117,15 @@ function defaultIndexerWorkerClient() {
   };
 }
 
-async function loadMainForWindowFlags(flags) {
+async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const originalArgv = process.argv;
   const originalHome = process.env.HOME;
   const home = join(tmpdir(), `obelisk-window-flags-${Date.now()}-${Math.random()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  if (settingsText !== undefined) {
+    writeFileSync(join(home, '.obelisk', 'settings.json'), settingsText);
+  }
   process.env.HOME = home;
   process.argv = [originalArgv[0] || 'node', originalArgv[1] || 'electron', ...flags];
 
@@ -199,6 +202,11 @@ test('dev mode does not open DevTools unless explicitly requested', async () => 
   assert.equal(devtoolsWindows[0].devToolsOpened, true);
 });
 
+test('malformed settings keep the desktop recovery window available', async () => {
+  const windows = await loadMainForWindowFlags([], { settingsText: '{broken' });
+  assert.equal(windows.length, 1);
+});
+
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
   const home = join(tmpdir(), `obelisk-main-watch-dirs-${Date.now()}`);
@@ -212,6 +220,7 @@ test('main process watches every root declared by the built-in provider registry
   process.env.HOME = home;
 
   const serviceOptions = [];
+  const workerCalls = [];
 
   class FakeDatabase {
     pragma() {}
@@ -251,7 +260,17 @@ test('main process watches every root declared by the built-in provider registry
         },
       },
     }],
-    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+    [INDEXER_WORKER_URL, {
+      namedExports: {
+        createWorkerBuildIndex: () => ({
+          buildIndex: async (args) => {
+            workerCalls.push(args);
+            return { files: 0, affectedSessionIds: [], complete: true };
+          },
+          stop() {},
+        }),
+      },
+    }],
   ]);
 
   try {
@@ -267,6 +286,8 @@ test('main process watches every root declared by the built-in provider registry
       join(home, '.kimi-code', 'session_index.jsonl'),
     ]);
     assert.equal(serviceOptions[0].watchDirs.includes(codexDir), false);
+    await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
+    assert.deepEqual(workerCalls[0].providerSettings, {});
   } finally {
     restore();
     process.env.HOME = originalHome;
@@ -286,6 +307,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
   let databaseOpens = 0;
   let serviceOptions;
   let notifications = 0;
+  const sent = [];
 
   class FakeDatabase {
     constructor() { databaseOpens += 1; }
@@ -302,7 +324,16 @@ test('main process forwards committed IDs without reopening after a deferred bui
     loadFile() {}
     loadURL() {}
     close() {}
-    static getAllWindows() { return [{ webContents: { send() { notifications += 1; } } }]; }
+    static getAllWindows() {
+      return [{
+        webContents: {
+          send(channel, payload) {
+            notifications += 1;
+            sent.push({ channel, payload });
+          },
+        },
+      }];
+    }
     static fromWebContents() { return null; }
   }
 
@@ -322,7 +353,19 @@ test('main process forwards committed IDs without reopening after a deferred bui
     [INDEXER_WORKER_URL, {
       namedExports: {
         createWorkerBuildIndex: () => ({
-          buildIndex: async () => ({ deferred: true, reason: 'database_busy', affectedSessionIds: ['session-1'] }),
+          buildIndex: async ({ reason }) => reason === 'inventory'
+            ? {
+                deferred: true,
+                complete: false,
+                reason: 'database_busy',
+                affectedSessionIds: [],
+                inventoryIssues: [{
+                  provider: 'pi',
+                  path: '/tmp/pi/locked',
+                  error: 'EACCES: permission denied',
+                }],
+              }
+            : { deferred: true, reason: 'database_busy', affectedSessionIds: ['session-1'] },
           stop() {},
         }),
       },
@@ -338,6 +381,22 @@ test('main process forwards committed IDs without reopening after a deferred bui
     assert.equal(result.deferred, true);
     assert.equal(databaseOpens, opensBeforeBuild);
     assert.equal(notifications, notificationsBeforeBuild + 2);
+
+    const beforeInventoryNotification = notifications;
+    await serviceOptions.buildIndex({ reason: 'inventory' });
+    assert.equal(databaseOpens, opensBeforeBuild);
+    assert.equal(notifications, beforeInventoryNotification + 1);
+    assert.deepEqual(sent.at(-1), {
+      channel: 'obelisk:index-updated',
+      payload: {
+        affectedSessionIds: [],
+        sourceIssues: [{
+          provider: 'pi',
+          path: '/tmp/pi/locked',
+          error: 'EACCES: permission denied',
+        }],
+      },
+    });
   } finally {
     restore();
     process.env.HOME = originalHome;
@@ -459,6 +518,39 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       input_tokens, output_tokens, source
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run('codex-message', 'codex:session', 'assistant', '2026-07-10T11:00:00Z', 'assistant', 'ok', 100, 10, 'codex');
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
+    .run('pi:session', 'pi');
+  setup.prepare(`
+    INSERT INTO summaries (
+      id, session_id, timestamp, source, content, visibility, input_tokens, output_tokens
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-summary', 'pi:session', '2026-07-10T12:00:00Z', 'pi:compaction', 'summary', 'inactive', 30, 5);
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-hidden-main', 'pi:session', 'assistant', 'assistant', 'inactive main', '2026-07-10T12:01:00Z', 'inactive', 'pi');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source, agent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-hidden-agent', 'pi:session', 'assistant', 'assistant', 'inactive agent', '2026-07-10T12:02:00Z', 'inactive', 'pi', 'pi:hidden-agent');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-hidden-main-call', 'pi-hidden-main', 'pi:session', 'read', '{"path":"secret"}');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-hidden-agent-call', 'pi-hidden-agent', 'pi:session', 'read', '{"path":"secret"}');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-hidden-main-call', 'pi-hidden-main', 'pi:session', 'hidden result');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-hidden-agent-call', 'pi-hidden-agent', 'pi:session', 'hidden result');
   setup.close();
 
   const ipcHandlers = new Map();
@@ -495,14 +587,26 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   try {
     await importMain();
 
+    assert.deepEqual(ipcHandlers.get('db:getSessionSummaries')(null, 'pi:session'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSessionMessages')(null, 'pi:session'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
+    assert.equal(ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
     assert.equal(claudeOnly.totalTokens, 65);
     assert.equal(claudeOnly.daily[0].tokens, 65);
 
     const allSources = ipcHandlers.get('db:getUsageStats')(null, { source: 'all' });
-    assert.equal(allSources.totalTokens, 175);
-    assert.equal(allSources.daily[0].tokens, 175);
-    assert.equal(allSources.peakDay.tokens, 175);
+    assert.equal(allSources.totalTokens, 210);
+    assert.equal(allSources.daily[0].tokens, 210);
+    assert.equal(allSources.peakDay.tokens, 210);
+
+    const piOnly = ipcHandlers.get('db:getUsageStats')(null, { source: 'pi' });
+    assert.equal(piOnly.totalTokens, 35);
   } finally {
     restore();
     process.env.HOME = originalHome;
@@ -793,7 +897,9 @@ test('settings rebuild reopens the database from the configured Claude path', as
   const openedDbPaths = [];
   const buildCalls = [];
   const serviceEvents = [];
+  const sent = [];
   let competingLeaseDuringBuild;
+  let publishRebuild = false;
 
   class FakeDatabase {
     constructor(dbPath) {
@@ -810,12 +916,19 @@ test('settings rebuild reopens the database from the configured Claude path', as
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = {
+        on() {},
+        setWindowOpenHandler() {},
+        getURL() { return ''; },
+        setZoomLevel() {},
+        openDevTools() {},
+        send(channel, payload) { sent.push({ channel, payload }); },
+      };
     }
     loadFile() {}
     loadURL() {}
     close() {}
-    static getAllWindows() { return []; }
+    static getAllWindows() { return [new FakeBrowserWindow()]; }
     static fromWebContents() { return null; }
   }
 
@@ -856,7 +969,20 @@ test('settings rebuild reopens the database from the configured Claude path', as
             competingLeaseDuringBuild = Boolean(competingLease);
             competingLease?.release();
             writeFileSync(args.dbPath, 'rebuilt temp db');
-            return { files: 2, affectedSessionIds: ['session-1', 'session-2'] };
+            return {
+              files: 2,
+              affectedSessionIds: ['session-1', 'session-2'],
+              complete: publishRebuild,
+              reason: publishRebuild ? undefined : 'incomplete_snapshot',
+              inventoryIssues: [],
+              skippedFiles: publishRebuild
+                ? []
+                : [{
+                    provider: 'pi',
+                    path: '/tmp/pi/structurally-invalid.jsonl',
+                    error: 'Malformed Pi message at line 2',
+                  }],
+            };
           },
           stop() { return Promise.resolve(); },
         }),
@@ -869,19 +995,45 @@ test('settings rebuild reopens the database from the configured Claude path', as
 
     const rebuild = ipcHandlers.get('settings:rebuildIndex');
     assert.equal(typeof rebuild, 'function');
+    const liveDbPath = join(home, '.obelisk', 'obelisk.sqlite');
+    const beforeIncomplete = require('node:fs').readFileSync(liveDbPath, 'utf8');
+    const incomplete = await rebuild();
+    assert.equal(incomplete.complete, false);
+    assert.deepEqual(sent.findLast(message => message.channel === 'obelisk:index-updated'), {
+      channel: 'obelisk:index-updated',
+      payload: {
+        affectedSessionIds: ['session-1', 'session-2'],
+        sourceIssues: [{
+          provider: 'pi',
+          path: '/tmp/pi/structurally-invalid.jsonl',
+          error: 'Malformed Pi message at line 2',
+        }],
+      },
+    });
+    assert.equal(
+      require('node:fs').readFileSync(liveDbPath, 'utf8'),
+      beforeIncomplete,
+      'an incomplete temp database must not replace the live database',
+    );
+
+    publishRebuild = true;
     await rebuild();
+    assert.deepEqual(
+      sent.findLast(message => message.channel === 'obelisk:index-updated').payload.sourceIssues,
+      [],
+    );
 
     assert.equal(buildCalls.at(-1).claudeDir, customClaudeDir);
     assert.equal(buildCalls.at(-1).projectsDir, join(customClaudeDir, 'projects'));
     assert.equal(buildCalls.at(-1).codexDir, customCodexDir);
-    assert.notEqual(buildCalls.at(-1).dbPath, join(home, '.obelisk', 'obelisk.sqlite'));
-    assert.equal(buildCalls.at(-1).preserveDbPath, join(home, '.obelisk', 'obelisk.sqlite'));
+    assert.notEqual(buildCalls.at(-1).dbPath, liveDbPath);
+    assert.equal(buildCalls.at(-1).preserveDbPath, liveDbPath);
     assert.equal(buildCalls.at(-1).writerLeasePath, join(home, '.obelisk', 'writer.lock.sqlite'));
     assert.equal(buildCalls.at(-1).writerLeaseMode, 'caller-held');
     assert.equal(competingLeaseDuringBuild, false);
-    assert.equal(openedDbPaths.at(-1), join(home, '.obelisk', 'obelisk.sqlite'));
+    assert.equal(openedDbPaths.at(-1), liveDbPath);
     assert.equal(
-      require('node:fs').readFileSync(join(home, '.obelisk', 'obelisk.sqlite'), 'utf8'),
+      require('node:fs').readFileSync(liveDbPath, 'utf8'),
       'rebuilt temp db',
     );
     assert.ok(serviceEvents.indexOf('build') > serviceEvents.indexOf('stop'));
@@ -1081,7 +1233,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
           buildIndex: async (args) => {
             serviceEvents.push(`build-${++buildIndexCalls}`);
             writeFileSync(args.dbPath, 'rebuilt temp db');
-            return { files: 2, affectedSessionIds: [] };
+            return { files: 2, affectedSessionIds: [], complete: true };
           },
           stop() {
             serviceEvents.push('worker-stop');

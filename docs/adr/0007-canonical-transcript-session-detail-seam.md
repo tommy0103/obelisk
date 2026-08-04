@@ -10,11 +10,24 @@ the direct parse path to drift from the persisted path.
 **Decision.** Every provider adapter emits a canonical `TranscriptRecord`
 stream. The adapter owns all source-specific interpretation: duplicate raw
 events, stable identities, tool relationships, message classification, and
-visibility. `visibility` is separate from `is_meta`: hidden transport context is
-omitted from session detail, while visible system evidence can remain a metadata
-card. Presentation-sensitive concepts are explicit canonical fields: tool calls
-carry a presentation class, Skill instructions carry a content type, and
-workflows carry their parent tool-call identity.
+visibility. Messages and summaries carry provider-normalized visibility.
+`visibility` is separate from `is_meta`. `visible` is current evidence.
+`inactive` is physical evidence that the provider explicitly attests was
+superseded; default queries omit it, and supported helpers may return it only
+with `includeInactive: true`. `hidden` is display-suppressed or transport-only
+material and no standard helper returns it. Session detail and the desktop app
+remain visible-only, while visible system evidence can remain a metadata card.
+Presentation-sensitive concepts are explicit canonical fields: tool calls carry
+a presentation class, Skill instructions carry a content type, and workflows
+carry their parent tool-call identity. Summaries carry normalized input/output
+usage when their provider performed a separate model call; cached input is
+folded into input usage by the provider, as it is for messages. Visibility does
+not erase accounting: aggregate usage includes model calls that were later
+abandoned.
+
+Only a provider with an explicit source-level supersession signal may emit
+`inactive`. Tree shape alone is insufficient; providers without that signal
+leave their evidence visible.
 
 The Core `assembleSessionDetail(input)` module is the only session-detail seam.
 It accepts either a provider's complete transcript stream from a fresh parse

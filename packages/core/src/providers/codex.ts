@@ -47,6 +47,9 @@ function messageVisibility(role: string, text: string | null): 'visible' | 'hidd
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const sessionsDir = join(rootDir, 'sessions');
+  if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
+    ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+  }
   const sessionIndexPath = normalize(join(rootDir, 'session_index.jsonl'));
   const sessionIndex = new Map<string, { title: string; updatedAt: string | null }>();
   if (existsSync(sessionIndexPath)) {
@@ -76,7 +79,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
     if (absolute.toLowerCase().endsWith('.jsonl')) changedFiles.add(absolute);
   }
-  return discoverCodexJsonlFiles(sessionsDir).flatMap((file) => {
+  return discoverCodexJsonlFiles(sessionsDir, ctx.reportIncompleteInventory).flatMap((file) => {
     if (ctx.changedPaths !== undefined && !sessionIndexChanged && !changedFiles.has(normalize(file.path))) return [];
     const cursor = ctx.lastCursor(file.path);
     const guardian = readCodexGuardianThreadInfo(file.path);
@@ -187,7 +190,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     out.push(rec);
     msgByUuid.set(uuid, rec);
     sm.lastMessageUuid = uuid;
-    if (!agentId) sm.n++;
+    if (!agentId && visibility === 'visible') sm.n++;
     if (type === 'assistant' && contentType === 'text') sm.lastTextAssistantUuid = uuid;
     updateBounds(timestamp);
     return uuid;

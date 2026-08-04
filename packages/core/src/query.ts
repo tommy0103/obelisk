@@ -18,6 +18,7 @@ interface QueryOptions extends Record<string, any> {
   branch?: string;
   source?: string;
   includeMeta?: boolean;
+  includeInactive?: boolean;
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
@@ -74,6 +75,34 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
 
 const BASH_EXIT_PAT = 'Exit code %';
 
+type QueryVisibility = 'visible' | 'inactive' | 'hidden';
+
+function normalizedVisibility(value: unknown): QueryVisibility {
+  if (value === null || value === undefined || value === 'visible') return 'visible';
+  if (value === 'inactive') return 'inactive';
+  return 'hidden';
+}
+
+function withVisibility(row: DbRow): DbRow {
+  return { ...row, visibility: normalizedVisibility(row.visibility) };
+}
+
+function isQueryableMessage(
+  row: DbRow | undefined,
+  includeInactive = false,
+): row is DbRow {
+  if (row === undefined) return false;
+  const visibility = normalizedVisibility(row.visibility);
+  return visibility === 'visible' || (includeInactive && visibility === 'inactive');
+}
+
+function visibilitySql(alias: string, includeInactive = false): string {
+  const column = `${alias}.visibility`;
+  return includeInactive
+    ? `COALESCE(${column},'visible') IN ('visible','inactive')`
+    : `COALESCE(${column},'visible')='visible'`;
+}
+
 function assertReadOnlySql(sql: unknown): void {
   const text = String(sql || '').trim();
   if (!/^(SELECT|WITH)\b/i.test(text)) {
@@ -120,7 +149,17 @@ function createQueryApi(
   };
 
   const search = (text: string, opts: QueryOptions = {}) => {
-    const { limit = 20, sessionId, project, after, before, cwd, source, includeMeta = false } = opts;
+    const {
+      limit = 20,
+      sessionId,
+      project,
+      after,
+      before,
+      cwd,
+      source,
+      includeMeta = false,
+      includeInactive = false,
+    } = opts;
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
@@ -130,8 +169,10 @@ function createQueryApi(
     if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
     if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
+    where += ` AND ${visibilitySql('m', includeInactive)}`;
     const stmt = db.prepare(`
-      SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,m.source as m_source,
+      SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
+             COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source,
              rank
@@ -151,11 +192,31 @@ function createQueryApi(
     return rows.map((r: DbRow) => {
       const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
       const ctx = db.prepare(
-        `SELECT uuid,text,content_type,is_meta,role,timestamp,model,COALESCE(source, 'claude') as source FROM messages WHERE session_id=? AND uuid!=? ${metaClause} ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?)) LIMIT 6`
-      ).all(r.session_id, r.uuid, r.timestamp).sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
+        `SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+                COALESCE(visibility,'visible') AS visibility,
+                COALESCE(source, 'claude') as source
+         FROM messages
+         WHERE session_id=? AND uuid!=? ${metaClause}
+           AND ${visibilitySql('messages', includeInactive)}
+         ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?))
+         LIMIT 6`
+      ).all(r.session_id, r.uuid, r.timestamp)
+        .map(withVisibility)
+        .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
       const sourceValue = r.m_source || r.s_source || 'claude';
       return {
-        message: { uuid: r.uuid, text: r.text, content_type: r.content_type, is_meta: r.is_meta || 0, role: r.role, timestamp: r.timestamp, model: r.model, cwd: r.cwd, source: sourceValue },
+        message: {
+          uuid: r.uuid,
+          text: r.text,
+          content_type: r.content_type,
+          is_meta: r.is_meta || 0,
+          role: r.role,
+          timestamp: r.timestamp,
+          model: r.model,
+          cwd: r.cwd,
+          visibility: normalizedVisibility(r.visibility),
+          source: sourceValue,
+        },
         session: { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue },
         rank: r.rank,
         context: ctx,
@@ -163,33 +224,49 @@ function createQueryApi(
     });
   };
 
-  const context = (uuid: string) => {
+  const context = (uuid: string, opts: QueryOptions = {}) => {
+    const includeInactive = opts.includeInactive === true;
     const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-    if (!msg) return null;
+    if (!isQueryableMessage(msg, includeInactive)) return null;
+    const message = withVisibility(msg);
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id);
     const chain: DbRow[] = [];
     let cur: DbRow | undefined = msg;
-    while (cur?.parent_uuid) { cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid); if (cur) chain.unshift(cur); }
+    while (cur?.parent_uuid) {
+      cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid);
+      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
+    }
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
     let workflow = null;
     if (msg.agent_id) {
       const wa = db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id);
       if (wa) workflow = db.prepare('SELECT * FROM workflows WHERE run_id=?').get(wa.run_id);
     }
-    return { message: msg, parentChain: chain, session, subagent, workflow };
+    return { message, parentChain: chain, session, subagent, workflow };
   };
 
-  const trace = (uuid: string) => {
+  const trace = (uuid: string, opts: QueryOptions = {}) => {
+    const includeInactive = opts.includeInactive === true;
     const chain: DbRow[] = [];
     let cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-    while (cur) { chain.unshift(cur); cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined; }
+    if (!isQueryableMessage(cur, includeInactive)) return chain;
+    while (cur) {
+      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
+      cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined;
+    }
     return chain;
   };
 
   const thread = (sid: string, opts: QueryOptions = {}) => {
     const includeMeta = opts?.includeMeta === true;
+    const includeInactive = opts?.includeInactive === true;
     const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
-    return db.prepare(`SELECT * FROM messages WHERE session_id=? ${metaClause} ORDER BY timestamp`).all(sid);
+    return db.prepare(`
+      SELECT * FROM messages
+      WHERE session_id=? ${metaClause}
+        AND ${visibilitySql('messages', includeInactive)}
+      ORDER BY timestamp
+    `).all(sid).map(withVisibility);
   };
 
   const subagents = (optsOrSid?: QueryOptions | string) => {
@@ -228,37 +305,73 @@ function createQueryApi(
   };
 
   const fileHistory = (fp: string, opts: QueryOptions = {}) => {
-    const { limit = 200, after, before, source } = opts;
-    let where = 'tc.file_path=?';
+    const { limit = 200, after, before, source, includeInactive = false } = opts;
+    let where = `tc.file_path=? AND ${visibilitySql('m', includeInactive)}`;
     const params: any[] = [fp];
     if (after)  { where += ' AND m.timestamp > ?'; params.push(after); }
     if (before) { where += ' AND m.timestamp < ?'; params.push(before); }
     if (source && source !== 'all') { where += " AND COALESCE(s.source, 'claude') = ?"; params.push(source); }
     params.push(limit);
     return db.prepare(
-      `SELECT tc.*,s.title as s_title,s.project as s_project,m.timestamp as ts FROM tool_calls tc LEFT JOIN sessions s ON s.id=tc.session_id LEFT JOIN messages m ON m.uuid=tc.message_uuid WHERE ${where} ORDER BY m.timestamp LIMIT ?`
+      `SELECT tc.*,s.title as s_title,s.project as s_project,m.timestamp as ts,
+              COALESCE(m.visibility,'visible') AS visibility
+       FROM tool_calls tc
+       LEFT JOIN sessions s ON s.id=tc.session_id
+       LEFT JOIN messages m ON m.uuid=tc.message_uuid
+       WHERE ${where}
+       ORDER BY m.timestamp
+       LIMIT ?`
     ).all(...params).map((r: DbRow) => ({
       toolCall: { id: r.id, message_uuid: r.message_uuid, name: r.name, input_json: r.input_json },
       session: { id: r.session_id, title: r.s_title, project: r.s_project },
       timestamp: r.ts,
+      visibility: normalizedVisibility(r.visibility),
     }));
   };
 
   const failures = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50 } = opts;
+    const includeInactive = opts.includeInactive === true;
     const needsJoin = opts.project || opts.branch || opts.source;
     const { where, params: filterParams } = buildWhere(opts, { sessionId: 'tr.session_id', project: 's.project', timestamp: 'rm.timestamp', branch: 's.git_branch', source: 's.source' });
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=tr.session_id' : '';
-    const errorCond = `(tr.is_error = 1 OR tr.content LIKE '${BASH_EXIT_PAT}')`;
+    const errorCond = [
+      `(tr.is_error = 1 OR tr.content LIKE '${BASH_EXIT_PAT}')`,
+      visibilitySql('rm', includeInactive),
+      visibilitySql('cm', includeInactive),
+    ].join(' AND ');
     const allParams = [...filterParams, limit];
-    const rows = db.prepare(`SELECT tr.* FROM tool_results tr ${join} LEFT JOIN messages rm ON rm.uuid=tr.message_uuid WHERE ${errorCond} AND ${where} ORDER BY rm.timestamp DESC LIMIT ?`).all(...allParams);
+    const rows = db.prepare(`
+      SELECT tr.*, COALESCE(rm.visibility,'visible') AS visibility
+      FROM tool_results tr
+      JOIN messages rm ON rm.uuid=tr.message_uuid
+      JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      JOIN messages cm ON cm.uuid=tc.message_uuid
+      ${join}
+      WHERE ${errorCond} AND ${where}
+      ORDER BY rm.timestamp DESC
+      LIMIT ?
+    `).all(...allParams);
     return rows.map((r: DbRow) => {
       const tc = db.prepare('SELECT * FROM tool_calls WHERE id=?').get(r.tool_use_id);
       const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(r.session_id);
-      const rm = db.prepare('SELECT * FROM messages WHERE uuid=?').get(r.message_uuid);
-      const next = rm?.timestamp ? db.prepare('SELECT * FROM messages WHERE session_id=? AND timestamp>? ORDER BY timestamp LIMIT 3').all(r.session_id, rm.timestamp) : [];
-      return { toolCall: tc, result: r, session, nextMessages: next };
+      const rmRow = db.prepare('SELECT * FROM messages WHERE uuid=?').get(r.message_uuid);
+      const rm = rmRow === undefined ? undefined : withVisibility(rmRow);
+      const next = rm?.timestamp ? db.prepare(`
+        SELECT * FROM messages
+        WHERE session_id=? AND timestamp>?
+          AND ${visibilitySql('messages', includeInactive)}
+        ORDER BY timestamp
+        LIMIT 3
+      `).all(r.session_id, rm.timestamp).map(withVisibility) : [];
+      return {
+        toolCall: tc,
+        result: withVisibility(r),
+        session,
+        nextMessages: next,
+        visibility: normalizedVisibility(r.visibility),
+      };
     });
   };
 
@@ -275,9 +388,17 @@ function createQueryApi(
   const summaries = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    const includeInactive = opts.includeInactive === true;
     const { where, params } = buildWhere(opts, { sessionId: 'su.session_id', project: 's.project', timestamp: 'su.timestamp', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
-    return db.prepare(`SELECT su.*, s.title as session_title, s.project FROM summaries su LEFT JOIN sessions s ON s.id=su.session_id WHERE ${where} ORDER BY su.timestamp DESC LIMIT ?`).all(...params);
+    return db.prepare(`
+      SELECT su.*, s.title as session_title, s.project
+      FROM summaries su
+      LEFT JOIN sessions s ON s.id=su.session_id
+      WHERE ${where} AND ${visibilitySql('su', includeInactive)}
+      ORDER BY su.timestamp DESC
+      LIMIT ?
+    `).all(...params).map(withVisibility);
   };
 
   const overview = (optsOrScalar?: QueryOptions | string | number) => {
@@ -456,10 +577,13 @@ function createQueryApi(
     };
   };
 
-  const raw = (messageUuid: string, opts: { offset?: number; limit?: number } = {}) => {
-    const { offset = 0, limit = 10000 } = opts;
+  const raw = (
+    messageUuid: string,
+    opts: { offset?: number; limit?: number; includeInactive?: boolean } = {},
+  ) => {
+    const { offset = 0, limit = 10000, includeInactive = false } = opts;
     const message = db.prepare('SELECT * FROM messages WHERE uuid=?').get(messageUuid);
-    if (!message) return null;
+    if (!isQueryableMessage(message, includeInactive)) return null;
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(message.session_id) ?? null;
     const subagent = message.agent_id
       ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(message.agent_id) ?? null
@@ -468,11 +592,15 @@ function createQueryApi(
       ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(message.agent_id) ?? null
       : null;
     const source = message.source || session?.source || 'claude';
+    const cursorRow = typeof session?.jsonl_path === 'string'
+      ? db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path)
+      : undefined;
     const record = providerRegistry.raw({
       source,
       messageUuid,
       session,
       agentId: message.agent_id || null,
+      cursor: typeof cursorRow?.cursor === 'string' ? cursorRow.cursor : null,
       subagent,
       workflowAgent,
     });
@@ -484,6 +612,7 @@ function createQueryApi(
       offset,
       limit,
       hasMore: offset + limit < totalLength,
+      visibility: normalizedVisibility(message.visibility),
     };
   };
 

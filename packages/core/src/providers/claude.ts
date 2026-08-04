@@ -12,7 +12,7 @@ import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
 
 import {
   extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
-  filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir,
+  filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir, sourceInventoryIssue,
 } from '../parsing.ts';
 
 import type {
@@ -61,6 +61,9 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const projectsDir = join(rootDir, 'projects');
+  if (!existsSync(projectsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
+    ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
+  }
   const historyPath = normalize(join(rootDir, 'history.jsonl'));
   const historyTitles = new Map<string, string>();
   if (existsSync(historyPath)) {
@@ -95,7 +98,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       changedWorkflowPaths.add(absolute);
     }
   }
-  const transcriptUnits = discoverJsonlFiles(projectsDir).filter((file) => {
+  const transcriptUnits = discoverJsonlFiles(projectsDir, ctx.reportIncompleteInventory).filter((file) => {
     const normalizedPath = normalize(file.path);
     if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath)) return false;
     const cursor = ctx.lastCursor(file.path);
@@ -118,18 +121,27 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const workflowUnits: IndexUnit[] = [];
   if (!existsSync(projectsDir)) return transcriptUnits;
   let projects: string[];
-  try { projects = readdirSync(projectsDir); } catch { return transcriptUnits; }
+  try { projects = readdirSync(projectsDir); } catch (error) {
+    ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectsDir, error));
+    return transcriptUnits;
+  }
   for (const project of projects) {
     const projectPath = join(projectsDir, project);
     if (!isDir(projectPath)) continue;
     let sessionIds: string[];
-    try { sessionIds = readdirSync(projectPath); } catch { continue; }
+    try { sessionIds = readdirSync(projectPath); } catch (error) {
+      ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectPath, error));
+      continue;
+    }
     for (const sessionId of sessionIds) {
       const workflowDir = join(projectPath, sessionId, 'workflows');
       if (!isDir(workflowDir)) continue;
       const mainTranscriptPath = join(projectPath, `${sessionId}.jsonl`);
       let files: string[];
-      try { files = readdirSync(workflowDir); } catch { continue; }
+      try { files = readdirSync(workflowDir); } catch (error) {
+        ctx.reportIncompleteInventory?.(sourceInventoryIssue(workflowDir, error));
+        continue;
+      }
       for (const file of files) {
         if (!file.endsWith('.json')) continue;
         const workflowPath = join(workflowDir, file);
