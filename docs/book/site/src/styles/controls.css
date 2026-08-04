@@ -1,0 +1,94 @@
+/* One button system for the whole book.
+ *
+ * Before this file, seven widgets each defined their own outline pill. They
+ * drifted, and worse, they landed in the same visual register as the badges —
+ * small, low-contrast, rounded, no fill — so a reader could not tell what was a
+ * label and what was clickable.
+ *
+ * The three registers are now deliberately distinct:
+ *   badge   4px radius · uppercase mono · letterspaced · no hover  → names a thing
+ *   tab     underline · no box                                     → switches a view
+ *   button  7px radius · filled surface · hover state              → does a thing
+ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.34rem 0.8rem;
+  border: 1px solid var(--edge-hi);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.05);
+  font: 0.79rem/1.5 var(--sans);
+  color: var(--fg-soft);
+  white-space: nowrap;
+  transition: background-color 0.15s var(--ease), border-color 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+
+.btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--edge-strong);
+  color: var(--fg);
+}
+
+.btn:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 2px;
+}
+
+/* The one action the widget wants you to take. */
+.btn.primary {
+  border-color: var(--accent-line);
+  background: rgba(167, 139, 250, 0.16);
+  color: var(--accent);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: rgba(167, 139, 250, 0.26);
+  border-color: var(--accent);
+  color: var(--accent-2);
+}
+
+/* Undo / reset / anything you reach for only when you want to start over. */
+.btn.quiet {
+  border-color: transparent;
+  background: none;
+  color: var(--faint);
+}
+
+.btn.quiet:hover:not(:disabled) {
+  border-color: var(--edge-hi);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--fg-soft);
+}
+
+.btn.danger {
+  border-color: rgba(248, 113, 113, 0.45);
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.2);
+}
+
+.btn:disabled {
+  opacity: 0.35;
+}
+
+.btn-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.btn-mono {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}

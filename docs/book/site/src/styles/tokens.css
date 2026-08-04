@@ -1,0 +1,199 @@
+/* Design tokens for the Obelisk Book.
+   Deliberately the same vocabulary as the desktop app (app/src/renderer/styles/base.css)
+   and the landing page (website/obelisk-landing.html) — the book should read as
+   part of the product, not as a detached doc site. */
+
+:root {
+  --bg: #0a0b14;
+  --bg-lift: #0d0e18;
+  --bg-sunk: #07080f;
+  --panel: rgba(255, 255, 255, 0.025);
+  --panel-hi: rgba(255, 255, 255, 0.05);
+  --panel-strong: rgba(255, 255, 255, 0.08);
+
+  --edge: rgba(255, 255, 255, 0.06);
+  --edge-hi: rgba(255, 255, 255, 0.11);
+  --edge-strong: rgba(255, 255, 255, 0.18);
+
+  /* Text ramp. The alphas are tuned against --bg (#0a0b14): --muted lands
+     around 7:1, --faint around 4.6:1, --dim around 3:1. --dim is for
+     decorative counters and separators only — anything a reader has to read
+     starts at --faint. */
+  --fg: #f7f5f1;
+  --fg-soft: rgba(243, 240, 233, 0.93);
+  --muted: rgba(214, 210, 199, 0.78);
+  --faint: rgba(208, 203, 192, 0.58);
+  --dim: rgba(204, 199, 188, 0.42);
+
+  --accent: #c4b5fd;
+  --accent-deep: #a78bfa;
+  --accent-soft: rgba(167, 139, 250, 0.13);
+  --accent-line: rgba(167, 139, 250, 0.34);
+  --accent-glow: rgba(167, 139, 250, 0.32);
+
+  --pink: #ec4899;
+  --indigo: #6366f1;
+  --amber: #f59e0b;
+  --amber-soft: rgba(245, 158, 11, 0.13);
+  --green: #6ee7b7;
+  --green-soft: rgba(110, 231, 183, 0.12);
+  --red: #f87171;
+  --red-soft: rgba(248, 113, 113, 0.12);
+
+  /* Source axis colours — one hue per provider, used everywhere a diagram or a
+     legend distinguishes them. Keep these stable across components. */
+  --claude: #e47aa2;
+  --codex: #83a9fa;
+  --kimi: #8bc7a5;
+
+  /* Comments in this book's code samples carry real argument, so they are not
+     allowed to fade into the background the way editor comments do. */
+  --tok-c: rgba(208, 203, 192, 0.6);
+  --tok-s: #9ad0b2;
+  --tok-k: #d7a8f0;
+
+  --serif: 'Iowan Old Style', 'Charter', Georgia, 'Source Han Serif SC',
+    'Noto Serif CJK SC', 'Songti SC', serif;
+  --sans: -apple-system, BlinkMacSystemFont, 'Inter', 'PingFang SC',
+    'Helvetica Neue', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --rail: 268px;
+  --measure: 43rem;
+  --radius: 12px;
+  --radius-sm: 7px;
+
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5rem;
+}
+
+body {
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(72% 48% at 92% -6%, rgba(236, 72, 153, 0.1), transparent 58%),
+    radial-gradient(64% 44% at 6% 4%, rgba(99, 102, 241, 0.13), transparent 60%);
+  background-attachment: fixed;
+  color: var(--fg-soft);
+  font: 16px/1.8 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--fg);
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.17);
+  background-clip: padding-box;
+}
+
+/* ---------------------------------------------------------------- shared bits */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.18em 0.62em;
+  border: 1px solid var(--edge-hi);
+  border-radius: 999px;
+  background: var(--panel);
+  font: 500 0.68rem/1.6 var(--mono);
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.card {
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.kbd {
+  display: inline-block;
+  min-width: 1.5em;
+  padding: 0.1em 0.4em;
+  border: 1px solid var(--edge-hi);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--panel-hi);
+  font: 0.72rem/1.5 var(--mono);
+  text-align: center;
+  color: var(--muted);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

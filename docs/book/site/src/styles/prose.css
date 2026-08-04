@@ -1,0 +1,163 @@
+/* Typography for rendered book prose. Scoped under .prose so interactive
+   widgets can sit inside the flow without inheriting body-copy rules. */
+
+.prose {
+  max-width: var(--measure);
+  font-size: 1.0125rem;
+  line-height: 1.85;
+}
+
+.prose > * + * {
+  margin-top: 1.2rem;
+}
+
+.prose h2,
+.prose h3 {
+  font-family: var(--serif);
+  color: var(--fg);
+  letter-spacing: 0.01em;
+  scroll-margin-top: 5.5rem;
+}
+
+.prose h2 {
+  margin-top: 3.6rem;
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.prose h3 {
+  margin-top: 2.6rem;
+  font-size: 1.16rem;
+  font-weight: 600;
+}
+
+/* A hairline that grows out of the heading — cheap, but it makes the section
+   boundaries legible when scrolling fast through a long chapter. */
+.prose h2::after {
+  content: '';
+  display: block;
+  width: 2.2rem;
+  height: 1px;
+  margin-top: 0.7rem;
+  background: linear-gradient(90deg, var(--accent-line), transparent);
+}
+
+.prose p {
+  color: var(--fg-soft);
+}
+
+.prose strong {
+  color: var(--fg);
+  font-weight: 640;
+}
+
+.prose a {
+  border-bottom: 1px solid var(--accent-line);
+  transition: border-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+
+.prose a:hover {
+  border-bottom-color: var(--accent);
+}
+
+.prose ul,
+.prose ol {
+  padding-left: 1.3rem;
+}
+
+.prose li {
+  margin: 0.5rem 0;
+  padding-left: 0.25rem;
+  color: var(--fg-soft);
+}
+
+.prose li::marker {
+  color: var(--dim);
+}
+
+.prose hr {
+  height: 1px;
+  margin: 3rem 0;
+  border: 0;
+  background: linear-gradient(90deg, var(--edge-hi), transparent);
+}
+
+/* Inline code only. A bare `.prose code` also hits `pre > code`, and since
+   `code` is inline, a fenced block then draws one chip per wrapped line. */
+.prose :not(pre) > code {
+  padding: 0.1em 0.36em;
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  font: 0.845em/1.5 var(--mono);
+  color: var(--accent);
+  word-break: break-word;
+}
+
+.prose blockquote {
+  padding-left: 1.15rem;
+  border-left: 2px solid var(--edge-hi);
+  color: var(--muted);
+}
+
+.prose blockquote p {
+  color: inherit;
+}
+
+/* A step reference — ① in the markdown. Drawn rather than typed, because
+   U+2460 is East Asian Ambiguous width and renders at a different size
+   depending on which font in the stack happens to own it. */
+.step-ref {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25em;
+  height: 1.25em;
+  margin: 0 0.12em;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-family: var(--mono);
+  font-size: 0.82em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  /* Keeps the ring on the text baseline instead of riding high. */
+  vertical-align: -0.12em;
+  opacity: 0.9;
+}
+
+/* Source references — `packages/core/src/persist.ts:120` in the markdown — are
+   rendered as chips that open the real file on GitHub. Line numbers drift as
+   the code moves; the file is what matters. */
+.src-ref {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.22em;
+  padding: 0.1em 0.42em;
+  border: 1px solid var(--edge-hi);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  font: 0.82em/1.5 var(--mono);
+  color: var(--fg-soft);
+  word-break: break-all;
+  transition: all 0.15s var(--ease);
+}
+
+.prose .src-ref {
+  border-bottom: 1px solid var(--edge-hi);
+}
+
+.src-ref:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.src-ref-mark {
+  font-size: 0.8em;
+  color: var(--dim);
+}
+
+.src-ref:hover .src-ref-mark {
+  color: var(--accent);
+}

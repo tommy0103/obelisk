@@ -1,0 +1,36 @@
+/* Shared code typography.
+ *
+ * Three surfaces show code — rendered blocks (CodeBlock.vue), the editable
+ * sandbox textarea, and the JSON output pane — and they sit next to each other
+ * on the page, so they have to agree on size and leading. They kept drifting
+ * while each owned its own numbers, which is exactly what a reader notices.
+ *
+ * The leading has to be set on the BLOCK box, not on an inner `code`: the line
+ * box strut comes from the block, so a `pre` without its own line-height
+ * inherits the 1.85 body leading from .prose and reads double-spaced.
+ */
+
+:root {
+  --code-size: 0.79rem;
+  --code-leading: 1.55;
+}
+
+.code-face {
+  font: var(--code-size) / var(--code-leading) var(--mono);
+  tab-size: 2;
+}
+
+/* Code inside an interactive widget: a quieter surface than a prose block,
+   since widgets already sit in their own frame. */
+.code-surface {
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunk);
+  overflow: auto;
+}
+
+.code-surface > pre,
+pre.code-surface {
+  margin: 0;
+  padding: 0.75rem 0.9rem;
+}
