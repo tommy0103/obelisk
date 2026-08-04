@@ -14,12 +14,14 @@ exist.
 
 ## Source Model
 
-Obelisk stores Claude Code, Codex, and Kimi Code transcripts in the same schema.
+Obelisk stores Claude Code, Codex, Kimi Code, and Pi transcripts in the same
+schema.
 
 - Claude rows use `source='claude'`.
 - Codex rows use `source='codex'`; root session and message IDs are prefixed
   with `codex:`.
 - Kimi Code rows use `source='kimi'`.
+- Pi rows use `source='pi'`; session IDs are prefixed with `pi:`.
 - Omit `source` filters unless provider provenance matters.
 - Codex child threads are represented through `subagents`; Codex may not have
   Claude-style workflow rows.
@@ -62,7 +64,7 @@ One row per root session.
 | `version` | Provider CLI/app version |
 | `message_count` | Visible canonical messages; inactive and hidden records are excluded |
 | `jsonl_path` | Source JSONL path |
-| `source` | Provider ID: `claude`, `codex`, or `kimi` |
+| `source` | Provider ID: `claude`, `codex`, `kimi`, or `pi` |
 
 ### `messages`
 
@@ -86,7 +88,7 @@ Core evidence table.
 | `cwd` | Working directory at message time |
 | `skill` | Skill that generated the response, if known |
 | `turn_duration_ms` | Wall-clock duration for the turn |
-| `source` | Provider ID: `claude`, `codex`, or `kimi` |
+| `source` | Provider ID: `claude`, `codex`, `kimi`, or `pi` |
 
 `content_type='tool_use'` is only a marker. Tool-call details live in
 `tool_calls`. `content_type='tool_result'` marks provider-emitted tool-result

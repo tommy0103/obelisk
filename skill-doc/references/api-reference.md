@@ -57,7 +57,7 @@ Full-text search across all indexed message text using FTS5.
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, or `"kimi"` |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"kimi"`, or `"pi"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
 
@@ -181,7 +181,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex' | 'kimi', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'kimi' | 'pi', session_count, last_session_at }]
   }
 }
 ```
@@ -200,7 +200,7 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, or `"kimi"`; omit for all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"kimi"`, or `"pi"`; omit for all |
 | `opts.sessionId` | `string` | Exact session ID |
 | `opts.sessions` | `string[]` | Restrict to session IDs |
 
@@ -301,7 +301,9 @@ search/context or compact SQL projections.
 
 Windowed access to the source record for one indexed message, normally its
 original JSONL line. Use this when indexed text, tool inputs, or tool results
-were truncated and you need the raw source.
+were truncated and you need the raw source. Pi returns the selected source
+message object for both direct and retained-tail storage, so one physical
+compaction line never exposes other retained messages.
 
 | Param | Type | Description |
 | --- | --- | --- |

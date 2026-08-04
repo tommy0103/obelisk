@@ -96,15 +96,17 @@ export function createConfiguredBuiltinProviderRuntime(
   persisted: PersistedProviderSettings = {},
   {
     homeDir = homedir(),
+    cwd = process.cwd(),
     baseRoots = {},
   }: {
     homeDir?: string;
+    cwd?: string;
     baseRoots?: BuiltinProviderRoots;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots);
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir });
-  const configured = createBuiltinProviderRegistry({ ...baseRoots, ...roots });
+  const configured = createBuiltinProviderRegistry({ ...baseRoots, ...roots }, { cwd });
   return {
     roots,
     registry: createProviderRegistry(configured.list().map((provider) => {

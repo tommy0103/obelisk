@@ -284,6 +284,7 @@ test('main process watches every root declared by the built-in provider registry
       join(codexDir, 'session_index.jsonl'),
       join(home, '.kimi-code', 'sessions'),
       join(home, '.kimi-code', 'session_index.jsonl'),
+      join(home, '.pi', 'agent', 'sessions'),
     ]);
     assert.equal(serviceOptions[0].watchDirs.includes(codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });

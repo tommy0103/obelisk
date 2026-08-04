@@ -25,9 +25,10 @@ folded into input usage by the provider, as it is for messages. Visibility does
 not erase accounting: aggregate usage includes model calls that were later
 abandoned.
 
-Only a provider with an explicit source-level supersession signal may emit
-`inactive`. Tree shape alone is insufficient; providers without that signal
-leave their evidence visible.
+Provider capability determines whether `inactive` is meaningful. Pi attests
+supersession through branch, leaf, and compaction state. Kimi undo/clear can
+attest it, but preserving that history is separate work. Claude transcripts do
+not attest rewind or current-leaf state, and Codex sessions do not branch.
 
 The Core `assembleSessionDetail(input)` module is the only session-detail seam.
 It accepts either a provider's complete transcript stream from a fresh parse

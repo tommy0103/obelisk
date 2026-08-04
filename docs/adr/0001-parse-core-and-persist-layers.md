@@ -33,15 +33,16 @@ binding-agnostic and does not need a per-binding implementation.
   replacement or tombstone unit without querying SQLite itself. Retraction and
   replacement records commit in the same unit transaction, so a failed parse
   preserves the last complete snapshot.
-  Provider identity may therefore be richer than a wire-level ID. An adapter
-  can namespace a local ID with immutable source metadata while keeping paths
-  as provenance rather than identity.
+  Provider identity may therefore be richer than a wire-level ID. Pi, whose
+  explicit session IDs are project-local, deterministically namespaces the
+  header ID by the normalized header cwd; source paths remain provenance rather
+  than identity, so copying or moving a transcript does not rename the session.
   Adding a source means adding one adapter and registering it; nothing else
   changes. `parse` exposes an iterator as its common interface and streams when
   the provider semantics permit it. An adapter may buffer one complete
   `IndexUnit` when correctness requires whole-unit semantics — for example,
   Codex duplicate reconciliation, Kimi `context.undo` / `context.clear`
-  replay, or tree projection. Each adapter maps its own resume/change
+  replay, or Pi tree projection. Each adapter maps its own resume/change
   semantics onto an opaque cursor stored exactly in `index_state.cursor`;
   `mtime` and `lines_processed` remain compatibility/index-inspection columns.
   A provider-wide replay is a destructive snapshot boundary. Discovery reports
@@ -81,6 +82,6 @@ extend the canonical language by explicit decision: summary-generating model
 calls, for example, carry the same normalized input/output usage as ordinary
 messages. The registry, not provider switches, drives both indexers, watcher
 roots, persisted source roots, source catalog/UI labels and colors, and
-raw-record routing. Adding another provider therefore adds no
-provider-specific branch to the shared schema, persist layer, indexers,
-settings, query API, or renderer.
+raw-record routing. Adding Pi therefore adds no Pi-specific branch to the
+shared schema, persist layer, indexers, settings, query API, or renderer; the
+provenance and summary-usage additions are provider-neutral contracts.

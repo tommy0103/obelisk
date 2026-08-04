@@ -61,12 +61,14 @@ test('built-in provider registry exposes every source without caller-side branch
     claude: '/sources/claude',
     codex: '/sources/codex',
     kimi: '/sources/kimi',
+    pi: '/sources/pi',
   });
 
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
     { id: 'claude', name: 'Claude Code' },
     { id: 'codex', name: 'Codex' },
     { id: 'kimi', name: 'Kimi Code' },
+    { id: 'pi', name: 'Pi' },
   ]);
   assert.deepEqual(registry.watchRoots(), [
     '/sources/claude/projects',
@@ -75,5 +77,6 @@ test('built-in provider registry exposes every source without caller-side branch
     '/sources/codex/session_index.jsonl',
     '/sources/kimi/sessions',
     '/sources/kimi/session_index.jsonl',
+    '/sources/pi',
   ]);
 });

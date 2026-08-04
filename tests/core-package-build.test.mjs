@@ -17,4 +17,8 @@ test('build:core emits an importable package with its schema resource', async ()
   assert.equal(typeof core.searchText, 'function');
   assert.equal(typeof core.executeQuery, 'function');
   assert.equal(typeof core.executeAttune, 'function');
+
+  const pi = await import(`${pathToFileURL(join(coreDist, 'providers', 'pi.js')).href}?test=${Date.now()}`);
+  assert.equal(typeof pi.createPiProvider, 'function');
+  assert.equal(pi.piProvider.descriptor.id, 'pi');
 });
