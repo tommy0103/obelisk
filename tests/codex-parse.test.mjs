@@ -195,3 +195,45 @@ test('codex provider folds session_index metadata into its canonical session rec
   assert.equal(session.title, 'Indexed title');
   assert.equal(session.ended_at, '2026-06-10T11:00:00Z');
 });
+
+test('codex discovery keeps the first subagent metadata when continuations replay parent metadata', () => {
+  const root = mkdtempSync(join(tmpdir(), 'obelisk-codex-replayed-meta-'));
+  const sessionsDir = join(root, 'sessions', '2026', '06', '10');
+  mkdirSync(sessionsDir, { recursive: true });
+  const childId = '019e8951-3e7d-7343-a3e3-05bff48a3101';
+  const parentId = '019e8951-3e7d-7343-a3e3-05bff48a3102';
+  const rootId = '019e8951-3e7d-7343-a3e3-05bff48a3103';
+  const path = join(sessionsDir, `rollout-${childId}.jsonl`);
+  const childMeta = {
+    ...META,
+    id: childId,
+    thread_source: 'subagent',
+    source: { subagent: { thread_spawn: { parent_thread_id: parentId } } },
+  };
+  const parentMeta = {
+    ...META,
+    id: parentId,
+    thread_source: 'subagent',
+    source: { subagent: { thread_spawn: { parent_thread_id: rootId } } },
+  };
+  const rootMeta = { ...META, id: rootId, thread_source: 'user', source: 'vscode' };
+  writeFileSync(path, [childMeta, parentMeta, rootMeta].map((payload, index) => JSON.stringify({
+    type: 'session_meta',
+    timestamp: `2026-06-10T10:00:0${index}Z`,
+    payload,
+  })).join('\n') + '\n');
+  writeFileSync(join(root, 'session_index.jsonl'), [
+    { id: childId, thread_name: 'Child task', updated_at: '2026-06-10T11:00:00Z' },
+    { id: parentId, thread_name: 'Parent task', updated_at: '2026-06-10T11:00:01Z' },
+    { id: rootId, thread_name: 'Root task', updated_at: '2026-06-10T11:00:02Z' },
+  ].map(record => JSON.stringify(record)).join('\n') + '\n');
+
+  const provider = createCodexProvider({ rootDir: root });
+  const units = provider.discover({ lastCursor: () => null });
+
+  assert.equal(units.length, 1);
+  assert.equal(units[0].sessionId, `codex:${parentId}`);
+  assert.equal(units[0].meta.guardian, false);
+  assert.equal(units[0].meta.indexedTitle, 'Child task');
+  assert.equal(units[0].meta.indexedUpdatedAt, '2026-06-10T11:00:00Z');
+});

@@ -182,6 +182,7 @@ interface CodexFileInspection {
 
 function inspectCodexFile(filePath: string): CodexFileInspection {
   let metaRecord: CodexFileInspection['metaRecord'] = null;
+  let guardianCandidate: CodexFileInspection['metaRecord'] = null;
   let sawAutoReview = false;
   for (const source of iterateCodexSourceLines(filePath)) {
     if (source.line === null) continue;
@@ -189,25 +190,27 @@ function inspectCodexFile(filePath: string): CodexFileInspection {
     if (obj === null) continue;
     if (obj?.payload?.model === 'codex-auto-review' || obj?.model === 'codex-auto-review') sawAutoReview = true;
     if (obj?.type === 'session_meta' && obj.payload?.id) {
-      // Match the legacy discovery helper exactly: later metadata replaces the
-      // candidate only while a legacy subagent scan is still in progress.
-      metaRecord = { lineNum: source.lineNumber, obj };
+      // Discovery has always used the first metadata record as the unit's
+      // identity, even when a continuation later replays parent metadata.
+      if (metaRecord === null) metaRecord = { lineNum: source.lineNumber, obj };
+      // Guardian detection historically tracks later metadata independently
+      // while a legacy subagent scan remains in progress.
+      guardianCandidate = { lineNum: source.lineNumber, obj };
       if (obj.payload?.source?.subagent?.other === 'guardian') break;
       if (obj.payload?.thread_source !== 'subagent') break;
     }
-    const meta = metaRecord?.obj?.payload;
-    if (meta && (
-      meta.source?.subagent?.other === 'guardian'
-      || (meta.thread_source === 'subagent' && sawAutoReview)
+    const candidate = guardianCandidate?.obj?.payload;
+    if (candidate && (
+      candidate.source?.subagent?.other === 'guardian'
+      || (candidate.thread_source === 'subagent' && sawAutoReview)
     )) break;
   }
-  const capturedMeta = metaRecord as CodexFileInspection['metaRecord'];
-  const meta = capturedMeta?.obj?.payload;
-  const guardian = Boolean(meta && (
-    meta.source?.subagent?.other === 'guardian'
-    || (meta.thread_source === 'subagent' && sawAutoReview)
+  const candidate = guardianCandidate?.obj?.payload;
+  const guardian = Boolean(candidate && (
+    candidate.source?.subagent?.other === 'guardian'
+    || (candidate.thread_source === 'subagent' && sawAutoReview)
   ));
-  return { metaRecord: capturedMeta, guardian };
+  return { metaRecord, guardian };
 }
 
 interface CodexFirstPass extends CodexFileInspection {
