@@ -10,6 +10,7 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, relative } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 import {
   trunc, truncJson, iterateLineSegments, readLines,
@@ -20,6 +21,7 @@ import {
   codexToolInput, codexToolOutput,
   extractMessageIsMeta, isSkillInstructions,
 } from '../parsing.ts';
+import type { LineReadOptions } from '../parsing.ts';
 
 import type {
   Cursor,
@@ -218,14 +220,14 @@ type CodexAnnotationEvent =
   | { kind: 'assistant'; lineNum: number; duplicateKey: string | null }
   | { kind: 'usage'; inputTokens: number | null; outputTokens: number | null };
 
-function scanCodexFirstPass(filePath: string, maxBytes?: number): CodexFirstPass {
+function scanCodexFirstPass(filePath: string, options: LineReadOptions = {}): CodexFirstPass {
   let metaRecord: CodexFileInspection['metaRecord'] = null;
   let sawAutoReview = false;
   let lineCount = 0;
   const eventMessageKeys = new Set<string>();
   const annotationEvents: CodexAnnotationEvent[] = [];
 
-  for (const source of iterateCodexSourceLines(filePath, { maxBytes })) {
+  for (const source of iterateCodexSourceLines(filePath, options)) {
     lineCount = source.lineNumber;
     if (source.line === null) continue;
     if (source.envelopeType === 'response_item'
@@ -315,7 +317,7 @@ type CodexLineMode = 'unknown' | 'ordinary' | 'skip';
  */
 function* iterateCodexSourceLines(
   filePath: string,
-  { maxBytes }: { maxBytes?: number } = {},
+  options: LineReadOptions = {},
 ): Generator<CodexSourceLine> {
   let lineNumber = 0;
   let mode: CodexLineMode = 'unknown';
@@ -324,6 +326,7 @@ function* iterateCodexSourceLines(
   let probeFragments: Buffer[] = [];
   let probeBytes = 0;
   let textFragments: string[] = [];
+  let decoder = new StringDecoder('utf8');
 
   const reset = () => {
     mode = 'unknown';
@@ -332,15 +335,16 @@ function* iterateCodexSourceLines(
     probeFragments = [];
     probeBytes = 0;
     textFragments = [];
+    decoder = new StringDecoder('utf8');
   };
 
-  for (const segment of iterateLineSegments(filePath, { maxBytes })) {
+  for (const segment of iterateLineSegments(filePath, options)) {
     if (segment.lineStart) {
       lineNumber++;
       reset();
     }
 
-    if (mode !== 'skip') textFragments.push(segment.bytes.toString('utf8'));
+    if (mode !== 'skip') textFragments.push(decoder.write(segment.bytes));
 
     if (mode === 'unknown') {
       const probe = probeFragments.length === 0
@@ -377,6 +381,8 @@ function* iterateCodexSourceLines(
 
     if (!segment.lineEnd) continue;
     if (mode === 'ordinary') {
+      const tail = decoder.end();
+      if (tail) textFragments.push(tail);
       const line = textFragments.join('');
       if (envelopeType === null) {
         const parsed = parseOrdinaryCodexLine(line);
@@ -460,7 +466,15 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
 
 export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
   const snapshot = statSync(unit.key);
-  const firstPass = scanCodexFirstPass(unit.key, snapshot.size);
+  const sourceOptions: LineReadOptions = {
+    maxBytes: snapshot.size,
+    expectedFile: {
+      dev: snapshot.dev,
+      ino: snapshot.ino,
+      minBytes: snapshot.size,
+    },
+  };
+  const firstPass = scanCodexFirstPass(unit.key, sourceOptions);
   const outCursor = `${snapshot.mtimeMs}:${firstPass.lineCount}`;
   const metaRecord = firstPass.metaRecord;
   if (!metaRecord) return outCursor;
@@ -532,7 +546,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     return rec;
   };
 
-  for (const source of iterateCodexSourceLines(unit.key, { maxBytes: snapshot.size })) {
+  for (const source of iterateCodexSourceLines(unit.key, sourceOptions)) {
     const currentLine = source.lineNumber;
     const envelopeType = source.envelopeType;
     if (envelopeType === 'compacted' || envelopeType === 'world_state') continue;

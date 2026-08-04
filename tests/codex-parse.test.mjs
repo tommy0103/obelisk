@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
 
@@ -26,6 +27,7 @@ function drain(gen) {
 }
 
 const META = { id: '019e8951-3e7d-7343-a3e3-05bff48a317d', cwd: '/proj', git: { branch: 'main' }, cli_version: '1.2', timestamp: '2026-06-10T10:00:00Z' };
+const REAL_FORMAT_FIXTURE = fileURLToPath(new URL('./fixtures/codex/streaming-rollout.jsonl', import.meta.url));
 
 test('codex parse() yields a deduped, tool-aware record stream with a total session', () => {
   const path = writeFixture([
@@ -72,7 +74,22 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].git_branch, 'main');
 });
 
-test('codex streaming parse preserves legacy UTF-8 chunk-boundary output', () => {
+test('codex streaming parse preserves canonical records from sanitized real output', () => {
+  const { values } = drain(parse({ key: REAL_FORMAT_FIXTURE, sessionId: '' }, null));
+  const byKind = kind => values.filter(record => record.kind === kind);
+  const messages = byKind('message');
+
+  assert.deepEqual(messages.map(message => message.content_type), ['text', 'text', 'tool_use']);
+  assert.deepEqual(messages.map(message => message.text), ['真实格式用户消息', '真实格式助手消息', null]);
+  assert.equal(messages[1].input_tokens, 321);
+  assert.equal(messages[1].output_tokens, 45);
+  assert.equal(byKind('tool_call')[0].name, 'exec_command');
+  assert.equal(byKind('tool_result')[0].content.includes('/fixture/project'), true);
+  assert.equal(byKind('summary').length, 0);
+  assert.equal(byKind('session')[0].message_count, 3);
+});
+
+test('codex streaming parse preserves UTF-8 and deduplication across chunk boundaries', () => {
   const dir = mkdtempSync(join(tmpdir(), 'obelisk-codex-boundary-'));
   const path = join(dir, 'rollout.jsonl');
   const metaLine = JSON.stringify({
@@ -100,11 +117,8 @@ test('codex streaming parse preserves legacy UTF-8 chunk-boundary output', () =>
   const { values } = drain(parse({ key: path, sessionId: '' }, null));
   const messages = values.filter(record => record.kind === 'message');
 
-  // The original reader decodes each 64 KiB read independently. The optimized
-  // parser intentionally mirrors that established output until a separate,
-  // explicitly semantic migration changes it.
-  assert.equal(messages.length, 2);
-  assert.notEqual(messages[0].text, messages[1].text);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].text, text);
 });
 
 test('codex parse() retracts a guardian thread via delete-session and emits nothing else', () => {

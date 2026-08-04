@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -42,6 +42,13 @@ test('readLines preserves empty-line, CRLF, and unterminated-tail behavior', () 
   assert.deepEqual(collect(path), ['first\r', 'last']);
 });
 
+test('readLines preserves UTF-8 split across its read buffer boundary', () => {
+  const line = `${'a'.repeat(64 * 1024 - 1)}你`;
+  const path = fixture(`${line}\n`);
+
+  assert.deepEqual(collect(path), [line]);
+});
+
 test('readLines stops immediately when the callback returns false', () => {
   const path = fixture(`first\n${'x'.repeat(2 * 1024 * 1024)}\nthird\n`);
   const lines = [];
@@ -56,9 +63,24 @@ test('readLines stops immediately when the callback returns false', () => {
 
 test('iterateLineSegments snapshots the readable byte boundary at open', () => {
   const path = fixture('first\n');
-  const segments = iterateLineSegments(path);
+  const source = statSync(path);
+  const segments = iterateLineSegments(path, {
+    maxBytes: source.size,
+    expectedFile: { dev: source.dev, ino: source.ino, minBytes: source.size },
+  });
 
   assert.equal(segments.next().value.bytes.toString('utf8'), 'first');
   appendFileSync(path, 'second\n');
   assert.deepEqual(segments.next(), { value: undefined, done: true });
+});
+
+test('iterateLineSegments rejects a different file identity between passes', () => {
+  const path = fixture('first\n');
+  const source = statSync(path);
+  const segments = iterateLineSegments(path, {
+    maxBytes: source.size,
+    expectedFile: { dev: source.dev, ino: source.ino + 1, minBytes: source.size },
+  });
+
+  assert.throws(() => segments.next(), /JSONL source changed/);
 });

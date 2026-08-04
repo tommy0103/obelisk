@@ -5,6 +5,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 const CLAUDE_DIR = join(homedir(), '.claude');
 const CODEX_DIR = join(homedir(), '.codex');
@@ -112,25 +113,38 @@ export interface LineBufferSegment {
 export interface LineReadOptions {
   /** Optional upper byte boundary for multi-pass parsers. */
   maxBytes?: number;
+  /** Optional identity guard ensuring repeated passes read the same source file. */
+  expectedFile?: {
+    dev: number;
+    ino: number;
+    minBytes: number;
+  };
 }
 
 function* iterateLineSegments(
   filePath: string,
-  { maxBytes }: LineReadOptions = {},
+  { maxBytes, expectedFile }: LineReadOptions = {},
 ): Generator<LineBufferSegment> {
   const fd = openSync(filePath, 'r');
-  const bufSize = 64 * 1024;
-  // A refresh observes one immutable byte range even if the producer keeps
-  // appending while the source is being scanned. The next refresh picks up
-  // bytes beyond this boundary.
-  const openedBytes = fstatSync(fd).size;
-  const snapshotBytes = maxBytes === undefined
-    ? openedBytes
-    : Math.min(openedBytes, Math.max(0, maxBytes));
-  const buffer = Buffer.allocUnsafe(bufSize);
-  let position = 0;
-  let continuingLine = false;
   try {
+    const opened = fstatSync(fd);
+    if (expectedFile && (
+      opened.dev !== expectedFile.dev
+      || opened.ino !== expectedFile.ino
+      || opened.size < expectedFile.minBytes
+    )) {
+      throw new Error('JSONL source changed while it was being parsed');
+    }
+    const bufSize = 64 * 1024;
+    // A refresh observes one immutable byte range even if the producer keeps
+    // appending while the source is being scanned. The next refresh picks up
+    // bytes beyond this boundary.
+    const snapshotBytes = maxBytes === undefined
+      ? opened.size
+      : Math.min(opened.size, Math.max(0, maxBytes));
+    const buffer = Buffer.allocUnsafe(bufSize);
+    let position = 0;
+    let continuingLine = false;
     while (position < snapshotBytes) {
       const bytesToRead = Math.min(buffer.length, snapshotBytes - position);
       const bytesRead = readSync(fd, buffer, 0, bytesToRead, position);
@@ -171,18 +185,20 @@ function readLines(filePath: string, callback: (line: string) => boolean | void)
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
+  const decoder = new StringDecoder('utf8');
   let remainder = '';
   let bytesRead;
   try {
     while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
-      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buf.subarray(0, bytesRead));
       const lines = chunk.split('\n');
       remainder = lines.pop() ?? '';
       for (const line of lines) {
         if (line && callback(line) === false) return;
       }
     }
-    if (remainder) callback(remainder);
+    const tail = remainder + decoder.end();
+    if (tail) callback(tail);
   } finally {
     closeSync(fd);
   }
