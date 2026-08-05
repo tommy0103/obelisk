@@ -139,3 +139,20 @@ test('delete-session cascades across tables', () => {
   assert.equal(db.prepare('SELECT COUNT(*) c FROM workflows WHERE session_id=?').get('sid-p').c, 0);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM workflow_agents WHERE session_id=?').get('sid-p').c, 0);
 });
+
+test('IndexUnit retracts a previously indexed session without adapter delete records', () => {
+  const db = freshDb();
+  const unit = fixtureUnit();
+  persist(db, unit, parse(unit, null));
+
+  function* tombstone() { yield* []; return '0:0'; }
+  persist(db, {
+    key: 'tombstone',
+    sessionId: unit.sessionId,
+    retractSessionIds: [unit.sessionId],
+  }, tombstone());
+
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM sessions WHERE id=?').get(unit.sessionId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM messages WHERE session_id=?').get(unit.sessionId).c, 0);
+  assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get('tombstone').cursor, '0:0');
+});

@@ -1331,12 +1331,8 @@ function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string
   const meta = unit.meta as PiSessionUnitMeta | undefined;
   if (meta?.kind === 'pi-tombstone') {
     return {
-      records: (unit.retractSessionIds ?? [unit.sessionId]).map((sessionId) => ({
-        kind: 'delete-session',
-        sessionId,
-      })),
-      // A zero watermark keeps recreation discoverable even if no watcher
-      // event is available, without teaching persist about provider tombstones.
+      records: [],
+      // A zero watermark keeps recreation discoverable even if no watcher event is available.
       cursor: '0:0',
     };
   }
@@ -1375,10 +1371,6 @@ function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string
   };
   return {
     records: [
-      ...(unit.retractSessionIds ?? []).map((staleSessionId) => ({
-        kind: 'delete-session' as const,
-        sessionId: staleSessionId,
-      })),
       { kind: 'delete-session', sessionId },
       session,
       ...projected.records,

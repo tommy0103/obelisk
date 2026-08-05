@@ -579,6 +579,35 @@ test('app replay keeps Pi identity stable across migration and retracts replacem
   db.close();
 });
 
+test('a failed Pi identity replacement preserves the prior session snapshot', () => {
+  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-replacement-rollback-'));
+  const piDir = join(home, 'pi-sessions');
+  const sessionPath = writeFixture(piDir);
+  const options = indexOptions(home, piDir);
+  const header = JSON.parse(readFileSync(TOOL_FIXTURE, 'utf8').split('\n')[0]);
+  const priorId = piSessionId(header);
+
+  assert.equal(buildIndex(options).complete, true);
+  writeFileSync(sessionPath, [
+    JSON.stringify({ ...header, id: 'invalid-replacement' }),
+    invalidMessageLine(),
+    '',
+  ].join('\n'));
+
+  assert.throws(
+    () => buildIndex({ ...options, changedPaths: [sessionPath] }),
+    /Malformed Pi message at line 2/,
+  );
+
+  const db = new TestDatabase(options.dbPath);
+  assert.deepEqual(
+    db.prepare("SELECT id,message_count FROM sessions WHERE source='pi'").all().map(row => ({ ...row })),
+    [{ id: priorId, message_count: 4 }],
+  );
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM messages WHERE session_id=?').get(priorId).c, 4);
+  db.close();
+});
+
 test('passive Pi inventory retracts deleted sessions when its configured root remains readable', () => {
   const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-passive-delete-'));
   const piDir = join(home, 'pi-sessions');

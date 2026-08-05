@@ -30,8 +30,8 @@ binding-agnostic and does not need a per-binding implementation.
   adapter is *pure*: it emits normalized records and never touches a database.
   Discovery receives a read-only view of the provider's already-indexed session
   paths. A full-reparse adapter can therefore attach `retractSessionIds` to a
-  replacement or tombstone unit without querying SQLite itself. Retraction and
-  replacement records commit in the same unit transaction, so a failed parse
+  replacement or tombstone unit without querying SQLite itself. Unit retractions
+  and replacement records commit in the same unit transaction, so a failed parse
   preserves the last complete snapshot.
   Provider identity may therefore be richer than a wire-level ID. Pi, whose
   explicit session IDs are project-local, deterministically namespaces the

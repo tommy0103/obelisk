@@ -1938,7 +1938,7 @@ test('identity migration retracts a legacy row attached to a non-selected identi
     drain(provider.parse(migration[0], null)).values
       .filter(record => record.kind === 'delete-session')
       .map(record => record.sessionId),
-    [legacyId, piSessionId(sourceHeader)],
+    [piSessionId(sourceHeader)],
   );
 });
 
@@ -2108,7 +2108,7 @@ test('indexed provenance retracts a replaced identity and emits an unlink tombst
   assert.notEqual(afterSession, beforeSession);
   assert.deepEqual(
     after.values.filter(record => record.kind === 'delete-session').map(record => record.sessionId),
-    [beforeSession, afterSession],
+    [afterSession],
   );
 
   unlinkSync(written.path);
@@ -2120,7 +2120,7 @@ test('indexed provenance retracts a replaced identity and emits an unlink tombst
   assert.equal(tombstones.length, 1);
   assert.deepEqual(tombstones[0].retractSessionIds, [afterSession]);
   const tombstone = drain(provider.parse(tombstones[0], after.cursor));
-  assert.deepEqual(tombstone.values, [{ kind: 'delete-session', sessionId: afterSession }]);
+  assert.deepEqual(tombstone.values, []);
   assert.equal(tombstone.cursor, '0:0');
 });
 
