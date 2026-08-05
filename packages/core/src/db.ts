@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines } from './parsing.ts';
 import { configureConnection } from './tx.ts';
-import { migrateCoreSchemaColumns } from './schema-migrations.ts';
+import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from './schema-migrations.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 
 const OBELISK_DIR = join(homedir(), '.obelisk');
@@ -28,6 +28,7 @@ function openDb(): NodeSqliteDb {
   migrateCoreSchemaColumns(db);
   db.exec(SCHEMA);
   migrateCoreSchemaColumns(db);
+  migrateFtsTokenizer(db, resolveFtsTokenizer());
   return db;
 }
 

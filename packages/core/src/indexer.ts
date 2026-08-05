@@ -9,6 +9,7 @@ import {
   ProviderIndexFailure,
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
+import { ftsTokenizerMigrationPending, resolveFtsTokenizer } from './schema-migrations.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
 import { acquireWriterLease, writerLockPathFor } from './writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from './write-coordinator.ts';
@@ -29,6 +30,7 @@ interface SkippedFile {
 interface BuildCheckOptions {
   now?: number;
   ignoreRecentBuild?: boolean;
+  ftsTokenizer?: string | null;
 }
 
 interface BuildIndexOptions {
@@ -60,14 +62,16 @@ function refreshSessionProjectPaths(db: NodeSqliteDb): void {
 const BUILD_DEBOUNCE_MS = 30000;
 const APP_HEARTBEAT_FRESH_MS = 60000;
 
-function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false }: BuildCheckOptions = {}) {
+function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ftsTokenizer = resolveFtsTokenizer() }: BuildCheckOptions = {}) {
   const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
   if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
     return { skip: true, reason: 'daemon_active' };
   }
   if (!ignoreRecentBuild) {
     const last = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__last_build__'").get();
-    if (last && now - last.mtime < BUILD_DEBOUNCE_MS) {
+    // A pending tokenizer switch needs the write path, which only the build acquires.
+    // Debouncing here would leave a newly configured tokenizer silently inactive.
+    if (last && now - last.mtime < BUILD_DEBOUNCE_MS && !ftsTokenizerMigrationPending(db, ftsTokenizer)) {
       return { skip: true, reason: 'recent_build' };
     }
   }

@@ -202,6 +202,23 @@ run `npm ci` again.
 
 Full-text search via FTS5 covers all layers.
 
+### CJK transcripts
+
+FTS5 defaults to the `unicode61` tokenizer, which treats an unbroken run of Chinese,
+Japanese, or Korean characters as a single token — a phrase only matches when it happens
+to be delimited by punctuation or ASCII, and identifiers glued to CJK text (`重跑gen-itgc后`)
+are missed. Sessions in those languages can set a different tokenizer:
+
+```bash
+export OBELISK_FTS_TOKENIZER=trigram
+```
+
+The next command migrates both FTS tables and reindexes them from the content tables;
+nothing else needs to be rebuilt, and unsetting the variable leaves the existing index
+alone. The trade-off is a larger index (the inverted index grows roughly 5x, though it is
+a small share of the database) and a floor of 3 characters per query — `trigram` cannot
+match anything shorter, so short queries need `sql()` with `LIKE`.
+
 ## Structure
 
 ```
