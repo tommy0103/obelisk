@@ -462,8 +462,7 @@ function buildIndex({
               error: error.sourceError instanceof Error
                 ? error.sourceError.message
                 : String(error.sourceError),
-              diagnostics: (error as { obelisk?: unknown }).obelisk
-                ?? (error.sourceError as { obelisk?: unknown } | null)?.obelisk,
+              diagnostics: (error as { obelisk?: unknown }).obelisk,
             });
             console.warn(
               `Warning: failed to index ${error.item.provider.name} unit ${error.item.unit.key}: ${error.message}`,

@@ -122,13 +122,15 @@ export function createConfiguredBuiltinProviderRuntime(
         },
         watchRoots: () => [],
         discover: (ctx) => {
-          ctx.reportIncompleteInventory?.({
-            path: provider.descriptor.defaultRoot,
-            error: reason,
-          });
+          const indexed = ctx.indexedSessions?.()[0];
+          if (indexed) {
+            ctx.reportIncompleteInventory?.({
+              path: indexed.jsonlPath,
+              error: reason,
+            });
+          }
           return [];
         },
-        raw: () => null,
       };
     })),
   };

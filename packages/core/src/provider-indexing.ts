@@ -58,6 +58,27 @@ export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
     : `${String(row.mtime)}:${String(row.lines_processed)}`;
 }
 
+export function providerSessionUnitKey(
+  provider: ProviderAdapter | undefined,
+  session: IndexedSession,
+): string {
+  return provider?.sessionUnitKey?.(session) ?? session.jsonlPath;
+}
+
+export function storedSessionCursor(
+  db: SqliteDb,
+  registry: ProviderRegistry,
+  session: Record<string, unknown> | null,
+): Cursor {
+  if (typeof session?.jsonl_path !== 'string') return null;
+  const source = typeof session.source === 'string' ? session.source : 'claude';
+  const unitKey = providerSessionUnitKey(registry.get(source), {
+    sessionId: typeof session.id === 'string' ? session.id : '',
+    jsonlPath: session.jsonl_path,
+  });
+  return storedProviderCursor(db, unitKey);
+}
+
 export function readProviderSessionProvenance(db: SqliteDb): ProviderSessionProvenance[] {
   return db.prepare(`
     SELECT id, jsonl_path, COALESCE(source, 'claude') AS source
@@ -100,7 +121,9 @@ export function createProviderIndexPlan(
     ).get(marker);
     const fullReindex = force || (markerMissing && indexedSessions.length > 0);
     if (markerMissing && indexedSessions.length > 0) {
-      replayKeys.set(provider.name, [...new Set(indexedSessions.map((session) => session.jsonlPath))]);
+      replayKeys.set(provider.name, [
+        ...new Set(indexedSessions.map((session) => providerSessionUnitKey(provider, session))),
+      ]);
     }
     let inventoryComplete = true;
     let reportedIssue: InventoryIssue | undefined;

@@ -19,11 +19,14 @@ const editorPicker = ref(null);
 const editorMenuOpen = ref(false);
 const memoryCount = ref(0);
 const rebuilding = ref(false);
+const rebuildError = ref('');
 const version = ref('');
 let stopIndexUpdates = null;
 
 onMounted(async () => {
-  stopIndexUpdates = window.obelisk?.onIndexUpdated?.(() => loadSettings()) ?? null;
+  stopIndexUpdates = window.obelisk?.onIndexUpdated?.(() => {
+    void loadSettings({ preserveRecapPath: true });
+  }) ?? null;
   document.addEventListener('pointerdown', closeEditorMenuOutside);
   document.addEventListener('keydown', closeEditorMenuOnEscape);
   await loadSettings();
@@ -36,12 +39,12 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', closeEditorMenuOnEscape);
 });
 
-async function loadSettings() {
+async function loadSettings({ preserveRecapPath = false } = {}) {
   if (!window.obelisk?.getSettings) return;
   const s = await window.obelisk.getSettings();
   sources.value = s.sources || [];
   dbPath.value = s.dbPath || '';
-  recapPath.value = s.recapDir || '~/.obelisk/recap';
+  if (!preserveRecapPath) recapPath.value = s.recapDir || '~/.obelisk/recap';
   autoRefresh.value = s.autoRefresh !== false;
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
@@ -106,11 +109,14 @@ async function commitRecapPath() {
 async function rebuildIndex() {
   if (rebuilding.value || !window.obelisk?.rebuildIndex) return;
   rebuilding.value = true;
+  rebuildError.value = '';
   await nextTick();
   await new Promise(resolve => requestAnimationFrame(resolve));
   try {
     await window.obelisk.rebuildIndex();
     await loadSettings();
+  } catch (error) {
+    rebuildError.value = error instanceof Error ? error.message : String(error);
   } finally {
     rebuilding.value = false;
   }
@@ -318,6 +324,7 @@ function fmtRelative(iso) {
             <div class="reset-hint">
               Rebuilding re-reads your coding agent session data. It does not delete memories or recaps.
             </div>
+            <div v-if="rebuildError" class="reset-error">{{ rebuildError }}</div>
           </div>
         </div>
       </section>
@@ -463,6 +470,7 @@ function fmtRelative(iso) {
 .btn.subtle { background: transparent; border-color: transparent; color: var(--muted); }
 .btn.subtle:hover { background: var(--surface); color: var(--fg-2); }
 .btn svg { width: 13px; height: 13px; }
+.reset-error { margin-top: 8px; color: #f87171; font-size: 11.5px; }
 
 .status-row {
   display: flex; align-items: center; gap: 14px;

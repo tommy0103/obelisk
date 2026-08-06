@@ -21,6 +21,20 @@ function tableExists(db: SqliteDb, table: string): boolean {
   return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table));
 }
 
+export function coreSchemaNeedsMigration(db: SqliteDb): boolean {
+  const columnsByTable = new Map<string, Set<string>>();
+  for (const [table, column] of COLUMN_MIGRATIONS) {
+    if (!tableExists(db, table)) return true;
+    let columns = columnsByTable.get(table);
+    if (!columns) {
+      columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => String(row.name)));
+      columnsByTable.set(table, columns);
+    }
+    if (!columns.has(column)) return true;
+  }
+  return false;
+}
+
 /** Binding-agnostic additive migrations shared by the CLI and desktop app. */
 export function migrateCoreSchemaColumns(db: SqliteDb): void {
   const columnsByTable = new Map<string, Set<string>>();

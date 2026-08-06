@@ -54,3 +54,18 @@ for (const [name, createProvider, inventoryDir] of providers) {
     }]);
   });
 }
+
+test('Kimi recovers its session unit key from canonical wire provenance', () => {
+  const root = join(tmpdir(), 'obelisk-kimi-unit-key');
+  const sessionDir = join(root, 'sessions', 'workspace', 'session');
+  const provider = createKimiProvider({ rootDir: root });
+
+  assert.equal(provider.sessionUnitKey({
+    sessionId: 'kimi:session',
+    jsonlPath: join(sessionDir, 'agents', 'main', 'wire.jsonl'),
+  }), sessionDir);
+  assert.equal(provider.sessionUnitKey({
+    sessionId: 'kimi:legacy',
+    jsonlPath: join(sessionDir, 'wire.jsonl'),
+  }), sessionDir);
+});

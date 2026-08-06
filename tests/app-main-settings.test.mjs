@@ -1263,3 +1263,112 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('settings changes during rebuild keep one watcher and re-enable with a catch-up build', async () => {
+  const home = join(tmpdir(), `obelisk-main-settings-rebuild-race-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({ autoRefresh: true }));
+  const originalHome = process.env.HOME;
+  process.env.HOME = home;
+
+  const ipcHandlers = new Map();
+  const services = [];
+  let finishRebuild;
+
+  class FakeDatabase {
+    constructor(dbPath) {
+      this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
+    }
+    pragma() {}
+    exec(sql) { return this.lockDb?.exec(sql); }
+    close() { this.lockDb?.close(); }
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, {
+      namedExports: {
+        createIndexerService: () => {
+          const service = {
+            starts: [],
+            stops: 0,
+            start(options) { this.starts.push(options); },
+            stop() { this.stops += 1; },
+            idle: async () => {},
+            runBuildNow() { return Promise.resolve(); },
+          };
+          services.push(service);
+          return service;
+        },
+      },
+    }],
+    [INDEXER_WORKER_URL, {
+      namedExports: {
+        createWorkerBuildIndex: () => ({
+          buildIndex: () => new Promise(resolve => {
+            finishRebuild = () => resolve({
+              files: 0,
+              affectedSessionIds: [],
+              complete: false,
+              deferred: false,
+              inventoryIssues: [],
+              skippedFiles: [],
+              reason: 'incomplete_snapshot',
+            });
+          }),
+          stop() { return Promise.resolve(); },
+        }),
+      },
+    }],
+  ]);
+
+  try {
+    await importMain();
+    assert.equal(services.length, 1);
+
+    const rebuildPromise = ipcHandlers.get('settings:rebuildIndex')();
+    await new Promise(resolve => setImmediate(resolve));
+    await ipcHandlers.get('settings:set')(null, 'autoRefresh', false);
+    await ipcHandlers.get('settings:set')(null, 'autoRefresh', true);
+
+    assert.equal(services.length, 2);
+    assert.deepEqual(services[1].starts, [{ buildOnStart: true }]);
+    finishRebuild();
+    await rebuildPromise;
+
+    assert.equal(services.length, 2, 'the rebuild finally block reused the current service');
+    assert.equal(services[0].stops, 1);
+    assert.equal(services[1].stops, 0);
+  } finally {
+    restore();
+    process.env.HOME = originalHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

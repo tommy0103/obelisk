@@ -297,6 +297,11 @@ export interface ProviderAdapter extends Provider {
   readonly descriptor: ProviderDescriptor;
   /** Optional index semantics marker; absence forces one provider-owned replay. */
   readonly indexVersionMarker?: string;
+  /**
+   * Recover the IndexUnit key for a persisted session when it differs from the
+   * canonical source path. File-backed providers normally omit this.
+   */
+  sessionUnitKey?(session: IndexedSession): string;
   watchRoots(configuredRoot: string): string[];
   raw(input: RawLookup): RawRecord | null;
 }

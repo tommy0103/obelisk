@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -160,6 +160,46 @@ test('CLI force rebuild rejects a structurally invalid Pi snapshot and preserves
   const failed = runCli(['--build'], { home, env });
   assert.equal(failed.status, 1, failed.stderr || failed.stdout);
   assert.match(JSON.parse(failed.stdout).error, /provider_failure/);
+
+  db = new DatabaseSync(dbPath, { readOnly: true });
+  const after = {
+    sessions: db.prepare("SELECT id,title,message_count,jsonl_path FROM sessions WHERE source='pi'").all()
+      .map(row => ({ ...row })),
+    messages: db.prepare("SELECT uuid,text FROM messages WHERE source='pi' ORDER BY uuid").all()
+      .map(row => ({ ...row })),
+  };
+  db.close();
+  assert.deepEqual(after, before);
+});
+
+test('CLI force rebuild rejects an incomplete provider inventory and preserves the last good index', () => {
+  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-cli-incomplete-force-'));
+  const piRoot = join(home, '.pi', 'agent', 'sessions');
+  const sessionPath = join(piRoot, 'project', 'session.jsonl');
+  mkdirSync(dirname(sessionPath), { recursive: true });
+  writeFileSync(
+    sessionPath,
+    readFileSync(new URL('./fixtures/pi/tool-session.jsonl', import.meta.url)),
+  );
+  const env = { PI_CODING_AGENT_DIR: '', PI_CODING_AGENT_SESSION_DIR: '' };
+  const first = runCli(['--build'], { home, env });
+  assert.equal(first.status, 0, first.stderr || first.stdout);
+
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  let db = new DatabaseSync(dbPath, { readOnly: true });
+  const before = {
+    sessions: db.prepare("SELECT id,title,message_count,jsonl_path FROM sessions WHERE source='pi'").all()
+      .map(row => ({ ...row })),
+    messages: db.prepare("SELECT uuid,text FROM messages WHERE source='pi' ORDER BY uuid").all()
+      .map(row => ({ ...row })),
+  };
+  db.close();
+
+  rmSync(piRoot, { recursive: true, force: true });
+  writeFileSync(piRoot, 'not a directory');
+  const failed = runCli(['--build'], { home, env });
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  assert.match(JSON.parse(failed.stdout).error, /incomplete_snapshot/);
 
   db = new DatabaseSync(dbPath, { readOnly: true });
   const after = {

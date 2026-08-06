@@ -11,7 +11,7 @@
 import { createContext, runInNewContext } from 'node:vm';
 
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
-import { buildIndex, shouldSkipBuild } from './indexer.ts';
+import { buildIndex, ensureReadableSchema, shouldSkipBuild } from './indexer.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
   readPersistedProviderSettings,
@@ -53,11 +53,23 @@ function refreshQueryIndex(): ProviderRegistry {
   const settings = readPersistedProviderSettings();
   const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
   if (!settings.ok) {
+    const schema = ensureReadableSchema();
+    if (!schema.ready) {
+      throw new Error(`Obelisk index schema upgrade is blocked by ${schema.reason ?? 'an unknown writer'}`);
+    }
     process.stderr.write(`Warning: ${settings.error}; index refresh skipped\n`);
     return providerRegistry;
   }
   reportIncompleteInventory(buildIndex({ providerRegistry }));
   return providerRegistry;
+}
+
+function rethrowUnlessSchemaBlocked(error: unknown): never {
+  const schema = ensureReadableSchema();
+  if (!schema.ready) {
+    throw new Error(`Obelisk index schema upgrade is blocked by ${schema.reason ?? 'an unknown writer'}`);
+  }
+  throw error;
 }
 
 // Run a user-supplied CodeAct script inside the query/attune sandbox. The script
@@ -76,7 +88,11 @@ export function searchText(text: string, opts?: Record<string, unknown>): unknow
   const providerRegistry = refreshQueryIndex();
   const db = openReadDb();
   try {
-    return createQueryApi(db, { providerRegistry }).search(text, opts);
+    try {
+      return createQueryApi(db, { providerRegistry }).search(text, opts);
+    } catch (error) {
+      return rethrowUnlessSchemaBlocked(error);
+    }
   } finally {
     db.close();
   }
@@ -87,7 +103,11 @@ export async function executeQuery(scriptContent: string): Promise<unknown> {
   const providerRegistry = refreshQueryIndex();
   const db = openReadDb();
   try {
-    return await runInSandbox(createQueryApi(db, { providerRegistry }), scriptContent);
+    try {
+      return await runInSandbox(createQueryApi(db, { providerRegistry }), scriptContent);
+    } catch (error) {
+      return rethrowUnlessSchemaBlocked(error);
+    }
   } finally {
     db.close();
   }
@@ -95,7 +115,10 @@ export async function executeQuery(scriptContent: string): Promise<unknown> {
 
 // Execute a memory-mutation CodeAct script (remember/forget only).
 export async function executeAttune(scriptContent: string): Promise<unknown> {
-  const build = buildIndex() as { reason?: string } | undefined;
+  const settings = readPersistedProviderSettings();
+  if (!settings.ok) throw new Error(`${settings.error}; attune was not applied`);
+  const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
+  const build = buildIndex({ providerRegistry }) as { reason?: string } | undefined;
   reportIncompleteInventory(build);
   if (build?.reason === 'daemon_active') {
     throw new Error('Obelisk daemon owns index writes; attune is read-only until the daemon stops');

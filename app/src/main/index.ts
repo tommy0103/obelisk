@@ -12,6 +12,7 @@ import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
+import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
@@ -269,10 +270,11 @@ function appendWhere(sql, params, clause) {
 }
 
 function startIndexerService({ buildOnStart = false } = {}) {
+  if (indexerService) return indexerService;
   const paths = getRuntimePaths();
   if (latestSettingsError !== null) return null;
   migrateLegacyDbIfNeeded(paths);
-  indexerService = createIndexerService({
+  const service = createIndexerService({
     projectsDir: paths.projectsDir,
     watchDirs: paths.providerRegistry.watchRoots(paths.providerRoots),
     buildIndex: async ({ reason, changedPaths }) => {
@@ -302,8 +304,9 @@ function startIndexerService({ buildOnStart = false } = {}) {
     },
     writeHeartbeat: () => writeHeartbeat({ dbPath: paths.dbPath }),
   });
-  indexerService.start({ buildOnStart });
-  return indexerService;
+  service.start({ buildOnStart });
+  indexerService = service;
+  return service;
 }
 
 function startBackgroundResources({ runStartupBuild = false } = {}) {
@@ -671,16 +674,13 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
   const workflowAgent = msg.agent_id
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
-  const cursorRow = typeof session?.jsonl_path === 'string'
-    ? db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path)
-    : undefined;
   const paths = getRuntimePaths();
   const raw = paths.providerRegistry.raw({
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
     agentId: msg.agent_id || null,
-    cursor: typeof cursorRow?.cursor === 'string' ? cursorRow.cursor : null,
+    cursor: storedSessionCursor(db, paths.providerRegistry, session),
     subagent,
     workflowAgent,
   });
@@ -1008,7 +1008,7 @@ ipcMain.handle('settings:set', async (_, key, value) => {
       await stopIndexerServiceAndWait();
     } else if (value !== false) {
       if (indexerService) await stopIndexerServiceAndWait();
-      startIndexerService({ buildOnStart: false });
+      startIndexerService({ buildOnStart: true });
     }
   }
 
@@ -1050,7 +1050,6 @@ ipcMain.handle('settings:rebuildIndex', async () => {
   if (latestSettingsError !== null) throw new Error(latestSettingsError);
   const paths = getRuntimePaths(persisted);
   const tempDbPath = rebuildTempDbPath(paths.dbPath);
-  const shouldRestartWatcher = persisted.autoRefresh !== false;
   await stopIndexerServiceAndWait({ waitForIdle: false });
   if (indexerWorker) {
     await Promise.resolve(indexerWorker.stop());
@@ -1117,7 +1116,9 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       }
     } finally {
       writerLease?.release();
-      if (shouldRestartWatcher) startIndexerService({ buildOnStart: false });
+      if (loadPersistedSettings().autoRefresh !== false) {
+        startIndexerService({ buildOnStart: false });
+      }
     }
   }
 });

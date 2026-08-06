@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -34,6 +34,46 @@ test('a passive query does not mutate the index while a fresh daemon owns writes
   const tables = check.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(row => row.name);
   check.close();
   assert.deepEqual(tables, ['index_state']);
+});
+
+test('a passive query reports when a daemon blocks its schema upgrade', () => {
+  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-schema-'));
+  const obeliskDir = join(home, '.obelisk');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(
+    new URL('../packages/core/src/schema.sql', import.meta.url),
+    'utf8',
+  )
+    .replace(', cursor TEXT);', ');')
+    .replace(
+      ", visibility TEXT DEFAULT 'visible',\n  input_tokens INTEGER, output_tokens INTEGER);",
+      ');',
+    );
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('daemon-legacy', 'Daemon legacy', 'claude');
+  db.prepare(`
+    INSERT INTO summaries (id,session_id,timestamp,source,content)
+    VALUES (?,?,?,?,?)
+  `).run('daemon-summary', 'daemon-legacy', '2026-08-05T00:00:00Z', 'compaction', 'summary');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed)
+    VALUES ('__app_heartbeat__',?,0)
+  `).run(Date.now());
+  db.close();
+
+  const queryPath = join(home, 'query.mjs');
+  writeFileSync(queryPath, "return summaries('daemon-legacy');");
+  const result = runCli(['--query', queryPath], { home });
+
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /schema upgrade is blocked by daemon_active/i);
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  assert.equal(check.prepare('PRAGMA table_info(index_state)').all().some(row => row.name === 'cursor'), false);
+  assert.equal(check.prepare('PRAGMA table_info(summaries)').all().some(row => row.name === 'visibility'), false);
+  check.close();
 });
 
 test('attune refuses to mutate the index while a fresh daemon owns writes', () => {

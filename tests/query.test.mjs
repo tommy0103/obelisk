@@ -230,6 +230,36 @@ test('raw rejects hidden targets and labels explicitly included inactive evidenc
   db.close();
 });
 
+test('raw looks up cursors by provider unit identity instead of source path', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,jsonl_path,source) VALUES (?,?,?,?)')
+    .run('sid-raw-key', 'Raw key', '/alpha/agents/main/wire.jsonl', 'alpha');
+  db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,content_type,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `).run('msg-raw-key', 'sid-raw-key', 'user', 'user', 'raw key', 'text', 'visible', 'alpha');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor)
+    VALUES (?,?,?,?)
+  `).run('alpha:unit', 10, 1, '10:1');
+  let cursor;
+  const provider = {
+    sessionUnitKey: () => 'alpha:unit',
+  };
+  const providerRegistry = {
+    get: () => provider,
+    raw(input) {
+      cursor = input.cursor;
+      return { text: 'raw', totalLength: 3 };
+    },
+  };
+
+  assert.equal(createQueryApi(db, { providerRegistry }).raw('msg-raw-key').text, 'raw');
+  assert.equal(cursor, '10:1');
+  db.close();
+});
+
 test('failures nextMessages does not leak hidden branch messages', () => {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
@@ -329,10 +359,32 @@ test('failures gates both result and linked call message visibility', () => {
   );
   assert.deepEqual(
     api.failures({ sessionId: 'sid-edge-visibility', includeInactive: true })
-      .map(record => record.toolCall.id)
+      .map(record => [record.toolCall.id, record.visibility])
       .sort(),
-    ['call-inactive', 'call-visible'],
+    [
+      ['call-inactive', 'inactive'],
+      ['call-visible', 'visible'],
+    ],
   );
+  db.close();
+});
+
+test('failures preserves orphaned error results without linked messages or calls', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-orphan-failure', 'Orphan failure', 'codex');
+  db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `).run('missing-call', '', 'sid-orphan-failure', 'orphaned failure', 1);
+
+  const rows = createQueryApi(db).failures('sid-orphan-failure');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].toolCall, undefined);
+  assert.equal(rows[0].result.content, 'orphaned failure');
+  assert.equal(rows[0].visibility, 'visible');
+  assert.deepEqual(rows[0].nextMessages, []);
   db.close();
 });
 

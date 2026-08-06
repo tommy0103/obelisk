@@ -171,6 +171,7 @@ test('indexer service logs a build that fails while running', async () => {
 });
 
 test('indexer service reports partial inventory paths on ordinary builds', async () => {
+  const timers = manualTimers();
   const warnings = [];
   const service = createIndexerService({
     buildIndex: async () => ({
@@ -185,14 +186,74 @@ test('indexer service reports partial inventory paths on ordinary builds', async
     watchProjects: () => null,
     writeHeartbeat: () => {},
     logger: { warn: (msg) => warnings.push(msg) },
+    timers,
     stabilityMs: 0,
   });
 
   await service.runBuildNow('startup');
+  service.stop();
 
   assert.deepEqual(warnings, [
     'Obelisk indexed a partial pi inventory at /tmp/pi/locked: EACCES: permission denied',
   ]);
+});
+
+test('an incomplete inventory schedules a full retry', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => {
+      calls.push(args);
+      return calls.length === 1
+        ? {
+            complete: false,
+            inventoryIssues: [{
+              provider: 'pi',
+              path: '/tmp/pi/locked',
+              error: 'EACCES: permission denied',
+            }],
+          }
+        : { complete: true };
+    },
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    logger: { warn() {} },
+    timers,
+    stabilityMs: 0,
+  });
+
+  await service.runBuildNow('watch', ['/tmp/pi/session.jsonl']);
+  timers.flush();
+  await service.idle();
+
+  assert.deepEqual(calls, [
+    { reason: 'watch', changedPaths: ['/tmp/pi/session.jsonl'] },
+    { reason: 'incomplete-inventory', changedPaths: undefined },
+  ]);
+});
+
+test('a failed unit does not promote its changed-path build to a full retry', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => {
+      calls.push(args);
+      return { complete: false, inventoryIssues: [] };
+    },
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+  });
+
+  await service.runBuildNow('watch', ['/tmp/pi/bad-session.jsonl']);
+  timers.flush();
+  await service.idle();
+
+  assert.deepEqual(calls, [{
+    reason: 'watch',
+    changedPaths: ['/tmp/pi/bad-session.jsonl'],
+  }]);
 });
 
 test('indexer service reports partial inventory paths before a deferred retry', async () => {

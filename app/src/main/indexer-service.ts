@@ -136,7 +136,7 @@ function createIndexerService({
   let stabilityTimer: TimerHandle | null = null;
   let heartbeatTimer: TimerHandle | null = null;
   let watchRetryTimer: TimerHandle | null = null;
-  let deferredRetryTimer: TimerHandle | null = null;
+  let retryTimer: TimerHandle | null = null;
   let watcher: Watcher | null = null;
   let stopped = false;
   let running = false;
@@ -200,16 +200,18 @@ function createIndexerService({
           );
         }
       }
-      if (result?.deferred) {
-        if (buildChangedPaths === undefined) requestFullInventory();
+      const incompleteInventory = (result?.inventoryIssues?.length ?? 0) > 0;
+      if (result?.deferred || incompleteInventory) {
+        if (incompleteInventory || buildChangedPaths === undefined) requestFullInventory();
         else addChangedPath(buildChangedPaths);
-        if (!stopped && !deferredRetryTimer) {
-          deferredRetryTimer = timers.setTimeout(() => {
-            deferredRetryTimer = null;
-            runBuildNow('writer-lease');
-          }, deferredRetryMs);
+        if (!stopped && !retryTimer) {
+          const retryReason = result?.deferred ? 'writer-lease' : 'incomplete-inventory';
+          retryTimer = timers.setTimeout(() => {
+            retryTimer = null;
+            runBuildNow(retryReason);
+          }, result?.deferred ? deferredRetryMs : heartbeatMs);
         }
-        return;
+        if (result?.deferred) return;
       }
       publishHeartbeat();
     })()
@@ -234,8 +236,8 @@ function createIndexerService({
     else addChangedPath(changedPath);
     lastReason = reason;
     if (running) pending = true;
-    if (deferredRetryTimer) timers.clearTimeout(deferredRetryTimer);
-    deferredRetryTimer = null;
+    if (retryTimer) timers.clearTimeout(retryTimer);
+    retryTimer = null;
     if (buildTimer) timers.clearTimeout(buildTimer);
     if (stabilityTimer) timers.clearTimeout(stabilityTimer);
     buildTimer = timers.setTimeout(() => {
@@ -294,8 +296,8 @@ function createIndexerService({
     stabilityTimer = null;
     if (watchRetryTimer) timers.clearTimeout(watchRetryTimer);
     watchRetryTimer = null;
-    if (deferredRetryTimer) timers.clearTimeout(deferredRetryTimer);
-    deferredRetryTimer = null;
+    if (retryTimer) timers.clearTimeout(retryTimer);
+    retryTimer = null;
     if (heartbeatTimer && typeof timers.clearInterval === 'function') timers.clearInterval(heartbeatTimer);
     heartbeatTimer = null;
     if (watcher?.close) watcher.close();

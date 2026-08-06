@@ -16,6 +16,7 @@ import {
   createConfiguredBuiltinProviderRuntime,
   readPersistedProviderSettings,
 } from './provider-settings.ts';
+import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type { NodeSqliteDb, SqliteRow } from './sqlite-types.ts';
 
@@ -83,7 +84,9 @@ function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
   if (!existsSync(DB_PATH)) return { skip: false };
   const db = openReadDb();
   try {
-    return shouldSkipBuild(db, { ignoreRecentBuild: force });
+    const ownership = shouldSkipBuild(db, { ignoreRecentBuild: force });
+    if (!ownership.skip || ownership.reason === 'daemon_active') return ownership;
+    return coreSchemaNeedsMigration(db) ? { skip: false } : ownership;
   } catch (error) {
     // A missing table means the write path must initialize a new/legacy index.
     // Any other read failure leaves daemon ownership unknown, so fail closed.
@@ -91,6 +94,44 @@ function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
     throw error;
   } finally {
     db.close();
+  }
+}
+
+function ensureReadableSchema(): { ready: boolean; reason?: string } {
+  const inspect = () => {
+    if (!existsSync(DB_PATH)) return { ready: false };
+    const db = openReadDb();
+    try {
+      if (!coreSchemaNeedsMigration(db)) return { ready: true };
+      try {
+        if (shouldSkipBuild(db, { ignoreRecentBuild: true }).reason === 'daemon_active') {
+          return { ready: false, reason: 'daemon_active' };
+        }
+      } catch (error) {
+        if (!isMissingIndexStateTable(error)) throw error;
+      }
+      return { ready: false };
+    } finally {
+      db.close();
+    }
+  };
+
+  let state = inspect();
+  if (state.ready || state.reason) return state;
+  const lease = acquireWriterLease({
+    lockPath: writerLockPathFor(DB_PATH),
+    openDb: openWriterLeaseDb,
+    waitMs: 1000,
+  });
+  if (!lease) return { ready: false, reason: 'writer_busy' };
+  try {
+    state = inspect();
+    if (state.ready || state.reason) return state;
+    const db = openDb();
+    db.close();
+    return { ready: true };
+  } finally {
+    lease.release();
   }
 }
 
@@ -171,8 +212,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
               provider: error.item.provider.name,
               path: error.item.unit.key,
               error: errorMessage(error.sourceError),
-              diagnostics: (error as { obelisk?: unknown }).obelisk
-                ?? (error.sourceError as { obelisk?: unknown } | null)?.obelisk,
+              diagnostics: (error as { obelisk?: unknown }).obelisk,
             };
             skippedFiles.push(skippedFile);
             process.stderr.write(
@@ -270,4 +310,4 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
   }
 }
 
-export { buildIndex, inferProjectPath, refreshSessionProjectPaths, shouldSkipBuild };
+export { buildIndex, ensureReadableSchema, inferProjectPath, refreshSessionProjectPaths, shouldSkipBuild };

@@ -1,6 +1,7 @@
 // Query and attune sandbox helpers for the Core package.
 import { statSync } from 'node:fs';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
+import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
@@ -343,11 +344,17 @@ function createQueryApi(
     ].join(' AND ');
     const allParams = [...filterParams, limit];
     const rows = db.prepare(`
-      SELECT tr.*, COALESCE(rm.visibility,'visible') AS visibility
+      SELECT tr.*,
+        CASE
+          WHEN COALESCE(rm.visibility,'visible') = 'inactive'
+            OR COALESCE(cm.visibility,'visible') = 'inactive'
+          THEN 'inactive'
+          ELSE 'visible'
+        END AS visibility
       FROM tool_results tr
-      JOIN messages rm ON rm.uuid=tr.message_uuid
-      JOIN tool_calls tc ON tc.id=tr.tool_use_id
-      JOIN messages cm ON cm.uuid=tc.message_uuid
+      LEFT JOIN messages rm ON rm.uuid=tr.message_uuid
+      LEFT JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      LEFT JOIN messages cm ON cm.uuid=tc.message_uuid
       ${join}
       WHERE ${errorCond} AND ${where}
       ORDER BY rm.timestamp DESC
@@ -592,15 +599,12 @@ function createQueryApi(
       ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(message.agent_id) ?? null
       : null;
     const source = message.source || session?.source || 'claude';
-    const cursorRow = typeof session?.jsonl_path === 'string'
-      ? db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path)
-      : undefined;
     const record = providerRegistry.raw({
       source,
       messageUuid,
       session,
       agentId: message.agent_id || null,
-      cursor: typeof cursorRow?.cursor === 'string' ? cursorRow.cursor : null,
+      cursor: storedSessionCursor(db, providerRegistry, session),
       subagent,
       workflowAgent,
     });

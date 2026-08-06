@@ -96,8 +96,61 @@ test('serialized invalid provider settings stay disabled when the worker rebuild
   });
 
   assert.equal(result.files, 0);
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.incompleteProviders, []);
+});
+
+test('an invalid provider root cannot erase a previously indexed source snapshot', () => {
+  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-settings-preserve-'));
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const sourcePath = join(home, '.claude', 'projects', 'session.jsonl');
+  const registry = createProviderRegistry([{
+    name: 'claude',
+    descriptor: { id: 'claude', name: 'Claude', vendor: 'Test', defaultRoot: join(home, '.claude'), color: '#123456' },
+    watchRoots: () => [],
+    discover: (ctx) => ctx.lastCursor(sourcePath) === '10:1'
+      ? []
+      : [{ key: sourcePath, sessionId: 'claude:preserved' }],
+    *parse(unit) {
+      yield {
+        kind: 'session', id: unit.sessionId, title: 'Preserved', project: null,
+        started_at: null, ended_at: null, git_branch: null, version: null,
+        message_count: 0, countMode: 'total', jsonl_path: sourcePath, source: 'claude',
+      };
+      return '10:1';
+    },
+    raw: () => null,
+  }]);
+
+  assert.equal(buildIndex({
+    providerRegistry: registry,
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  }).complete, true);
+
+  const result = buildIndex({
+    force: true,
+    providerSettings: {
+      providerRoots: {
+        claude: './invalid',
+        codex: './invalid',
+        kimi: './invalid',
+        pi: './invalid',
+      },
+    },
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  });
+
   assert.equal(result.complete, false);
-  assert.deepEqual(result.incompleteProviders, ['claude', 'codex', 'kimi']);
+  assert.equal(result.reason, 'incomplete_snapshot');
+  assert.deepEqual(result.incompleteProviders, ['claude']);
+  assert.equal(result.inventoryIssues[0].path, sourcePath);
+  const db = new TestDatabase(dbPath);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE id=?').get('claude:preserved').c, 1);
+  db.close();
 });
 
 test('an incomplete canonical inventory converges without replaying readable units forever', () => {
@@ -181,6 +234,63 @@ test('an incomplete canonical inventory converges without replaying readable uni
   db.close();
   assert.equal(buildIndex(options).files, 0);
   assert.equal(parseCalls, 2);
+});
+
+test('marker replay invalidates provider unit keys that differ from source paths', () => {
+  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-unit-key-replay-'));
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const unitKey = 'alpha:session-unit';
+  const sourcePath = '/alpha/session/agents/main/wire.jsonl';
+  const marker = '__alpha_canonical_v1__';
+  let incomplete = false;
+  let parseCalls = 0;
+  const provider = {
+    name: 'alpha',
+    descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
+    indexVersionMarker: marker,
+    sessionUnitKey: () => unitKey,
+    watchRoots: () => [],
+    discover(ctx) {
+      if (incomplete) {
+        ctx.reportIncompleteInventory({ path: '/alpha/locked', error: 'EACCES' });
+        return [];
+      }
+      return ctx.lastCursor(unitKey) === '10:1'
+        ? []
+        : [{ key: unitKey, sessionId: 'alpha:session' }];
+    },
+    *parse(unit) {
+      parseCalls += 1;
+      yield {
+        kind: 'session', id: unit.sessionId, title: 'Alpha', project: null,
+        started_at: null, ended_at: null, git_branch: null, version: null,
+        message_count: 0, countMode: 'total', jsonl_path: sourcePath, source: 'alpha',
+      };
+      return '10:1';
+    },
+    raw: () => null,
+  };
+  const options = {
+    providerRegistry: createProviderRegistry([provider]),
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  assert.equal(buildIndex(options).complete, true);
+  assert.equal(parseCalls, 1);
+  let db = new TestDatabase(dbPath);
+  db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(marker);
+  db.close();
+
+  incomplete = true;
+  assert.equal(buildIndex(options).complete, false);
+  db = new TestDatabase(dbPath);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(unitKey).c, 0);
+  db.close();
+
+  incomplete = false;
+  assert.equal(buildIndex(options).complete, true);
+  assert.equal(parseCalls, 2, 'the missing unit retries after an incomplete marker replay');
 });
 
 test('a provider can withhold inventory-dependent tombstones from a partial census', () => {

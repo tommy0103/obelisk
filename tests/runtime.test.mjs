@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, normalize } from 'node:path';
 
@@ -67,6 +67,20 @@ test('malformed Obelisk settings skip refresh without disabling provider-backed 
   assert.equal(rebuild.status, 1);
   assert.match(JSON.parse(rebuild.stdout).error, /settings_unavailable/);
   assert.match(JSON.parse(rebuild.stdout).error, /Unable to read Obelisk settings/);
+
+  const memoryPath = join(home, 'blocked-memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Blocked memory\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'runtime-test',
+      summary: 'Decision: this mutation must not use an index with unavailable settings.'
+    });
+  `);
+  const attune = runRuntime(['--attune', attunePath], { home });
+  assert.equal(attune.status, 1);
+  assert.match(JSON.parse(attune.stdout).error, /settings.*attune was not applied/i);
 });
 
 test('runtime attune scripts expose only memory mutation helpers', () => {
@@ -137,6 +151,108 @@ test('runtime migrates old memories schema before recall', () => {
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(JSON.parse(result.stdout), [{ id: 'mem-old', rankType: 'number' }]);
+});
+
+test('runtime migrates a recently built legacy schema before honoring the skip window', () => {
+  const home = tempHome();
+  const obeliskDir = join(home, '.obelisk');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(
+    new URL('../packages/core/src/schema.sql', import.meta.url),
+    'utf8',
+  )
+    .replace(', cursor TEXT);', ');')
+    .replace(
+      ", visibility TEXT DEFAULT 'visible',\n  input_tokens INTEGER, output_tokens INTEGER);",
+      ');',
+    );
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare(`
+    INSERT INTO sessions (id,title,jsonl_path,source)
+    VALUES (?,?,?,?)
+  `).run('legacy-session', 'Legacy session', '/missing/session.jsonl', 'claude');
+  db.prepare(`
+    INSERT INTO messages (
+      uuid,session_id,type,role,text,content_type,visibility,source
+    ) VALUES (?,?,?,?,?,?,?,?)
+  `).run('legacy-message', 'legacy-session', 'user', 'user', 'legacy evidence', 'text', 'visible', 'claude');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed)
+    VALUES ('__last_build__',?,0)
+  `).run(Date.now());
+  db.close();
+
+  const scriptPath = join(home, 'legacy-query.mjs');
+  writeFileSync(scriptPath, `
+    return thread('legacy-session').map(message => message.uuid);
+  `);
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), ['legacy-message']);
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  assert.ok(migrated.prepare('PRAGMA table_info(index_state)').all().some(row => row.name === 'cursor'));
+  assert.ok(migrated.prepare('PRAGMA table_info(summaries)').all().some(row => row.name === 'visibility'));
+  migrated.close();
+});
+
+test('malformed settings still allow a legacy query schema to migrate', () => {
+  const home = tempHome();
+  const obeliskDir = join(home, '.obelisk');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(
+    new URL('../packages/core/src/schema.sql', import.meta.url),
+    'utf8',
+  )
+    .replace(', cursor TEXT);', ');')
+    .replace(
+      ", visibility TEXT DEFAULT 'visible',\n  input_tokens INTEGER, output_tokens INTEGER);",
+      ');',
+    );
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare(`
+    INSERT INTO sessions (id,title,jsonl_path,source)
+    VALUES (?,?,?,?)
+  `).run('legacy-recovery', 'Legacy recovery', '/missing/session.jsonl', 'claude');
+  db.prepare(`
+    INSERT INTO messages (
+      uuid,session_id,type,role,text,content_type,visibility,source
+    ) VALUES (?,?,?,?,?,?,?,?)
+  `).run('legacy-recovery-message', 'legacy-recovery', 'user', 'user', 'legacy recovery', 'text', 'visible', 'claude');
+  db.prepare(`
+    INSERT INTO summaries (id,session_id,timestamp,source,content)
+    VALUES (?,?,?,?,?)
+  `).run('legacy-summary', 'legacy-recovery', '2026-08-05T00:00:00Z', 'compaction', 'summary');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed)
+    VALUES ('__last_build__',?,0)
+  `).run(Date.now());
+  db.close();
+  writeFileSync(join(obeliskDir, 'settings.json'), '{broken');
+
+  const scriptPath = join(home, 'legacy-recovery-query.mjs');
+  writeFileSync(scriptPath, `
+    return {
+      summaries: summaries('legacy-recovery').map(summary => summary.id),
+      raw: raw('legacy-recovery-message')
+    };
+  `);
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /index refresh skipped/);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    summaries: ['legacy-summary'],
+    raw: null,
+  });
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  assert.ok(migrated.prepare('PRAGMA table_info(index_state)').all().some(row => row.name === 'cursor'));
+  assert.ok(migrated.prepare('PRAGMA table_info(summaries)').all().some(row => row.name === 'visibility'));
+  migrated.close();
 });
 
 test('runtime indexes Codex root sessions into the shared query helpers', () => {

@@ -619,6 +619,13 @@ function changedSessionDirectories(rootDir: string, changedPaths: readonly strin
   return result;
 }
 
+function sessionDirectoryFromWirePath(wirePath: string): string {
+  const parent = dirname(wirePath);
+  return basename(parent) === 'main' && basename(dirname(parent)) === 'agents'
+    ? dirname(dirname(parent))
+    : parent;
+}
+
 function rawFromWire(path: string, messageUuid: string): RawRecord | null {
   if (!existsSync(path)) return null;
   const fallbackLine = /:line-(\d+)$/.exec(messageUuid)?.[1];
@@ -664,6 +671,7 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
     name,
     descriptor: { id: name, name: 'Kimi Code', vendor: 'Moonshot AI', defaultRoot: rootDir, color: '#6d6afc' },
     indexVersionMarker: KIMI_CANONICAL_TRANSCRIPT_MARKER,
+    sessionUnitKey: ({ jsonlPath }) => sessionDirectoryFromWirePath(jsonlPath),
     watchRoots: (configuredRoot) => [join(configuredRoot, 'sessions'), join(configuredRoot, 'session_index.jsonl')],
     discover(ctx: DiscoverContext): IndexUnit[] {
       const units: IndexUnit[] = [];
@@ -739,9 +747,7 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       if (input.agentId === null) return rawFromWire(mainPath, input.messageUuid);
       const rawAgentId = input.agentId.split(':').at(-1);
       if (rawAgentId === undefined) return null;
-      const sessionDir = basename(dirname(mainPath)) === 'main'
-        ? dirname(dirname(dirname(mainPath)))
-        : dirname(mainPath);
+      const sessionDir = sessionDirectoryFromWirePath(mainPath);
       return rawFromWire(join(sessionDir, 'agents', rawAgentId, 'wire.jsonl'), input.messageUuid);
     },
   };

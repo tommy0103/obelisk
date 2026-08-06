@@ -172,6 +172,9 @@ test('relative provider roots never depend on the Obelisk process cwd', () => {
 });
 
 test('an invalid persisted root disables that provider instead of selecting its default', () => {
+  const rawDir = mkdtempSync(join(tmpdir(), 'obelisk-disabled-provider-'));
+  const rawPath = join(rawDir, 'session.jsonl');
+  writeFileSync(rawPath, '{"uuid":"raw-message","message":{"content":"preserved"}}\n');
   const runtime = createConfiguredBuiltinProviderRuntime({
     providerRoots: { claude: './relative-claude' },
   }, {
@@ -179,21 +182,34 @@ test('an invalid persisted root disables that provider instead of selecting its 
     baseRoots: { claude: '/default/claude' },
   });
   const claude = runtime.registry.get('claude');
-  let issue;
 
   assert.equal(runtime.roots.claude, undefined);
   assert.equal(claude.descriptor.requiresExplicitRoot, true);
   assert.deepEqual(claude.watchRoots('/default/claude'), []);
+  let issue;
   assert.deepEqual(claude.discover({
     lastCursor: () => null,
-    reportIncompleteInventory(value) {
-      issue = value;
-    },
+    indexedSessions: () => [],
+  }), []);
+  assert.deepEqual(claude.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{ sessionId: 'claude:preserved', jsonlPath: rawPath }],
+    reportIncompleteInventory(value) { issue = value; },
   }), []);
   assert.deepEqual(issue, {
-    path: '/default/claude',
+    path: rawPath,
     error: 'Configured claude root must be absolute or start with ~',
   });
+  assert.match(claude.raw({
+    source: 'claude',
+    messageUuid: 'raw-message',
+    session: { id: 'claude:preserved', jsonl_path: rawPath },
+    agentId: null,
+    cursor: null,
+    subagent: null,
+    workflowAgent: null,
+  }).text, /preserved/);
+  rmSync(rawDir, { recursive: true, force: true });
 });
 
 test('malformed provider root containers cannot select defaults and are repairable', () => {
