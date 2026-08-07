@@ -29,6 +29,9 @@ interface ColumnAliases {
   sessionId: string;
   project: string;
   timestamp: string;
+  /** Optional per-direction overrides for range-typed rows (activity intervals). */
+  timestampAfter?: string;
+  timestampBefore?: string;
   branch: string;
   source?: string;
 }
@@ -64,8 +67,8 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
     params.push(...opts.sessions);
   }
   if (opts.project) { clauses.push(`${aliases.project} LIKE ?`); params.push(opts.project); }
-  if (opts.after) { clauses.push(`${aliases.timestamp} > ?`); params.push(opts.after); }
-  if (opts.before) { clauses.push(`${aliases.timestamp} < ?`); params.push(opts.before); }
+  if (opts.after) { clauses.push(`${aliases.timestampAfter ?? aliases.timestamp} > ?`); params.push(opts.after); }
+  if (opts.before) { clauses.push(`${aliases.timestampBefore ?? aliases.timestamp} < ?`); params.push(opts.before); }
   if (opts.branch) { clauses.push(`${aliases.branch} = ?`); params.push(opts.branch); }
   if (opts.source && opts.source !== 'all' && aliases.source) {
     clauses.push(`COALESCE(${aliases.source}, 'claude') = ?`);
@@ -275,8 +278,13 @@ function createQueryApi(
     const { limit = 100 } = opts;
     const needsJoin = opts.project || opts.branch || opts.source;
     // The subagents table has no timestamp column; scope time filters by the
-    // subagent's own message timeline instead of comparing session IDs.
-    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: '(SELECT MIN(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)', branch: 's.git_branch', source: 's.source' });
+    // subagent's activity interval instead of comparing session IDs. `after`
+    // matches agents still active past the bound (latest message), `before`
+    // matches agents already started by the bound (earliest message), so
+    // combined bounds select every agent active during the window.
+    const firstMessageAt = '(SELECT MIN(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
+    const lastMessageAt = '(SELECT MAX(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
+    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: firstMessageAt, timestampAfter: lastMessageAt, timestampBefore: firstMessageAt, branch: 's.git_branch', source: 's.source' });
     params.push(limit);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {

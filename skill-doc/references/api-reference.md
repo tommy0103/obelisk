@@ -334,8 +334,8 @@ Subagent metadata plus message counts. Passing a string is treated as
 | --- | --- | --- |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over source session project |
-| `opts.after` | `string` | ISO lower bound on the subagent's first message timestamp |
-| `opts.before` | `string` | ISO upper bound on the subagent's first message timestamp |
+| `opts.after` | `string` | ISO lower bound; matches subagents still active past it (latest message) |
+| `opts.before` | `string` | ISO upper bound; matches subagents already started by it (earliest message) |
 | `opts.source` | `string` | Provider filter |
 | `opts.limit` | `number` | Max rows, default 100 |
 

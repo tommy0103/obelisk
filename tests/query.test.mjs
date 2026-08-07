@@ -641,7 +641,7 @@ test('remember rejects missing memory files', () => {
   db.close();
 });
 
-test('subagents after/before narrow by the subagent message timeline, not session IDs', () => {
+test('subagents after/before narrow by the subagent activity interval, not session IDs', () => {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
   db.prepare('INSERT INTO sessions (id,title,started_at) VALUES (?,?,?)')
@@ -652,6 +652,7 @@ test('subagents after/before narrow by the subagent message timeline, not sessio
   `);
   insertAgent.run('agent-early', 'sid-agents', 'explore', 'Early agent');
   insertAgent.run('agent-late', 'sid-agents', 'coder', 'Late agent');
+  insertAgent.run('agent-spanning', 'sid-agents', 'coder', 'Agent active across the bound');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid,session_id,type,role,text,timestamp,agent_id)
     VALUES (?,?,?,?,?,?,?)
@@ -659,19 +660,30 @@ test('subagents after/before narrow by the subagent message timeline, not sessio
   insertMessage.run('m-early-1', 'sid-agents', 'assistant', 'assistant', 'early start', '2026-06-01T10:00:00Z', 'agent-early');
   insertMessage.run('m-early-2', 'sid-agents', 'assistant', 'assistant', 'early end', '2026-06-01T10:05:00Z', 'agent-early');
   insertMessage.run('m-late-1', 'sid-agents', 'assistant', 'assistant', 'late start', '2026-06-03T10:00:00Z', 'agent-late');
+  insertMessage.run('m-span-1', 'sid-agents', 'assistant', 'assistant', 'spanning start', '2026-06-01T12:00:00Z', 'agent-spanning');
+  insertMessage.run('m-span-2', 'sid-agents', 'assistant', 'assistant', 'spanning end', '2026-06-03T12:00:00Z', 'agent-spanning');
   const api = createQueryApi(db);
 
+  // `after` keeps agents still active past the bound: the spanning agent's
+  // interval crosses 06-02 even though it started before it.
   assert.deepEqual(
-    api.subagents({ after: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id),
-    ['agent-late'],
+    api.subagents({ after: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-late', 'agent-spanning'],
   );
+  // `before` keeps agents already started by the bound.
   assert.deepEqual(
-    api.subagents({ before: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id),
-    ['agent-early'],
+    api.subagents({ before: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-early', 'agent-spanning'],
   );
+  // Combined bounds select every agent active during the window.
   assert.deepEqual(
     api.subagents({ after: '2026-06-01T09:00:00Z', before: '2026-06-04T00:00:00Z' }).map((row) => row.agent_id).sort(),
-    ['agent-early', 'agent-late'],
+    ['agent-early', 'agent-late', 'agent-spanning'],
+  );
+  // A window inside the spanning agent's interval matches it alone.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-02T00:00:00Z', before: '2026-06-03T00:00:00Z' }).map((row) => row.agent_id),
+    ['agent-spanning'],
   );
 
   db.close();
