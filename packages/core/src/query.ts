@@ -274,7 +274,9 @@ function createQueryApi(
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
     const needsJoin = opts.project || opts.branch || opts.source;
-    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: 'sa.session_id', branch: 's.git_branch', source: 's.source' });
+    // The subagents table has no timestamp column; scope time filters by the
+    // subagent's own message timeline instead of comparing session IDs.
+    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: '(SELECT MIN(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {

@@ -640,3 +640,39 @@ test('remember rejects missing memory files', () => {
 
   db.close();
 });
+
+test('subagents after/before narrow by the subagent message timeline, not session IDs', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,started_at) VALUES (?,?,?)')
+    .run('sid-agents', 'Subagent session', '2026-06-01T09:00:00Z');
+  const insertAgent = db.prepare(`
+    INSERT INTO subagents (agent_id,session_id,agent_type,description)
+    VALUES (?,?,?,?)
+  `);
+  insertAgent.run('agent-early', 'sid-agents', 'explore', 'Early agent');
+  insertAgent.run('agent-late', 'sid-agents', 'coder', 'Late agent');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,agent_id)
+    VALUES (?,?,?,?,?,?,?)
+  `);
+  insertMessage.run('m-early-1', 'sid-agents', 'assistant', 'assistant', 'early start', '2026-06-01T10:00:00Z', 'agent-early');
+  insertMessage.run('m-early-2', 'sid-agents', 'assistant', 'assistant', 'early end', '2026-06-01T10:05:00Z', 'agent-early');
+  insertMessage.run('m-late-1', 'sid-agents', 'assistant', 'assistant', 'late start', '2026-06-03T10:00:00Z', 'agent-late');
+  const api = createQueryApi(db);
+
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id),
+    ['agent-late'],
+  );
+  assert.deepEqual(
+    api.subagents({ before: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id),
+    ['agent-early'],
+  );
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-01T09:00:00Z', before: '2026-06-04T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-early', 'agent-late'],
+  );
+
+  db.close();
+});
