@@ -10,9 +10,12 @@ import { createIndexerService } from '../app/src/main/indexer-service.ts';
 
 function manualTimers() {
   const timers = new Set();
+  const delays = [];
   return {
-    setTimeout(fn) {
+    delays,
+    setTimeout(fn, ms) {
       timers.add(fn);
+      delays.push(ms);
       return fn;
     },
     clearTimeout(fn) {
@@ -230,6 +233,44 @@ test('an incomplete inventory schedules a full retry', async () => {
     { reason: 'watch', changedPaths: ['/tmp/pi/session.jsonl'] },
     { reason: 'incomplete-inventory', changedPaths: undefined },
   ]);
+});
+
+test('incomplete inventory retries back off to ten minutes and reset after recovery', async () => {
+  const timers = manualTimers();
+  let incomplete = true;
+  const service = createIndexerService({
+    buildIndex: async () => incomplete
+      ? {
+          complete: false,
+          inventoryIssues: [{
+            provider: 'pi',
+            path: '/tmp/pi/locked',
+            error: 'EACCES: permission denied',
+          }],
+        }
+      : { complete: true, inventoryIssues: [] },
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    logger: { warn() {} },
+    timers,
+    heartbeatMs: 120_000,
+    stabilityMs: 0,
+  });
+
+  await service.runBuildNow('startup');
+  for (let attempt = 0; attempt < 4; attempt++) {
+    timers.flush();
+    await service.idle();
+  }
+  assert.deepEqual(timers.delays, [120_000, 240_000, 480_000, 600_000, 600_000]);
+
+  incomplete = false;
+  timers.flush();
+  await service.idle();
+  incomplete = true;
+  await service.runBuildNow('manual');
+  assert.equal(timers.delays.at(-1), 120_000);
+  service.stop();
 });
 
 test('a failed unit does not promote its changed-path build to a full retry', async () => {

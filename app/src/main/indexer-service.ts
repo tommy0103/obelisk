@@ -9,6 +9,7 @@ const DEFAULT_STABILITY_MS = 500;
 const DEFAULT_HEARTBEAT_MS = 30000;
 const DEFAULT_WATCH_RETRY_MS = 5000;
 const DEFAULT_DEFERRED_RETRY_MS = 250;
+const MAX_INVENTORY_RETRY_MS = 10 * 60 * 1000;
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 
@@ -144,6 +145,7 @@ function createIndexerService({
   let lastReason: string | null = null;
   let changedPaths = new Set<string>();
   let fullInventoryPending = false;
+  let nextInventoryRetryMs = heartbeatMs;
   let idlePromise = Promise.resolve();
 
   const requestFullInventory = () => {
@@ -201,15 +203,25 @@ function createIndexerService({
         }
       }
       const incompleteInventory = (result?.inventoryIssues?.length ?? 0) > 0;
+      if (!result?.deferred && !incompleteInventory && buildChangedPaths === undefined) {
+        nextInventoryRetryMs = heartbeatMs;
+      }
       if (result?.deferred || incompleteInventory) {
         if (incompleteInventory || buildChangedPaths === undefined) requestFullInventory();
         else addChangedPath(buildChangedPaths);
         if (!stopped && !retryTimer) {
           const retryReason = result?.deferred ? 'writer-lease' : 'incomplete-inventory';
+          const retryMs = result?.deferred ? deferredRetryMs : nextInventoryRetryMs;
           retryTimer = timers.setTimeout(() => {
             retryTimer = null;
             runBuildNow(retryReason);
-          }, result?.deferred ? deferredRetryMs : heartbeatMs);
+          }, retryMs);
+          if (!result?.deferred) {
+            nextInventoryRetryMs = Math.min(nextInventoryRetryMs * 2, Math.max(
+              heartbeatMs,
+              MAX_INVENTORY_RETRY_MS,
+            ));
+          }
         }
         if (result?.deferred) return;
       }
@@ -298,6 +310,7 @@ function createIndexerService({
     watchRetryTimer = null;
     if (retryTimer) timers.clearTimeout(retryTimer);
     retryTimer = null;
+    nextInventoryRetryMs = heartbeatMs;
     if (heartbeatTimer && typeof timers.clearInterval === 'function') timers.clearInterval(heartbeatTimer);
     heartbeatTimer = null;
     if (watcher?.close) watcher.close();
