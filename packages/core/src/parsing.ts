@@ -1,10 +1,11 @@
 // Core's pure parse/discover helpers — node:sqlite-free by construction, so the compiled
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
-// typed seam while remaining limited to node:fs/path/os.
+// typed seam while remaining limited to node:fs/os/path/string_decoder.
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 import type { InventoryIssue } from './providers/types.ts';
 
@@ -110,22 +111,25 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
+const READ_BUFFER_SIZE = 64 * 1024;
+
 function readLines(filePath: string, callback: (line: string) => boolean | void): void {
   const fd = openSync(filePath, 'r');
-  const bufSize = 64 * 1024;
-  const buf = Buffer.alloc(bufSize);
+  const buf = Buffer.alloc(READ_BUFFER_SIZE);
+  const decoder = new StringDecoder('utf8');
   let remainder = '';
   let bytesRead;
   try {
-    while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
-      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+    while ((bytesRead = readSync(fd, buf, 0, READ_BUFFER_SIZE, null)) > 0) {
+      const chunk = remainder + decoder.write(buf.subarray(0, bytesRead));
       const lines = chunk.split('\n');
       remainder = lines.pop() ?? '';
       for (const line of lines) {
         if (line && callback(line) === false) return;
       }
     }
-    if (remainder) callback(remainder);
+    const tail = remainder + decoder.end();
+    if (tail) callback(tail);
   } finally {
     closeSync(fd);
   }
@@ -380,7 +384,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 }
 
 export {
-  CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
+  CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT, READ_BUFFER_SIZE,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,

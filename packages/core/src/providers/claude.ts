@@ -35,7 +35,7 @@ function cursorToSkip(cursor: Cursor): number {
 }
 
 export const name = 'claude';
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v2__';
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v3__';
 
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
