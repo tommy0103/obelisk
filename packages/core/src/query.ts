@@ -678,7 +678,7 @@ function createQueryApi(
   return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
-function createAttuneApi(db: SqliteDb) {
+function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {
   const resolveMemoryPath = (memoryPath: string, sessionId?: string): string => {
     let base = null;
     if (sessionId) {
@@ -726,8 +726,8 @@ function createAttuneApi(db: SqliteDb) {
     const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const proj = project || db.prepare('SELECT project FROM sessions WHERE id=?').get(session_id)?.project || null;
     const created_at = new Date().toISOString();
-    db.prepare('INSERT OR REPLACE INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
-      id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
+    runMutation(() => db.prepare('INSERT OR REPLACE INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
+      id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at));
     return { id, path: normalizedPath, project: proj, anchors: normalizedAnchors, created_at };
   };
 
@@ -740,7 +740,7 @@ function createAttuneApi(db: SqliteDb) {
       return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
     }
     const deleted_at = new Date().toISOString();
-    db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id);
+    runMutation(() => db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id));
     return { id, deleted_at, deleted_reason: deletionReason };
   };
 

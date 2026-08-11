@@ -79,6 +79,11 @@ remember, forget
 `--attune` does not expose `search()`, `sql()`, `memories()`, or other read
 helpers. If you need IDs, discover them first with a normal `--query` script.
 
+Memory writes are independent of index writes: `--attune` does not refresh the
+index, does not read provider settings, and works while the app daemon owns
+index writes. It requires an already-initialized index (run any query or
+`obelisk --build` once first) and fails honestly otherwise.
+
 ---
 
 ## Core Helpers

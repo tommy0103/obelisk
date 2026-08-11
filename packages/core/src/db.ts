@@ -39,6 +39,32 @@ function openReadDb(): NodeSqliteDb {
   return db;
 }
 
+// Memory mutations (remember/forget) touch only memories/memories_fts, which
+// index builds never delete from — so attune is independent of daemon write
+// ownership and the writer lease (ADR 0006 amendment). It must still never
+// migrate or configure the index: it opens the existing database as-is and
+// fails honestly when the memory layer is not there yet.
+const ATTUNE_MEMORY_COLUMNS = [
+  'id', 'session_id', 'project', 'message_start', 'message_end',
+  'path', 'anchors', 'summary', 'created_at', 'deleted_at', 'deleted_reason',
+] as const;
+
+function openAttuneDb(): NodeSqliteDb {
+  if (!existsSync(DB_PATH)) {
+    throw new Error('Obelisk index is not initialized; run an index build (obelisk --build) before writing memories');
+  }
+  const db = new DatabaseSync(DB_PATH);
+  db.exec('PRAGMA busy_timeout=5000');
+  const columns = new Set(
+    db.prepare('PRAGMA table_info(memories)').all().map((row) => String(row.name)),
+  );
+  if (!ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))) {
+    db.close();
+    throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
+  }
+  return db;
+}
+
 function openWriterLeaseDb(lockPath: string): NodeSqliteDb {
   return new DatabaseSync(lockPath);
 }
@@ -48,4 +74,4 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openAttuneDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };

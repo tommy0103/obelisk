@@ -68,19 +68,21 @@ test('malformed Obelisk settings skip refresh without disabling provider-backed 
   assert.match(JSON.parse(rebuild.stdout).error, /settings_unavailable/);
   assert.match(JSON.parse(rebuild.stdout).error, /Unable to read Obelisk settings/);
 
-  const memoryPath = join(home, 'blocked-memory.md');
+  const memoryPath = join(home, 'settings-free-memory.md');
   const attunePath = join(home, 'attune.mjs');
-  writeFileSync(memoryPath, '# Blocked memory\n');
+  writeFileSync(memoryPath, '# Settings-free memory\n');
   writeFileSync(attunePath, `
     return remember({
       path: ${JSON.stringify(memoryPath)},
       project: 'runtime-test',
-      summary: 'Decision: this mutation must not use an index with unavailable settings.'
+      summary: 'Decision: memory writes do not depend on provider settings.'
     });
   `);
+  // Memory writes touch only the memories table, so they stay available even
+  // while provider settings are unreadable.
   const attune = runRuntime(['--attune', attunePath], { home });
-  assert.equal(attune.status, 1);
-  assert.match(JSON.parse(attune.stdout).error, /settings.*attune was not applied/i);
+  assert.equal(attune.status, 0, attune.stderr || attune.stdout);
+  assert.equal(JSON.parse(attune.stdout).project, 'runtime-test');
 });
 
 test('runtime attune scripts expose only memory mutation helpers', () => {
@@ -88,6 +90,11 @@ test('runtime attune scripts expose only memory mutation helpers', () => {
   const memoryPath = join(home, 'memory.md');
   const scriptPath = join(home, 'attune.mjs');
   writeFileSync(memoryPath, '# Memory\n');
+  // Attune no longer builds the index itself; initialize it with a query first.
+  const initPath = join(home, 'init.mjs');
+  writeFileSync(initPath, "return 'init';");
+  const init = runRuntime(['--query', initPath], { home });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
   writeFileSync(scriptPath, `
     return {
       rememberType: typeof remember,

@@ -76,28 +76,62 @@ test('a passive query reports when a daemon blocks its schema upgrade', () => {
   check.close();
 });
 
-test('attune refuses to mutate the index while a fresh daemon owns writes', () => {
+test('attune writes memories while a fresh daemon owns index writes', () => {
   const home = makeTempDir('obelisk-daemon-attune-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
   const db = new DatabaseSync(dbPath);
-  db.exec('CREATE TABLE index_state (jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER)');
-  const marker = db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)');
-  const now = Date.now();
-  marker.run('__app_heartbeat__', now);
+  db.exec(schema);
+  db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)')
+    .run('__app_heartbeat__', Date.now());
   db.close();
 
+  // A live transcript that an index build would pick up: attune must not
+  // trigger any indexing while the daemon owns writes.
+  const projectDir = join(home, '.claude', 'projects', '-proj');
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, 'sid-live.jsonl'), `${JSON.stringify({
+    uuid: 'msg-live', type: 'user', timestamp: '2026-06-10T10:00:00Z',
+    message: { role: 'user', content: 'must stay unindexed' },
+  })}\n`);
+
+  const memoryPath = join(home, 'memory.md');
   const attunePath = join(home, 'attune.mjs');
-  writeFileSync(attunePath, 'return true;');
+  writeFileSync(memoryPath, '# Daemon-time memory\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'daemon-test',
+      summary: 'Decision: memory writes stay available while the daemon owns index writes.'
+    });
+  `);
   const result = runCli(['--attune', attunePath], { home });
-  assert.equal(result.status, 1);
-  assert.match(JSON.parse(result.stdout).error, /daemon owns index writes/i);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.project, 'daemon-test');
+  assert.ok(payload.id);
 
   const check = new DatabaseSync(dbPath, { readOnly: true });
-  const tables = check.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(row => row.name);
+  const memory = check.prepare('SELECT summary, deleted_at FROM memories WHERE id=?').get(payload.id);
+  assert.match(memory.summary, /memory writes stay available/);
+  assert.equal(memory.deleted_at, null);
+  // The FTS trigger fired, so recall sees the memory immediately.
+  assert.ok(check.prepare("SELECT id FROM memories_fts WHERE memories_fts MATCH 'daemon'").all().some(row => row.id === payload.id));
+  // No index build ran as a side effect of attune.
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM messages').get().c, 0);
   check.close();
-  assert.deepEqual(tables, ['index_state']);
+});
+
+test('attune reports honestly when the index is not initialized', () => {
+  const home = makeTempDir('obelisk-daemon-attune-empty-');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(attunePath, 'return true;');
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /index is not initialized/i);
 });
 
 test('a passive query stays read-only when another process holds the writer lease', () => {

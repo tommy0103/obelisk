@@ -77,6 +77,12 @@ test('--query surfaces a throw as { error, stack } and exits 1', () => {
 
 test('--attune surfaces a throw as { error, stack } and exits 1', () => {
   const home = tempHome();
+  // Attune requires an initialized index; bring one up so the script's own
+  // throw is what surfaces.
+  const initPath = join(home, 'init.mjs');
+  writeFileSync(initPath, "return 'init';");
+  const init = runRuntime(['--query', initPath], { home });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
   const scriptPath = join(home, 'attune-boom.mjs');
   writeFileSync(scriptPath, "throw new Error('attune-envelope');");
 

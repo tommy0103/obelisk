@@ -94,18 +94,15 @@ test('passive-pull runtime honors the same persisted Pi root as the app', () => 
 });
 
 test('passive CLI operations report an incomplete Pi inventory without hiding partial results', () => {
-  for (const command of ['search', 'query', 'attune']) {
+  // --attune is deliberately absent: memory writes no longer run an index
+  // build, so there is no inventory to report on that path.
+  for (const command of ['search', 'query']) {
     const home = makeTempDir(`obelisk-pi-partial-${command}-`);
     const piRoot = join(home, '.pi', 'agent', 'sessions');
     mkdirSync(dirname(piRoot), { recursive: true });
     writeFileSync(piRoot, 'not a directory');
     const queryPath = join(home, 'query.mjs');
-    writeFileSync(
-      queryPath,
-      command === 'attune'
-        ? 'return null;'
-        : "return sessions({ source: 'pi', limit: 5 });",
-    );
+    writeFileSync(queryPath, "return sessions({ source: 'pi', limit: 5 });");
     const args = command === 'search'
       ? ['--search', 'partial-probe']
       : [`--${command}`, queryPath];
@@ -116,7 +113,7 @@ test('passive CLI operations report an incomplete Pi inventory without hiding pa
     });
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.deepEqual(JSON.parse(result.stdout), command === 'attune' ? null : []);
+    assert.deepEqual(JSON.parse(result.stdout), []);
     assert.match(result.stderr, /Warning: incomplete pi source inventory/);
     assert.match(
       result.stderr,
