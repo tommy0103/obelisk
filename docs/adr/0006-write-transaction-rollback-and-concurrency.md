@@ -74,3 +74,35 @@ overlap when policy information races or is stale. A single bad transcript can
 still be skipped so the index self-heals on a later build; structural/finalize
 failures remain visible. Longer timeouts must not replace the transaction and
 ownership rules recorded here.
+
+**Amendment (2026-08-11): invocation-nonce freshness carve-out.** The original
+decision makes a fresh `__app_heartbeat__` policy ownership for every CLI write
+path. One narrow exception is now granted: the invocation-nonce freshness
+build — the single incremental build a query runs when its invocation nonce is
+not yet indexed (`buildIndex({ ignoreRecentBuild: true, ignoreDaemonOwnership:
+true })`) — may ignore daemon policy ownership. Without the carve-out, nonce
+resolution in daemon mode could never succeed: the pre-query refresh always
+skips with `daemon_active`, and the daemon's watcher-driven build lags the
+just-written tool-call record by seconds.
+
+The heartbeat's job is unchanged; the writer lease remains the sole arbitrator
+of who actually writes. The carve-out build acquires the lease non-blocking, so
+it can never overlap a daemon build. Loser paths are unchanged: on
+`writer_busy` the CLI falls back to the existing bounded poll of freshly opened
+read snapshots and then to honest null, and the daemon's indexer service keeps
+its defer-and-retry on lease contention with changed paths retained.
+Consistency holds because incremental cursors live in `index_state` inside the
+database: a CLI incremental build and later daemon builds read and advance the
+same cursors. The carve-out build never selects the force full-republish path,
+and it runs only against an already-initialized index: schema setup under a
+fresh heartbeat remains the daemon's job, so a CLI query against an
+uninitialized index stays read-only and falls back to the bounded poll.
+Note that `openDb()` always applies the shared `schema.sql` idempotently, so
+additive `IF NOT EXISTS` statements (for example a new index) may also be
+applied by a carve-out build while holding the lease; this is safe because
+the daemon applies the identical shared schema on its own builds. What the
+carve-out never does is initialize or migrate a missing/legacy schema.
+
+Every other CLI write path keeps the original rule: the regular pre-query
+refresh, `attune`, migrations, schema setup, and checkpoints all remain
+read-only under a fresh heartbeat.

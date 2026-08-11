@@ -31,19 +31,26 @@ sessions by default.
 
 ## Quick Start
 
-Fast keyword search:
+Fast keyword search (pass a unique nonce so Obelisk can recognize your own
+session in results):
 
 ```bash
-obelisk --search "keyword"
+obelisk --search "keyword" --nonce "$(uuidgen 2>/dev/null || echo "$$.$RANDOM.$RANDOM")"
 ```
 
 Custom query:
 
-1. Write a bounded JS query to a temp file, for example `/tmp/q.mjs`.
+1. Write a bounded JS query to a unique temp file — the as-typed file path is
+   your invocation nonce:
+
+   ```bash
+   qfile=$(mktemp /tmp/obq.XXXXXX 2>/dev/null || echo "/tmp/obq.$$.$RANDOM.mjs")
+   ```
+
 2. Run:
 
    ```bash
-   obelisk --query /tmp/q.mjs
+   obelisk --query "$qfile"
    ```
 
 3. Parse JSON stdout and answer with concise evidence.
@@ -51,6 +58,18 @@ Custom query:
 The query file runs inside `(async () => { ... })()`. Use `return` to emit JSON.
 Query scripts are read-only: `remember()` and `forget()` are not available, and
 `sql()` only accepts read-only SELECT/WITH queries.
+
+## Your Own Session In Results
+
+Obelisk refreshes the index before each query, so your own live session shows
+up in results. The invocation nonce (`--search --nonce`, or the unique
+`--query` file path) lets Obelisk mark it: session projections in `search()`
+hits and `sessions()` rows carry `is_invoking: true`, and
+`overview().current.session_id` holds the invoking session id when known. Treat
+a session flagged `is_invoking` as your own current context, NOT as independent
+historical evidence. Resolution is newest-wins over recent matches; only a
+near-simultaneous same-nonce collision (or no match at all) leaves nothing
+marked and `current.session_id` null — identity is honestly unknown.
 
 ## Default First Pass
 
@@ -148,10 +167,13 @@ Returns:
 
 ```js
 [{ message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, visibility, source },
-   session: { id, title, project, started_at, source },
+   session: { id, title, project, started_at, source, is_invoking? },
    rank,
    context }]
 ```
+
+`session.is_invoking` is `true` only when the hit belongs to the session that
+ran this query (see "Your Own Session In Results"); it is omitted otherwise.
 
 `context` here means temporal neighbors: nearby messages in the same session by
 timestamp. It is not the parent chain. Use `context(uuid)` or `trace(uuid)` for
@@ -238,8 +260,8 @@ All list helpers accept a bounded `limit`. Many also accept:
 `references/api-reference.md` or a tiny sample before relying on less common
 filters or return fields.
 
-- `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
-- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded.
+- `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, the invoking session id (`current.session_id`) when the invocation nonce resolved, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
+- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded. The invoking session row carries `is_invoking: true`.
 - `recent(n?)` -- shorthand for recent sessions.
 - `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, visibility, session_title, project }`; inactive rows require `includeInactive: true`, hidden rows are never returned, and `source` is the summary kind rather than the transcript provider.
 - `subagents(opts?)` -- subagent metadata plus `messageCount`.

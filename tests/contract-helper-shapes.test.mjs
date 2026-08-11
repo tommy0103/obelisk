@@ -168,7 +168,8 @@ test('overview() shape matches api-reference.md', () => {
   const view = createQueryApi(db).overview({ limit: 5 });
 
   exactKeys(view, ['current', 'current_project', 'projects', 'totals'], 'overview()');
-  exactKeys(view.current, ['cwd', 'project'], 'overview() current');
+  exactKeys(view.current, ['cwd', 'project', 'session_id'], 'overview() current');
+  assert.equal(view.current.session_id, null, 'no invocation nonce: session_id is null');
   exactKeys(view.totals, ['projects', 'sessions', 'memories', 'sources'], 'overview() totals');
   db.close();
 });

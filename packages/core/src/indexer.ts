@@ -30,10 +30,21 @@ interface SkippedFile {
 interface BuildCheckOptions {
   now?: number;
   ignoreRecentBuild?: boolean;
+  ignoreDaemonOwnership?: boolean;
 }
 
 interface BuildIndexOptions {
   force?: boolean;
+  // Bypass the recent-build debounce without selecting the force full-republish
+  // path: the build stays incremental. Used by the invocation-nonce freshness
+  // recovery, which needs the just-written transcript indexed cheaply.
+  ignoreRecentBuild?: boolean;
+  // Bypass the daemon-ownership policy check (fresh __app_heartbeat__). Narrow
+  // carve-out for the invocation-nonce freshness build: the writer lease
+  // remains the sole write arbitrator, and the build stays incremental so
+  // daemon and CLI cursors in index_state stay consistent. force does NOT
+  // imply this; the carve-out is always explicit (ADR 0006 amendment).
+  ignoreDaemonOwnership?: boolean;
   providerRegistry?: ProviderRegistry;
 }
 
@@ -61,10 +72,12 @@ function refreshSessionProjectPaths(db: NodeSqliteDb): void {
 const BUILD_DEBOUNCE_MS = 30000;
 const APP_HEARTBEAT_FRESH_MS = 60000;
 
-function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false }: BuildCheckOptions = {}) {
-  const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
-  if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
-    return { skip: true, reason: 'daemon_active' };
+function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ignoreDaemonOwnership = false }: BuildCheckOptions = {}) {
+  if (!ignoreDaemonOwnership) {
+    const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
+    if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
+      return { skip: true, reason: 'daemon_active' };
+    }
   }
   if (!ignoreRecentBuild) {
     const last = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__last_build__'").get();
@@ -80,11 +93,11 @@ function isMissingIndexStateTable(error: unknown): boolean {
   return /no such table:\s*(?:main\.)?index_state\b/i.test(message);
 }
 
-function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
+function inspectBuildOwnership({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false }: { force?: boolean; ignoreRecentBuild?: boolean; ignoreDaemonOwnership?: boolean } = {}) {
   if (!existsSync(DB_PATH)) return { skip: false };
   const db = openReadDb();
   try {
-    const ownership = shouldSkipBuild(db, { ignoreRecentBuild: force });
+    const ownership = shouldSkipBuild(db, { ignoreRecentBuild: force || ignoreRecentBuild, ignoreDaemonOwnership });
     if (!ownership.skip || ownership.reason === 'daemon_active') return ownership;
     return coreSchemaNeedsMigration(db) ? { skip: false } : ownership;
   } catch (error) {
@@ -135,8 +148,8 @@ function ensureReadableSchema(): { ready: boolean; reason?: string } {
   }
 }
 
-function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {}) {
-  const ownership = inspectBuildOwnership({ force });
+function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false, providerRegistry }: BuildIndexOptions = {}) {
+  const ownership = inspectBuildOwnership({ force, ignoreRecentBuild, ignoreDaemonOwnership });
   if (ownership.skip) return ownership;
   const lease = acquireWriterLease({
     lockPath: writerLockPathFor(DB_PATH),
@@ -145,7 +158,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
   if (!lease) return { skip: true, reason: 'writer_busy' };
   try {
     // Ownership may change between the first read and lease acquisition.
-    const ownershipAfterLease = inspectBuildOwnership({ force });
+    const ownershipAfterLease = inspectBuildOwnership({ force, ignoreRecentBuild, ignoreDaemonOwnership });
     if (ownershipAfterLease.skip) return ownershipAfterLease;
     let registry = providerRegistry;
     if (registry === undefined) {

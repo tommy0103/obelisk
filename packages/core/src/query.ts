@@ -138,7 +138,10 @@ function buildSafeFtsQuery(text: unknown): string {
 
 function createQueryApi(
   db: SqliteDb,
-  { providerRegistry = createBuiltinProviderRegistry() }: { providerRegistry?: ProviderRegistry } = {},
+  {
+    providerRegistry = createBuiltinProviderRegistry(),
+    invokingSessionId = null,
+  }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
 ) {
   const q = (sql: string, ...p: any[]) => {
     assertReadOnlySql(sql);
@@ -208,6 +211,10 @@ function createQueryApi(
         .map(withVisibility)
         .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
       const sourceValue = r.m_source || r.s_source || 'claude';
+      const session: DbRow = { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue };
+      // is_invoking marks the session that ran this query; it is the agent's
+      // own live context, not independent historical evidence.
+      if (invokingSessionId && r.s_id === invokingSessionId) session.is_invoking = true;
       return {
         message: {
           uuid: r.uuid,
@@ -221,7 +228,7 @@ function createQueryApi(
           visibility: normalizedVisibility(r.visibility),
           source: sourceValue,
         },
-        session: { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue },
+        session,
         rank: r.rank,
         context: ctx,
       };
@@ -397,7 +404,8 @@ function createQueryApi(
     const { limit = 50 } = opts;
     const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
-    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params);
+    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params)
+      .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
   };
 
   const recent = (n = 10) => sessions({ limit: n });
@@ -582,6 +590,9 @@ function createQueryApi(
       current: {
         cwd,
         project: currentProject,
+        // The session that invoked this query, when the invocation nonce
+        // resolved to exactly one indexed session; null when unknown.
+        session_id: invokingSessionId || null,
       },
       current_project,
       projects,

@@ -7,6 +7,8 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    '0218f39cb41dabd055eed895cd08906d9f93a856fc2a30850d2d6cb8ee63e1cf',
+    // 2026-08-11: added idx_messages_time on messages(timestamp) so the
+    // invocation-nonce resolver can bound its tool_calls scan to recent rows.
+    '712df79e346a09f753deeb951f975c36f0148bfe047df68830fbc7e172aec09a',
   );
 });

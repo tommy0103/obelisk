@@ -58,11 +58,25 @@ async function main() {
     return;
   }
   if (args[0] === '--search' && args[1]) {
-    try { emit(searchText(args.slice(1).join(' '))); } catch (error) { fail(error); }
+    try {
+      // --nonce <token> marks this invocation in the transcript so the query
+      // layer can identify the invoking session; it is not part of the FTS text.
+      let nonce: string | undefined;
+      const textParts: string[] = [];
+      const rest = args.slice(1);
+      for (let i = 0; i < rest.length; i++) {
+        if (rest[i] === '--nonce' && rest[i + 1]) { nonce = rest[i + 1]; i++; } else { textParts.push(rest[i]); }
+      }
+      emit(searchText(textParts.join(' '), undefined, { invocationNonce: nonce }));
+    } catch (error) { fail(error); }
     return;
   }
   if (args[0] === '--query' && args[1]) {
-    try { emit(await executeQuery(readFileSync(resolve(args[1]), 'utf8'))); } catch (error) { fail(error); }
+    try {
+      // The nonce is the query file path as typed (not resolved): the
+      // transcript records what the agent typed.
+      emit(await executeQuery(readFileSync(resolve(args[1]), 'utf8'), { invocationNonce: args[1] }));
+    } catch (error) { fail(error); }
     return;
   }
   if (args[0] === '--attune' && args[1]) {
@@ -84,7 +98,7 @@ async function main() {
     }
     return;
   }
-  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text"\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
+  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text" [--nonce <token>]\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
   process.exitCode = 1;
 }
 
