@@ -96,7 +96,10 @@ database: a CLI incremental build and later daemon builds read and advance the
 same cursors. The carve-out build never selects the force full-republish path,
 and it runs only against an already-initialized index: schema setup under a
 fresh heartbeat remains the daemon's job, so a CLI query against an
-uninitialized index stays read-only and falls back to the bounded poll.
+uninitialized index stays read-only and falls back to the bounded poll. The
+gate enforces this with `coreSchemaNeedsMigration`, so a legacy schema whose
+tables exist but whose columns predate the current version also blocks the
+carve-out build.
 Note that `openDb()` always applies the shared `schema.sql` idempotently, so
 additive `IF NOT EXISTS` statements (for example a new index) may also be
 applied by a carve-out build while holding the lease; this is safe because

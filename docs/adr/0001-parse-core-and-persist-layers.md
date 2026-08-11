@@ -66,6 +66,9 @@ binding-agnostic and does not need a per-binding implementation.
 the index fresh) and **passive pull mode** (a CLI command indexes on invocation
 when no daemon is active). They never write concurrently — passive mode detects
 a fresh daemon via heartbeat markers in `index_state` (**daemon arbitration**).
+One narrow exception: the invocation-nonce freshness build may index
+incrementally under a fresh daemon heartbeat, arbitrated by the writer lease
+(see the 2026-08-11 amendment in ADR-0006).
 
 **Consequences.** Golden tests anchor on each adapter's `parse` output (feed
 fixture JSONL, assert the yielded record sequence) — independent of binding and
