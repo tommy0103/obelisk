@@ -10,6 +10,23 @@ bottom applies to every PR.
 
 ---
 
+## Before you open a pull request
+
+- **Bug reports are always welcome** as issues — no permission needed.
+- **Bugfix PRs may be opened directly**, but state the reproduction and the root
+  cause in the description. Review turnaround is not guaranteed for PRs that did
+  not come out of an issue discussion.
+- **Feature or behavior-change PRs require an issue first.** Unsolicited ones
+  are closed without review — not because the code is bad, but because the
+  design conversation has to happen before the implementation, not after.
+- **Absorption is a normal outcome.** Sometimes the maintainer lands an
+  equivalent change directly instead of merging the PR — when the surrounding
+  design is still moving, or the fix touches code with constraints that are
+  faster to apply than to explain. A closed PR with the underlying change
+  landed is a contribution that made it in.
+
+---
+
 ## Six things that decide whether a PR lands
 
 **1. Run every sentence of your PR description end to end.**
