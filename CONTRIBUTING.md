@@ -22,8 +22,8 @@ bottom applies to every PR.
 - **Absorption is a normal outcome.** Sometimes the maintainer lands an
   equivalent change directly instead of merging the PR — when the surrounding
   design is still moving, or the fix touches code with constraints that are
-  faster to apply than to explain. When this happens the closing comment says
-  so explicitly; a PR closed without that note was simply not taken.
+  faster to apply than to explain. When a change is absorbed this way, the
+  closing comment will say so.
 
 ---
 
