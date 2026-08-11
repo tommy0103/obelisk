@@ -162,3 +162,49 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   assert.deepEqual(persistedDetail, detail);
   db.close();
 });
+
+test('claude links repeated workflow names by unique run id', () => {
+  const root = makeTempDir('obelisk-claude-workflow-link-');
+  const projectDir = join(root, 'projects', '-proj');
+  const workflowDir = join(projectDir, 'sid-workflow', 'workflows');
+  mkdirSync(workflowDir, { recursive: true });
+  writeFileSync(join(projectDir, 'sid-workflow.jsonl'), [
+    {
+      uuid: 'assistant-old', type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'old-call', name: 'Workflow', input: {} }] },
+    },
+    {
+      uuid: 'old-result', type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'old-call', content: 'Run ID: old-run\nSummary: same-name' }] },
+    },
+    {
+      uuid: 'assistant-new', type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'new-call', name: 'Workflow', input: {} }] },
+    },
+    {
+      uuid: 'new-result', type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'new-call', content: 'Run ID: new-run\nSummary: same-name' }] },
+    },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n');
+  for (const runId of ['old-run', 'new-run']) {
+    writeFileSync(join(workflowDir, `${runId}.json`), JSON.stringify({
+      runId, workflowName: 'same-name', status: 'completed', workflowProgress: [],
+    }));
+  }
+
+  const provider = createClaudeProvider({ rootDir: root });
+  const workflowUnits = provider.discover({ lastCursor: () => null })
+    .filter(unit => unit.meta?.kind === 'workflow');
+  assert.equal(workflowUnits.length, 2);
+
+  // Both runs share the workflow name, so name-based matching would attach the
+  // newer run to the older call; each run must link by its unique run id.
+  const parentByRun = new Map();
+  for (const unit of workflowUnits) {
+    const records = drain(provider.parse(unit, null)).values;
+    const workflow = records.find(record => record.kind === 'workflow');
+    parentByRun.set(workflow.run_id, workflow.parent_tool_use_id);
+  }
+  assert.equal(parentByRun.get('old-run'), 'old-call');
+  assert.equal(parentByRun.get('new-run'), 'new-call');
+});
