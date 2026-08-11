@@ -89,6 +89,18 @@ test('resolver finds the invoking session via the tool-call command line', () =>
   db.close();
 });
 
+test('resolver matches a JSON-escaped nonce in tool_calls input_json', () => {
+  // Windows-style nonces contain backslashes, which JSON encoding doubles in
+  // stored input_json; the raw LIKE pattern alone would miss the record.
+  const db = invokingDb();
+  const winNonce = 'C:\\tmp\\obq.win789.mjs';
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-win', 'msg-self-call', 'sid-self', 'Bash', JSON.stringify({ command: `obelisk --query ${winNonce}` }));
+
+  assert.equal(resolveInvokingSessionId(db, winNonce, { nowMs: FIXTURE_NOW_MS }), 'sid-self');
+  db.close();
+});
+
 test('resolver finds the invoking session via message text', () => {
   const db = invokingDb();
   db.prepare('INSERT INTO messages (uuid, session_id, type, role, text, timestamp) VALUES (?,?,?,?,?,?)')

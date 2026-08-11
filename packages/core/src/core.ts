@@ -170,12 +170,18 @@ export function resolveInvokingSessionId(
   // from messages (idx_messages_time) and probe tool_calls by message_uuid;
   // a plain JOIN lets SQLite drive from a 150k-row tool_calls scan instead.
   if (indexedTables.has('tool_calls') && indexedTables.has('messages')) {
-    const like = `%${nonce.replace(/[\\%_]/g, '\\$&')}%`;
+    // input_json is JSON-encoded, so a nonce containing JSON-escaped
+    // characters (notably backslashes in Windows paths) is stored in escaped
+    // form; match both the raw and the JSON-escaped spelling.
+    const likePattern = (value: string): string => `%${value.replace(/[\\%_]/g, '\\$&')}%`;
+    const jsonEscaped = JSON.stringify(nonce).slice(1, -1);
+    const patterns = jsonEscaped === nonce ? [likePattern(nonce)] : [likePattern(nonce), likePattern(jsonEscaped)];
+    const likeClause = patterns.map(() => "tc.input_json LIKE ? ESCAPE '\\'").join(' OR ');
     const toolRows = db.prepare(`
       SELECT tc.session_id AS session_id, m.timestamp AS timestamp
       FROM messages m CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
-      WHERE m.timestamp >= ? AND tc.input_json LIKE ? ESCAPE '\\'
-    `).all(cutoff, like);
+      WHERE m.timestamp >= ? AND (${likeClause})
+    `).all(cutoff, ...patterns);
     for (const row of toolRows) {
       track(row.session_id, row.timestamp);
     }
