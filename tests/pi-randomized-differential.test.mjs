@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { createPiProvider } from '../packages/core/src/providers/pi.ts';
@@ -14,6 +13,7 @@ import {
   pi083LeafId,
   projectCanonicalEvidence,
 } from './fixtures/pi/pi-0.83.0-context-oracle.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const CASES = 512;
 const SEED = 0x5eedc0de;
@@ -167,7 +167,7 @@ function createCase(random, caseIndex, totals) {
 test('fixed-seed randomized differential matches vendored Pi 0.83.0 context oracles', () => {
   assert.equal(PI_CONTEXT_ORACLE_VERSION, '0.83.0');
   const random = randomGenerator(SEED);
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-randomized-differential-'));
+  const root = makeTempDir('obelisk-pi-randomized-differential-');
   const generated = [];
   const totals = {
     cases: CASES,

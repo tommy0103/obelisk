@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { makeTempDir } from './temp-dirs.mjs';
 
 test('passive-pull runtime indexes Kimi sessions from the default home', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-runtime-'));
+  const home = makeTempDir('obelisk-kimi-runtime-');
   const sessionDir = join(home, '.kimi-code', 'sessions', 'workspace-1', 'session-runtime-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   mkdirSync(mainDir, { recursive: true });

@@ -1,18 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease, writerLockPathFor } from '../packages/core/src/writer-lease.ts';
 import { runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
 
 test('a passive query does not mutate the index while a fresh daemon owns writes', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-arbitration-'));
+  const home = makeTempDir('obelisk-daemon-arbitration-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -37,7 +37,7 @@ test('a passive query does not mutate the index while a fresh daemon owns writes
 });
 
 test('a passive query reports when a daemon blocks its schema upgrade', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-schema-'));
+  const home = makeTempDir('obelisk-daemon-schema-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -77,7 +77,7 @@ test('a passive query reports when a daemon blocks its schema upgrade', () => {
 });
 
 test('attune refuses to mutate the index while a fresh daemon owns writes', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-attune-'));
+  const home = makeTempDir('obelisk-daemon-attune-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -101,7 +101,7 @@ test('attune refuses to mutate the index while a fresh daemon owns writes', () =
 });
 
 test('a passive query stays read-only when another process holds the writer lease', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-writer-owned-'));
+  const home = makeTempDir('obelisk-writer-owned-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -131,7 +131,7 @@ test('a passive query stays read-only when another process holds the writer leas
 });
 
 test('a passive query fails closed when daemon ownership cannot be read', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-ownership-error-'));
+  const home = makeTempDir('obelisk-daemon-ownership-error-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });

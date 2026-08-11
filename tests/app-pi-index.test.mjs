@@ -4,14 +4,12 @@ import { createRequire } from 'node:module';
 import {
   chmodSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -21,6 +19,7 @@ import {
   PI_CANONICAL_TRANSCRIPT_MARKER,
 } from '../packages/core/src/providers/pi.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -69,7 +68,7 @@ function indexOptions(home, piDir) {
 }
 
 test('app build indexes Pi through the registry and replays complete session snapshots', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-index-'));
+  const home = makeTempDir('obelisk-pi-index-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -110,7 +109,7 @@ test('app build indexes Pi through the registry and replays complete session sna
 test('an unreadable Pi directory does not block readable sessions on a fresh index', {
   skip: process.platform === 'win32',
 }, (t) => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-partial-inventory-'));
+  const home = makeTempDir('obelisk-pi-partial-inventory-');
   const piDir = join(home, 'pi-sessions');
   writeFixture(piDir);
   const lockedDir = join(piDir, 'locked');
@@ -159,7 +158,7 @@ test('an unreadable Pi directory does not block readable sessions on a fresh ind
 test('an incomplete Pi identity census preserves committed provenance over a readable copy', {
   skip: process.platform === 'win32',
 }, (t) => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-partial-copy-'));
+  const home = makeTempDir('obelisk-pi-partial-copy-');
   const piDir = join(home, 'pi-sessions');
   const lockedDir = join(piDir, 'locked');
   const committedPath = join(lockedDir, 'session.jsonl');
@@ -227,7 +226,7 @@ test('an incomplete Pi identity census preserves committed provenance over a rea
 });
 
 test('Pi canonical marker forces one provider-owned replay after projection changes', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-marker-'));
+  const home = makeTempDir('obelisk-pi-marker-');
   const piDir = join(home, 'pi-sessions');
   writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -256,7 +255,7 @@ test('Pi canonical marker forces one provider-owned replay after projection chan
 });
 
 test('a structurally invalid Pi file retries alone after a canonical replay', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-marker-retry-'));
+  const home = makeTempDir('obelisk-pi-marker-retry-');
   const piDir = join(home, 'pi-sessions');
   const validPath = writeFixture(piDir);
   const options = {
@@ -320,7 +319,7 @@ test('a structurally invalid Pi file retries alone after a canonical replay', ()
 });
 
 test('a failed Pi unit rolls back a force rebuild to the last complete snapshot', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-force-rollback-'));
+  const home = makeTempDir('obelisk-pi-force-rollback-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = {
@@ -362,7 +361,7 @@ test('a failed Pi unit rolls back a force rebuild to the last complete snapshot'
 });
 
 test('a temp force rebuild uses live Pi provenance before publishing an empty snapshot', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-temp-provenance-'));
+  const home = makeTempDir('obelisk-pi-temp-provenance-');
   const piDir = join(home, 'pi-sessions');
   writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -388,7 +387,7 @@ test('a temp force rebuild uses live Pi provenance before publishing an empty sn
 });
 
 test('an unavailable Pi root keeps replay pending on the missing session cursor', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-incomplete-marker-'));
+  const home = makeTempDir('obelisk-pi-incomplete-marker-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -448,7 +447,7 @@ test('an unavailable Pi root keeps replay pending on the missing session cursor'
 });
 
 test('an unresolved Pi root keeps replay pending on the unresolved session cursor', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-unresolved-marker-'));
+  const home = makeTempDir('obelisk-pi-unresolved-marker-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -499,7 +498,7 @@ test('an unresolved Pi root keeps replay pending on the unresolved session curso
 });
 
 test('Pi identity marker retracts a legacy id through a non-selected identical copy', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-identity-marker-'));
+  const home = makeTempDir('obelisk-pi-identity-marker-');
   const piDir = join(home, 'pi-sessions');
   const selectedPath = writeFixture(piDir);
   const copiedPath = join(piDir, 'z-copy', 'session.jsonl');
@@ -531,7 +530,7 @@ test('Pi identity marker retracts a legacy id through a non-selected identical c
 });
 
 test('app replay keeps Pi identity stable across migration and retracts replacement and unlink', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-provenance-'));
+  const home = makeTempDir('obelisk-pi-provenance-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -580,7 +579,7 @@ test('app replay keeps Pi identity stable across migration and retracts replacem
 });
 
 test('a failed Pi identity replacement preserves the prior session snapshot', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-replacement-rollback-'));
+  const home = makeTempDir('obelisk-pi-replacement-rollback-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -609,7 +608,7 @@ test('a failed Pi identity replacement preserves the prior session snapshot', ()
 });
 
 test('passive Pi inventory retracts deleted sessions when its configured root remains readable', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-passive-delete-'));
+  const home = makeTempDir('obelisk-pi-passive-delete-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);
@@ -625,7 +624,7 @@ test('passive Pi inventory retracts deleted sessions when its configured root re
 });
 
 test('a terminal malformed line follows Pi by publishing the valid replacement prefix', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-torn-replacement-'));
+  const home = makeTempDir('obelisk-pi-torn-replacement-');
   const piDir = join(home, 'pi-sessions');
   const sessionPath = writeFixture(piDir);
   const options = indexOptions(home, piDir);

@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
 import { acquireWriterLease, writerLockPathFor } from '../packages/core/src/writer-lease.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -23,7 +23,7 @@ class TestDatabase {
 }
 
 test('an app build defers without opening the target database when another writer owns the lease', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-writer-lease-'));
+  const home = makeTempDir('obelisk-app-writer-lease-');
   const claudeDir = join(home, '.claude');
   const projectsDir = join(claudeDir, 'projects');
   const projectDir = join(projectsDir, '-tmp-project');
@@ -59,7 +59,7 @@ test('an app build defers without opening the target database when another write
 });
 
 test('a failed force cleanup leaves the existing index intact', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-force-atomic-'));
+  const home = makeTempDir('obelisk-app-force-atomic-');
   const claudeDir = join(home, '.claude');
   const projectsDir = join(claudeDir, 'projects');
   const projectDir = join(projectsDir, '-tmp-project');

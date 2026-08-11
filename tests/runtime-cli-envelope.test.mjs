@@ -14,14 +14,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli as runRuntime } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 function tempHome() {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-cli-envelope-'));
+  const home = makeTempDir('obelisk-cli-envelope-');
   mkdirSync(join(home, '.claude'), { recursive: true });
   return home;
 }

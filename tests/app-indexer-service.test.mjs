@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 import { createIndexerService } from '../app/src/main/indexer-service.ts';
@@ -387,7 +387,7 @@ test('indexer service publishes daemon ownership as soon as it starts', () => {
 });
 
 test('indexer service watches Claude JSON files through chokidar', async () => {
-  const projectsDir = mkdtempSync(join(tmpdir(), 'obelisk-chokidar-projects-'));
+  const projectsDir = makeTempDir('obelisk-chokidar-projects-');
   const timers = manualTimers();
   const calls = [];
   let watchArgs = null;
@@ -438,7 +438,7 @@ test('indexer service watches Claude JSON files through chokidar', async () => {
 });
 
 test('indexer service passes changed JSONL paths to the build worker', async () => {
-  const projectsDir = mkdtempSync(join(tmpdir(), 'obelisk-changed-paths-'));
+  const projectsDir = makeTempDir('obelisk-changed-paths-');
   const timers = manualTimers();
   const calls = [];
   const handlers = {};
@@ -480,8 +480,8 @@ test('indexer service passes changed JSONL paths to the build worker', async () 
 });
 
 test('indexer service watches Claude projects and Codex sessions for app-side indexing', async () => {
-  const claudeProjectsDir = mkdtempSync(join(tmpdir(), 'obelisk-watch-claude-'));
-  const codexSessionsDir = mkdtempSync(join(tmpdir(), 'obelisk-watch-codex-sessions-'));
+  const claudeProjectsDir = makeTempDir('obelisk-watch-claude-');
+  const codexSessionsDir = makeTempDir('obelisk-watch-codex-sessions-');
   const timers = manualTimers();
   const calls = [];
   const watchers = [];
@@ -529,8 +529,8 @@ test('indexer service watches Claude projects and Codex sessions for app-side in
 });
 
 test('indexer service starts watching a configured root that appears after startup', async () => {
-  const existingRoot = mkdtempSync(join(tmpdir(), 'obelisk-watch-existing-'));
-  const parent = mkdtempSync(join(tmpdir(), 'obelisk-watch-late-parent-'));
+  const existingRoot = makeTempDir('obelisk-watch-existing-');
+  const parent = makeTempDir('obelisk-watch-late-parent-');
   const lateRoot = join(parent, 'nested', 'sessions');
   const timers = manualTimers();
   const calls = [];

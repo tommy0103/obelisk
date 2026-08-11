@@ -1,17 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 
 import { runCli as runRuntime } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
 
 function tempHome() {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-runtime-home-'));
+  const home = makeTempDir('obelisk-runtime-home-');
   mkdirSync(join(home, '.claude'), { recursive: true });
   return home;
 }

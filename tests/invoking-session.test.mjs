@@ -12,8 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -21,6 +20,7 @@ import { createQueryApi } from '../packages/core/src/query.ts';
 import { resolveInvokingSessionId, resolveInvokingSessionIdWithWait } from '../packages/core/src/core.ts';
 import { acquireWriterLease, writerLockPathFor } from '../packages/core/src/writer-lease.ts';
 import { cliEntry, repoRoot, runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -32,7 +32,7 @@ const NONCE = 'obq-7f3c9a2e-4b1d-8e5f-unique';
 const FIXTURE_NOW_MS = Date.parse('2026-08-11T10:00:10Z');
 
 function tempHome(prefix) {
-  const home = mkdtempSync(join(tmpdir(), prefix));
+  const home = makeTempDir(prefix);
   mkdirSync(join(home, '.claude'), { recursive: true });
   return home;
 }
@@ -222,7 +222,7 @@ test('unknown invocation marks nothing and leaves results unchanged', () => {
 });
 
 test('cli --search --nonce marks the invoking session end to end', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-invoking-home-'));
+  const home = makeTempDir('obelisk-invoking-home-');
   const projectDir = join(home, '.claude', 'projects', '-tmp-invoking');
   mkdirSync(projectDir, { recursive: true });
   const nonce = 'obq-e2e-91c2-live-invocation';
@@ -269,7 +269,7 @@ test('wait helper skips the recovery build and poll on an immediate hit', () => 
 });
 
 test('wait helper re-resolves after the recovery build publishes the nonce', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-invoking-build-'));
+  const dir = makeTempDir('obelisk-invoking-build-');
   const dbPath = join(dir, 'obelisk.sqlite');
   const seed = new DatabaseSync(dbPath);
   seed.exec(SCHEMA);
@@ -299,7 +299,7 @@ test('wait helper never runs the recovery build on an uninitialized index', () =
   // Schema setup under a fresh daemon heartbeat stays read-only (ADR 0006):
   // with only index_state present, the carve-out build must not run; the poll
   // fallback resolves honest null.
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-invoking-noschema-'));
+  const dir = makeTempDir('obelisk-invoking-noschema-');
   const dbPath = join(dir, 'obelisk.sqlite');
   const seed = new DatabaseSync(dbPath);
   seed.exec('CREATE TABLE index_state (jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER)');
@@ -320,7 +320,7 @@ test('wait helper never runs the recovery build on an uninitialized index', () =
 });
 
 test('wait helper returns null within the cap when the nonce never appears', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-invoking-timeout-'));
+  const dir = makeTempDir('obelisk-invoking-timeout-');
   const dbPath = join(dir, 'obelisk.sqlite');
   const seed = new DatabaseSync(dbPath);
   seed.exec(SCHEMA);

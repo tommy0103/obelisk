@@ -1,12 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -20,7 +19,7 @@ class TestDatabase {
 }
 
 test('app indexer persists every provider through one registry-driven loop', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-indexer-'));
+  const home = makeTempDir('obelisk-provider-indexer-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const registry = createProviderRegistry([{
     name: 'alpha',
@@ -79,7 +78,7 @@ test('app indexer persists every provider through one registry-driven loop', () 
 });
 
 test('serialized invalid provider settings stay disabled when the worker rebuilds the registry', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-settings-worker-'));
+  const home = makeTempDir('obelisk-provider-settings-worker-');
   const result = buildIndex({
     providerSettings: {
       providerRoots: {
@@ -101,7 +100,7 @@ test('serialized invalid provider settings stay disabled when the worker rebuild
 });
 
 test('an invalid provider root cannot erase a previously indexed source snapshot', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-settings-preserve-'));
+  const home = makeTempDir('obelisk-provider-settings-preserve-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const sourcePath = join(home, '.claude', 'projects', 'session.jsonl');
   const registry = createProviderRegistry([{
@@ -154,7 +153,7 @@ test('an invalid provider root cannot erase a previously indexed source snapshot
 });
 
 test('an incomplete canonical inventory converges without replaying readable units forever', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-incomplete-replay-'));
+  const home = makeTempDir('obelisk-provider-incomplete-replay-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const marker = '__alpha_canonical_v1__';
   let incomplete = true;
@@ -237,7 +236,7 @@ test('an incomplete canonical inventory converges without replaying readable uni
 });
 
 test('marker replay invalidates provider unit keys that differ from source paths', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-unit-key-replay-'));
+  const home = makeTempDir('obelisk-provider-unit-key-replay-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const unitKey = 'alpha:session-unit';
   const sourcePath = '/alpha/session/agents/main/wire.jsonl';
@@ -294,7 +293,7 @@ test('marker replay invalidates provider unit keys that differ from source paths
 });
 
 test('a provider can withhold inventory-dependent tombstones from a partial census', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-incomplete-tombstone-'));
+  const home = makeTempDir('obelisk-provider-incomplete-tombstone-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const marker = '__alpha_canonical_v1__';
   let removeSession = false;
@@ -363,7 +362,7 @@ test('a provider can withhold inventory-dependent tombstones from a partial cens
 });
 
 test('force rebuild resets arbitrary provider keys and rewrites arbitrary provider markers', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-force-keys-'));
+  const home = makeTempDir('obelisk-provider-force-keys-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const unitKey = '__remote-1__';
   const marker = 'alpha-v1';
@@ -412,7 +411,7 @@ test('force rebuild resets arbitrary provider keys and rewrites arbitrary provid
 });
 
 test('force rebuild keeps legacy providers without inventory certification compatible', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-provider-force-certification-'));
+  const home = makeTempDir('obelisk-provider-force-certification-');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const unitKey = 'alpha:unit';
   const marker = 'alpha-marker';

@@ -4,19 +4,19 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
 function writeFixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-claude-parse-'));
+  const dir = makeTempDir('obelisk-claude-parse-');
   const path = join(dir, 'sid-x.jsonl');
   const lines = [
     { type: 'ai-title', aiTitle: 'My Session' },
@@ -101,7 +101,7 @@ test('claude parse() resumes from a cursor, skipping already-indexed lines', () 
 });
 
 test('claude provider emits workflow artifacts with an explicit canonical tool edge', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-claude-workflow-'));
+  const root = makeTempDir('obelisk-claude-workflow-');
   const projectDir = join(root, 'projects', '-proj');
   const workflowDir = join(projectDir, 'sid-workflow', 'workflows');
   const workflowAgentDir = join(projectDir, 'sid-workflow', 'subagents', 'workflows', 'run-workflow');

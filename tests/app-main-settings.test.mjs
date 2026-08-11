@@ -4,10 +4,10 @@ import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -120,7 +120,7 @@ function defaultIndexerWorkerClient() {
 async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const originalArgv = process.argv;
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-window-flags-${Date.now()}-${Math.random()}`);
+  const home = makeTempDir(`obelisk-window-flags-${Date.now()}-${Math.random()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   if (settingsText !== undefined) {
@@ -209,7 +209,7 @@ test('malformed settings keep the desktop recovery window available', async () =
 
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-watch-dirs-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   mkdirSync(join(claudeDir, 'projects'), { recursive: true });
@@ -298,7 +298,7 @@ test('main process watches every root declared by the built-in provider registry
 
 test('main process forwards committed IDs without reopening after a deferred build', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-deferred-build-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-deferred-build-${Date.now()}`);
   mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
   mkdirSync(join(home, '.codex', 'sessions'), { recursive: true });
   mkdirSync(join(home, '.obelisk'), { recursive: true });
@@ -407,7 +407,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
 
 test('session IPC hides Codex rows by default and supports explicit source opt-in', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-source-filter-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-source-filter-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
@@ -499,7 +499,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
 
 test('usage IPC aggregates normalized tokens across all indexed providers', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-usage-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-usage-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
@@ -617,7 +617,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
 
 test('main process migrates an existing app database before source-filtered IPC queries', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-db-migration-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-db-migration-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
@@ -701,7 +701,7 @@ test('main process migrates an existing app database before source-filtered IPC 
 
 test('main process keeps schema and memory mutations behind the writer lease', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-migration-lease-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-migration-lease-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -766,7 +766,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
 test('closing the last macOS window releases background resources until activation', async () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-window-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-window-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
@@ -876,7 +876,7 @@ test('closing the last macOS window releases background resources until activati
 });
 
 test('settings rebuild reopens the database from the configured Claude path', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-${Date.now()}`);
   const defaultClaudeDir = join(home, '.claude');
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
@@ -1052,7 +1052,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
 });
 
 test('settings rebuild keeps the existing database after a worker failure', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-failure-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-failure-${Date.now()}`);
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
   mkdirSync(customClaudeDir, { recursive: true });
@@ -1162,7 +1162,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
 });
 
 test('settings rebuild cancels an in-flight background build instead of waiting for it', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-cancel-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-cancel-${Date.now()}`);
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
   mkdirSync(customClaudeDir, { recursive: true });
@@ -1265,7 +1265,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
 });
 
 test('settings changes during rebuild keep one watcher and re-enable with a catch-up build', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-race-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-race-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({ autoRefresh: true }));

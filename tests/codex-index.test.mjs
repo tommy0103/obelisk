@@ -6,11 +6,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, utimesSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, appendFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -47,7 +47,7 @@ function codexCounts(home) {
 }
 
 test('codex full build then incremental rebuild replaces the total count without duplicates', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-codex-idx-'));
+  const home = makeTempDir('obelisk-codex-idx-');
   const dir = join(home, '.codex', 'sessions', '2026', '06', '15');
   mkdirSync(dir, { recursive: true });
   const jsonl = join(dir, `rollout-2026-06-15T10-00-00-${ID}.jsonl`);

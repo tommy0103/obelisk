@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -14,6 +13,7 @@ import {
   resolveProviderRoots,
   setPersistedSetting,
 } from '../app/src/main/provider-settings.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 function provider(id, defaultRoot, color, descriptor = {}) {
   return {
@@ -172,7 +172,7 @@ test('relative provider roots never depend on the Obelisk process cwd', () => {
 });
 
 test('an invalid persisted root disables that provider instead of selecting its default', () => {
-  const rawDir = mkdtempSync(join(tmpdir(), 'obelisk-disabled-provider-'));
+  const rawDir = makeTempDir('obelisk-disabled-provider-');
   const rawPath = join(rawDir, 'session.jsonl');
   writeFileSync(rawPath, '{"uuid":"raw-message","message":{"content":"preserved"}}\n');
   const runtime = createConfiguredBuiltinProviderRuntime({
@@ -226,7 +226,7 @@ test('malformed provider root containers cannot select defaults and are repairab
 });
 
 test('settings reader rejects malformed provider root containers', () => {
-  const directory = mkdtempSync(join(tmpdir(), 'obelisk-provider-settings-'));
+  const directory = makeTempDir('obelisk-provider-settings-');
   const settingsPath = join(directory, 'settings.json');
   try {
     for (const providerRoots of [[], 'invalid']) {

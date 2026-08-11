@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createClaudeProvider } from '../packages/core/src/providers/claude.ts';
 import { createCodexProvider } from '../packages/core/src/providers/codex.ts';
 import { createKimiProvider } from '../packages/core/src/providers/kimi.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const providers = [
   ['claude', createClaudeProvider, 'projects'],
@@ -16,7 +17,7 @@ const providers = [
 
 for (const [name, createProvider, inventoryDir] of providers) {
   test(`${name} reports directory enumeration failures`, () => {
-    const root = mkdtempSync(join(tmpdir(), `obelisk-${name}-inventory-`));
+    const root = makeTempDir(`obelisk-${name}-inventory-`);
     const sourcePath = join(root, inventoryDir);
     writeFileSync(sourcePath, 'not a directory');
     let issue;
@@ -34,7 +35,7 @@ for (const [name, createProvider, inventoryDir] of providers) {
   });
 
   test(`${name} treats a missing source as incomplete only when prior sessions exist`, () => {
-    const root = join(mkdtempSync(join(tmpdir(), `obelisk-${name}-missing-`)), 'absent');
+    const root = join(makeTempDir(`obelisk-${name}-missing-`), 'absent');
     const provider = createProvider({ rootDir: root });
     const issues = [];
     const context = {

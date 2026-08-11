@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createKimiProvider } from '../packages/core/src/providers/kimi.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 function drain(gen) {
   const values = [];
@@ -19,7 +19,7 @@ function drain(gen) {
 }
 
 function writeKimiFixture() {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-kimi-'));
+  const root = makeTempDir('obelisk-kimi-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-native-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   const childDir = join(sessionDir, 'agents', 'agent-7');
@@ -146,7 +146,7 @@ test('kimi provider ignores a torn final wire line until it is completed', () =>
 });
 
 test('kimi provider normalizes think parts and drops empty thinking placeholders', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-kimi-think-'));
+  const root = makeTempDir('obelisk-kimi-think-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-think-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   const wirePath = join(mainDir, 'wire.jsonl');
@@ -192,7 +192,7 @@ test('kimi provider normalizes think parts and drops empty thinking placeholders
 });
 
 test('kimi provider replays clear and undo markers with Kimi transcript semantics', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-kimi-undo-'));
+  const root = makeTempDir('obelisk-kimi-undo-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-undo-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   mkdirSync(mainDir, { recursive: true });
@@ -224,7 +224,7 @@ test('kimi provider replays clear and undo markers with Kimi transcript semantic
 });
 
 test('kimi provider scopes changed-path discovery to one session and bypasses an unchanged cursor', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-kimi-changed-path-'));
+  const root = makeTempDir('obelisk-kimi-changed-path-');
   const firstDir = join(root, 'sessions', 'workspace-1', 'session-1');
   const secondDir = join(root, 'sessions', 'workspace-1', 'session-2');
   for (const sessionDir of [firstDir, secondDir]) {
@@ -245,7 +245,7 @@ test('kimi provider scopes changed-path discovery to one session and bypasses an
 });
 
 test('kimi provider presents user-slash activations as real user prompts', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-kimi-user-slash-'));
+  const root = makeTempDir('obelisk-kimi-user-slash-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-user-slash-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   mkdirSync(mainDir, { recursive: true });
@@ -295,7 +295,7 @@ test('kimi provider presents user-slash activations as real user prompts', () =>
 });
 
 test('kimi provider maps protocol-1.0 embedded tool calls and results', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-kimi-legacy-tools-'));
+  const root = makeTempDir('obelisk-kimi-legacy-tools-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-tools-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   mkdirSync(mainDir, { recursive: true });

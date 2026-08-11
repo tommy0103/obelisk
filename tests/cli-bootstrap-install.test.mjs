@@ -4,13 +4,12 @@ import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -47,7 +46,7 @@ test('README presents agent-led installation before manual npm setup', () => {
 });
 
 test('install.sh installs and verifies only the CLI', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-install-script-'));
+  const home = makeTempDir('obelisk-install-script-');
   const fakeBin = join(home, 'bin');
   const npmCapture = join(home, 'npm-args');
   const obeliskCapture = join(home, 'obelisk-args');

@@ -1,17 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import { repoRoot, runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const cliPackage = JSON.parse(readFileSync(join(repoRoot, 'packages', 'cli', 'package.json'), 'utf8'));
 
 test('the packaged obelisk command preserves the runtime query envelope', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-cli-package-'));
+  const home = makeTempDir('obelisk-cli-package-');
   const query = join(home, 'query.mjs');
   writeFileSync(query, 'return { answer: 42 };');
 
@@ -31,7 +31,7 @@ test('obelisk --version reports the installed CLI package version', () => {
 });
 
 test('CLI test process suppresses only Node ExperimentalWarning output', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-cli-warning-'));
+  const home = makeTempDir('obelisk-cli-warning-');
   const preload = join(home, 'warnings.cjs');
   writeFileSync(preload, `
     process.emitWarning('simulated SQLite warning', 'ExperimentalWarning');
@@ -49,7 +49,7 @@ test('CLI test process suppresses only Node ExperimentalWarning output', () => {
 });
 
 test('obelisk install delegates official skill installation to the skills CLI', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-cli-install-'));
+  const home = makeTempDir('obelisk-cli-install-');
   const fakeBin = join(home, 'bin');
   const capture = join(home, 'args.json');
   const captureScript = join(home, 'capture.mjs');
@@ -88,7 +88,7 @@ test('obelisk install delegates official skill installation to the skills CLI', 
 });
 
 test('npm pack installs one platform-neutral CLI with its schema resource', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-cli-pack-'));
+  const root = makeTempDir('obelisk-cli-pack-');
   const packDir = join(root, 'pack');
   const prefix = join(root, 'prefix');
   const npmCache = join(root, 'npm-cache');

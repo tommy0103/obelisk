@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
@@ -9,9 +8,10 @@ import {
   normalizeRoots,
   resolveFileReference,
 } from '../app/src/main/file-reference.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 function tempProject() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'obelisk-file-ref-'));
+  const root = makeTempDir('obelisk-file-ref-');
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });
   fs.writeFileSync(path.join(root, 'src', 'app.ts'), 'export const a = 1;\n');
   return fs.realpathSync(root);
@@ -41,7 +41,7 @@ test('resolves a relative reference against the message cwd', () => {
 
 test('refuses paths outside the session roots', () => {
   const root = tempProject();
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'obelisk-outside-'));
+  const outside = makeTempDir('obelisk-outside-');
   fs.writeFileSync(path.join(outside, 'secret.txt'), 'nope\n');
   assert.equal(resolveFileReference({ rawPath: path.join(outside, 'secret.txt'), cwd: root }), null);
   assert.equal(resolveFileReference({ rawPath: '../../etc/hosts', cwd: root }), null);
@@ -49,7 +49,7 @@ test('refuses paths outside the session roots', () => {
 
 test('refuses a symlink that escapes the session roots', () => {
   const root = tempProject();
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'obelisk-outside-'));
+  const outside = makeTempDir('obelisk-outside-');
   const secret = path.join(outside, 'secret.txt');
   fs.writeFileSync(secret, 'nope\n');
   fs.symlinkSync(secret, path.join(root, 'escape.txt'));

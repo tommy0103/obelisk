@@ -1,12 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { nodeSqliteTransactionAdapter, runWriteTransaction } from '../packages/core/src/tx.ts';
 import { hasUnusableTransaction, isBeginBusyFailure, isRetryableWriteFailure } from '../packages/core/src/write-coordinator.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -124,7 +123,7 @@ test('node:sqlite generic error codes preserve BUSY classification from the mess
 });
 
 test('a real node:sqlite BEGIN lock is classified as a deferrable BUSY', () => {
-  const dbPath = join(mkdtempSync(join(tmpdir(), 'obelisk-node-sqlite-busy-')), 'index.sqlite');
+  const dbPath = join(makeTempDir('obelisk-node-sqlite-busy-'), 'index.sqlite');
   const holder = new DatabaseSync(dbPath);
   const contender = new DatabaseSync(dbPath);
   holder.exec('PRAGMA busy_timeout=0; CREATE TABLE test (value TEXT); BEGIN IMMEDIATE');
