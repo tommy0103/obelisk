@@ -83,7 +83,7 @@ test('malformed Obelisk settings skip refresh without disabling provider-backed 
   assert.match(JSON.parse(attune.stdout).error, /settings.*attune was not applied/i);
 });
 
-test('runtime attune scripts expose only memory mutation helpers', () => {
+test('runtime attune exposes only memory mutation helpers and remembers without session_id', () => {
   const home = tempHome();
   const memoryPath = join(home, 'memory.md');
   const scriptPath = join(home, 'attune.mjs');
@@ -97,7 +97,6 @@ test('runtime attune scripts expose only memory mutation helpers', () => {
       overviewType: typeof overview,
       result: remember({
         path: ${JSON.stringify(memoryPath)},
-        project: 'runtime-test',
         summary: 'Decision: runtime remember exposes only memory registration.'
       })
     };
@@ -113,6 +112,7 @@ test('runtime attune scripts expose only memory mutation helpers', () => {
   assert.equal(payload.sqlType, 'undefined');
   assert.equal(payload.overviewType, 'undefined');
   assert.equal(payload.result.path, memoryPath);
+  assert.equal(payload.result.project, null);
 });
 
 test('runtime rejects removed remember mode', () => {
