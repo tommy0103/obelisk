@@ -18,7 +18,7 @@ import {
 } from './provider-settings.ts';
 import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { NodeSqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { NodeSqliteDb, SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 interface SkippedFile {
   provider: string;
@@ -67,6 +67,39 @@ function refreshSessionProjectPaths(db: NodeSqliteDb): void {
     const projectPath = inferProjectPath(session.project, cwds);
     if (projectPath) update.run(projectPath, session.id);
   }
+}
+
+// A workflow unit links to its parent Workflow tool call by matching the unique
+// run id in the tool_result text — but the run json can reach the index before
+// that tool_result lands in the main transcript, leaving parent_tool_use_id
+// null with no later re-parse to fix it (the run json's mtime no longer moves).
+// Once every unit is persisted the tool_results table holds the result text, so
+// the match can be completed in SQL. Runs at every finalize: missed links heal
+// on the next refresh instead of waiting for a force rebuild. instr() is exact
+// substring matching (no LIKE wildcards); unresolvable rows stay null.
+function healWorkflowParentLinks(db: SqliteDb): void {
+  db.prepare(`
+    UPDATE workflows
+    SET parent_tool_use_id = (
+      SELECT tr.tool_use_id
+      FROM tool_results tr
+      JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
+      WHERE tr.session_id = workflows.session_id
+        AND tc.name = 'Workflow'
+        AND instr(tr.content, workflows.run_id) > 0
+      ORDER BY tr.rowid
+      LIMIT 1
+    )
+    WHERE parent_tool_use_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM tool_results tr
+        JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
+        WHERE tr.session_id = workflows.session_id
+          AND tc.name = 'Workflow'
+          AND instr(tr.content, workflows.run_id) > 0
+      )
+  `).run();
 }
 
 const BUILD_DEBOUNCE_MS = 30000;
@@ -203,6 +236,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               plan: providerPlan,
             });
             refreshSessionProjectPaths(db);
+            healWorkflowParentLinks(db);
             db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
             rebuildMemoryFts(db);
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -288,6 +322,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       try {
         runRetryableWriteTransaction(txDb, () => {
           refreshSessionProjectPaths(db);
+          healWorkflowParentLinks(db);
           db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
           rebuildMemoryFts(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -323,4 +358,4 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
   }
 }
 
-export { buildIndex, ensureReadableSchema, inferProjectPath, refreshSessionProjectPaths, shouldSkipBuild };
+export { buildIndex, ensureReadableSchema, healWorkflowParentLinks, inferProjectPath, refreshSessionProjectPaths, shouldSkipBuild };
