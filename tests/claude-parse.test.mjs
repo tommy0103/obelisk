@@ -162,3 +162,38 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   assert.deepEqual(persistedDetail, detail);
   db.close();
 });
+
+test('claude links repeated workflow names by unique run id', () => {
+  const root = makeTempDir('obelisk-claude-workflow-link-');
+  const projectDir = join(root, 'projects', '-proj');
+  const workflowDir = join(projectDir, 'sid-workflow', 'workflows');
+  mkdirSync(workflowDir, { recursive: true });
+  writeFileSync(join(projectDir, 'sid-workflow.jsonl'), [
+    {
+      uuid: 'assistant-old', type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'old-call', name: 'Workflow', input: {} }] },
+    },
+    {
+      uuid: 'old-result', type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'old-call', content: 'Run ID: old-run\nSummary: same-name' }] },
+    },
+    {
+      uuid: 'assistant-new', type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'new-call', name: 'Workflow', input: {} }] },
+    },
+    {
+      uuid: 'new-result', type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'new-call', content: 'Run ID: new-run\nSummary: same-name' }] },
+    },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n');
+  writeFileSync(join(workflowDir, 'new-run.json'), JSON.stringify({
+    runId: 'new-run', workflowName: 'same-name', status: 'completed', workflowProgress: [],
+  }));
+
+  const provider = createClaudeProvider({ rootDir: root });
+  const workflowUnit = provider.discover({ lastCursor: () => null })
+    .find(unit => unit.meta?.kind === 'workflow');
+  const records = drain(provider.parse(workflowUnit, null)).values;
+
+  assert.equal(records.find(record => record.kind === 'workflow').parent_tool_use_id, 'new-call');
+});
