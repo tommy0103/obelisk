@@ -69,15 +69,20 @@ function openAttuneDb(): NodeSqliteDb {
   );
   // The FTS table and its maintenance triggers are part of the memory layer:
   // without them a write "succeeds" but the memory can never be recalled.
-  const objects = new Set(
-    db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
-      .all().map((row) => String(row.name)),
+  // Names alone are not enough — a plain table or a hollow trigger with the
+  // right name would fool a name check, so verify the definitions too.
+  const definitions = new Map(
+    db.prepare("SELECT name, sql FROM sqlite_master WHERE type IN ('table', 'trigger')")
+      .all().map((row) => [String(row.name), String(row.sql ?? '')]),
   );
+  const ftsSql = definitions.get('memories_fts') ?? '';
+  const ftsOk = /create\s+virtual\s+table/i.test(ftsSql) && /fts5/i.test(ftsSql);
+  const triggersOk = ATTUNE_MEMORY_TRIGGERS.length > 0
+    && ATTUNE_MEMORY_TRIGGERS.every((trigger) => (definitions.get(trigger) ?? '').includes('memories_fts'));
   const complete = ATTUNE_MEMORY_COLUMNS.length > 0
-    && ATTUNE_MEMORY_TRIGGERS.length > 0
     && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
-    && objects.has('memories_fts')
-    && ATTUNE_MEMORY_TRIGGERS.every((trigger) => objects.has(trigger));
+    && ftsOk
+    && triggersOk;
   if (!complete) {
     db.close();
     throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');

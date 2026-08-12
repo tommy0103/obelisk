@@ -1,5 +1,6 @@
 // Query and attune sandbox helpers for the Core package.
 import { statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
 import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
@@ -723,11 +724,26 @@ function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (w
     assertEnglishMemoryText(summary, 'remember() summary');
     const normalizedPath = resolveMemoryPath(memoryPath, session_id);
     const normalizedAnchors = normalizeAnchors(anchors);
-    const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const proj = project || db.prepare('SELECT project FROM sessions WHERE id=?').get(session_id)?.project || null;
     const created_at = new Date().toISOString();
-    runMutation(() => db.prepare('INSERT OR REPLACE INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
-      id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at));
+    // Plain INSERT, never OR REPLACE: a memory id must not silently overwrite
+    // an existing memory. Collisions regenerate instead of losing data.
+    let id = `mem-${randomUUID()}`;
+    runMutation(() => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          db.prepare('INSERT INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
+            id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
+          return;
+        } catch (error) {
+          if (attempt < 2 && error instanceof Error && /UNIQUE constraint/i.test(error.message)) {
+            id = `mem-${randomUUID()}`;
+            continue;
+          }
+          throw error;
+        }
+      }
+    });
     return { id, path: normalizedPath, project: proj, anchors: normalizedAnchors, created_at };
   };
 

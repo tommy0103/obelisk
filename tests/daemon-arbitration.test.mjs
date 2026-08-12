@@ -171,6 +171,49 @@ test('attune reports honestly when the memory layer is incomplete', () => {
   check.close();
 });
 
+test('attune rejects a forged memory layer with hollow lookalikes', () => {
+  const home = makeTempDir('obelisk-daemon-attune-forged-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  // A plain table named memories_fts and hollow triggers with the right
+  // names: passes a name-only check, but recall would break. Attune must
+  // refuse, not accept writes that can never be recalled.
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+      message_start TEXT, message_end TEXT,
+      path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
+      deleted_at TEXT, deleted_reason TEXT
+    );
+    CREATE TABLE memories_fts (id TEXT, path TEXT, summary TEXT);
+    CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN SELECT 1; END;
+    CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN SELECT 1; END;
+    CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN SELECT 1; END;
+  `);
+  db.close();
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Forged layer\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'forged-test',
+      summary: 'Decision: this write must be refused, not silently unrecallable.'
+    });
+  `);
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
+  check.close();
+});
+
 test('a passive query stays read-only when another process holds the writer lease', () => {
   const home = makeTempDir('obelisk-writer-owned-');
   const obeliskDir = join(home, '.obelisk');
