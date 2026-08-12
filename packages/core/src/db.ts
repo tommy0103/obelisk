@@ -49,6 +49,10 @@ const ATTUNE_MEMORY_COLUMNS = [
   'path', 'anchors', 'summary', 'created_at', 'deleted_at', 'deleted_reason',
 ] as const;
 
+const ATTUNE_MEMORY_TRIGGERS = [
+  'memories_fts_ai', 'memories_fts_ad', 'memories_fts_au',
+] as const;
+
 function openAttuneDb(): NodeSqliteDb {
   if (!existsSync(DB_PATH)) {
     throw new Error('Obelisk index is not initialized; run an index build (obelisk --build) before writing memories');
@@ -58,7 +62,16 @@ function openAttuneDb(): NodeSqliteDb {
   const columns = new Set(
     db.prepare('PRAGMA table_info(memories)').all().map((row) => String(row.name)),
   );
-  if (!ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))) {
+  // The FTS table and its maintenance triggers are part of the memory layer:
+  // without them a write "succeeds" but the memory can never be recalled.
+  const objects = new Set(
+    db.prepare("SELECT name FROM sqlite_master WHERE name IN ('memories_fts', 'memories_fts_ai', 'memories_fts_ad', 'memories_fts_au')")
+      .all().map((row) => String(row.name)),
+  );
+  const complete = ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
+    && objects.has('memories_fts')
+    && ATTUNE_MEMORY_TRIGGERS.every((trigger) => objects.has(trigger));
+  if (!complete) {
     db.close();
     throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
   }

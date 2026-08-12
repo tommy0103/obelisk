@@ -734,14 +734,18 @@ function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (w
   const forget = ({ id, reason }: ForgetInput) => {
     const deletionReason = String(reason || '').trim();
     if (!id || !deletionReason) throw new Error('forget() requires id and reason');
-    const row = db.prepare('SELECT id, deleted_at, deleted_reason FROM memories WHERE id=?').get(id);
-    if (!row) throw new Error(`forget() memory not found: ${id}`);
-    if (row.deleted_at) {
-      return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
-    }
-    const deleted_at = new Date().toISOString();
-    runMutation(() => db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id));
-    return { id, deleted_at, deleted_reason: deletionReason };
+    // Read, decide, and update in one write transaction: a concurrent forget
+    // must observe the deleted state, not overwrite another forget's reason.
+    return runMutation(() => {
+      const row = db.prepare('SELECT id, deleted_at, deleted_reason FROM memories WHERE id=?').get(id);
+      if (!row) throw new Error(`forget() memory not found: ${id}`);
+      if (row.deleted_at) {
+        return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
+      }
+      const deleted_at = new Date().toISOString();
+      db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id);
+      return { id, deleted_at, deleted_reason: deletionReason };
+    });
   };
 
   return { remember, forget };

@@ -337,7 +337,7 @@ export async function executeAttune(scriptContent: string): Promise<unknown> {
   const db = openAttuneDb();
   try {
     const txDb = nodeSqliteTransactionAdapter(db);
-    const runMutation = <T>(work: () => T): T => runRetryableWriteTransaction(txDb, work, { label: 'attune' });
+    const runMutation = <T>(work: () => T): T => runRetryableWriteTransaction(txDb, work, { label: 'attune' }, { retryOnBeginBusy: true });
     return await runInSandbox(createAttuneApi(db, runMutation), scriptContent);
   } finally {
     db.close();

@@ -134,6 +134,43 @@ test('attune reports honestly when the index is not initialized', () => {
   assert.match(JSON.parse(result.stdout).error, /index is not initialized/i);
 });
 
+test('attune reports honestly when the memory layer is incomplete', () => {
+  const home = makeTempDir('obelisk-daemon-attune-partial-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  // A database with a full-column memories table but no memories_fts or
+  // maintenance triggers: writes would "succeed" yet never be recallable.
+  const db = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'));
+  db.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+      message_start TEXT, message_end TEXT,
+      path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
+      deleted_at TEXT, deleted_reason TEXT
+    );
+  `);
+  db.close();
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Unreachable memory\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'partial-test',
+      summary: 'Decision: this write must be refused, not silently unrecallable.'
+    });
+  `);
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+  const check = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'), { readOnly: true });
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
+  check.close();
+});
+
 test('a passive query stays read-only when another process holds the writer lease', () => {
   const home = makeTempDir('obelisk-writer-owned-');
   const obeliskDir = join(home, '.obelisk');
