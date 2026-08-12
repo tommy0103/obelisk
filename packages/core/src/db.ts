@@ -70,12 +70,14 @@ function openAttuneDb(): NodeSqliteDb {
   db.exec('PRAGMA busy_timeout=250');
   const info = db.prepare('PRAGMA table_info(memories)').all();
   const columns = new Set(info.map((row) => String(row.name)));
-  // Column names alone are not enough: without `id` as PRIMARY KEY, remember
-  // ids lose uniqueness and forget() can update multiple rows at once.
-  const idRow = info.find((row) => row.name === 'id');
+  // Column names alone are not enough: id must be the ONLY primary-key
+  // column. A composite PRIMARY KEY (id, project) still lets duplicate ids
+  // in, so remember ids lose uniqueness and forget() can update several
+  // rows at once.
+  const pkColumns = info.filter((row) => Number(row.pk ?? 0) > 0).map((row) => String(row.name));
   const columnsOk = ATTUNE_MEMORY_COLUMNS.length > 0
     && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
-    && Number(idRow?.pk ?? 0) > 0;
+    && pkColumns.length === 1 && pkColumns[0] === 'id';
   if (!columnsOk) {
     db.close();
     throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
@@ -110,6 +112,10 @@ function probeAttuneMemoryLayer(db: SqliteDb): void {
     db.prepare('DELETE FROM memories WHERE id=?').run(probeId);
     if (matches(updateToken) !== 0) throw layerError;
   } catch (error) {
+    // Failure path: the probe throws, so the outer transaction rolls back
+    // regardless — a cleanup error here may be swallowed to keep the primary
+    // error (ADR 0006: cleanup never masks the primary exception).
+    try { db.exec('ROLLBACK TO attune_probe'); db.exec('RELEASE attune_probe'); } catch { /* the outer transaction's rollback cleans up */ }
     // Translate only the expected schema defects into the honest layer
     // error; real I/O failures (disk full, SQLITE_IOERR, corruption) must
     // surface as themselves.
@@ -118,11 +124,11 @@ function probeAttuneMemoryLayer(db: SqliteDb): void {
       throw error;
     }
     throw layerError;
-  } finally {
-    // The probe never persists: roll its writes back whether it passed or
-    // failed. The surrounding transaction stays usable either way.
-    try { db.exec('ROLLBACK TO attune_probe'); db.exec('RELEASE attune_probe'); } catch { /* the outer transaction's rollback cleans up */ }
   }
+  // Success path: a cleanup failure MUST propagate — otherwise the outer
+  // transaction would commit the probe writes it was meant to discard.
+  db.exec('ROLLBACK TO attune_probe');
+  db.exec('RELEASE attune_probe');
 }
 
 function openWriterLeaseDb(lockPath: string): NodeSqliteDb {

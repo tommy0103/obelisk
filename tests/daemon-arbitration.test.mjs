@@ -267,38 +267,50 @@ test('attune rejects a layer whose UPDATE trigger does not maintain the FTS', ()
   check.close();
 });
 
-test('attune rejects a memories table whose id is not a primary key', () => {
-  const home = makeTempDir('obelisk-daemon-attune-no-pk-');
-  const obeliskDir = join(home, '.obelisk');
-  mkdirSync(obeliskDir, { recursive: true });
-  // Full columns, real FTS, real triggers — but id is plain TEXT. Without
-  // the primary key, remember ids lose uniqueness and forget() can update
-  // several rows at once.
-  const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
-  const dbPath = join(obeliskDir, 'obelisk.sqlite');
-  const db = new DatabaseSync(dbPath);
-  db.exec(schema.replace('CREATE TABLE IF NOT EXISTS memories (\n  id TEXT PRIMARY KEY,', 'CREATE TABLE IF NOT EXISTS memories (\n  id TEXT,'));
-  assert.equal(db.prepare('PRAGMA table_info(memories)').all().find(row => row.name === 'id').pk, 0);
-  db.close();
+test('attune rejects a memories table whose id is not the sole primary key', () => {
+  const variants = {
+    // id is plain TEXT: no uniqueness at all.
+    'no-pk': 'CREATE TABLE IF NOT EXISTS memories (\n  id TEXT,',
+    // PRIMARY KEY (id, project): id.pk > 0 yet duplicate ids still allowed.
+    'composite-pk': 'CREATE TABLE IF NOT EXISTS memories (\n  id TEXT, session_id TEXT, project TEXT,\n  message_start TEXT, message_end TEXT,\n  path TEXT, anchors TEXT, summary TEXT, created_at TEXT,\n  deleted_at TEXT, deleted_reason TEXT,\n  PRIMARY KEY (id, project));',
+  };
+  for (const [name, memoriesDdl] of Object.entries(variants)) {
+    const home = makeTempDir(`obelisk-daemon-attune-${name}-`);
+    const obeliskDir = join(home, '.obelisk');
+    mkdirSync(obeliskDir, { recursive: true });
+    // Full columns, real FTS, real triggers — only the memories table's
+    // primary key deviates. Without id as the sole key, remember ids lose
+    // uniqueness and forget() can update several rows at once.
+    const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+    const dbPath = join(obeliskDir, 'obelisk.sqlite');
+    const db = new DatabaseSync(dbPath);
+    if (name === 'no-pk') {
+      db.exec(schema.replace('CREATE TABLE IF NOT EXISTS memories (\n  id TEXT PRIMARY KEY,', memoriesDdl));
+    } else {
+      const memoriesBlock = schema.match(/CREATE TABLE IF NOT EXISTS memories \([\s\S]+?\);/)[0];
+      db.exec(schema.replace(memoriesBlock, memoriesDdl));
+    }
+    db.close();
 
-  const memoryPath = join(home, 'memory.md');
-  const attunePath = join(home, 'attune.mjs');
-  writeFileSync(memoryPath, '# No primary key\n');
-  writeFileSync(attunePath, `
-    return remember({
-      path: ${JSON.stringify(memoryPath)},
-      project: 'no-pk-test',
-      summary: 'Decision: this write must be refused without a primary key.'
-    });
-  `);
+    const memoryPath = join(home, 'memory.md');
+    const attunePath = join(home, 'attune.mjs');
+    writeFileSync(memoryPath, '# Bad primary key\n');
+    writeFileSync(attunePath, `
+      return remember({
+        path: ${JSON.stringify(memoryPath)},
+        project: '${name}-test',
+        summary: 'Decision: this write must be refused without a sole primary key.'
+      });
+    `);
 
-  const result = runCli(['--attune', attunePath], { home });
-  assert.equal(result.status, 1);
-  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+    const result = runCli(['--attune', attunePath], { home });
+    assert.equal(result.status, 1, `${name}: ${result.stderr || result.stdout}`);
+    assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
 
-  const check = new DatabaseSync(dbPath, { readOnly: true });
-  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
-  check.close();
+    const check = new DatabaseSync(dbPath, { readOnly: true });
+    assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0, name);
+    check.close();
+  }
 });
 
 test('an attune probe leaves no persistent state behind', () => {
