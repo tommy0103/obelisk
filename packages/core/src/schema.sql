@@ -1,3 +1,6 @@
+-- Copyright (C) 2026 tommy0103 and contributors.
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 -- Shared Obelisk Core schema.
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, title TEXT, project TEXT, project_path TEXT,

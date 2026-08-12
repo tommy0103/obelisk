@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Tests create throwaway directories with mkdtempSync but never deleted them,
 // leaking hundreds of MB into $TMPDIR over repeated runs (this caused ENOSPC).
 // makeTempDir records every directory it creates and removes them all when the

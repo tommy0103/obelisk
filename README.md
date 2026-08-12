@@ -335,4 +335,6 @@ ownership. The PR template mirrors them as per-area checklists.
 
 ## License
 
-AGPL-3.0 @tommy0103
+Copyright (C) 2026 tommy0103 and contributors.
+
+Obelisk is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only); see [LICENSE](LICENSE). Derivative works are welcome: if you distribute a modified version, please keep the per-file copyright notices intact and mark your modifications prominently with a date, as AGPL-3.0 §5 requires.

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Claude Code provider adapter in Core (see docs/adr/0001).
 //
 // Pure: discovers Claude transcript files and parses one into a record stream.

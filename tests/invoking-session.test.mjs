@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Nonce self-search: the CLI embeds a unique invocation nonce in its argv
 // (--search --nonce <token>, or the as-typed --query file path). Providers
 // write the tool-call record before the tool finishes, so after the pre-query

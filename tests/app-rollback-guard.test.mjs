@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Regression tests for the write-transaction runner (docs/adr/0006):
 //  - a transient BUSY (auto-rolled-back txn) is retried and recovers;
 //  - a persistent BUSY exhausts retries without publishing a partial force rebuild;

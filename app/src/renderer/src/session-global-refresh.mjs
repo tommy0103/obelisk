@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 /**
  * Keeps global catalogue snapshots out of the active SessionDetail view.
  * SessionDetail receives its own incremental stream; the catalogue is an

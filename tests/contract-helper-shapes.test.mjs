@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Tier 2 contract golden tests (see docs/adr/0002-two-tier-runtime-contract.md).
 //
 // These lock the *composite return shapes* that agents parse and that

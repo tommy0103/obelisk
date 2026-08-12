@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2026 tommy0103 and contributors. -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
 <script setup>
 import { computed } from 'vue';
 import { formatProjectLabel } from '../utils.js';

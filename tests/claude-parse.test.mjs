@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5b golden test: pins the claude adapter's parse() record stream.
 // This is the binding-independent contract — no database is involved. If the
 // per-line parse behavior drifts, this fails before persist ever runs.

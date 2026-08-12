@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5c: exercises the full codex buildIndex path (discover → codex.parse →
 // persist) for both a fresh full build and an incremental rebuild after append.
 // Codex is full-reparse with countMode 'total', so growth must REPLACE the count

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Binding-agnostic SQLite write plumbing shared from the Core package
 // (docs/adr/0006). The injected db must expose `exec(sql)`; this works for both
 // node:sqlite (CLI) and better-sqlite3 (app), same injection model as
