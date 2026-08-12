@@ -12,6 +12,9 @@ import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 type DbRow = SqliteRow;
 
+// SQLite extended result code for a primary-key uniqueness violation.
+const SQLITE_CONSTRAINT_PRIMARYKEY = 1555;
+
 interface QueryOptions extends Record<string, any> {
   limit?: number;
   sessionId?: string;
@@ -739,10 +742,10 @@ function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (w
             id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
           return;
         } catch (error) {
-          // SQLITE_CONSTRAINT_PRIMARYKEY (1555): id collision, regenerate.
-          // Any other constraint or error propagates unchanged.
+          // Primary-key collision: regenerate the id and retry. Any other
+          // constraint or error propagates unchanged.
           const errcode = (error as { errcode?: unknown })?.errcode;
-          if (attempt < 2 && errcode === 1555) {
+          if (attempt < 2 && errcode === SQLITE_CONSTRAINT_PRIMARYKEY) {
             id = `mem-${randomUUID()}`;
             continue;
           }

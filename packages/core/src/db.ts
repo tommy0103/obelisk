@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // node:sqlite lifecycle and migrations for the Core package.
+import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -84,20 +85,34 @@ function openAttuneDb(): NodeSqliteDb {
 // Names and SQL text prove nothing — a trigger's own name contains
 // 'memories_fts', and a lookalike table can borrow the right DDL — so
 // validate to executability instead. Must run inside a write transaction
-// (executeAttune's retryable mutation wrapper): the probe writes and deletes
-// one row, so a committed probe is net-zero and a failed probe rolls back.
+// (executeAttune's retryable mutation wrapper): the probe writes, updates,
+// and deletes one row, so a committed probe is net-zero and a failed probe
+// rolls back. Id and tokens are random per probe: fixed values could match a
+// legitimate memory and produce a false "incomplete layer" verdict.
 function probeAttuneMemoryLayer(db: SqliteDb): void {
+  const layerError = new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
+  const probeId = `__attune_probe_${randomUUID()}`;
+  const insertToken = `pins${randomUUID().replaceAll('-', '')}`;
+  const updateToken = `pupd${randomUUID().replaceAll('-', '')}`;
+  // FTS MATCH on the random token, filtered by the probe id: pre-existing
+  // memories can never interfere either way.
+  const matches = (token: string) => db.prepare('SELECT id FROM memories_fts WHERE memories_fts MATCH ? AND id = ?').all(token, probeId).length;
   try {
-    db.prepare("INSERT INTO memories (id, path, summary, created_at) VALUES ('__attune_probe__', '/probe', 'attuneprobetoken marker', '1970-01-01T00:00:00Z')").run();
-    const visible = db.prepare("SELECT id FROM memories_fts WHERE memories_fts MATCH 'attuneprobetoken'").get();
-    db.prepare("DELETE FROM memories WHERE id='__attune_probe__'").run();
-    const gone = db.prepare("SELECT id FROM memories_fts WHERE memories_fts MATCH 'attuneprobetoken'").get();
-    if (!visible || gone) throw new Error('probe mismatch');
-  } catch {
-    // Lock errors cannot occur here: BEGIN IMMEDIATE already holds the write
-    // lock before this probe runs, so any failure is a broken layer, not
-    // contention. Report honestly and let the transaction roll back.
-    throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
+    db.prepare('INSERT INTO memories (id, path, summary, created_at) VALUES (?, ?, ?, ?)').run(probeId, '/probe', `${insertToken} marker`, '1970-01-01T00:00:00Z');
+    if (matches(insertToken) !== 1) throw layerError;
+    db.prepare('UPDATE memories SET summary=? WHERE id=?').run(`${updateToken} marker`, probeId);
+    if (matches(insertToken) !== 0 || matches(updateToken) !== 1) throw layerError;
+    db.prepare('DELETE FROM memories WHERE id=?').run(probeId);
+    if (matches(updateToken) !== 0) throw layerError;
+  } catch (error) {
+    if (error === layerError) throw error;
+    // Translate only the expected schema defects into the honest layer
+    // error; real I/O failures (disk full, SQLITE_IOERR, corruption) must
+    // surface as themselves.
+    if (error instanceof Error && /no such table|no such column|unable to use function MATCH/i.test(error.message)) {
+      throw layerError;
+    }
+    throw error;
   }
 }
 

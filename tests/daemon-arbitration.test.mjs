@@ -220,6 +220,53 @@ test('attune rejects a forged memory layer with hollow lookalikes', () => {
   check.close();
 });
 
+test('attune rejects a layer whose UPDATE trigger does not maintain the FTS', () => {
+  const home = makeTempDir('obelisk-daemon-attune-hollow-au-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  // Real INSERT/DELETE triggers from the schema, but a hollow UPDATE trigger:
+  // only a probe with an UPDATE leg can catch this.
+  const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+  const realTrigger = (name) => schema.match(new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}[\\s\\S]+?END;`))?.[0];
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+      message_start TEXT, message_end TEXT,
+      path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
+      deleted_at TEXT, deleted_reason TEXT
+    );
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+      id UNINDEXED, path, summary,
+      content=memories, content_rowid=rowid,
+      tokenize='unicode61 remove_diacritics 1');
+    ${realTrigger('memories_fts_ai')}
+    ${realTrigger('memories_fts_ad')}
+    CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN SELECT 'memories_fts'; END;
+  `);
+  db.close();
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Hollow update trigger\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'hollow-au-test',
+      summary: 'Decision: this write must be refused while the update trigger is hollow.'
+    });
+  `);
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
+  check.close();
+});
+
 test('a passive query stays read-only when another process holds the writer lease', () => {
   const home = makeTempDir('obelisk-writer-owned-');
   const obeliskDir = join(home, '.obelisk');

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Lock-contention test for the attune memory carve-out, exercising the real
 // openAttuneDb + executeAttune combination: the connection busy_timeout is
 // deliberately short (250 ms), so a contended BEGIN IMMEDIATE fails fast and
