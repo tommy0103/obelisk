@@ -87,4 +87,4 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openAttuneDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, openDb, openReadDb, openAttuneDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };

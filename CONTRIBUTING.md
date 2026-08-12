@@ -184,7 +184,10 @@ interactions, or the full Electron suites.
 
 - **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
   is read-only: no write connection, no schema migration, no PRAGMA change, no
-  checkpoint, no indexing. Guarded by `tests/daemon-arbitration.test.mjs` and
+  checkpoint, no indexing. Two narrow carve-outs, both recorded in ADR 0006:
+  the invocation-nonce freshness build, and memory mutations (`--attune`),
+  which write only the `memories` table and never migrate or configure the
+  index. Guarded by `tests/daemon-arbitration.test.mjs` and
   `tests/app-writer-lease.test.mjs`.
 - **If you add something that needs periodic refresh, prove its refresh point is
   actually called repeatedly.** Hanging a full rebuild off a first-run-only gate
