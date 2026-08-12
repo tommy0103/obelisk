@@ -736,7 +736,10 @@ function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (w
             id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
           return;
         } catch (error) {
-          if (attempt < 2 && error instanceof Error && /UNIQUE constraint/i.test(error.message)) {
+          // SQLITE_CONSTRAINT_PRIMARYKEY (1555): id collision, regenerate.
+          // Any other constraint or error propagates unchanged.
+          const errcode = (error as { errcode?: unknown })?.errcode;
+          if (attempt < 2 && errcode === 1555) {
             id = `mem-${randomUUID()}`;
             continue;
           }

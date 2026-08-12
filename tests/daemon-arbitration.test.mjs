@@ -175,9 +175,9 @@ test('attune rejects a forged memory layer with hollow lookalikes', () => {
   const home = makeTempDir('obelisk-daemon-attune-forged-');
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
-  // A plain table named memories_fts and hollow triggers with the right
-  // names: passes a name-only check, but recall would break. Attune must
-  // refuse, not accept writes that can never be recalled.
+  // A REAL FTS5 table plus triggers whose bodies only *mention* memories_fts
+  // without maintaining it: passes name- and DDL-level checks, but a probe
+  // write can never be recalled. Attune must refuse.
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   const db = new DatabaseSync(dbPath);
   db.exec(`
@@ -187,10 +187,13 @@ test('attune rejects a forged memory layer with hollow lookalikes', () => {
       path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
       deleted_at TEXT, deleted_reason TEXT
     );
-    CREATE TABLE memories_fts (id TEXT, path TEXT, summary TEXT);
-    CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN SELECT 1; END;
-    CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN SELECT 1; END;
-    CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN SELECT 1; END;
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+      id UNINDEXED, path, summary,
+      content=memories, content_rowid=rowid,
+      tokenize='unicode61 remove_diacritics 1');
+    CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN SELECT 'memories_fts'; END;
+    CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN SELECT 'memories_fts'; END;
+    CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN SELECT 'memories_fts'; END;
   `);
   db.close();
 

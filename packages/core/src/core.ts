@@ -10,7 +10,7 @@
 
 import { createContext, runInNewContext } from 'node:vm';
 
-import { DB_PATH, openAttuneDb, openReadDb } from './db.ts';
+import { DB_PATH, openAttuneDb, openReadDb, probeAttuneMemoryLayer } from './db.ts';
 import { buildIndex, ensureReadableSchema } from './indexer.ts';
 import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import {
@@ -347,6 +347,11 @@ export async function executeAttune(scriptContent: string): Promise<unknown> {
       // to cap it first (each cycle costs ~250 ms timeout + growing backoff).
       { retryOnBeginBusy: true, budgetMs: 5000, retryDelayMs: 100, maxAttempts: 10 },
     );
+    // Verify the recall half of the memory layer (FTS + triggers) actually
+    // works before accepting mutations. The probe runs inside the same
+    // retryable transaction wrapper, so lock contention is waited out by the
+    // same budget instead of failing the open with a misleading error.
+    runMutation(() => probeAttuneMemoryLayer(db));
     return await runInSandbox(createAttuneApi(db, runMutation), scriptContent);
   } finally {
     db.close();

@@ -547,15 +547,19 @@ test('remember regenerates the id on a primary-key collision instead of overwrit
   writeFileSync(memoryPath, '# Memory\n');
 
   const inserted = [];
+  const attempted = [];
   let failFirstInsert = true;
   const fakeDb = {
     prepare(sql) {
       if (sql.startsWith('INSERT INTO memories')) {
         return {
           run: (...args) => {
+            attempted.push(args[0]);
             if (failFirstInsert) {
               failFirstInsert = false;
-              throw new Error('UNIQUE constraint failed: memories.id');
+              const error = new Error('UNIQUE constraint failed: memories.id');
+              error.errcode = 1555; // SQLITE_CONSTRAINT_PRIMARYKEY
+              throw error;
             }
             inserted.push(args);
           },
@@ -573,10 +577,14 @@ test('remember regenerates the id on a primary-key collision instead of overwrit
     summary: 'Decision: memory ids regenerate on collision instead of overwriting.',
   });
 
-  // The first id collided; the persisted row must carry a regenerated id,
+  // The first attempt collided; the persisted row must carry a REGENERATED
+  // id (a retry of the same id would satisfy inserted[0][0] === result.id),
   // and the existing row was never replaced (plain INSERT, not OR REPLACE).
+  assert.equal(attempted.length, 2);
+  assert.notEqual(attempted[0], attempted[1]);
   assert.equal(inserted.length, 1);
   assert.equal(inserted[0][0], result.id);
+  assert.equal(attempted[1], result.id);
   assert.match(result.id, /^mem-[0-9a-f-]{36}$/);
 });
 

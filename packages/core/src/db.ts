@@ -67,27 +67,35 @@ function openAttuneDb(): NodeSqliteDb {
   const columns = new Set(
     db.prepare('PRAGMA table_info(memories)').all().map((row) => String(row.name)),
   );
-  // The FTS table and its maintenance triggers are part of the memory layer:
-  // without them a write "succeeds" but the memory can never be recalled.
-  // Names alone are not enough — a plain table or a hollow trigger with the
-  // right name would fool a name check, so verify the definitions too.
-  const definitions = new Map(
-    db.prepare("SELECT name, sql FROM sqlite_master WHERE type IN ('table', 'trigger')")
-      .all().map((row) => [String(row.name), String(row.sql ?? '')]),
-  );
-  const ftsSql = definitions.get('memories_fts') ?? '';
-  const ftsOk = /create\s+virtual\s+table/i.test(ftsSql) && /fts5/i.test(ftsSql);
-  const triggersOk = ATTUNE_MEMORY_TRIGGERS.length > 0
-    && ATTUNE_MEMORY_TRIGGERS.every((trigger) => (definitions.get(trigger) ?? '').includes('memories_fts'));
-  const complete = ATTUNE_MEMORY_COLUMNS.length > 0
-    && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
-    && ftsOk
-    && triggersOk;
-  if (!complete) {
+  const columnsOk = ATTUNE_MEMORY_COLUMNS.length > 0
+    && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column));
+  if (!columnsOk) {
     db.close();
     throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
   }
   return db;
+}
+
+// The FTS table and its maintenance triggers are the recall half of the
+// memory layer: without them a write "succeeds" but can never be found.
+// Names and SQL text prove nothing — a trigger's own name contains
+// 'memories_fts', and a lookalike table can borrow the right DDL — so
+// validate to executability instead. Must run inside a write transaction
+// (executeAttune's retryable mutation wrapper): the probe writes and deletes
+// one row, so a committed probe is net-zero and a failed probe rolls back.
+function probeAttuneMemoryLayer(db: SqliteDb): void {
+  try {
+    db.prepare("INSERT INTO memories (id, path, summary, created_at) VALUES ('__attune_probe__', '/probe', 'attuneprobetoken marker', '1970-01-01T00:00:00Z')").run();
+    const visible = db.prepare("SELECT id FROM memories_fts WHERE memories_fts MATCH 'attuneprobetoken'").get();
+    db.prepare("DELETE FROM memories WHERE id='__attune_probe__'").run();
+    const gone = db.prepare("SELECT id FROM memories_fts WHERE memories_fts MATCH 'attuneprobetoken'").get();
+    if (!visible || gone) throw new Error('probe mismatch');
+  } catch {
+    // Lock errors cannot occur here: BEGIN IMMEDIATE already holds the write
+    // lock before this probe runs, so any failure is a broken layer, not
+    // contention. Report honestly and let the transaction roll back.
+    throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
+  }
 }
 
 function openWriterLeaseDb(lockPath: string): NodeSqliteDb {
@@ -99,4 +107,4 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, openDb, openReadDb, openAttuneDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, openDb, openReadDb, openAttuneDb, probeAttuneMemoryLayer, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
