@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Two reference shapes appear in transcripts and need different handling:
 //   A. Markdown links with an absolute path — `[roadmap.md](/Users/me/proj/roadmap.md:162)`
 //   B. Inline code holding a project-relative path — `` `src/hooks/hook.ts:40` ``

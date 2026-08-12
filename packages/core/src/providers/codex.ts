@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Codex provider adapter in Core (see docs/adr/0001).
 //
 // Pure: discovers Codex rollout files and parses one into a record stream. It

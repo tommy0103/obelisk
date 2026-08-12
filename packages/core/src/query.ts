@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Query and attune sandbox helpers for the Core package.
 import { statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';

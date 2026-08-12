@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Core's pure parse/discover helpers — node:sqlite-free by construction, so the compiled
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // End-to-end regression test for the workflow parent-link race: a workflow run
 // json can be indexed before its Workflow tool_result lands in the main
 // transcript. The workflow unit is then never re-parsed (its file no longer

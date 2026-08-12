@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Core's bounded retry policy above the transaction primitive. Callers opt in only for
 // idempotent work; an uncertain/live transaction is never retried. BEGIN contention is
 // not retried by default — builds defer it to their scheduler — but idempotent callers

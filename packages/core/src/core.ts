@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Obelisk Core package (see docs/adr/0003-core-typescript-esm-precompiled.md).
 //
 // The single shared implementation behind every transport. The CLI and later

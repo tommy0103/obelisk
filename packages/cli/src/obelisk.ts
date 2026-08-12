@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

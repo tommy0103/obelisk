@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5b-2b: verifies incremental (resume) indexing through the full rewired
 // buildIndex path (needsReindex → cursor → claude.parse → persist). A force
 // --build re-scans everything (skip=0) and never exercises resume, so this

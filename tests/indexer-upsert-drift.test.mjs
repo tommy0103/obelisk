@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Regression test for the message write semantics (formerly the indexJsonl
 // INSERT-OR-REPLACE vs ON-CONFLICT drift; now enforced through the shared
 // persist layer). Re-indexing a claude session must upsert messages (stable

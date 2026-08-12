@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5b-2a: unit-tests the shared persist layer in isolation (no buildIndex).
 // Feeds claude.parse output into persist against an in-memory node:sqlite db and
 // asserts rows + the drift-fixed session merge semantics.

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5c-2 golden test: pins the codex adapter's parse() record stream.
 // Binding-independent (no database). Covers the event_msg↔response_item dedup,
 // tool call/result, token patching, turn-duration, the 'total' session count,
