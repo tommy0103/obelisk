@@ -337,7 +337,16 @@ export async function executeAttune(scriptContent: string): Promise<unknown> {
   const db = openAttuneDb();
   try {
     const txDb = nodeSqliteTransactionAdapter(db);
-    const runMutation = <T>(work: () => T): T => runRetryableWriteTransaction(txDb, work, { label: 'attune' }, { retryOnBeginBusy: true });
+    const runMutation = <T>(work: () => T): T => runRetryableWriteTransaction(
+      txDb,
+      work,
+      { label: 'attune' },
+      // The connection's busy_timeout is short (250 ms, per ADR 0006), so a
+      // contended BEGIN fails fast and this layer owns the waiting: retry
+      // within a 5 s budget, BEGIN-busy included (the work never ran, so
+      // replay is safe).
+      { retryOnBeginBusy: true, budgetMs: 5000, retryDelayMs: 100 },
+    );
     return await runInSandbox(createAttuneApi(db, runMutation), scriptContent);
   } finally {
     db.close();

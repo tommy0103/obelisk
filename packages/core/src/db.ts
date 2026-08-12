@@ -58,14 +58,17 @@ function openAttuneDb(): NodeSqliteDb {
     throw new Error('Obelisk index is not initialized; run an index build (obelisk --build) before writing memories');
   }
   const db = new DatabaseSync(DB_PATH);
-  db.exec('PRAGMA busy_timeout=5000');
+  // Kept short on purpose: lock waiting is owned by the retry layer in
+  // executeAttune (ADR 0006 uses the same 250 ms for index-writer/CLI
+  // connections), so each BEGIN fails fast and retries within that budget.
+  db.exec('PRAGMA busy_timeout=250');
   const columns = new Set(
     db.prepare('PRAGMA table_info(memories)').all().map((row) => String(row.name)),
   );
   // The FTS table and its maintenance triggers are part of the memory layer:
   // without them a write "succeeds" but the memory can never be recalled.
   const objects = new Set(
-    db.prepare("SELECT name FROM sqlite_master WHERE name IN ('memories_fts', 'memories_fts_ai', 'memories_fts_ad', 'memories_fts_au')")
+    db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
       .all().map((row) => String(row.name)),
   );
   const complete = ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))

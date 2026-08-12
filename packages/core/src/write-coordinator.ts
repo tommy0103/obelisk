@@ -1,6 +1,7 @@
 // Core's bounded retry policy above the transaction primitive. Callers opt in only for
-// idempotent work; BEGIN contention and an uncertain/live transaction are never
-// retried here.
+// idempotent work; an uncertain/live transaction is never retried. BEGIN contention is
+// not retried by default — builds defer it to their scheduler — but idempotent callers
+// without a scheduler (e.g. attune) may opt in via retryOnBeginBusy.
 
 import { runWriteTransaction, type WriteTxDb, type WriteTxOptions } from './tx.ts';
 
