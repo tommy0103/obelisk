@@ -68,11 +68,14 @@ function openAttuneDb(): NodeSqliteDb {
   // executeAttune (ADR 0006 uses the same 250 ms for index-writer/CLI
   // connections), so each BEGIN fails fast and retries within that budget.
   db.exec('PRAGMA busy_timeout=250');
-  const columns = new Set(
-    db.prepare('PRAGMA table_info(memories)').all().map((row) => String(row.name)),
-  );
+  const info = db.prepare('PRAGMA table_info(memories)').all();
+  const columns = new Set(info.map((row) => String(row.name)));
+  // Column names alone are not enough: without `id` as PRIMARY KEY, remember
+  // ids lose uniqueness and forget() can update multiple rows at once.
+  const idRow = info.find((row) => row.name === 'id');
   const columnsOk = ATTUNE_MEMORY_COLUMNS.length > 0
-    && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column));
+    && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
+    && Number(idRow?.pk ?? 0) > 0;
   if (!columnsOk) {
     db.close();
     throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
@@ -85,10 +88,11 @@ function openAttuneDb(): NodeSqliteDb {
 // Names and SQL text prove nothing — a trigger's own name contains
 // 'memories_fts', and a lookalike table can borrow the right DDL — so
 // validate to executability instead. Must run inside a write transaction
-// (executeAttune's retryable mutation wrapper): the probe writes, updates,
-// and deletes one row, so a committed probe is net-zero and a failed probe
-// rolls back. Id and tokens are random per probe: fixed values could match a
-// legitimate memory and produce a false "incomplete layer" verdict.
+// (executeAttune's retryable mutation wrapper). The probe body is wrapped in
+// a SAVEPOINT that is always rolled back, so even a successful probe leaves
+// no persistent trace — not just no logical row, but no FTS5 shadow-table
+// churn either. Id and tokens are random per probe: fixed values could match
+// a legitimate memory and produce a false "incomplete layer" verdict.
 function probeAttuneMemoryLayer(db: SqliteDb): void {
   const layerError = new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
   const probeId = `__attune_probe_${randomUUID()}`;
@@ -97,6 +101,7 @@ function probeAttuneMemoryLayer(db: SqliteDb): void {
   // FTS MATCH on the random token, filtered by the probe id: pre-existing
   // memories can never interfere either way.
   const matches = (token: string) => db.prepare('SELECT id FROM memories_fts WHERE memories_fts MATCH ? AND id = ?').all(token, probeId).length;
+  db.exec('SAVEPOINT attune_probe');
   try {
     db.prepare('INSERT INTO memories (id, path, summary, created_at) VALUES (?, ?, ?, ?)').run(probeId, '/probe', `${insertToken} marker`, '1970-01-01T00:00:00Z');
     if (matches(insertToken) !== 1) throw layerError;
@@ -105,14 +110,18 @@ function probeAttuneMemoryLayer(db: SqliteDb): void {
     db.prepare('DELETE FROM memories WHERE id=?').run(probeId);
     if (matches(updateToken) !== 0) throw layerError;
   } catch (error) {
-    if (error === layerError) throw error;
     // Translate only the expected schema defects into the honest layer
     // error; real I/O failures (disk full, SQLITE_IOERR, corruption) must
     // surface as themselves.
-    if (error instanceof Error && /no such table|no such column|unable to use function MATCH/i.test(error.message)) {
-      throw layerError;
+    if (error !== layerError
+      && !(error instanceof Error && /no such table|no such column|unable to use function MATCH/i.test(error.message))) {
+      throw error;
     }
-    throw error;
+    throw layerError;
+  } finally {
+    // The probe never persists: roll its writes back whether it passed or
+    // failed. The surrounding transaction stays usable either way.
+    try { db.exec('ROLLBACK TO attune_probe'); db.exec('RELEASE attune_probe'); } catch { /* the outer transaction's rollback cleans up */ }
   }
 }
 
