@@ -342,10 +342,10 @@ export async function executeAttune(scriptContent: string): Promise<unknown> {
       work,
       { label: 'attune' },
       // The connection's busy_timeout is short (250 ms, per ADR 0006), so a
-      // contended BEGIN fails fast and this layer owns the waiting: retry
-      // within a 5 s budget, BEGIN-busy included (the work never ran, so
-      // replay is safe).
-      { retryOnBeginBusy: true, budgetMs: 5000, retryDelayMs: 100 },
+      // contended BEGIN fails fast and this layer owns the waiting. The 5 s
+      // budget is the real bound; maxAttempts just has to be large enough not
+      // to cap it first (each cycle costs ~250 ms timeout + growing backoff).
+      { retryOnBeginBusy: true, budgetMs: 5000, retryDelayMs: 100, maxAttempts: 10 },
     );
     return await runInSandbox(createAttuneApi(db, runMutation), scriptContent);
   } finally {

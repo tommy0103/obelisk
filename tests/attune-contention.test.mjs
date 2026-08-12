@@ -39,18 +39,28 @@ test('attune mutation succeeds through real lock contention via the retry budget
   writeFileSync(memoryPath, '# Contended memory\n');
 
   // A child process holds the write lock well past the 250 ms connection
-  // busy_timeout. It must be a separate process: the retry layer's backoff
-  // sleep blocks this thread's event loop, so an in-process timer could not
-  // fire between attempts.
+  // busy_timeout and across several retry attempts. It must be a separate
+  // process: the retry layer's backoff sleep blocks this thread's event loop,
+  // so an in-process timer could not fire between attempts. The child prints
+  // 'ready' only after BEGIN IMMEDIATE succeeds — without this handshake the
+  // test could pass with no contention at all (e.g. on a slow CI where the
+  // child has not acquired the lock yet).
   const holder = spawn(process.execPath, ['-e', `
     const { DatabaseSync } = require('node:sqlite');
     const db = new DatabaseSync(process.argv[1]);
     db.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE');
-    setTimeout(() => { db.exec('ROLLBACK'); db.close(); }, 800);
+    process.stdout.write('ready');
+    setTimeout(() => { db.exec('ROLLBACK'); db.close(); }, 1500);
   `, dbPath]);
   const holderExit = new Promise(resolve => holder.on('exit', resolve));
-  // Give the child a moment to acquire the lock before contending.
-  await new Promise(resolve => setTimeout(resolve, 150));
+  // Wait for the child to actually hold the lock before contending, and fail
+  // fast if it died before signalling (e.g. it never acquired the lock).
+  await new Promise((resolve, reject) => {
+    holder.stdout.once('data', chunk => {
+      if (chunk.toString().includes('ready')) resolve();
+    });
+    holder.once('exit', code => reject(new Error(`lock holder exited before ready (code ${code})`)));
+  });
 
   try {
     const result = await executeAttune(`

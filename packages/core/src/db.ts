@@ -43,15 +43,17 @@ function openReadDb(): NodeSqliteDb {
 // index builds never delete from — so attune is independent of daemon write
 // ownership and the writer lease (ADR 0006 amendment). It must still never
 // migrate or configure the index: it opens the existing database as-is and
-// fails honestly when the memory layer is not there yet.
-const ATTUNE_MEMORY_COLUMNS = [
-  'id', 'session_id', 'project', 'message_start', 'message_end',
-  'path', 'anchors', 'summary', 'created_at', 'deleted_at', 'deleted_reason',
-] as const;
+// fails honestly when the memory layer is not there yet. The expected layer
+// shape is derived from the shared schema.sql, not restated, so the two can
+// never drift apart.
+const ATTUNE_MEMORY_COLUMNS = Object.freeze(
+  (/CREATE TABLE IF NOT EXISTS memories \(([^;]+)\);/s.exec(SCHEMA)?.[1] ?? '')
+    .split(',').map(part => part.trim().split(/\s+/)[0]).filter(Boolean),
+);
 
-const ATTUNE_MEMORY_TRIGGERS = [
-  'memories_fts_ai', 'memories_fts_ad', 'memories_fts_au',
-] as const;
+const ATTUNE_MEMORY_TRIGGERS = Object.freeze(
+  [...SCHEMA.matchAll(/CREATE TRIGGER IF NOT EXISTS (memories_fts_\w+)/g)].map(match => match[1]),
+);
 
 function openAttuneDb(): NodeSqliteDb {
   if (!existsSync(DB_PATH)) {
@@ -71,7 +73,9 @@ function openAttuneDb(): NodeSqliteDb {
     db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
       .all().map((row) => String(row.name)),
   );
-  const complete = ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
+  const complete = ATTUNE_MEMORY_COLUMNS.length > 0
+    && ATTUNE_MEMORY_TRIGGERS.length > 0
+    && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
     && objects.has('memories_fts')
     && ATTUNE_MEMORY_TRIGGERS.every((trigger) => objects.has(trigger));
   if (!complete) {
