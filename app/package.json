@@ -1,6 +1,6 @@
 {
   "name": "obelisk",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Memory management for Obelisk — let Claude Code search its own memory",
   "homepage": "https://github.com/tommy0103/obelisk",
   "author": {
