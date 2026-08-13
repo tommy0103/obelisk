@@ -11,6 +11,8 @@ const props = defineProps({
   item: { type: Object, required: true },
   focused: Boolean,
   query: { type: String, default: '' },
+  showTools: { type: Boolean, default: true },
+  showThinking: { type: Boolean, default: true },
   disclosures: { type: Object, required: true },
   expandedMessageText: { type: Object, required: true },
   fullTextLoading: { type: Object, required: true },
@@ -193,7 +195,7 @@ function navigateToSubagent(agentId, description = '') {
         <span class="when">{{ msg.timestamp ? fmtClockTime(msg.timestamp) : '' }}</span>
       </div>
 
-      <div v-if="msg._thinking" class="msg-thinking" :class="{ open: disclosures.isOpen(`thinking:${msg.uuid}`) }" :data-view-key="`thinking:${msg.uuid}`">
+      <div v-if="showThinking && msg._thinking" class="msg-thinking" :class="{ open: disclosures.isOpen(`thinking:${msg.uuid}`) }" :data-view-key="`thinking:${msg.uuid}`">
         <button class="thinking-toggle" @click="toggleDisclosure(`thinking:${msg.uuid}`, msg.uuid)">
           <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
           <span class="thinking-label">Thinking</span>
@@ -210,11 +212,11 @@ function navigateToSubagent(agentId, description = '') {
           @click="loadFullText(msg.uuid)"
         >{{ fullTextLoading.has(msg.uuid) ? 'Loading full text…' : 'Message truncated — click to load full text' }}</button>
       </template>
-      <template v-else-if="!(msg.tool_calls && msg.tool_calls.length)">
+      <template v-else-if="!(showThinking && msg._thinking) && (!showTools || !(msg.tool_calls && msg.tool_calls.length))">
         <div class="msg-text empty-text">(no text content)</div>
       </template>
 
-      <div v-if="msg.tool_calls && msg.tool_calls.length" class="msg-tools">
+      <div v-if="showTools && msg.tool_calls && msg.tool_calls.length" class="msg-tools">
         <template v-for="tc in msg.tool_calls" :key="tc.id">
           <template v-if="tc.name === 'Skill'">
             <div class="skill-badge">

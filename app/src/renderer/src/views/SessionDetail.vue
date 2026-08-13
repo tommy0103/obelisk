@@ -15,6 +15,10 @@ import {
 import { clearSessionDirty, consumeGlobalSessionDirty, markSessionDirty } from '../session-live.mjs';
 import { applySnapshot } from '../session-timeline.mjs';
 import { reconcileTimelineItems } from '../session-timeline-items.mjs';
+import {
+  filterSessionTimelineItems,
+  normalizeSessionTimelineVisibility,
+} from '../session-timeline-filter.mjs';
 import { createSessionDisclosureState } from '../session-disclosures.mjs';
 import { createSessionLiveReloadCoordinator } from '../session-live-reload.mjs';
 import { createSessionUserScroll } from '../session-user-scroll.mjs';
@@ -40,6 +44,7 @@ const session = computed(() => (
   liveSessionMetadata.value || getSessionSummary(props.id)
 ));
 const messages = shallowRef([]);
+const allTimelineItems = shallowRef([]);
 const timelineItems = shallowRef([]);
 const loading = ref(false);
 const timelineReady = ref(false);
@@ -51,6 +56,24 @@ const pendingFocusUuid = ref(
 );
 const expandedMessageText = reactive(new Map());
 const fullTextLoading = reactive(new Set());
+const CONTENT_VISIBILITY_KEY = 'obelisk:session-content-visibility';
+const contentFilterOpen = ref(false);
+const contentFilterRef = ref(null);
+
+function loadTimelineVisibility() {
+  try {
+    return normalizeSessionTimelineVisibility(
+      JSON.parse(localStorage.getItem(CONTENT_VISIBILITY_KEY) || '{}'),
+    );
+  } catch {
+    return normalizeSessionTimelineVisibility();
+  }
+}
+
+const timelineVisibility = reactive(loadTimelineVisibility());
+const hiddenContentTypeCount = computed(() => (
+  Number(!timelineVisibility.tools) + Number(!timelineVisibility.thinking)
+));
 let removeSessionUpdated = null;
 let keydownAttached = false;
 let focusTimer = null;
@@ -88,6 +111,61 @@ const liveReloadCoordinator = createSessionLiveReloadCoordinator({
   load: loadLiveSnapshot,
   commit: commitLiveSnapshot,
 });
+
+function persistTimelineVisibility() {
+  localStorage.setItem(CONTENT_VISIBILITY_KEY, JSON.stringify({
+    tools: timelineVisibility.tools,
+    thinking: timelineVisibility.thinking,
+  }));
+}
+
+function refreshTimelineItems() {
+  timelineItems.value = filterSessionTimelineItems(
+    allTimelineItems.value,
+    timelineVisibility,
+  );
+}
+
+async function setTimelineContentVisible(type, visible) {
+  if (!(type in timelineVisibility) || timelineVisibility[type] === visible) return;
+  const readerPosition = timelineItems.value.length > 0
+    ? timelineViewport.captureReaderPosition()
+    : null;
+  timelineVisibility[type] = visible;
+  persistTimelineVisibility();
+  refreshTimelineItems();
+  await nextTick();
+  if (readerPosition && timelineItems.value.length > 0) {
+    await timelineViewport.restoreReaderPosition(readerPosition);
+  } else if (timelineItems.value.length === 0) {
+    wrapRef.value?.scrollTo({ top: 0, behavior: 'auto' });
+  }
+  updateScrollProgress();
+}
+
+function toggleTimelineContent(type) {
+  return setTimelineContentVisible(type, !timelineVisibility[type]);
+}
+
+async function showAllTimelineContent() {
+  const readerPosition = timelineItems.value.length > 0
+    ? timelineViewport.captureReaderPosition()
+    : null;
+  timelineVisibility.tools = true;
+  timelineVisibility.thinking = true;
+  persistTimelineVisibility();
+  refreshTimelineItems();
+  await nextTick();
+  if (readerPosition && timelineItems.value.length > 0) {
+    await timelineViewport.restoreReaderPosition(readerPosition);
+  }
+  updateScrollProgress();
+}
+
+function handleDocumentPointerDown(event) {
+  if (!contentFilterOpen.value || contentFilterRef.value?.contains(event.target)) return;
+  contentFilterOpen.value = false;
+}
 
 async function handleUserScrollEnd() {
   if (!active.value) return;
@@ -155,6 +233,10 @@ function adjustFont(delta) {
 }
 
 function handleZoom(e) {
+  if (e.key === 'Escape' && contentFilterOpen.value) {
+    contentFilterOpen.value = false;
+    return;
+  }
   if (!(e.metaKey || e.ctrlKey)) return;
   if (e.key === '=' || e.key === '+') {
     e.preventDefault();
@@ -190,6 +272,7 @@ onMounted(async () => {
   active.value = true;
   userScroll.attach(wrapRef.value);
   attachKeydown();
+  document.addEventListener('pointerdown', handleDocumentPointerDown);
   removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId } = {}) => {
     if (!active.value || !props.id || sessionId !== props.id) return;
     void liveReloadCoordinator.request();
@@ -213,6 +296,7 @@ onUnmounted(() => {
   active.value = false;
   loadRevision++;
   detachKeydown();
+  document.removeEventListener('pointerdown', handleDocumentPointerDown);
   if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
   scrollFrame = null;
   if (focusTimer !== null) clearTimeout(focusTimer);
@@ -346,12 +430,17 @@ async function commitSessionSnapshot(latest) {
       const addedMessages = reconciliation.messages.slice(
         reconciliation.messages.length - reconciliation.addedIds.length,
       );
-      timelineItems.value = [
-        ...timelineItems.value,
+      allTimelineItems.value = [
+        ...allTimelineItems.value,
         ...reconcileTimelineItems([], addedMessages),
       ];
+      refreshTimelineItems();
     } else {
-      timelineItems.value = reconcileTimelineItems(timelineItems.value, reconciliation.messages);
+      allTimelineItems.value = reconcileTimelineItems(
+        allTimelineItems.value,
+        reconciliation.messages,
+      );
+      refreshTimelineItems();
       const retainedMessageUuids = new Set(reconciliation.messages.map(message => message.uuid));
       disclosures.retainMessages(retainedMessageUuids);
       for (const uuid of reconciliation.updatedIds) expandedMessageText.delete(uuid);
@@ -531,6 +620,8 @@ function navigateToSubagent(agentId) {
               :item="timelineItems[virtualRow.index]"
               :focused="focusedItemKey === timelineItems[virtualRow.index].key"
               :query="state.query"
+              :show-tools="timelineVisibility.tools"
+              :show-thinking="timelineVisibility.thinking"
               :disclosures="disclosures"
               :expanded-message-text="expandedMessageText"
               :full-text-loading="fullTextLoading"
@@ -539,7 +630,87 @@ function navigateToSubagent(agentId) {
             />
           </div>
         </div>
+
+        <div
+          v-if="timelineReady && allTimelineItems.length > 0 && timelineItems.length === 0"
+          class="timeline-filter-empty"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 5h14M5.5 10h9M8 15h4"/>
+          </svg>
+          <strong>No content in this view</strong>
+          <span>Tool calls and thinking are both hidden.</span>
+          <button @click="showAllTimelineContent">Show all content</button>
+        </div>
       </template>
+    </div>
+
+    <div
+      v-if="session && !loading && timelineReady && allTimelineItems.length > 0"
+      ref="contentFilterRef"
+      class="session-view-filter"
+    >
+      <Transition name="view-filter-popover">
+        <div
+          v-if="contentFilterOpen"
+          id="session-view-filter-panel"
+          class="session-view-filter-panel"
+          role="group"
+          aria-label="Timeline content visibility"
+        >
+          <div class="session-view-filter-head">
+            <span>Show in timeline</span>
+            <button v-if="hiddenContentTypeCount" @click="showAllTimelineContent">Reset</button>
+          </div>
+          <button
+            class="session-view-filter-option"
+            :class="{ checked: timelineVisibility.tools }"
+            data-filter="tools"
+            role="switch"
+            :aria-checked="timelineVisibility.tools"
+            @click="toggleTimelineContent('tools')"
+          >
+            <span class="session-view-filter-check">
+              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 6l2.3 2.3L9.5 3.5"/></svg>
+            </span>
+            <span class="session-view-filter-copy">
+              <strong>Tool calls</strong>
+              <small>Commands, skills, and workflows</small>
+            </span>
+          </button>
+          <button
+            class="session-view-filter-option"
+            :class="{ checked: timelineVisibility.thinking }"
+            data-filter="thinking"
+            role="switch"
+            :aria-checked="timelineVisibility.thinking"
+            @click="toggleTimelineContent('thinking')"
+          >
+            <span class="session-view-filter-check">
+              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 6l2.3 2.3L9.5 3.5"/></svg>
+            </span>
+            <span class="session-view-filter-copy">
+              <strong>Thinking</strong>
+              <small>Reasoning and analysis blocks</small>
+            </span>
+          </button>
+        </div>
+      </Transition>
+
+      <button
+        class="session-view-filter-trigger"
+        :class="{ active: hiddenContentTypeCount > 0 }"
+        :aria-expanded="contentFilterOpen"
+        aria-controls="session-view-filter-panel"
+        :aria-label="hiddenContentTypeCount ? `Timeline view, ${hiddenContentTypeCount} content types hidden` : 'Timeline view'"
+        @click="contentFilterOpen = !contentFilterOpen"
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2.5 4h11M4.5 8h7M6.5 12h3"/>
+        </svg>
+        <span>View</span>
+        <span v-if="hiddenContentTypeCount" class="session-view-filter-count">{{ hiddenContentTypeCount }}</span>
+      </button>
     </div>
 
     <!-- Pagination nav -->
@@ -600,6 +771,200 @@ function navigateToSubagent(agentId) {
   left: 0;
   width: 100%;
 }
+.timeline-filter-empty {
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  text-align: center;
+}
+.timeline-filter-empty > svg {
+  width: 24px;
+  height: 24px;
+  margin-bottom: 4px;
+  color: var(--muted-2);
+}
+.timeline-filter-empty strong {
+  color: var(--fg-2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.timeline-filter-empty span {
+  font-size: 12px;
+}
+.timeline-filter-empty button {
+  margin-top: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 5px;
+  color: var(--accent-2);
+  background: var(--surface);
+  font-size: 11px;
+  transition: background 0.12s, border-color 0.12s, transform 0.12s;
+}
+.timeline-filter-empty button:hover {
+  border-color: rgba(167, 139, 250, 0.35);
+  background: var(--accent-soft);
+}
+.timeline-filter-empty button:active {
+  transform: scale(0.98);
+}
+.session-view-filter {
+  position: fixed;
+  right: 18px;
+  bottom: 16px;
+  z-index: 11;
+}
+.session-view-filter-trigger {
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 11px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(10, 11, 20, 0.88);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  transition: color 0.12s, background 0.12s, border-color 0.12s, transform 0.12s;
+}
+.session-view-filter-trigger:hover,
+.session-view-filter-trigger[aria-expanded="true"] {
+  color: var(--fg-2);
+  background: rgba(17, 19, 31, 0.94);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.session-view-filter-trigger.active {
+  color: var(--accent-2);
+  border-color: rgba(167, 139, 250, 0.28);
+  background: rgba(25, 22, 43, 0.92);
+}
+.session-view-filter-trigger:active {
+  transform: scale(0.98);
+}
+.session-view-filter-trigger > svg {
+  width: 14px;
+  height: 14px;
+}
+.session-view-filter-count {
+  min-width: 16px;
+  height: 16px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--accent-2);
+  background: var(--accent-soft);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.session-view-filter-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: 228px;
+  padding: 6px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 9px;
+  background: rgba(17, 19, 31, 0.97);
+  box-shadow: 0 16px 42px rgba(5, 6, 12, 0.56), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+.session-view-filter-head {
+  height: 29px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.session-view-filter-head button {
+  color: var(--accent-2);
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.session-view-filter-head button:hover {
+  color: var(--fg);
+}
+.session-view-filter-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border-radius: 6px;
+  text-align: left;
+  transition: background 0.1s, transform 0.1s;
+}
+.session-view-filter-option:hover {
+  background: var(--surface-strong);
+}
+.session-view-filter-option:active {
+  transform: scale(0.985);
+}
+.session-view-filter-check {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--muted-2);
+  border-radius: 4px;
+  color: var(--bg);
+  transition: background 0.12s, border-color 0.12s;
+}
+.session-view-filter-check svg {
+  width: 10px;
+  height: 10px;
+  opacity: 0;
+}
+.session-view-filter-option.checked .session-view-filter-check {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.session-view-filter-option.checked .session-view-filter-check svg {
+  opacity: 1;
+}
+.session-view-filter-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.session-view-filter-copy strong {
+  color: var(--fg-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+.session-view-filter-option.checked .session-view-filter-copy strong {
+  color: var(--fg);
+}
+.session-view-filter-copy small {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+.view-filter-popover-enter-active,
+.view-filter-popover-leave-active {
+  transition: opacity 0.14s, transform 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.view-filter-popover-enter-from,
+.view-filter-popover-leave-to {
+  opacity: 0;
+  transform: translateY(5px) scale(0.98);
+}
 .font-toast {
   position: fixed;
   bottom: 48px;
@@ -620,4 +985,34 @@ function navigateToSubagent(agentId) {
 .toast-leave-active { transition: opacity 0.6s, transform 0.6s; }
 .toast-enter-from { opacity: 0; transform: translateX(-50%) translateY(8px); }
 .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(-4px); }
+
+@media (max-width: 760px) {
+  .session-view-filter {
+    right: 10px;
+    bottom: 10px;
+  }
+  .session-view-filter-trigger {
+    width: 40px;
+    padding: 0;
+    justify-content: center;
+  }
+  .session-view-filter-trigger > span:not(.session-view-filter-count) {
+    display: none;
+  }
+  .session-view-filter-count {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-view-filter-trigger,
+  .session-view-filter-option,
+  .timeline-filter-empty button,
+  .view-filter-popover-enter-active,
+  .view-filter-popover-leave-active {
+    transition: none;
+  }
+}
 </style>

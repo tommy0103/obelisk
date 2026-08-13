@@ -65,6 +65,9 @@ const fixtures = {
   },
 };
 fixtures[sessionA].messages[2].text = `Truncated preview ${'indexed content '.repeat(700)}`;
+fixtures[sessionA].messages[3].type = 'assistant';
+fixtures[sessionA].messages[3].content_type = 'thinking';
+fixtures[sessionA].messages[3].text = 'Standalone reasoning block';
 
 function summary(sessionId) {
   const fixture = fixtures[sessionId];
@@ -179,6 +182,10 @@ async function run() {
 
   await win.loadFile(join(appRoot, 'out', 'renderer', 'index.html'), { hash: '/sessions' });
   await waitFor(win.webContents, `document.body.textContent.includes('Reader state A')`, 'session list');
+  await win.webContents.executeJavaScript(
+    `localStorage.removeItem('obelisk:session-content-visibility')`,
+    true,
+  );
 
   await navigate(win, sessionA);
   await win.webContents.executeJavaScript(
@@ -325,6 +332,73 @@ async function run() {
     afterInterruptedRestore.anchorUuid === sameSessionFocus.anchorUuid
       && Math.abs(afterInterruptedRestore.anchorOffset - sameSessionFocus.anchorOffset) <= 2,
     `leaving during restore does not overwrite the cached reader anchor (${JSON.stringify({ sameSessionFocus, afterInterruptedRestore })})`,
+  );
+
+  await win.webContents.executeJavaScript(`document.querySelector('button[title="First"]')?.click()`, true);
+  await delay(350);
+  await win.webContents.executeJavaScript(
+    `document.querySelector('.session-view-filter-trigger')?.click()`,
+    true,
+  );
+  await waitFor(
+    win.webContents,
+    `document.querySelector('.session-view-filter-panel')`,
+    'session content filter panel',
+  );
+  await win.webContents.executeJavaScript(
+    `document.querySelector('.session-view-filter-option[data-filter="tools"]')?.click()`,
+    true,
+  );
+  await waitFor(
+    win.webContents,
+    `document.querySelector('.session-view-filter-option[data-filter="tools"]')?.getAttribute('aria-checked') === 'false'`,
+    'tool content hidden',
+  );
+  const toolContentHidden = await win.webContents.executeJavaScript(
+    `!document.querySelector('[data-view-key="tool:a-tool-call"]')`,
+    true,
+  );
+  assert(toolContentHidden, 'tool calls can be removed from mixed message rows');
+
+  await win.webContents.executeJavaScript(
+    `document.querySelector('.session-view-filter-option[data-filter="thinking"]')?.click()`,
+    true,
+  );
+  await waitFor(
+    win.webContents,
+    `document.querySelector('.flap-number')?.getAttribute('aria-label') === '${fixtures[sessionA].messages.length - 1}'`,
+    'thinking root removed from timeline navigation',
+  );
+  const compactView = await win.webContents.executeJavaScript(`(() => ({
+    thinkingVisible: Boolean(document.querySelector('[data-uuid="a-message-3"]')),
+    hiddenCount: document.querySelector('.session-view-filter-count')?.textContent,
+    persisted: JSON.parse(localStorage.getItem('obelisk:session-content-visibility')),
+  }))()`, true);
+  assert(
+    !compactView.thinkingVisible
+      && compactView.hiddenCount === '2'
+      && compactView.persisted.tools === false
+      && compactView.persisted.thinking === false,
+    `compact timeline view hides both extra types and persists the choice (${JSON.stringify(compactView)})`,
+  );
+
+  await win.webContents.executeJavaScript(
+    `document.querySelector('.session-view-filter-head button')?.click()`,
+    true,
+  );
+  await waitFor(
+    win.webContents,
+    `document.querySelector('.flap-number')?.getAttribute('aria-label') === '${fixtures[sessionA].messages.length}'`,
+    'timeline content filter reset',
+  );
+  const filterReset = await win.webContents.executeJavaScript(`(() => ({
+    allOptionsChecked: [...document.querySelectorAll('.session-view-filter-option')]
+      .every(option => option.getAttribute('aria-checked') === 'true'),
+    hiddenCountRemoved: !document.querySelector('.session-view-filter-count'),
+  }))()`, true);
+  assert(
+    filterReset.allOptionsChecked && filterReset.hiddenCountRemoved,
+    `timeline content filter restores the complete reader view (${JSON.stringify(filterReset)})`,
   );
 
   win.destroy();
