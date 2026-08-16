@@ -372,6 +372,59 @@ test('runtime indexes Codex root sessions into the shared query helpers', () => 
   assert.ok(payload.overviewSources.some(s => s.source === 'codex' && s.session_count === 1));
 });
 
+test('runtime indexes Codex archived sessions into the shared query helpers', () => {
+  const home = tempHome();
+  const archiveDir = join(home, '.codex', 'archived_sessions');
+  mkdirSync(archiveDir, { recursive: true });
+
+  const codexId = '019ec6ee-cebd-7431-9c93-ceec89a98a5e';
+  writeFileSync(join(archiveDir, `rollout-2026-06-15T00-19-59-${codexId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-06-14T16:19:59.842Z',
+      type: 'session_meta',
+      payload: {
+        id: codexId,
+        timestamp: '2026-06-14T16:19:59.842Z',
+        cwd: '/tmp/obelisk-archive-runtime',
+        source: 'cli',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-14T16:20:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'archived runtime indexing sentinel' },
+    }),
+    '',
+  ].join('\n'));
+
+  const scriptPath = join(home, 'query.mjs');
+  writeFileSync(scriptPath, `
+    const sid = ${JSON.stringify(`codex:${codexId}`)};
+    return {
+      session: sessions({ source: 'codex', limit: 5 })
+        .filter(session => session.id === sid)
+        .map(({ id, project, project_path, message_count, source }) => ({ id, project, project_path, message_count, source }))[0],
+      message: thread(sid)[0]?.text,
+      rawHasMessage: raw(${JSON.stringify(`codex:${codexId}:000002`)}, { limit: 1000 })?.text.includes('archived runtime indexing sentinel') || false,
+    };
+  `);
+
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    session: {
+      id: `codex:${codexId}`,
+      project: '-tmp-obelisk-archive-runtime',
+      project_path: normalize('/tmp/obelisk-archive-runtime'),
+      message_count: 1,
+      source: 'codex',
+    },
+    message: 'archived runtime indexing sentinel',
+    rawHasMessage: true,
+  });
+});
+
 test('runtime raw lookup uses the configured Codex root for child sessions', () => {
   const home = tempHome();
   const codexDir = join(home, 'custom-codex');

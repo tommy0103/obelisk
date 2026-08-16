@@ -77,6 +77,7 @@ test('built-in provider registry exposes every source without caller-side branch
     '/sources/claude/projects',
     '/sources/claude/history.jsonl',
     '/sources/codex/sessions',
+    '/sources/codex/archived_sessions',
     '/sources/codex/session_index.jsonl',
     '/sources/kimi/sessions',
     '/sources/kimi/session_index.jsonl',
