@@ -60,7 +60,7 @@ interface ProjectedSession {
 }
 
 const SOURCE = 'kimi';
-export const KIMI_CANONICAL_TRANSCRIPT_MARKER = '__kimi_canonical_transcript_v4__';
+export const KIMI_CANONICAL_TRANSCRIPT_MARKER = '__kimi_canonical_transcript_v5__';
 
 function defaultKimiRoot(): string {
   return process.env['KIMI_CODE_HOME'] ?? join(homedir(), '.kimi-code');
@@ -301,7 +301,6 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
       let removedUserCount = 0;
       for (let index = messages.length - 1; index >= undoFloor; index--) {
         const message = messages[index]!;
-        if (injectionMessageUuids.has(message.uuid)) continue;
         messages.splice(index, 1);
         removedMessageUuids.add(message.uuid);
         injectionMessageUuids.delete(message.uuid);

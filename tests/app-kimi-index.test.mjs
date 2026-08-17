@@ -270,7 +270,7 @@ test('Kimi canonical transcript marker replays unchanged sessions once', () => {
   buildIndex(options);
   let db = new TestDatabase(dbPath);
   const marker = createKimiProvider({ rootDir: kimiDir }).indexVersionMarker;
-  assert.equal(marker, '__kimi_canonical_transcript_v4__');
+  assert.equal(marker, '__kimi_canonical_transcript_v5__');
   db.prepare("UPDATE messages SET text='stale expanded instructions', is_meta=1 WHERE source='kimi'").run();
   db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(marker);
   db.close();

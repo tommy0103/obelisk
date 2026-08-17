@@ -194,7 +194,7 @@ test('kimi provider normalizes think parts and drops empty thinking placeholders
   }).messageText, 'private reasoning');
 });
 
-test('kimi provider replays clear and undo markers with Kimi transcript semantics', () => {
+test('kimi provider removes injection messages inside an undone range', () => {
   const root = makeTempDir('obelisk-kimi-undo-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-undo-1');
   const mainDir = join(sessionDir, 'agents', 'main');
@@ -221,9 +221,9 @@ test('kimi provider replays clear and undo markers with Kimi transcript semantic
   const { values } = drain(provider.parse(unit, null));
   assert.deepEqual(
     values.filter(record => record.kind === 'message').map(record => record.text),
-    ['before clear', 'kept answer', 'persistent injection'],
+    ['before clear', 'kept answer'],
   );
-  assert.equal(values.find(record => record.kind === 'session').message_count, 3);
+  assert.equal(values.find(record => record.kind === 'session').message_count, 2);
 });
 
 test('kimi provider scopes changed-path discovery to one session and bypasses an unchanged cursor', () => {
