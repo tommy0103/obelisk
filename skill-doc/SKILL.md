@@ -47,6 +47,11 @@ Custom query:
    qfile=$(mktemp /tmp/obq.XXXXXX 2>/dev/null || echo "/tmp/obq.$$.$RANDOM.mjs")
    ```
 
+   Keep the `mktemp` template ending on `XXXXXX`. BSD `mktemp` treats only a
+   trailing `X` run as the unique part, so `/tmp/obq.XXXXXX.mjs` is one colliding
+   path and the next call fails with `File exists` before Obelisk runs. The
+   fallback already carries `.mjs`.
+
 2. Run:
 
    ```bash
