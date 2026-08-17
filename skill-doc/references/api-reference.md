@@ -23,8 +23,8 @@ session appears in results. The CLI carries an invocation nonce to identify it:
   search text.
 - `obelisk --query <file>` — the nonce is the query file path as typed, so use
   unique temp names such as
-  `$(mktemp /tmp/obq.XXXXXX 2>/dev/null || echo "/tmp/obq.$$.$RANDOM.mjs")`
-  (note: `mktemp` templates must end in the `X` run, so no `.mjs` suffix).
+  `qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; }) && qfile="$qdir/query.mjs"`
+  (a unique directory per query; the `mktemp` template always ends in the `X` run).
 
 Resolution is newest-wins within a ~15-minute recency window (both the
 message-text and tool-call legs are bounded to it, which keeps weeks-old

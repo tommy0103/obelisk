@@ -44,13 +44,12 @@ Custom query:
    your invocation nonce:
 
    ```bash
-   qfile=$(mktemp /tmp/obq.XXXXXX 2>/dev/null || echo "/tmp/obq.$$.$RANDOM.mjs")
+   qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; })
+   qfile="$qdir/query.mjs"
    ```
 
-   Keep the `mktemp` template ending on `XXXXXX`. BSD `mktemp` treats only a
-   trailing `X` run as the unique part, so `/tmp/obq.XXXXXX.mjs` is one colliding
-   path and the next call fails with `File exists` before Obelisk runs. The
-   fallback already carries `.mjs`.
+   The `.mjs` name lives inside the unique directory, so the `mktemp`
+   template always ends on the `X` run (BSD `mktemp` requires that).
 
 2. Run:
 
