@@ -230,7 +230,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex' | 'kimi' | 'pi', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'kimi' | 'pi' | 'deepseek', session_count, last_session_at }]
   }
 }
 ```

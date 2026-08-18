@@ -421,6 +421,10 @@ test('cli polls fresh snapshots until a concurrent writer indexes the nonce', as
 // the real ~/.obelisk. Same pattern as tests/pi-runtime.test.mjs.
 function runCoreScript(home, script, env = {}) {
   const coreUrl = pathToFileURL(join(repoRoot, 'packages/core/src/core.ts')).href;
+  // The deepseek provider prefers $DSH_HOME over ~/.dsh; a harness shell that
+  // exports DSH_HOME would point the build at the real session store.
+  const childEnv = { ...process.env, HOME: home, USERPROFILE: home, OBELISK_CORE_URL: coreUrl, ...env };
+  delete childEnv.DSH_HOME;
   const run = spawnSync(process.execPath, [
     '--experimental-strip-types',
     '--disable-warning=ExperimentalWarning',
@@ -429,7 +433,7 @@ function runCoreScript(home, script, env = {}) {
     script,
   ], {
     cwd: repoRoot,
-    env: { ...process.env, HOME: home, USERPROFILE: home, OBELISK_CORE_URL: coreUrl, ...env },
+    env: childEnv,
     encoding: 'utf8',
   });
   assert.equal(run.status, 0, run.stderr);

@@ -14,7 +14,7 @@ exist.
 
 ## Source Model
 
-Obelisk stores Claude Code, Codex, Kimi Code, and Pi transcripts in the same
+Obelisk stores Claude Code, Codex, Kimi Code, Pi, and DeepSeek Harness transcripts in the same
 schema.
 
 - Claude rows use `source='claude'`.
@@ -64,7 +64,7 @@ One row per root session.
 | `version` | Provider CLI/app version |
 | `message_count` | Visible canonical messages; inactive and hidden records are excluded |
 | `jsonl_path` | Source JSONL path |
-| `source` | Provider ID: `claude`, `codex`, `kimi`, or `pi` |
+| `source` | Provider ID: `claude`, `codex`, `kimi`, `pi`, or `deepseek` |
 
 ### `messages`
 
@@ -88,7 +88,7 @@ Core evidence table.
 | `cwd` | Working directory at message time |
 | `skill` | Skill that generated the response, if known |
 | `turn_duration_ms` | Wall-clock duration for the turn |
-| `source` | Provider ID: `claude`, `codex`, `kimi`, or `pi` |
+| `source` | Provider ID: `claude`, `codex`, `kimi`, `pi`, or `deepseek` |
 
 `content_type='tool_use'` is only a marker. Tool-call details live in
 `tool_calls`. `content_type='tool_result'` marks provider-emitted tool-result
