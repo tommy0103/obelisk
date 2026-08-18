@@ -226,6 +226,35 @@ test('kimi provider removes injection messages inside an undone range', () => {
   assert.equal(values.find(record => record.kind === 'session').message_count, 2);
 });
 
+test('kimi provider removes a prompt-owned injection that precedes an undone prompt', () => {
+  const root = makeTempDir('obelisk-kimi-undo-injection-');
+  const sessionDir = join(root, 'sessions', 'workspace-1', 'session-undo-injection-1');
+  const mainDir = join(sessionDir, 'agents', 'main');
+  mkdirSync(mainDir, { recursive: true });
+  writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({
+    workDir: '/tmp/kimi-undo-injection',
+    agents: { main: { type: 'main' } },
+  }));
+  const records = [
+    { type: 'metadata', protocol_version: '1.5', created_at: 1753005600000 },
+    { type: 'context.append_message', time: 1, message: { role: 'user', id: 'p1', content: 'kept prompt', toolCalls: [], origin: { kind: 'user' } } },
+    { type: 'context.append_loop_event', time: 2, event: { type: 'content.part', uuid: 'kept-answer', stepUuid: 's1', part: { type: 'text', text: 'kept answer' } } },
+    { type: 'context.append_message', time: 3, message: { role: 'user', id: 'inj-1', content: 'compressed image context', toolCalls: [], origin: { kind: 'injection', ownerPromptId: 'X', variant: 'image_compression' } } },
+    { type: 'context.append_message', time: 4, message: { role: 'user', id: 'X', content: 'undone prompt', toolCalls: [], origin: { kind: 'user' } } },
+    { type: 'context.undo', time: 5, count: 1 },
+  ];
+  writeFileSync(join(mainDir, 'wire.jsonl'), records.map(record => JSON.stringify(record)).join('\n') + '\n');
+  const provider = createKimiProvider({ rootDir: root });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+
+  const { values } = drain(provider.parse(unit, null));
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message').map(record => record.text),
+    ['kept prompt', 'kept answer'],
+  );
+  assert.equal(values.find(record => record.kind === 'session').message_count, 2);
+});
+
 test('kimi provider scopes changed-path discovery to one session and bypasses an unchanged cursor', () => {
   const root = makeTempDir('obelisk-kimi-changed-path-');
   const firstDir = join(root, 'sessions', 'workspace-1', 'session-1');
