@@ -285,8 +285,8 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
     const stepStarts = new Map<string, number>();
     const stepMessages = new Map<string, MessageRecord[]>();
     const callMessageUuids = new Map<string, string>();
-    const injectionOwnerPromptIds = new Map<string, unknown>();
-    const realUserPromptIds = new Map<string, unknown>();
+    const injectionOwnerPromptIds = new Map<string, string | undefined>();
+    const realUserPromptIds = new Map<string, string | undefined>();
     let undoFloor = wireMessageStart;
 
     const resetOpenState = (): void => {
@@ -299,13 +299,13 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
       if (count <= 0) return;
       const removedMessageUuids = new Set<string>();
       let removedUserCount = 0;
-      let anchorPromptId: unknown;
+      let anchorPromptId: string | undefined;
       for (let index = messages.length - 1; index >= undoFloor; index--) {
         const message = messages[index]!;
         // Once the requested prompts are gone, keep walking back only through the
         // injections that this last-removed prompt owns and that precede it.
         if (removedUserCount >= count) {
-          if (typeof anchorPromptId !== 'string'
+          if (anchorPromptId === undefined
             || injectionOwnerPromptIds.get(message.uuid) !== anchorPromptId) break;
         }
         messages.splice(index, 1);
