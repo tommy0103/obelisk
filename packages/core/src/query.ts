@@ -143,6 +143,61 @@ function buildSafeFtsQuery(text: unknown): string {
     .join(' ');
 }
 
+function queryTokens(text: unknown): string[] {
+  return String(text || '').match(/[\p{Letter}\p{Number}]+/gu) || [];
+}
+
+const FTS5_OPERATOR_TOKENS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
+
+// A plain query is tokens and whitespace only — no phrases, parens, column
+// filters, or prefix stars — and none of its tokens is an FTS5 operator.
+// Anything else is honored as raw FTS5 syntax and left untouched.
+function isPlainQuery(text: unknown): boolean {
+  if (/[^\p{Letter}\p{Number}\s]/u.test(String(text || ''))) return false;
+  return !queryTokens(text).some((token) => FTS5_OPERATOR_TOKENS.has(token));
+}
+
+// The trigram tokenizer emits no tokens for terms shorter than three code
+// points. A lone short term can then only match nothing, and a short term
+// next to longer ones becomes an empty phrase that constrains nothing — the
+// query silently returns rows that do not contain the term at all. The guard
+// below only engages when messages_fts is actually built with trigram, which
+// is read from the live schema rather than configuration so it stays correct
+// across tokenizer migrations.
+function isTrigramMessagesFts(db: SqliteDb): boolean {
+  try {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'").get();
+    return /tokenize\s*=\s*['"]*trigram/i.test(String(row?.sql ?? ''));
+  } catch {
+    return false;
+  }
+}
+
+const SNIPPET_BEFORE = 60;
+const SNIPPET_AFTER = 100;
+
+// Hit-centered snippet: the head of a long message often does not contain the
+// match at all, so slice a window around the earliest term occurrence instead
+// of truncating from the front. Returns null when no term appears literally
+// (e.g. raw FTS5 syntax queries), in which case the caller has message.text.
+function makeSnippet(rawText: unknown, terms: string[]): string | null {
+  const text = String(rawText ?? '');
+  if (!text || terms.length === 0) return null;
+  const hay = text.toLowerCase();
+  let hit = -1;
+  for (const term of terms) {
+    const idx = hay.indexOf(term.toLowerCase());
+    if (idx !== -1 && (hit === -1 || idx < hit)) hit = idx;
+  }
+  if (hit === -1) return null;
+  let start = Math.max(0, hit - SNIPPET_BEFORE);
+  let end = Math.min(text.length, hit + SNIPPET_AFTER);
+  // Never split a surrogate pair at a window edge.
+  if (start > 0 && (text.charCodeAt(start) & 0xFC00) === 0xDC00) start--;
+  if (end < text.length && (text.charCodeAt(end) & 0xFC00) === 0xDC00) end++;
+  return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
+}
+
 function createQueryApi(
   db: SqliteDb,
   {
@@ -174,35 +229,89 @@ function createQueryApi(
       includeMeta = false,
       includeInactive = false,
     } = opts;
-    let where = 'WHERE mf.text MATCH ?';
+    // Filters reference m./s. (not mf.) so the same clause serves both the
+    // MATCH statement and the LIKE fallback scan; the join makes them equal.
+    let filterWhere = '';
     const filterParams: any[] = [];
-    if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
-    if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
-    if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
-    if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
-    if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
-    if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
-    if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
-    where += ` AND ${visibilitySql('m', includeInactive)}`;
-    const stmt = db.prepare(`
+    if (sessionId) { filterWhere += ' AND m.session_id=?'; filterParams.push(sessionId); }
+    if (project)   { filterWhere += ' AND s.project LIKE ?'; filterParams.push(project); }
+    if (after)     { filterWhere += ' AND m.timestamp>?';    filterParams.push(after); }
+    if (before)    { filterWhere += ' AND m.timestamp<?';    filterParams.push(before); }
+    if (cwd)       { filterWhere += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
+    if (source && source !== 'all') { filterWhere += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
+    if (!includeMeta) filterWhere += ' AND COALESCE(m.is_meta,0)=0';
+    filterWhere += ` AND ${visibilitySql('m', includeInactive)}`;
+    const selectCols = `
       SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
              COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
-             s.source as s_source,
+             s.source as s_source`;
+    const stmt = db.prepare(`${selectCols},
              rank
       FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
-      ${where} ORDER BY rank LIMIT ?`);
-    const runMatch = (matchText: string): DbRow[] => stmt.all(matchText, ...filterParams, limit);
-    // Honor raw FTS5 syntax when the query is valid, but never crash on ordinary
-    // input (hyphens, punctuation) that FTS5 would parse as operators: fall back
-    // to safe per-token quoting, the same tokenization memories() uses.
-    let rows;
-    try {
-      rows = runMatch(text);
-    } catch {
-      const safe = buildSafeFtsQuery(text);
-      rows = safe ? runMatch(safe) : [];
+      WHERE mf.text MATCH ?${filterWhere} ORDER BY rank LIMIT ?`);
+    const runMatch = (matchText: string, rowLimit: number = limit): DbRow[] =>
+      stmt.all(matchText, ...filterParams, rowLimit);
+
+    // Terms below the trigram minimum cannot go through MATCH; scan the
+    // content table instead. Tokens are alphanumeric-only, so no LIKE escaping
+    // is needed. rank is NULL — recency stands in for relevance here.
+    const runLikeScan = (terms: string[]): DbRow[] => {
+      const likeWhere = terms.map(() => 'm.text LIKE ?').join(' AND ');
+      const likeStmt = db.prepare(`${selectCols},
+             NULL as rank
+      FROM messages m LEFT JOIN sessions s ON s.id=m.session_id
+      WHERE ${likeWhere}${filterWhere} ORDER BY m.timestamp DESC LIMIT ?`);
+      return likeStmt.all(...terms.map((t) => `%${t}%`), ...filterParams, limit);
+    };
+
+    // Under trigram, terms shorter than three code points silently constrain
+    // nothing (false positives next to longer terms, zero hits alone). Split
+    // the tokens: MATCH the indexable ones, then require the short ones as
+    // literal substrings; with nothing indexable, fall back to a LIKE scan.
+    const runTokensGuarded = (tokens: string[]): { rows: DbRow[]; degraded: string | null } => {
+      const unique = [...new Set(tokens)];
+      const short = unique.filter((token) => [...token].length < 3);
+      const long = unique.filter((token) => [...token].length >= 3);
+      const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
+      if (short.length === 0) return { rows: matchText ? runMatch(matchText) : [], degraded: null };
+      if (long.length === 0) return { rows: runLikeScan(short), degraded: 'like-scan' };
+      // Overselect to leave the post-filter room, bounded so a broad first
+      // term cannot turn the guard into a full-table crawl.
+      const scanLimit = Math.min(limit * 5, limit + 200);
+      const needles = short.map((token) => token.toLowerCase());
+      const rows = runMatch(matchText, scanLimit)
+        .filter((r: DbRow) => {
+          const hay = String(r.text ?? '').toLowerCase();
+          return needles.every((needle) => hay.includes(needle));
+        })
+        .slice(0, limit);
+      return { rows, degraded: 'short-token-post-filter' };
+    };
+
+    const trigram = isTrigramMessagesFts(db);
+    let rows: DbRow[];
+    let degraded: string | null = null;
+    if (trigram && isPlainQuery(text)) {
+      ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
+    } else {
+      // Honor raw FTS5 syntax when the query is valid, but never crash on
+      // ordinary input (hyphens, punctuation) that FTS5 would parse as
+      // operators: fall back to safe per-token quoting — routed through the
+      // same short-token guard under trigram, since the extracted tokens can
+      // be short too ('gen-itgc ok').
+      try {
+        rows = runMatch(text);
+      } catch {
+        if (trigram) {
+          ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
+        } else {
+          const safe = buildSafeFtsQuery(text);
+          rows = safe ? runMatch(safe) : [];
+        }
+      }
     }
+    const snippetTerms = queryTokens(text);
     return rows.map((r: DbRow) => {
       const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
       const ctx = db.prepare(
@@ -222,7 +331,7 @@ function createQueryApi(
       // is_invoking marks the session that ran this query; it is the agent's
       // own live context, not independent historical evidence.
       if (invokingSessionId && r.s_id === invokingSessionId) session.is_invoking = true;
-      return {
+      const result: DbRow = {
         message: {
           uuid: r.uuid,
           text: r.text,
@@ -239,6 +348,10 @@ function createQueryApi(
         rank: r.rank,
         context: ctx,
       };
+      const snippet = makeSnippet(r.text, snippetTerms);
+      if (snippet !== null) result.snippet = snippet;
+      if (degraded) result.degraded = degraded;
+      return result;
     });
   };
 
