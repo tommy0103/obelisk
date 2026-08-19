@@ -4,7 +4,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import chokidarModule from 'chokidar';
 
 const DEFAULT_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const DEFAULT_DEBOUNCE_MS = 2000;
@@ -54,7 +53,8 @@ interface IndexerServiceOptions {
   buildIndex?: IndexerBuild;
   writeHeartbeat?: () => unknown;
   watchProjects?: (onChange: (changedPath?: string) => void) => Watcher | null;
-  chokidar?: any;
+  /** Injection point for the default watcher's fs.watch (tests). */
+  watchFs?: typeof fs.watch;
   timers?: Timers;
   logger?: { warn?: (msg: string) => void };
 }
@@ -70,7 +70,7 @@ function createIndexerService({
   buildIndex,
   writeHeartbeat = () => {},
   watchProjects,
-  chokidar,
+  watchFs = fs.watch,
   timers = {
     setTimeout,
     clearTimeout,
@@ -87,32 +87,36 @@ function createIndexerService({
     const watchedRoots = new Set<string>();
     const addRoot = (root: string) => {
       if (watchedRoots.has(root) || !fs.existsSync(root)) return false;
-      const onFileChange = (filename) => {
-        const name = filename ? String(filename) : '';
-        if (!name || name.endsWith('.jsonl') || name.endsWith('.json')) {
-          onChange(name && !path.isAbsolute(name) ? path.join(root, name) : name);
-        }
-      };
-      const watcher = (chokidar || chokidarModule).watch(root, {
-        cwd: root,
-        ignoreInitial: true,
-        awaitWriteFinish: {
-          stabilityThreshold: Math.max(stabilityMs, 500),
-          pollInterval: 100,
-        },
-        ignored: (targetPath, stats) => {
-          if (stats?.isDirectory()) return false;
-          if (!stats) return false;
-          return !String(targetPath).endsWith('.jsonl') && !String(targetPath).endsWith('.json');
-        },
+      // One recursive fs.watch per root — a single FSEvents stream / inotify
+      // tree instead of one watcher per path. A per-path model (chokidar 4
+      // without fsevents) opens an O_EVTONLY fd per file and an FSEventStream
+      // per directory; measured on a real ~23k-path transcript tree it
+      // exhausts a per-process FSEvents/mach resource long before
+      // RLIMIT_NOFILE and floods EMFILE, while stream creation degrades
+      // super-linearly (~7 ms each at 1k streams, minutes at 6k). The
+      // recursive watcher is O(1) on both axes and still reports events for
+      // files in directories created after it started. Write stability is
+      // owned by the service's debounce + stability timers, so no
+      // awaitWriteFinish equivalent is needed here.
+      let watcher: fs.FSWatcher;
+      try {
+        watcher = watchFs(
+          root,
+          { recursive: fs.statSync(root).isDirectory() },
+          (_eventType, filename) => {
+            const name = filename ? String(filename) : '';
+            if (!name || name.endsWith('.jsonl') || name.endsWith('.json')) {
+              onChange(name && !path.isAbsolute(name) ? path.join(root, name) : name);
+            }
+          },
+        );
+      } catch (error) {
+        logger.warn?.(`Obelisk watcher failed: ${(error as Error).message}`);
+        return false;
+      }
+      watcher.on('error', (error) => {
+        logger.warn?.(`Obelisk watcher failed: ${(error as Error).message}`);
       });
-      watcher
-        .on('add', onFileChange)
-        .on('change', onFileChange)
-        .on('unlink', onFileChange)
-        .on('error', (error) => {
-          logger.warn?.(`Obelisk watcher failed: ${(error as Error).message}`);
-        });
       watchers.push(watcher);
       watchedRoots.add(root);
       return true;

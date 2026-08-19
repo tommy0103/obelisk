@@ -389,33 +389,29 @@ test('indexer service publishes daemon ownership as soon as it starts', () => {
   service.stop();
 });
 
-test('indexer service watches Claude JSON files through chokidar', async () => {
-  const projectsDir = makeTempDir('obelisk-chokidar-projects-');
+test('indexer service watches Claude JSON files through one recursive watcher', async () => {
+  const projectsDir = makeTempDir('obelisk-recursive-projects-');
   const timers = manualTimers();
   const calls = [];
   let watchArgs = null;
-  const handlers = {};
+  let emit = null;
   const watcher = {
-    on(event, handler) {
-      handlers[event] = handler;
-      return watcher;
-    },
+    on() { return watcher; },
     closeCalled: false,
     close() {
       watcher.closeCalled = true;
     },
   };
-  const chokidar = {
-    watch(paths, options) {
-      watchArgs = { paths, options };
-      return watcher;
-    },
+  const watchFs = (root, options, listener) => {
+    watchArgs = { root, options };
+    emit = listener;
+    return watcher;
   };
 
   const service = createIndexerService({
     projectsDir,
     buildIndex: async ({ reason }) => calls.push(reason),
-    chokidar,
+    watchFs,
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
@@ -424,12 +420,10 @@ test('indexer service watches Claude JSON files through chokidar', async () => {
 
   try {
     service.start({ buildOnStart: false });
-    assert.equal(watchArgs.paths, projectsDir);
-    assert.equal(watchArgs.options.cwd, projectsDir);
-    assert.equal(watchArgs.options.ignoreInitial, true);
-    assert.ok(watchArgs.options.awaitWriteFinish);
+    assert.equal(watchArgs.root, projectsDir);
+    assert.equal(watchArgs.options.recursive, true);
 
-    handlers.change('session.jsonl');
+    emit('change', 'session.jsonl');
     timers.flush();
     await service.idle();
     assert.deepEqual(calls, ['watch']);
@@ -444,24 +438,17 @@ test('indexer service passes changed JSONL paths to the build worker', async () 
   const projectsDir = makeTempDir('obelisk-changed-paths-');
   const timers = manualTimers();
   const calls = [];
-  const handlers = {};
-  const watcher = {
-    on(event, handler) {
-      handlers[event] = handler;
-      return watcher;
-    },
-    close() {},
-  };
-  const chokidar = {
-    watch() {
-      return watcher;
-    },
+  let emit = null;
+  const watcher = { on() { return watcher; }, close() {} };
+  const watchFs = (_root, _options, listener) => {
+    emit = listener;
+    return watcher;
   };
 
   const service = createIndexerService({
     projectsDir,
     buildIndex: async (args) => calls.push(args),
-    chokidar,
+    watchFs,
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
@@ -469,8 +456,8 @@ test('indexer service passes changed JSONL paths to the build worker', async () 
   });
 
   service.start({ buildOnStart: false });
-  handlers.change('project-a/session-1.jsonl');
-  handlers.add('project-a/session-2.json');
+  emit('change', 'project-a/session-1.jsonl');
+  emit('rename', 'project-a/session-2.json');
   timers.flush();
   await service.idle();
 
@@ -487,30 +474,20 @@ test('indexer service watches Claude projects and Codex sessions for app-side in
   const codexSessionsDir = makeTempDir('obelisk-watch-codex-sessions-');
   const timers = manualTimers();
   const calls = [];
-  const watchers = [];
+  const emitters = [];
   const watchArgs = [];
-  const chokidar = {
-    watch(paths, options) {
-      const handlers = {};
-      const watcher = {
-        handlers,
-        on(event, handler) {
-          handlers[event] = handler;
-          return watcher;
-        },
-        close() {},
-      };
-      watchers.push(watcher);
-      watchArgs.push({ paths, options });
-      return watcher;
-    },
+  const watchFs = (root, options, listener) => {
+    watchArgs.push({ root, options });
+    emitters.push(listener);
+    const watcher = { on() { return watcher; }, close() {} };
+    return watcher;
   };
 
   const service = createIndexerService({
     projectsDir: claudeProjectsDir,
     watchDirs: [claudeProjectsDir, codexSessionsDir],
     buildIndex: async (args) => calls.push(args),
-    chokidar,
+    watchFs,
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
@@ -518,10 +495,10 @@ test('indexer service watches Claude projects and Codex sessions for app-side in
   });
 
   service.start({ buildOnStart: false });
-  assert.deepEqual(watchArgs.map(arg => arg.paths), [claudeProjectsDir, codexSessionsDir]);
-  assert.deepEqual(watchArgs.map(arg => arg.options.cwd), [claudeProjectsDir, codexSessionsDir]);
+  assert.deepEqual(watchArgs.map(arg => arg.root), [claudeProjectsDir, codexSessionsDir]);
+  assert.deepEqual(watchArgs.map(arg => arg.options.recursive), [true, true]);
 
-  watchers[1].handlers.change('2026/06/15/rollout-2026-06-15T00-00-00-codex.jsonl');
+  emitters[1]('change', '2026/06/15/rollout-2026-06-15T00-00-00-codex.jsonl');
   timers.flush();
   await service.idle();
 
@@ -538,22 +515,15 @@ test('indexer service starts watching a configured root that appears after start
   const timers = manualTimers();
   const calls = [];
   const watchArgs = [];
-  const chokidar = {
-    watch(root) {
-      watchArgs.push(root);
-      const watcher = {
-        on() {
-          return watcher;
-        },
-        close() {},
-      };
-      return watcher;
-    },
+  const watchFs = (root) => {
+    watchArgs.push(root);
+    const watcher = { on() { return watcher; }, close() {} };
+    return watcher;
   };
   const service = createIndexerService({
     watchDirs: [existingRoot, lateRoot],
     buildIndex: async (args) => calls.push(args),
-    chokidar,
+    watchFs,
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
