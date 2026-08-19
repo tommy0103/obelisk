@@ -286,6 +286,7 @@ test('main process watches every root declared by the built-in provider registry
       join(codexDir, 'sessions'),
       join(codexDir, 'archived_sessions'),
       join(codexDir, 'session_index.jsonl'),
+      join(home, '.dsh', 'sessions'),
       join(home, '.kimi-code', 'sessions'),
       join(home, '.kimi-code', 'session_index.jsonl'),
       join(home, '.pi', 'agent', 'sessions'),

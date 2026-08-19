@@ -255,6 +255,12 @@ function createQueryApi(
       if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
     }
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
+    if (subagent) {
+      // Present query-derived usage like subagents() does (see there).
+      const tokens = db.prepare('SELECT COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS t FROM messages WHERE agent_id=?').get(msg.agent_id);
+      const total = tokens && typeof tokens.t === 'number' && tokens.t > 0 ? tokens.t : null;
+      subagent.total_tokens = total;
+    }
     let workflow = null;
     if (msg.agent_id) {
       const wa = db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id);
@@ -303,7 +309,12 @@ function createQueryApi(
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {
       const c = db.prepare('SELECT COUNT(*) as c FROM messages WHERE agent_id=?').get(r.agent_id);
-      return { ...r, messageCount: c?.c || 0 };
+      // Subagent total tokens are derived from the sidechain messages' usage,
+      // not stored: incremental indexing may never have seen the full stream,
+      // and the message rows always carry the authoritative per-step usage.
+      const tokens = db.prepare('SELECT COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS t FROM messages WHERE agent_id=?').get(r.agent_id);
+      const total = tokens && typeof tokens.t === 'number' && tokens.t > 0 ? tokens.t : null;
+      return { ...r, messageCount: c?.c || 0, total_tokens: total };
     });
   };
 

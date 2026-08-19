@@ -738,3 +738,22 @@ test('subagents after/before narrow by the subagent activity interval, not sessi
 
   db.close();
 });
+
+test('subagents() derives total_tokens from sidechain message usage', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title, source) VALUES ('sid-sub', 'sub parent', 'deepseek')").run();
+  // The stored row carries no total_tokens: the value is derived at query time.
+  db.prepare("INSERT INTO subagents (agent_id, session_id, agent_type, description) VALUES ('deepseek:agent-1', 'sid-sub', 'deepseek-official', 'helper')").run();
+  const insertMsg = db.prepare("INSERT INTO messages (uuid, session_id, type, role, text, timestamp, agent_id, input_tokens, output_tokens, source) VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insertMsg.run('sub-m1', 'sid-sub', 'assistant', 'assistant', 'a', '2026-06-01T00:00:00Z', 'deepseek:agent-1', 10, 5, 'deepseek');
+  insertMsg.run('sub-m2', 'sid-sub', 'assistant', 'assistant', 'b', '2026-06-01T00:01:00Z', 'deepseek:agent-1', 3, 2, 'deepseek');
+
+  const api = createQueryApi(db);
+  const row = api.subagents()[0];
+  assert.equal(row.agent_id, 'deepseek:agent-1');
+  assert.equal(row.total_tokens, 20); // (10+5) + (3+2)
+  assert.equal(row.messageCount, 2);
+
+  db.close();
+});
