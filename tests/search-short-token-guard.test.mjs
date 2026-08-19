@@ -84,6 +84,30 @@ test('trigram: the punctuation fallback path routes through the same guard', () 
   assert.deepEqual(hits.map((h) => h.message.uuid), ['m-hyphen-ok']);
 });
 
+test('trigram: recall survives when top-ranked long-term hits lack the short term', () => {
+  // Regression: an early implementation post-filtered a small overselected
+  // window in JS; on a real index every top bm25 hit for the long term lacked
+  // the short one and the query returned zero rows. The substring condition
+  // must apply to the full MATCH set, before LIMIT.
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.exec('DROP TABLE messages_fts');
+  db.exec("CREATE VIRTUAL TABLE messages_fts USING fts5(uuid UNINDEXED, session_id UNINDEXED, text, content=messages, content_rowid=rowid, tokenize='trigram')");
+  db.prepare("INSERT INTO sessions (id, title, project, started_at) VALUES ('s1','t','p','2026-06-10T10:00:00Z')").run();
+  const ins = db.prepare('INSERT INTO messages (uuid, session_id, role, text, timestamp) VALUES (?,?,?,?,?)');
+  // Short, quick-dense messages rank far above the one real combined hit.
+  for (let i = 0; i < 40; i++) ins.run(`m-dense-${i}`, 's1', 'user', 'quick quick quick', '2026-06-10T10:00:01Z');
+  ins.run('m-real', 's1', 'user',
+    `quick note buried in prose ${'filler words here '.repeat(30)}and in the end it was ok`,
+    '2026-06-10T10:00:02Z');
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+
+  const hits = createQueryApi(db).search('quick ok', { limit: 3 });
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-real'],
+    'the only row containing both terms is found regardless of its bm25 position');
+  db.close();
+});
+
 test('trigram: raw FTS5 syntax is honored untouched', () => {
   const api = createQueryApi(trigramDb());
   const hits = api.search('"quick" OR "fine"');

@@ -265,6 +265,20 @@ function createQueryApi(
       return likeStmt.all(...terms.map((t) => `%${t}%`), ...filterParams, limit);
     };
 
+    // MATCH the indexable terms with the short ones pushed down as SQL LIKE
+    // substring conditions: the filter runs over the full MATCH result set
+    // before LIMIT, so recall does not depend on where the combined hits rank.
+    // (A JS post-filter over an overselected window returned zero rows on a
+    // real index whose top bm25 hits for the long term lacked the short one.)
+    const runMatchWithSubstrings = (matchText: string, terms: string[]): DbRow[] => {
+      const likeAnd = terms.map(() => ' AND m.text LIKE ?').join('');
+      const guarded = db.prepare(`${selectCols},
+             rank
+      FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
+      WHERE mf.text MATCH ?${likeAnd}${filterWhere} ORDER BY rank LIMIT ?`);
+      return guarded.all(matchText, ...terms.map((t) => `%${t}%`), ...filterParams, limit);
+    };
+
     // Under trigram, terms shorter than three code points silently constrain
     // nothing (false positives next to longer terms, zero hits alone). Split
     // the tokens: MATCH the indexable ones, then require the short ones as
@@ -276,17 +290,7 @@ function createQueryApi(
       const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
       if (short.length === 0) return { rows: matchText ? runMatch(matchText) : [], degraded: null };
       if (long.length === 0) return { rows: runLikeScan(short), degraded: 'like-scan' };
-      // Overselect to leave the post-filter room, bounded so a broad first
-      // term cannot turn the guard into a full-table crawl.
-      const scanLimit = Math.min(limit * 5, limit + 200);
-      const needles = short.map((token) => token.toLowerCase());
-      const rows = runMatch(matchText, scanLimit)
-        .filter((r: DbRow) => {
-          const hay = String(r.text ?? '').toLowerCase();
-          return needles.every((needle) => hay.includes(needle));
-        })
-        .slice(0, limit);
-      return { rows, degraded: 'short-token-post-filter' };
+      return { rows: runMatchWithSubstrings(matchText, short), degraded: 'short-token-post-filter' };
     };
 
     const trigram = isTrigramMessagesFts(db);
