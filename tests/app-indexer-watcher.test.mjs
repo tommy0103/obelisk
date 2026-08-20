@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 
 import { createIndexerService } from '../app/src/main/indexer-service.ts';
+import { createRecursiveWatcher } from '../app/src/main/watcher.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 async function waitFor(cond, ms = 1000) {
@@ -206,5 +207,88 @@ test('silently missed watcher events are reconciled by a periodic full-inventory
       'the reconcile build is a full-inventory build, not a changed-paths build');
   } finally {
     service.stop();
+  }
+});
+
+
+test('a missing root is retried quietly', async () => {
+  const root = join(makeTempDir('obelisk-watch-missing-'), 'not-there-yet');
+  const warns = [];
+  let probeCalls = 0;
+  let lost = 0;
+  const watcher = createRecursiveWatcher({
+    roots: [root],
+    filter: () => true,
+    onChange: () => {},
+    logger: { warn: (msg) => warns.push(msg) },
+    onRootLost: () => { lost += 1; },
+    // The real fs probe through the injection point: ENOENT is genuine.
+    access: async (p) => { probeCalls += 1; return fs.promises.access(p); },
+    subscribe: () => Promise.resolve({ unsubscribe: () => Promise.resolve() }),
+  });
+
+  try {
+    assert.ok(await waitFor(() => lost === 1), 'the missing root drives a retry');
+    watcher.refreshMissingRoots();
+    assert.ok(await waitFor(() => lost === 2), 'the retry re-probes the root');
+    assert.equal(probeCalls, 2);
+    assert.deepEqual(warns, [], 'a missing root never logs a warning');
+  } finally {
+    await watcher.close();
+  }
+});
+
+test('an inaccessible root warns once per failure, and again after a recurrence', async () => {
+  const root = makeTempDir('obelisk-watch-denied-');
+  const warns = [];
+  let denied = true;
+  let lost = 0;
+  let subscribeCalls = 0;
+  let emit = null;
+  const access = async () => {
+    if (!denied) return;
+    const error = new Error('permission denied');
+    error.code = 'EACCES';
+    throw error;
+  };
+  const watcher = createRecursiveWatcher({
+    roots: [root],
+    filter: () => true,
+    onChange: () => {},
+    logger: { warn: (msg) => warns.push(msg) },
+    onRootLost: () => { lost += 1; },
+    access,
+    subscribe: (_root, callback) => {
+      subscribeCalls += 1;
+      emit = callback;
+      return Promise.resolve({ unsubscribe: () => Promise.resolve() });
+    },
+  });
+
+  try {
+    assert.ok(await waitFor(() => lost === 1), 'the first failure drives a retry');
+    watcher.refreshMissingRoots();
+    assert.ok(await waitFor(() => lost === 2));
+    watcher.refreshMissingRoots();
+    assert.ok(await waitFor(() => lost === 3));
+    assert.equal(warns.length, 1, 'a permanent failure warns once, not on every retry tick');
+
+    // The root recovers: it establishes (which clears the dedup entry)...
+    denied = false;
+    watcher.refreshMissingRoots();
+    assert.ok(await waitFor(() => subscribeCalls === 1), 'the recovered root is subscribed');
+
+    // ...then its stream dies (one warn for the death) and the retry finds
+    // the root inaccessible again — reported again, because the dedup entry
+    // was cleared on establishment.
+    emit(new Error('stream died'), []);
+    assert.ok(await waitFor(() => lost === 4), 'the dead stream drives a retry');
+    denied = true;
+    watcher.refreshMissingRoots();
+    assert.ok(await waitFor(() => lost === 5), 'the recurrence is re-probed');
+    const accessWarns = warns.filter((msg) => msg.includes('cannot access'));
+    assert.equal(accessWarns.length, 2, 'the same access failure warns again after a recovery');
+  } finally {
+    await watcher.close();
   }
 });

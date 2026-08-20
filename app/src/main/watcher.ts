@@ -13,8 +13,12 @@
 //   Electron main process (CONTRIBUTING.md). A stat on a network mount must
 //   not freeze the UI.
 // - A missing root is a normal steady state (e.g. no ~/.codex), not an
-//   error: the existence check stays quiet and only drives the retry loop
-//   through onRootLost. Only a genuine subscribe failure logs a warning.
+//   error: the probe classifies ENOENT/ENOTDIR as "not there yet" and stays
+//   quiet, only driving the retry loop through onRootLost. Anything else
+//   (EACCES, EIO, ENAMETOOLONG, ...) is a genuine problem and is warned —
+//   once per (root, failure), so a permanent misconfiguration does not spam
+//   on every retry tick; the entry clears when the root establishes, so a
+//   later recurrence reports again.
 // - A subscription that errors after establishing is dropped from the
 //   watched set and re-attached through the same retry loop — a dead stream
 //   never lingers as "watched".
@@ -47,6 +51,8 @@ interface RecursiveWatcherOptions {
   filter: (path: string) => boolean;
   onChange: (changedPath?: string) => void;
   subscribe?: ParcelSubscribe;
+  /** Injection point for the root existence probe (tests). */
+  access?: (path: string) => Promise<unknown>;
   logger?: { warn?: (msg: string) => void };
   /** Called when a root needs a later retry: it does not exist yet, its
    * subscribe attempt failed, or its subscription errored. This callback is
@@ -59,6 +65,7 @@ function createRecursiveWatcher({
   filter,
   onChange,
   subscribe = parcelWatcher.subscribe as ParcelSubscribe,
+  access = fs.promises.access,
   logger = console,
   onRootLost,
 }: RecursiveWatcherOptions): RecursiveWatcher | null {
@@ -75,6 +82,17 @@ function createRecursiveWatcher({
     if (!initialPassDone && pending.size === 0) initialPassDone = true;
   };
 
+  // Warn once per (root, failure) pair: permanent problems (a bad configured
+  // path, permissions) would otherwise log on every retry tick. Cleared on
+  // establishment so a later recurrence reports again.
+  const lastWarned = new Map<string, string>();
+  const warnOnce = (root: string, error: unknown, message: string) => {
+    const key = `${(error as NodeJS.ErrnoException)?.code ?? ''}:${message}`;
+    if (lastWarned.get(root) === key) return;
+    lastWarned.set(root, key);
+    logger.warn?.(message);
+  };
+
   const dropRoot = (root: string) => {
     const sub = subscriptions.get(root);
     subscriptions.delete(root);
@@ -89,7 +107,7 @@ function createRecursiveWatcher({
     try {
       result = subscribe(root, (err, events) => {
         if (err) {
-          logger.warn?.(`Obelisk watcher failed for ${root}: ${(err as Error).message ?? err}`);
+          warnOnce(root, err, `Obelisk watcher failed for ${root}: ${(err as Error).message ?? err}`);
           dropRoot(root);
           return;
         }
@@ -100,7 +118,7 @@ function createRecursiveWatcher({
     } catch (error) {
       pending.delete(root);
       noteSettled();
-      logger.warn?.(`Obelisk watcher failed to subscribe ${root}: ${(error as Error).message}`);
+      warnOnce(root, error, `Obelisk watcher failed to subscribe ${root}: ${(error as Error).message}`);
       if (!closed) onRootLost?.(root);
       return;
     }
@@ -115,6 +133,7 @@ function createRecursiveWatcher({
         return;
       }
       subscriptions.set(root, sub);
+      lastWarned.delete(root);
       // The initial establishment pass is quiet — the startup build already
       // covers those roots. Later establishments are genuine coverage
       // increases and warrant a full-inventory build.
@@ -122,7 +141,7 @@ function createRecursiveWatcher({
     }, (error) => {
       pending.delete(root);
       noteSettled();
-      logger.warn?.(`Obelisk watcher failed to subscribe ${root}: ${(error as Error).message ?? error}`);
+      warnOnce(root, error, `Obelisk watcher failed to subscribe ${root}: ${(error as Error).message ?? error}`);
       if (!closed) onRootLost?.(root);
     });
   };
@@ -130,13 +149,16 @@ function createRecursiveWatcher({
   const addRoot = (root: string): boolean => {
     if (closed || subscriptions.has(root) || pending.has(root)) return false;
     pending.add(root);
-    fs.promises.access(root).then(() => {
+    Promise.resolve(access(root)).then(() => {
       if (closed || !pending.has(root)) return;
       subscribeRoot(root);
-    }, () => {
-      // The root does not exist (yet) — a normal steady state, not an error.
+    }, (error) => {
       pending.delete(root);
       noteSettled();
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        warnOnce(root, error, `Obelisk watcher cannot access ${root}: ${(error as Error).message ?? error}`);
+      }
       if (!closed) onRootLost?.(root);
     });
     return true;
