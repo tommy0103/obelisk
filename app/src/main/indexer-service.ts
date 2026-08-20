@@ -1,10 +1,9 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import chokidarModule from 'chokidar';
+import { createRecursiveWatcher, type ParcelSubscribe } from './watcher.ts';
 
 const DEFAULT_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const DEFAULT_DEBOUNCE_MS = 2000;
@@ -12,6 +11,7 @@ const DEFAULT_STABILITY_MS = 500;
 const DEFAULT_HEARTBEAT_MS = 30000;
 const DEFAULT_WATCH_RETRY_MS = 5000;
 const DEFAULT_DEFERRED_RETRY_MS = 250;
+const DEFAULT_RECONCILE_MS = 5 * 60 * 1000;
 const MAX_INVENTORY_RETRY_MS = 10 * 60 * 1000;
 
 type TimerHandle = ReturnType<typeof setTimeout>;
@@ -51,10 +51,14 @@ interface IndexerServiceOptions {
   heartbeatMs?: number;
   watchRetryMs?: number;
   deferredRetryMs?: number;
+  /** Interval for a periodic full-inventory reconcile build; bounds worst-case
+   * staleness from events the watcher silently drops. 0 disables it. */
+  reconcileMs?: number;
   buildIndex?: IndexerBuild;
   writeHeartbeat?: () => unknown;
   watchProjects?: (onChange: (changedPath?: string) => void) => Watcher | null;
-  chokidar?: any;
+  /** Injection point for the default watcher's @parcel/watcher subscribe (tests). */
+  subscribe?: ParcelSubscribe;
   timers?: Timers;
   logger?: { warn?: (msg: string) => void };
 }
@@ -67,10 +71,11 @@ function createIndexerService({
   heartbeatMs = DEFAULT_HEARTBEAT_MS,
   watchRetryMs = DEFAULT_WATCH_RETRY_MS,
   deferredRetryMs = DEFAULT_DEFERRED_RETRY_MS,
+  reconcileMs = DEFAULT_RECONCILE_MS,
   buildIndex,
   writeHeartbeat = () => {},
   watchProjects,
-  chokidar,
+  subscribe,
   timers = {
     setTimeout,
     clearTimeout,
@@ -82,63 +87,22 @@ function createIndexerService({
   if (typeof buildIndex !== 'function') throw new Error('createIndexerService() requires buildIndex');
   const watch = watchProjects || ((onChange) => {
     const roots = [...new Set((Array.isArray(watchDirs) ? watchDirs : [watchDirs]).filter(Boolean))];
-    if (!roots.length) return null;
-    const watchers: any[] = [];
-    const watchedRoots = new Set<string>();
-    const addRoot = (root: string) => {
-      if (watchedRoots.has(root) || !fs.existsSync(root)) return false;
-      const onFileChange = (filename) => {
-        const name = filename ? String(filename) : '';
-        if (!name || name.endsWith('.jsonl') || name.endsWith('.json')) {
-          onChange(name && !path.isAbsolute(name) ? path.join(root, name) : name);
-        }
-      };
-      const watcher = (chokidar || chokidarModule).watch(root, {
-        cwd: root,
-        ignoreInitial: true,
-        awaitWriteFinish: {
-          stabilityThreshold: Math.max(stabilityMs, 500),
-          pollInterval: 100,
-        },
-        ignored: (targetPath, stats) => {
-          if (stats?.isDirectory()) return false;
-          if (!stats) return false;
-          return !String(targetPath).endsWith('.jsonl') && !String(targetPath).endsWith('.json');
-        },
-      });
-      watcher
-        .on('add', onFileChange)
-        .on('change', onFileChange)
-        .on('unlink', onFileChange)
-        .on('error', (error) => {
-          logger.warn?.(`Obelisk watcher failed: ${(error as Error).message}`);
-        });
-      watchers.push(watcher);
-      watchedRoots.add(root);
-      return true;
-    };
-    const refreshMissingRoots = (notify: boolean) => {
-      let added = false;
-      for (const root of roots) {
-        if (addRoot(root)) added = true;
-      }
-      if (added && notify) onChange();
-      return watchedRoots.size === roots.length;
-    };
-    refreshMissingRoots(false);
-    return {
-      close() {
-        return Promise.all(watchers.map(w => Promise.resolve(w.close?.())));
-      },
-      refreshMissingRoots() {
-        return refreshMissingRoots(true);
-      },
-    };
+    return createRecursiveWatcher({
+      roots,
+      filter: (targetPath) => targetPath.endsWith('.jsonl') || targetPath.endsWith('.json'),
+      subscribe,
+      logger,
+      onChange,
+      // A subscription that died (async error) is re-attached through the
+      // same retry loop that picks up late-appearing roots.
+      onRootLost: () => scheduleWatchRetry(),
+    });
   });
 
   let buildTimer: TimerHandle | null = null;
   let stabilityTimer: TimerHandle | null = null;
   let heartbeatTimer: TimerHandle | null = null;
+  let reconcileTimer: TimerHandle | null = null;
   let watchRetryTimer: TimerHandle | null = null;
   let retryTimer: TimerHandle | null = null;
   let watcher: Watcher | null = null;
@@ -299,6 +263,13 @@ function createIndexerService({
       heartbeatTimer = timers.setInterval(() => {
         publishHeartbeat();
       }, heartbeatMs);
+      // Periodic full-inventory reconcile: bounds worst-case staleness from
+      // events the watcher silently drops (no error signal) to one interval.
+      if (reconcileMs > 0) {
+        reconcileTimer = timers.setInterval(() => {
+          scheduleBuild('reconcile');
+        }, reconcileMs);
+      }
     }
   };
 
@@ -314,8 +285,12 @@ function createIndexerService({
     if (retryTimer) timers.clearTimeout(retryTimer);
     retryTimer = null;
     nextInventoryRetryMs = heartbeatMs;
-    if (heartbeatTimer && typeof timers.clearInterval === 'function') timers.clearInterval(heartbeatTimer);
+    if (typeof timers.clearInterval === 'function') {
+      if (heartbeatTimer) timers.clearInterval(heartbeatTimer);
+      if (reconcileTimer) timers.clearInterval(reconcileTimer);
+    }
     heartbeatTimer = null;
+    reconcileTimer = null;
     if (watcher?.close) watcher.close();
     watcher = null;
   };

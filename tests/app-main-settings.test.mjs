@@ -40,8 +40,8 @@ class SqliteCompatDatabase {
 // `mock.module` keys mocks by the *resolved* module URL. The app's dependencies
 // live in `app/node_modules`, so they are NOT resolvable from this test file's
 // directory, and bare specifiers ('electron', ...) would either fail to resolve
-// here or resolve to the wrong ESM entry (e.g. chokidar exposes esm/index.js via
-// its "exports" map, which differs from require.resolve's CJS entry). We instead
+// here or resolve to a different entry than the main module sees (a package's
+// "exports" map can give ESM and CJS importers different files). We instead
 // resolve each bare specifier exactly as the main module sees it (ESM resolution
 // relative to the main module's directory) and mock that URL. Relative deps are
 // resolved against the main module URL directly.
@@ -59,7 +59,7 @@ function esmResolve(specifier) {
 
 const ELECTRON_URL = esmResolve('electron');
 const DATABASE_URL = esmResolve('better-sqlite3');
-const CHOKIDAR_URL = esmResolve('chokidar');
+const WATCHER_URL = new URL('./watcher.ts', mainUrl).href;
 const INDEXER_URL = new URL('./indexer.ts', mainUrl).href;
 const INDEXER_SERVICE_URL = new URL('./indexer-service.ts', mainUrl).href;
 const INDEXER_WORKER_URL = new URL('./indexer-worker-client.ts', mainUrl).href;
@@ -96,8 +96,13 @@ function electronNamespace({ app, BrowserWindow, ipcMain }) {
   };
 }
 
-function noopChokidar() {
-  return { watch: () => ({ on() { return this; }, close() {} }) };
+function noopWatcher() {
+  return {
+    createRecursiveWatcher: () => ({
+      close() { return Promise.resolve(); },
+      refreshMissingRoots() { return true; },
+    }),
+  };
 }
 
 function defaultIndexerService() {
@@ -169,7 +174,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -248,7 +253,7 @@ test('main process watches every root declared by the built-in provider registry
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -345,7 +350,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -467,7 +472,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -583,7 +588,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -679,7 +684,7 @@ test('main process migrates an existing app database before source-filtered IPC 
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -743,7 +748,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -816,10 +821,13 @@ test('closing the last macOS window releases background resources until activati
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, {
-      defaultExport: {
-        watch: () => {
-          const watcher = { on() { return this; }, close() { serviceEvents.push('watcher-close'); } };
+    [WATCHER_URL, {
+      namedExports: {
+        createRecursiveWatcher: () => {
+          const watcher = {
+            close() { serviceEvents.push('watcher-close'); return Promise.resolve(); },
+            refreshMissingRoots() { return true; },
+          };
           watchers.push(watcher);
           return watcher;
         },
@@ -949,7 +957,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -1116,7 +1124,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -1220,7 +1228,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -1315,7 +1323,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {

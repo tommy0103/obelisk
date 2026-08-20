@@ -202,8 +202,8 @@ export function resolveInvokingSessionId(
 
 // Poll bounds for the nonce freshness fallback. The poll runs only when the
 // incremental recovery build loses the writer lease (writer_busy); the cap
-// gives a concurrent build — the daemon's watcher-driven build is chokidar
-// debounced ~2s plus 0.5s write stability — time to publish the nonce.
+// gives a concurrent build — the daemon's watcher-driven build (@parcel/watcher
+// debounced ~2s plus 0.5s write stability) — time to publish the nonce.
 const INVOCATION_POLL_INTERVAL_MS = 300;
 const INVOCATION_POLL_CAP_MS = 4000;
 

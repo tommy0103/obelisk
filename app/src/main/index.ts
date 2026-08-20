@@ -7,9 +7,9 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import chokidar from 'chokidar';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
+import { createRecursiveWatcher } from './watcher.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
@@ -341,6 +341,9 @@ async function stopBackgroundResources({ stopWorker = false } = {}) {
   if (obeliskWatcher) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
+    if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
+    if (obeliskRetryTimer) { clearTimeout(obeliskRetryTimer); obeliskRetryTimer = null; }
+    pendingObeliskChanges.clear();
     if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
   }
   closeDb();
@@ -428,25 +431,41 @@ function createWindow() {
 
 const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
 const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
-let obeliskWatcher: import("chokidar").FSWatcher | null = null;
+let obeliskWatcher: ReturnType<typeof createRecursiveWatcher> = null;
+let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+let obeliskRetryTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingObeliskChanges = new Set<string>();
+
+function flushObeliskChanges() {
+  obeliskNotifyTimer = null;
+  const changedPaths = [...pendingObeliskChanges];
+  pendingObeliskChanges.clear();
+  for (const changedPath of changedPaths) onObeliskChange(changedPath);
+}
 
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
   if (!fs.existsSync(OBELISK_DIR)) {
     fs.mkdirSync(OBELISK_DIR, { recursive: true });
   }
-  obeliskWatcher = chokidar.watch(OBELISK_DIR, {
-    ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
-    ignored: (p, stats) => {
-      if (stats?.isDirectory()) return false;
-      if (!stats) return false;
-      return !p.endsWith('.md') && !p.endsWith('.json');
+  obeliskWatcher = createRecursiveWatcher({
+    roots: [OBELISK_DIR],
+    filter: (targetPath) => targetPath.endsWith('.md') || targetPath.endsWith('.json'),
+    onChange: (changedPath) => {
+      // A trailing 300 ms debounce replaces chokidar's awaitWriteFinish.
+      if (changedPath) pendingObeliskChanges.add(changedPath);
+      if (pendingObeliskChanges.size && !obeliskNotifyTimer) {
+        obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
+      }
+    },
+    onRootLost: () => {
+      if (obeliskRetryTimer) return;
+      obeliskRetryTimer = setTimeout(() => {
+        obeliskRetryTimer = null;
+        obeliskWatcher?.refreshMissingRoots();
+      }, 5000);
     },
   });
-  obeliskWatcher.on('add', onObeliskChange);
-  obeliskWatcher.on('change', onObeliskChange);
-  obeliskWatcher.on('unlink', onObeliskChange);
   return obeliskWatcher;
 }
 
