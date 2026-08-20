@@ -65,6 +65,14 @@ decisions. Prefer a learned faceted detail pass over `LIMIT 25` session windows.
 If vocabulary is still unclear, use a small filtered window and say so in
 `query_plan`.
 
+For correlation questions such as "while implementing X, did we discuss Y?",
+build the candidate session set from X first, then search for Y only inside that
+set. Independent global searches for X and Y do not establish that the topics
+belonged to the same work. Start with visible user/assistant text; use tool
+results to locate artifacts, not as conversation conclusions. Run an explicit
+inactive second pass only when superseded reasoning matters, and label it as
+historical rather than final.
+
 ### Structure Before Text
 
 Use the database shape before asking the model to read text. This means
@@ -86,7 +94,7 @@ Ordering and context are semantic:
 - `search().context` is temporal neighbors in one session, not causal context.
 - `context(uuid)` and `trace(uuid)` are for parent-chain/causal expansion.
   They return only current evidence by default. Use `includeInactive: true` for
-  a Pi path that was tried and then superseded; hidden records remain
+  a Pi or OMP path that was tried and then superseded; hidden records remain
   unavailable.
 
 ### Evidence Before Conclusion

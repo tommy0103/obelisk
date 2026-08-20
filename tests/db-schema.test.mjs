@@ -275,6 +275,8 @@ test('skill routes agents to the right reference document', async () => {
 
   assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
   assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);
   assert.match(skill, /Reference Map/);
   assert.match(skill, /references\/schema\.md.*raw SQL/i);
   assert.match(skill, /references\/api-reference\.md.*helper/i);
