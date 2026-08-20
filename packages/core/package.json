@@ -16,6 +16,7 @@
     "./providers/codex": "./dist/providers/codex.js",
     "./providers/deepseek": "./dist/providers/deepseek.js",
     "./providers/kimi": "./dist/providers/kimi.js",
+    "./providers/omp": "./dist/providers/omp.js",
     "./providers/pi": "./dist/providers/pi.js",
     "./providers/registry": "./dist/providers/registry.js",
     "./providers/builtins": "./dist/providers/builtins.js",

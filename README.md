@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, Kimi Code, Pi, and DeepSeek Harness sessions -- queryable by your agent, browsable by you.
+Past Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi sessions -- queryable by your agent, browsable by you.
 
 </div>
 
@@ -25,7 +25,7 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 **App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
 
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), Pi sessions from `~/.pi/agent/sessions`, and DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`).
+Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, and Pi sessions from `~/.pi/agent/sessions`.
 
 ## Multi-provider support
 
@@ -38,20 +38,25 @@ Kimi session directories become one Obelisk session each. Main and child-agent
 subagents tables. Undo/clear is handled as a full session replay, so retracted
 wire records do not remain in the index.
 
+OMP's Pi-compatible JSONL v3 sessions use a dedicated adapter and `source='omp'` identity. The adapter consumes OMP's mutable title prelude as session metadata while preserving the underlying tree, messages, tools, usage, visibility, and raw evidence semantics. OMP and Pi roots are independent, so both histories can be indexed at the same time.
+
 Pi JSONL v1-v3 sessions are projected through the same provider contract. Pi's tree, branch summaries, compactions, durable leaf, retained checkpoint tail, custom messages, bash records, tool calls, token usage, and raw JSONL evidence stay inside the adapter; no Pi-specific database or renderer branch is needed. Active visibility follows Pi's own context rules: a retained tail replaces pre-compaction ancestors even when those physical entries still exist and bounds any later legacy compaction, while a legacy-only chain retains ancestors beginning at `firstKeptEntryId`. Missing parents form orphan branch roots, matching Pi's recovery behavior. Pi entries that the source explicitly superseded are stored as `inactive`: the app and normal agent queries omit them, while supported query helpers can include them with `includeInactive: true`. Display-suppressed or transport-only records remain `hidden` and are never returned by those helpers.
 
 | Provider | Superseded-history support |
 | --- | --- |
 | Pi | Branch, leaf, and compaction state attests inactive history |
+| OMP | Branch, leaf, and compaction state attests inactive history |
 | Kimi Code | Undo/clear can attest supersession; preservation is a follow-up |
 | Claude Code | The source does not attest rewind or current-leaf state |
 | Codex | Sessions have no branching semantics |
 
-Because Pi's explicit `--session-id` is project-local, Obelisk combines the header ID with a deterministic hash of the normalized header `cwd`; this keeps the identity stable across file moves and v1-v3 migration while allowing two projects to use the same custom ID. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
+Because Pi and OMP explicit session IDs are project-local, Obelisk combines each provider's header ID with a deterministic hash of the normalized header `cwd`; this keeps identities stable across file moves while allowing two projects to use the same custom ID. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
 
-For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, and `~/.pi/agent/sessions`. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
+For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, and `~/.pi/agent/sessions`. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
 
 Pi chooses its session directory in this order: `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in settings, then the default under `~/.pi/agent/sessions`. Obelisk automatically follows absolute or `~`-prefixed environment/global settings and the project setting for Obelisk's launch cwd; a relative project setting is resolved against that cwd. CLI-only roots, relative environment/global settings, and project settings from another launch cwd cannot be inferred safely, so select the resolved directory in Obelisk **Settings** instead of letting Obelisk guess.
+
+OMP uses `~/.omp/agent/sessions` by default. Select another absolute session directory in Obelisk **Settings** when OMP is configured with a custom root.
 
 ## Skill: agent-first retrieval
 
@@ -168,7 +173,7 @@ npm ci
 npm run dev
 ```
 
-`electron-vite` starts the renderer dev server and launches Electron. On first run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available registered-provider transcripts, and then watches them for changes. The default sources include `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, and `~/.pi/agent/sessions`; use **Settings** to point the app at different directories. On Windows, Obelisk also checks common WSL distributions for the Claude Code directory.
+`electron-vite` starts the renderer dev server and launches Electron. On first run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available registered-provider transcripts, and then watches them for changes. The default sources include `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, and `~/.pi/agent/sessions`; use **Settings** to point the app at different directories. On Windows, Obelisk also checks common WSL distributions for the Claude Code directory.
 
 ### Debug the app
 

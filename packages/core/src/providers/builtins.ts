@@ -5,6 +5,7 @@ import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
 import { createDeepseekProvider } from './deepseek.ts';
 import { createKimiProvider } from './kimi.ts';
+import { createOmpProvider } from './omp.ts';
 import { createPiProvider } from './pi.ts';
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 
@@ -19,6 +20,7 @@ export function createBuiltinProviderRegistry(
     createCodexProvider({ rootDir: roots['codex'] }),
     createDeepseekProvider({ rootDir: roots['deepseek'] }),
     createKimiProvider({ rootDir: roots['kimi'] }),
+    createOmpProvider({ rootDir: roots['omp'] }),
     createPiProvider({ rootDir: roots['pi'], cwd }),
   ]);
 }

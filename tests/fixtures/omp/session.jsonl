@@ -1,0 +1,7 @@
+{"type":"title","v":1,"title":"OMP indexed title","source":"auto","updatedAt":"2026-08-20T06:53:32.387Z","pad":" "}
+{"type":"session","version":3,"id":"omp-fixture-session","timestamp":"2026-08-20T06:52:46.629Z","cwd":"/tmp/omp-project","title":"Header fallback title","titleSource":"auto"}
+{"type":"model_change","id":"model-change","parentId":null,"timestamp":"2026-08-20T06:52:46.941Z","model":"kiro/gpt-5.6-sol"}
+{"type":"message","id":"user-message","parentId":"model-change","timestamp":"2026-08-20T06:53:30.369Z","message":{"role":"user","content":[{"type":"text","text":"OMP fixture request"}],"timestamp":1787208810283}}
+{"type":"message","id":"assistant-message","parentId":"user-message","timestamp":"2026-08-20T06:53:31.369Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Inspect the fixture"},{"type":"text","text":"Reading the OMP fixture."},{"type":"toolCall","id":"omp-tool-call","name":"read","arguments":{"path":"/tmp/omp-project/file.ts"}}],"model":"kiro/gpt-5.6-sol","usage":{"input":12,"output":7}}}
+{"type":"message","id":"tool-result","parentId":"assistant-message","timestamp":"2026-08-20T06:53:32.369Z","message":{"role":"toolResult","toolCallId":"omp-tool-call","toolName":"read","content":[{"type":"text","text":"OMP tool result"}],"isError":false}}
+{"type":"message","id":"assistant-final","parentId":"tool-result","timestamp":"2026-08-20T06:53:33.369Z","message":{"role":"assistant","content":[{"type":"text","text":"OMP fixture complete."}],"model":"kiro/gpt-5.6-sol","usage":{"input":15,"output":4}}}
