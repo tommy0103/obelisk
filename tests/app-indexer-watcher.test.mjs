@@ -164,17 +164,16 @@ test('a subscription that errors is re-attached by the watch retry loop', async 
 
   try {
     service.start({ buildOnStart: false });
-    assert.equal(subscriptions.length, 1);
+    assert.ok(await waitFor(() => subscriptions.length === 1), 'the root is subscribed');
 
     // The stream dies asynchronously with an error; the root must not stay
     // "watched" (a dead stream would never deliver another event).
     subscriptions[0].callback(new Error('stream died'), []);
-    await waitFor(() => subscriptions[0].unsubscribed);
-    assert.equal(subscriptions[0].unsubscribed, true);
+    assert.ok(await waitFor(() => subscriptions[0].unsubscribed), 'the dead stream is unsubscribed');
 
     // The retry loop re-attaches the root.
     timers.flush();
-    assert.equal(subscriptions.length, 2);
+    assert.ok(await waitFor(() => subscriptions.length === 2), 'the retry loop re-attaches the root');
   } finally {
     service.stop();
   }

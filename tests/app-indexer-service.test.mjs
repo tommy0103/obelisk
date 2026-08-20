@@ -32,6 +32,18 @@ function manualTimers() {
   };
 }
 
+// Polls with real timers — subscribing a root is async (the adapter probes
+// existence via fs.promises before subscribing), so tests cannot assert
+// subscription state synchronously after start().
+async function until(cond, ms = 2000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return cond();
+}
+
 test('indexer service debounces repeated build requests', async () => {
   const timers = manualTimers();
   const calls = [];
@@ -420,6 +432,7 @@ test('indexer service watches Claude JSON files through a recursive @parcel/watc
 
   try {
     service.start({ buildOnStart: false });
+    assert.ok(await until(() => watchArgs !== null), 'the root is subscribed');
     assert.equal(watchArgs, projectsDir);
 
     emit(null, [{ type: 'update', path: join(projectsDir, 'session.jsonl') }]);
@@ -430,7 +443,7 @@ test('indexer service watches Claude JSON files through a recursive @parcel/watc
     service.stop();
   }
 
-  assert.equal(subscription.unsubscribeCalled, true);
+  assert.ok(await until(() => subscription.unsubscribeCalled), 'the subscription is released on stop');
 });
 
 test('indexer service passes changed JSONL paths to the build worker', async () => {
@@ -454,6 +467,7 @@ test('indexer service passes changed JSONL paths to the build worker', async () 
   });
 
   service.start({ buildOnStart: false });
+  assert.ok(await until(() => emit !== null), 'the root is subscribed');
   emit(null, [{ type: 'update', path: join(projectsDir, 'project-a/session-1.jsonl') }]);
   emit(null, [{ type: 'create', path: join(projectsDir, 'project-a/session-2.json') }]);
   timers.flush();
@@ -492,7 +506,10 @@ test('indexer service watches Claude projects and Codex sessions for app-side in
   });
 
   service.start({ buildOnStart: false });
-  assert.deepEqual(watchArgs, [claudeProjectsDir, codexSessionsDir]);
+  assert.ok(await until(() => watchArgs.length === 2), 'both roots are subscribed');
+  // Subscription order is nondeterministic — the async existence probes
+  // complete in threadpool order. The requirement is coverage, not order.
+  assert.deepEqual([...watchArgs].sort(), [claudeProjectsDir, codexSessionsDir].sort());
 
   emitters[1](null, [{
     type: 'update',
@@ -531,11 +548,13 @@ test('indexer service starts watching a configured root that appears after start
 
   try {
     service.start({ buildOnStart: false });
+    assert.ok(await until(() => watchArgs.length === 1), 'the existing root is subscribed');
     assert.deepEqual(watchArgs, [existingRoot]);
 
     mkdirSync(lateRoot, { recursive: true });
     writeFileSync(join(lateRoot, 'pre-existing.jsonl'), '{}\n');
     timers.flush();
+    assert.ok(await until(() => watchArgs.length === 2), 'the late root is picked up by the retry');
     assert.deepEqual(watchArgs, [existingRoot, lateRoot]);
 
     timers.flush();
