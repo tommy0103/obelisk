@@ -1416,6 +1416,19 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
     static fromWebContents() { return null; }
   }
 
+  // Model the real adapter's contract: refreshMissingRoots re-pends the
+  // missing root and returns true (it is attaching, not watched); the async
+  // probe then fails and reports through onRootLost — that callback, not a
+  // false return, is what drives the next retry in production.
+  const fakeWatcher = {
+    close() { return Promise.resolve(); },
+    refreshMissingRoots() {
+      refreshCalls += 1;
+      watcherOptions.onRootLost('still-gone');
+      return true;
+    },
+  };
+
   mock.timers.enable({ apis: ['setTimeout'] });
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
@@ -1424,12 +1437,7 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
       namedExports: {
         createRecursiveWatcher: (options) => {
           watcherOptions = options;
-          return {
-            close() { return Promise.resolve(); },
-            // The root never becomes watched — the retry must keep repeating
-            // rather than firing once.
-            refreshMissingRoots() { refreshCalls += 1; return false; },
-          };
+          return fakeWatcher;
         },
       },
     }],
@@ -1443,7 +1451,8 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
     assert.ok(watcherOptions, 'the OBELISK_DIR watcher was created');
 
     // CONTRIBUTING: a periodic refresh point must be proven to actually fire
-    // repeatedly, not once.
+    // repeatedly, not once. The chain under test is the real one:
+    // onRootLost → retry timer → refresh → probe fails → onRootLost → …
     watcherOptions.onRootLost('gone');
     mock.timers.tick(5000);
     assert.equal(refreshCalls, 1, 'a lost root schedules a retry');
