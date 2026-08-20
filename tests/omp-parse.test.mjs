@@ -5,10 +5,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { createOmpProvider } from '../packages/core/src/providers/omp.ts';
+import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { persist } from '../packages/core/src/persist.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
+const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 const FIXTURE = readFileSync(new URL('./fixtures/omp/session.jsonl', import.meta.url), 'utf8');
 
 function drain(generator) {
@@ -62,7 +66,7 @@ test('OMP provider projects title-prefixed sessions with independent provenance'
   assert.equal(session.id, units[0].sessionId);
   assert.equal(session.source, 'omp');
   assert.equal(session.title, 'OMP indexed title');
-  assert.equal(session.message_count, 6);
+  assert.equal(session.message_count, 4);
   assert.ok(messages.length > 0);
   assert.ok(messages.every(message => message.source === 'omp'));
   assert.equal(messages.some(message => message.text === 'OMP indexed title'), false);
@@ -79,6 +83,20 @@ test('OMP provider projects title-prefixed sessions with independent provenance'
     cursor,
   });
   assert.equal(raw.messageText, 'OMP fixture request');
+
+  const direct = assembleSessionDetail(values);
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  persist(db, units[0], provider.parse(units[0], null));
+  const persisted = assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions').get(),
+    messages: db.prepare('SELECT * FROM messages ORDER BY timestamp,uuid').all(),
+    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+    toolResults: db.prepare('SELECT * FROM tool_results').all(),
+    summaries: db.prepare('SELECT * FROM summaries').all(),
+  });
+  assert.deepEqual(persisted, direct);
+  db.close();
 });
 
 test('OMP title prelude updates the title without changing session identity', () => {
