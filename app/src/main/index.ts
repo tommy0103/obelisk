@@ -443,6 +443,16 @@ function flushObeliskChanges() {
   for (const changedPath of changedPaths) onObeliskChange(changedPath);
 }
 
+function scheduleObeliskWatchRetry() {
+  if (obeliskRetryTimer) return;
+  obeliskRetryTimer = setTimeout(() => {
+    obeliskRetryTimer = null;
+    // Mirror the indexer service's retry loop: keep retrying while any root
+    // is unwatched, so a deleted-and-recreated OBELISK_DIR is picked up too.
+    if (obeliskWatcher?.refreshMissingRoots() === false) scheduleObeliskWatchRetry();
+  }, 5000);
+}
+
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
   if (!fs.existsSync(OBELISK_DIR)) {
@@ -458,13 +468,7 @@ function startObeliskWatcher() {
         obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
       }
     },
-    onRootLost: () => {
-      if (obeliskRetryTimer) return;
-      obeliskRetryTimer = setTimeout(() => {
-        obeliskRetryTimer = null;
-        obeliskWatcher?.refreshMissingRoots();
-      }, 5000);
-    },
+    onRootLost: () => scheduleObeliskWatchRetry(),
   });
   return obeliskWatcher;
 }
