@@ -1384,3 +1384,77 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+
+test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async () => {
+  const originalHome = process.env.HOME;
+  const home = makeTempDir(`obelisk-watch-retry-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  process.env.HOME = home;
+
+  let watcherOptions = null;
+  let refreshCalls = 0;
+
+  class FakeDatabase {
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, {
+      namedExports: {
+        createRecursiveWatcher: (options) => {
+          watcherOptions = options;
+          return {
+            close() { return Promise.resolve(); },
+            // The root never becomes watched — the retry must keep repeating
+            // rather than firing once.
+            refreshMissingRoots() { refreshCalls += 1; return false; },
+          };
+        },
+      },
+    }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+    assert.ok(watcherOptions, 'the OBELISK_DIR watcher was created');
+
+    // CONTRIBUTING: a periodic refresh point must be proven to actually fire
+    // repeatedly, not once.
+    watcherOptions.onRootLost('gone');
+    mock.timers.tick(5000);
+    assert.equal(refreshCalls, 1, 'a lost root schedules a retry');
+    mock.timers.tick(5000);
+    assert.equal(refreshCalls, 2, 'the retry repeats while the root stays unwatched');
+    mock.timers.tick(5000);
+    assert.equal(refreshCalls, 3, 'and keeps repeating');
+  } finally {
+    restore();
+    mock.timers.reset();
+    process.env.HOME = originalHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

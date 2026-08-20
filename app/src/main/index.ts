@@ -455,18 +455,22 @@ function scheduleObeliskWatchRetry() {
 
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
-  if (!fs.existsSync(OBELISK_DIR)) {
-    fs.mkdirSync(OBELISK_DIR, { recursive: true });
-  }
+  // Idempotent ensure, off the main thread (mkdir recursive does not need an
+  // existence check). The watcher tolerates the directory appearing late —
+  // that is what the probe + retry loop is for — so there is no ordering
+  // dependency between the two.
+  void fs.promises.mkdir(OBELISK_DIR, { recursive: true }).catch(() => {});
   obeliskWatcher = createRecursiveWatcher({
     roots: [OBELISK_DIR],
     filter: (targetPath) => targetPath.endsWith('.md') || targetPath.endsWith('.json'),
     onChange: (changedPath) => {
-      // A trailing 300 ms debounce replaces chokidar's awaitWriteFinish.
-      if (changedPath) pendingObeliskChanges.add(changedPath);
-      if (pendingObeliskChanges.size && !obeliskNotifyTimer) {
-        obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
-      }
+      // True trailing debounce — reset on every event so an actively written
+      // file notifies only after its writes settle (the awaitWriteFinish
+      // replacement). Without the reset this would be a throttle.
+      if (!changedPath) return;
+      pendingObeliskChanges.add(changedPath);
+      if (obeliskNotifyTimer) clearTimeout(obeliskNotifyTimer);
+      obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
     },
     onRootLost: () => scheduleObeliskWatchRetry(),
   });
