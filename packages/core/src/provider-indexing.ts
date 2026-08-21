@@ -64,8 +64,13 @@ export class ProviderIndexFailure extends Error {
 //
 // Unit keys are not always files: Kimi's key is the session directory, whose
 // mtime does not track appends to the wire files inside. Directory keys are
-// expanded to the transcripts they contain (bounded); missing keys are
-// dropped. Both run in the indexer worker, never on the Electron main thread.
+// expanded to the transcripts they contain (bounded, mtime-ranked); missing
+// keys are dropped. Both run in the indexer worker, never on the Electron
+// main thread. The authoritative wire-layout knowledge lives in the Kimi
+// provider (kimi.ts sessionDirectoryFromWirePath and its discover walk) —
+// this generic expansion deliberately relies on file mtime instead of
+// duplicating that layout logic; if the Kimi wire layout changes, revisit
+// both.
 const WATCH_HINT_LIMIT = 64;
 const HINT_DIRECTORY_FILE_LIMIT = 4;
 // Candidates collected before ranking by mtime — a Kimi session dir holds

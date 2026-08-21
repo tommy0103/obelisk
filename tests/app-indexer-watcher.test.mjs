@@ -81,9 +81,9 @@ test('default watcher reports deep new files in freshly created directories', as
     const sawFile = () =>
       builds.some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('agent-1.jsonl')));
     let sawIt = false;
-    for (let attempt = 0; attempt < 10 && !sawIt; attempt++) {
+    for (let attempt = 0; attempt < 20 && !sawIt; attempt++) {
       fs.appendFileSync(newFile, '{"probe":1}\n');
-      sawIt = await waitFor(sawFile);
+      sawIt = await waitFor(sawFile, 1500);
     }
     assert.ok(sawIt, 'the deep new transcript reached buildIndex as a changed path');
     const hit = builds.find((b) => (b.changedPaths ?? []).some((p) => p.endsWith('agent-1.jsonl')));
@@ -112,21 +112,33 @@ test('default watcher filters non-transcript files', async () => {
   service.start({ buildOnStart: false });
 
   try {
+    // Establish the subscription first: FSEvents latency on CI runners is
+    // real and unbounded, so without a probe the test races subscription
+    // setup and flakes (macOS CI waited ~11 s and saw nothing).
+    let established = false;
+    for (let attempt = 0; attempt < 20 && !established; attempt++) {
+      fs.appendFileSync(join(root, 'probe.json'), '{}\n');
+      established = await waitFor(() =>
+        builds.some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('probe.json'))), 1500);
+    }
+    assert.ok(established, 'the subscription is delivering events');
+
+    const noiseStart = builds.length;
     fs.writeFileSync(join(root, 'noise.txt'), 'not a transcript');
     // Give a wrong-positive time to surface, then send a real one as a control.
     await new Promise((resolve) => setTimeout(resolve, 700));
-    const noiseBuilds = builds.length;
-    const realFile = join(root, 'real.json');
-    const sawReal = () =>
-      builds.slice(noiseBuilds).some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('real.json')));
-    let sawIt = false;
-    for (let attempt = 0; attempt < 10 && !sawIt; attempt++) {
-      fs.appendFileSync(realFile, '{}\n');
-      sawIt = await waitFor(sawReal);
-    }
+    const sawNoise = builds.slice(noiseStart)
+      .some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('noise.txt')));
+    assert.equal(sawNoise, false, 'a .txt write alone must not schedule a build');
 
-    assert.equal(noiseBuilds, 0, 'a .txt write alone must not schedule a build');
-    assert.ok(sawIt, 'the .json control write does schedule a build');
+    const realFile = join(root, 'real.json');
+    let sawReal = false;
+    for (let attempt = 0; attempt < 20 && !sawReal; attempt++) {
+      fs.appendFileSync(realFile, '{}\n');
+      sawReal = await waitFor(() =>
+        builds.slice(noiseStart).some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('real.json'))), 1500);
+    }
+    assert.ok(sawReal, 'the .json control write does schedule a build');
   } finally {
     service.stop();
     await service.idle();
