@@ -127,6 +127,7 @@ function defaultIndexerWorkerClient() {
 async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const originalArgv = process.argv;
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-window-flags-${Date.now()}-${Math.random()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
@@ -134,6 +135,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
     writeFileSync(join(home, '.obelisk', 'settings.json'), settingsText);
   }
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   process.argv = [originalArgv[0] || 'node', originalArgv[1] || 'electron', ...flags];
 
   const windows = [];
@@ -186,6 +188,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
     restore();
     process.argv = originalArgv;
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 }
@@ -216,6 +219,7 @@ test('malformed settings keep the desktop recovery window available', async () =
 
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -225,6 +229,7 @@ test('main process watches every root declared by the built-in provider registry
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const serviceOptions = [];
   const workerCalls = [];
@@ -300,18 +305,21 @@ test('main process watches every root declared by the built-in provider registry
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process forwards committed IDs without reopening after a deferred build', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-deferred-build-${Date.now()}`);
   mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
   mkdirSync(join(home, '.codex', 'sessions'), { recursive: true });
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   let databaseOpens = 0;
   let serviceOptions;
@@ -409,16 +417,19 @@ test('main process forwards committed IDs without reopening after a deferred bui
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('session IPC hides Codex rows by default and supports explicit source opt-in', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-source-filter-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const queries = [];
@@ -501,16 +512,19 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('usage IPC aggregates normalized tokens across all indexed providers', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-usage-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   const setup = new DatabaseSync(dbPath);
@@ -619,16 +633,19 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process migrates an existing app database before source-filtered IPC queries', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-db-migration-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const { DatabaseSync } = require('node:sqlite');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
@@ -703,17 +720,20 @@ test('main process migrates an existing app database before source-filtered IPC 
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process keeps schema and memory mutations behind the writer lease', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-migration-lease-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const legacy = new DatabaseSync(dbPath);
   legacy.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY)');
@@ -767,6 +787,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
     restore();
     holder.release();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -774,10 +795,12 @@ test('main process keeps schema and memory mutations behind the writer lease', a
 test('closing the last macOS window releases background resources until activation', async () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-main-window-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   Object.defineProperty(process, 'platform', { value: 'darwin' });
 
   const appHandlers = new Map();
@@ -880,6 +903,7 @@ test('closing the last macOS window releases background resources until activati
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     rmSync(home, { recursive: true, force: true });
   }
@@ -902,7 +926,10 @@ test('settings rebuild reopens the database from the configured Claude path', as
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const openedDbPaths = [];
@@ -1066,6 +1093,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1084,7 +1112,10 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const openedDbPaths = [];
@@ -1176,6 +1207,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1194,7 +1226,10 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const serviceEvents = [];
@@ -1279,6 +1314,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1289,7 +1325,9 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({ autoRefresh: true }));
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const services = [];
@@ -1388,6 +1426,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
   } finally {
     restore();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1395,10 +1434,12 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
 
 test('main process watches OBELISK_DIR as a tree target and debounces recap notifications', async () => {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const home = makeTempDir(`obelisk-watch-retry-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   let watcherOptions = null;
   const windows = [];
@@ -1473,6 +1514,7 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
     restore();
     mock.timers.reset();
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });

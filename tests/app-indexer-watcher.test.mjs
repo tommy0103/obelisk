@@ -139,6 +139,12 @@ test('default watcher filters non-transcript files', async () => {
         builds.slice(noiseStart).some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('real.json'))), 1500);
     }
     assert.ok(sawReal, 'the .json control write does schedule a build');
+
+    // Re-scan after the control succeeded: at unbounded CI event latency a
+    // wrong-positive .txt build could arrive long after the 700 ms probe.
+    const sawNoiseLate = builds.slice(noiseStart)
+      .some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('noise.txt')));
+    assert.equal(sawNoiseLate, false, 'a .txt write never schedules a build, even at CI event latency');
   } finally {
     service.stop();
     await service.idle();
