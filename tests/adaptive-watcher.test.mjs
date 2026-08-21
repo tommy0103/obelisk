@@ -362,7 +362,7 @@ test('close awaits the unsubscribe of a subscription dropped by a stream error',
 
 // ---------------------------------------------------------------- hot overlay
 
-test('a promoted hot file baselines silently, then later appends are detected', async () => {
+test('a hint-promoted hot file reports its first observation, then later appends are detected', async () => {
   const root = makeTempDir('obelisk-adw-hot-');
   const file = join(root, 'active.jsonl');
   const timers = fakeTimers();
@@ -384,13 +384,17 @@ test('a promoted hot file baselines silently, then later appends are detected', 
   };
 
   try {
+    // The public promote() is the build-hint channel: appends after the
+    // build finished are covered by no delivered signal, so the first
+    // observation must report — never baseline silently.
     watcher.promote(file);
     await tick();
-    assert.deepEqual(invalidations, [], 'promotion baselines silently — the promoting signal already delivered the change');
+    assert.deepEqual(invalidations, [{ type: 'paths', paths: [file] }],
+      'a hint-promoted file reports its first observation as an appearance');
 
     state = { ...state, size: 180, mtimeMs: 2000 };
     await tick();
-    assert.deepEqual(invalidations, [{ type: 'paths', paths: [file] }], 'a post-promotion append is detected');
+    assert.equal(invalidations.length, 2, 'a post-promotion append is detected');
     assert.ok(statCalls.every((p) => p === file), 'only the hot file is polled');
   } finally {
     await watcher.close();
@@ -446,17 +450,24 @@ test('native events promote matching paths before delivering the invalidation', 
   const root = makeTempDir('obelisk-adw-promote-');
   const timers = fakeTimers();
   const { subscriptions, subscribe } = fakeSubscribeStore();
+  const invalidations = [];
+  let state = { dev: 1, ino: 11, size: 10, mtimeMs: 1000 };
   const statCalls = [];
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'tree', path: root }],
-    onInvalidate: () => {},
+    onInvalidate: (inv) => invalidations.push(inv),
     hotPolling: true,
     shouldPromote: (p) => p.endsWith('.jsonl'),
     subscribe,
-    stat: async (p) => { statCalls.push(p); return { dev: 1, ino: 1, size: 1, mtimeMs: 1 }; },
+    stat: async (p) => { statCalls.push(p); return { ...state }; },
     timers,
     logger: { warn: () => {} },
   });
+
+  const tick = async () => {
+    timers.flush();
+    assert.ok(await waitFor(() => timers.pendingCount === 1), 'the next poll tick is scheduled');
+  };
 
   try {
     assert.ok(await waitFor(() => subscriptions.length === 1), 'the tree root is subscribed');
@@ -464,10 +475,63 @@ test('native events promote matching paths before delivering the invalidation', 
       { type: 'create', path: join(root, 'new-session.jsonl') },
       { type: 'create', path: join(root, 'notes.txt') },
     ]);
-    timers.flush();
-    assert.ok(await waitFor(() => statCalls.length > 0), 'the promoted path is polled');
+    await tick();
     assert.deepEqual([...new Set(statCalls)], [join(root, 'new-session.jsonl')],
       'only shouldPromote-matching paths enter the hot set');
+    const afterPromotion = invalidations.length;
+    assert.ok(afterPromotion >= 1, 'the event itself was delivered');
+
+    // Event promotion baselines silently (the event already delivered the
+    // change); a later append through a possibly-invisible writer is polled.
+    state = { ...state, size: 40, mtimeMs: 2000 };
+    await tick();
+    const appended = invalidations.slice(afterPromotion)
+      .some((inv) => inv.type === 'paths' && inv.paths.includes(join(root, 'new-session.jsonl')));
+    assert.ok(appended, 'a post-promotion append on an event-promoted file is detected');
+
+    // Delete events never promote: the removed transcript would otherwise
+    // hold a hot slot while permanently missing.
+    subscriptions[0].callback(null, [{ type: 'delete', path: join(root, 'gone.jsonl') }]);
+    statCalls.length = 0;
+    await tick();
+    assert.ok(!statCalls.includes(join(root, 'gone.jsonl')), 'a delete event does not promote');
+  } finally {
+    await watcher.close();
+  }
+});
+
+test('a directory hint is dropped from the hot set instead of being polled forever', async () => {
+  // Kimi's unit key is the session directory, so watchHints can contain
+  // directories; polling one cannot see appends to the wire file inside.
+  const root = makeTempDir('obelisk-adw-dirhint-');
+  const dirTarget = join(root, 'session-dir');
+  const timers = fakeTimers();
+  const invalidations = [];
+  const statCalls = [];
+  const watcher = createAdaptiveWatcher({
+    targets: [],
+    onInvalidate: (inv) => invalidations.push(inv),
+    hotPolling: true,
+    stat: async (p) => {
+      statCalls.push(p);
+      return { dev: 1, ino: 1, size: 64, mtimeMs: 1000, isDirectory: true };
+    },
+    timers,
+    logger: { warn: () => {} },
+  });
+
+  const tick = async () => {
+    timers.flush();
+    assert.ok(await waitFor(() => timers.pendingCount === 1), 'the next poll tick is scheduled');
+  };
+
+  try {
+    watcher.promote(dirTarget);
+    await tick();
+    assert.equal(statCalls.length, 1, 'a promoted path is probed once');
+    assert.deepEqual(invalidations, [], 'a directory hint reports nothing');
+    await tick();
+    assert.equal(statCalls.length, 1, 'a directory hint is evicted from the hot set, not polled again');
   } finally {
     await watcher.close();
   }

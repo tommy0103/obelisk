@@ -50,7 +50,17 @@ export type ParcelSubscribe = (
   callback: (err: Error | null, events: Array<{ type: string; path: string }>) => void,
 ) => Promise<{ unsubscribe(): Promise<void> }>;
 
-export type FileSignature = { dev: number; ino: number; size: number; mtimeMs: number };
+export type FileSignature = { dev: number; ino: number; size: number; mtimeMs: number; isDirectory?: boolean };
+
+/** Real fs.Stats exposes isDirectory() as a method; test fakes may use a
+ * plain boolean. Both are accepted. */
+export type StatProbeResult = {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  isDirectory?: boolean | (() => boolean);
+};
 
 export interface AdaptiveWatcherTimers {
   // `any` handles: whatever the injected setTimeout returns is only ever
@@ -88,7 +98,7 @@ export interface AdaptiveWatcherOptions {
   /** Injection point for the root existence probe (tests). */
   access?: (path: string) => Promise<unknown>;
   /** Injection point for the file metadata probe (tests). */
-  stat?: (path: string) => Promise<FileSignature>;
+  stat?: (path: string) => Promise<StatProbeResult>;
   timers?: AdaptiveWatcherTimers;
   logger?: { warn?: (msg: string) => void };
 }
@@ -131,6 +141,10 @@ export function createAdaptiveWatcher({
   const hotEnabled = hotPolling ?? process.platform === 'darwin';
   // Insertion-ordered LRU of hot (non-pinned) polled paths. Values unused.
   const hotFiles = new Map<string, null>();
+  // Hot paths promoted by a native event baseline silently on first
+  // observation — the event itself already delivered the change. Hint-seeded
+  // paths (public promote) must report their first observation instead.
+  const silentFirstBaseline = new Set<string>();
 
   let closed = false;
 
@@ -198,9 +212,13 @@ export function createAdaptiveWatcher({
         if (paths.length) {
           // Promotion precedes delivery: the caller's catch-up build reads
           // content written before promotion, polling covers later appends.
+          // Deletes never promote — a removed transcript would hold a hot
+          // slot while permanently missing and evict live files.
           if (hotEnabled && shouldPromote) {
-            for (const eventPath of paths) {
-              if (shouldPromote(eventPath)) promote(eventPath);
+            for (const event of events ?? []) {
+              if (event?.path && event.type !== 'delete' && shouldPromote(event.path)) {
+                promoteHot(event.path, { silent: true });
+              }
             }
           }
           onInvalidate({ type: 'paths', paths });
@@ -276,7 +294,15 @@ export function createAdaptiveWatcher({
   const statFile = async (file: string): Promise<FileSignature | null> => {
     try {
       const stats = await stat(file);
-      return { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs };
+      return {
+        dev: stats.dev,
+        ino: stats.ino,
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+        isDirectory: typeof stats.isDirectory === 'function'
+          ? stats.isDirectory()
+          : stats.isDirectory === true,
+      };
     } catch (error) {
       const code = errorCode(error);
       if (code === 'ENOENT' || code === 'ENOTDIR') return null;
@@ -304,13 +330,27 @@ export function createAdaptiveWatcher({
       for (const [file, isHot] of observed) {
         const prev = baselines.get(file);
         const next = await statFile(file);
+        // Evicted while its stat was in flight: stay evicted — do not
+        // re-insert a baseline or report (the hard cap must hold).
+        if (isHot && !hotFiles.has(file)) continue;
+        // Unit keys are not always files (Kimi's key is the session
+        // directory); polling a directory cannot see appends to the wire
+        // file inside it, and the tree watch already covers it.
+        if (isHot && next !== null && next.isDirectory) {
+          hotFiles.delete(file);
+          baselines.delete(file);
+          silentFirstBaseline.delete(file);
+          continue;
+        }
         if (prev === undefined) {
           baselines.set(file, next);
-          // Pinned: first observation of an existing file IS an appearance —
-          // a redundant incremental build beats a missed event. Hot: silent
-          // baseline, because promotion always follows a signal (a native
-          // event or a build hint) that already delivered the change.
-          if (!isHot && next !== null) changed.push(file);
+          // Pinned targets and hint-promoted hot files report their first
+          // observation of an existing file as an appearance (a redundant
+          // incremental build beats a missed event); event-promoted hot
+          // files baseline silently because the event already delivered
+          // the change.
+          const silent = isHot && silentFirstBaseline.delete(file);
+          if (next !== null && !silent) changed.push(file);
           continue;
         }
         if (signatureChanged(prev ?? null, next)) {
@@ -330,7 +370,7 @@ export function createAdaptiveWatcher({
     }
   };
 
-  const promote = (path: string) => {
+  const promoteHot = (path: string, { silent }: { silent: boolean }) => {
     if (!hotEnabled || closed || pinnedFiles.has(path)) return;
     if (hotFiles.has(path)) {
       // LRU refresh; the baseline survives.
@@ -343,10 +383,18 @@ export function createAdaptiveWatcher({
       if (oldest === undefined) break;
       hotFiles.delete(oldest);
       baselines.delete(oldest);
+      silentFirstBaseline.delete(oldest);
     }
     hotFiles.set(path, null);
     baselines.set(path, undefined);
+    if (silent) silentFirstBaseline.add(path);
   };
+
+  // The build-hint channel: a hint means "the build saw this as recently
+  // active", but appends after the build finished are covered by no
+  // delivered signal — the first observation must report, never baseline
+  // silently.
+  const promote = (path: string) => promoteHot(path, { silent: false });
 
   // ------------------------------------------------------------- lifecycle
 

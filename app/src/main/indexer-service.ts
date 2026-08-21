@@ -194,7 +194,11 @@ function createIndexerService({
       const result = await buildIndex({ reason, changedPaths: buildChangedPaths });
       // Seed the watcher's hot set with the transcripts the build just saw
       // as recently active (ADR-0009 hot-set closure, startup/reconcile leg).
-      for (const hint of result?.watchHints ?? []) watcher?.promote?.(hint);
+      // Hints arrive newest-first; promote oldest-first so the Map's
+      // insertion order leaves the NEWEST hint as the most-recently-used —
+      // otherwise the next promotion would evict the freshest transcript.
+      const hints = result?.watchHints ?? [];
+      for (const hint of [...hints].reverse()) watcher?.promote?.(hint);
       if (result?.complete === false) {
         for (const issue of result.inventoryIssues ?? []) {
           logger.warn?.(

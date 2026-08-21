@@ -53,8 +53,22 @@ export class ProviderIndexFailure extends Error {
   }
 }
 
-export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
-  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
+// Hot-file seeding for the adaptive watcher (ADR-0009): after a build, the
+// most recently written transcripts are the best guess for what is still
+// being appended through long-lived descriptors. index_state.mtime holds the
+// source file mtime per unit; marker rows carry `__` prefixes and are not
+// transcripts. Unit keys are not always files (Kimi's key is a session
+// directory) — the watcher drops non-file hints itself. Keep the limit in
+// sync with the watcher's DEFAULT_MAX_HOT_FILES.
+const WATCH_HINT_LIMIT = 64;
+
+export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT): string[] {
+  return db.prepare(
+    "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC LIMIT ?",
+  ).all(limit).map((row) => String(row.jsonl_path));
+}
+
+export function storedProviderCursor(db: SqliteDb, key: string): Cursor {  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
   if (!row) return null;
   return typeof row.cursor === 'string'
     ? row.cursor
