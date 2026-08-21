@@ -68,11 +68,15 @@ export class ProviderIndexFailure extends Error {
 // dropped. Both run in the indexer worker, never on the Electron main thread.
 const WATCH_HINT_LIMIT = 64;
 const HINT_DIRECTORY_FILE_LIMIT = 4;
+// Candidates collected before ranking by mtime — a Kimi session dir holds
+// several wire files (main + agents), and readdir order says nothing about
+// which one is actively appended.
+const HINT_DIRECTORY_CANDIDATE_LIMIT = 16;
 
 function expandHintDirectory(dir: string): string[] {
-  const found: string[] = [];
+  const candidates: string[] = [];
   const walk = (current: string, depth: number) => {
-    if (found.length >= HINT_DIRECTORY_FILE_LIMIT || depth > 4) return;
+    if (candidates.length >= HINT_DIRECTORY_CANDIDATE_LIMIT || depth > 4) return;
     let entries: Dirent[];
     try {
       entries = readdirSync(current, { withFileTypes: true });
@@ -80,14 +84,27 @@ function expandHintDirectory(dir: string): string[] {
       return;
     }
     for (const entry of entries) {
-      if (found.length >= HINT_DIRECTORY_FILE_LIMIT) return;
+      if (candidates.length >= HINT_DIRECTORY_CANDIDATE_LIMIT) return;
       const full = join(current, entry.name);
       if (entry.isDirectory()) walk(full, depth + 1);
-      else if (entry.name.endsWith('.jsonl')) found.push(full);
+      else if (entry.name.endsWith('.jsonl')) candidates.push(full);
     }
   };
   walk(dir, 0);
-  return found;
+  // Rank by file mtime: the actively appended wire (the main one in
+  // practice) is the most recently written, while a plain readdir/DFS order
+  // would systematically pick stale agent wires first.
+  return candidates
+    .map((file) => {
+      try {
+        return { file, mtimeMs: statSync(file).mtimeMs };
+      } catch {
+        return { file, mtimeMs: 0 };
+      }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, HINT_DIRECTORY_FILE_LIMIT)
+    .map(({ file }) => file);
 }
 
 export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT): string[] {

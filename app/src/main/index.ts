@@ -1139,10 +1139,17 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       writerLease?.release();
       if (loadPersistedSettings().autoRefresh !== false) {
         const service = startIndexerService({ buildOnStart: false });
-        // The rebuild bypassed the service's own build path, so seed the hot
-        // set from its hints here — otherwise already-open transcripts would
-        // wait for the next reconcile to be re-seeded.
-        service?.promoteWatchHints?.(rebuildWatchHints);
+        if (rebuildWatchHints.length) {
+          // The rebuild bypassed the service's own build path, so seed the
+          // hot set from its hints here.
+          service?.promoteWatchHints?.(rebuildWatchHints);
+        } else {
+          // A failed/deferred rebuild produced no hints and the old hot set
+          // died with the old watcher. Run one reconciling build through the
+          // service — its deferral retry absorbs writer-busy — so long-open
+          // transcripts are re-seeded now, not at the next 5-min reconcile.
+          service?.runBuildNow('reconcile');
+        }
       }
     }
   }

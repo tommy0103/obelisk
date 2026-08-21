@@ -37,7 +37,7 @@ jobs:
       - name: Verify adaptive watcher package
         run: |
           npm run build --workspace @obelisk-apps/adaptive-watcher
-          node --experimental-strip-types --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs
+          node --experimental-strip-types --experimental-sqlite --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs
 
       - name: Verify POSIX bootstrap installer
         if: runner.os != 'Windows'

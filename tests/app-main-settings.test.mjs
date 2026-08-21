@@ -909,6 +909,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
   const buildCalls = [];
   const serviceEvents = [];
   const sent = [];
+  const promotedHints = [];
   let competingLeaseDuringBuild;
   let publishRebuild = false;
 
@@ -964,6 +965,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
           stop() { serviceEvents.push('stop'); },
           idle: async () => { serviceEvents.push('idle'); },
           runBuildNow() { serviceEvents.push('runBuildNow'); return Promise.resolve(); },
+          promoteWatchHints(hints) { promotedHints.push(hints); },
         }),
       },
     }],
@@ -993,6 +995,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
                     path: '/tmp/pi/structurally-invalid.jsonl',
                     error: 'Malformed Pi message at line 2',
                   }],
+              watchHints: publishRebuild ? ['/hint/live-session.jsonl'] : [],
             };
           },
           stop() { return Promise.resolve(); },
@@ -1010,6 +1013,10 @@ test('settings rebuild reopens the database from the configured Claude path', as
     const beforeIncomplete = require('node:fs').readFileSync(liveDbPath, 'utf8');
     const incomplete = await rebuild();
     assert.equal(incomplete.complete, false);
+    assert.ok(
+      serviceEvents.includes('runBuildNow'),
+      'a rebuild without hints schedules a reconciling build to reseed the hot set',
+    );
     assert.deepEqual(sent.findLast(message => message.channel === 'obelisk:index-updated'), {
       channel: 'obelisk:index-updated',
       payload: {
@@ -1048,6 +1055,8 @@ test('settings rebuild reopens the database from the configured Claude path', as
       'rebuilt temp db',
     );
     assert.ok(serviceEvents.indexOf('build') > serviceEvents.indexOf('stop'));
+    assert.deepEqual(promotedHints, [['/hint/live-session.jsonl']],
+      'a successful rebuild seeds the recreated watcher with its watch hints');
     const postRebuildLease = acquireWriterLease({
       lockPath: join(home, '.obelisk', 'writer.lock.sqlite'),
       openDb: lockPath => new DatabaseSync(lockPath),
