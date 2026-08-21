@@ -192,7 +192,7 @@ test('an inaccessible tree root warns once per failure, and again after a recurr
   }
 });
 
-test('file targets are polled for append, replacement, and disappearance — never subscribed', async () => {
+test('file targets are polled for appearance, append, replacement, and disappearance — never subscribed', async () => {
   const root = makeTempDir('obelisk-adw-file-');
   const file = join(root, 'session_index.jsonl');
   const timers = fakeTimers();
@@ -224,23 +224,32 @@ test('file targets are polled for append, replacement, and disappearance — nev
   };
 
   try {
+    // The file exists at first observation: this is reported as an
+    // appearance on purpose — a redundant incremental startup build is
+    // cheap, a silently baselined appearance is a missed event. There is no
+    // silent-baseline state at all.
     await tick();
-    assert.deepEqual(invalidations, [], 'the first tick only sets the baseline');
+    assert.deepEqual(invalidations, [{ type: 'paths', paths: [file] }],
+      'first observation of an existing file reports an appearance');
 
     state = { ...state, size: 160, mtimeMs: 2000 };
     await tick();
-    assert.deepEqual(invalidations, [{ type: 'paths', paths: [file] }], 'an append is detected');
+    assert.equal(invalidations.length, 2, 'an append is detected');
 
     state = { dev: 1, ino: 22, size: 160, mtimeMs: 2000 };
     await tick();
-    assert.equal(invalidations.length, 2, 'a same-size replacement is detected by identity');
+    assert.equal(invalidations.length, 3, 'a same-size replacement is detected by identity');
 
     missing = true;
     await tick();
-    assert.equal(invalidations.length, 3, 'a disappearance is detected');
+    assert.equal(invalidations.length, 4, 'a disappearance is detected');
 
     await tick();
-    assert.equal(invalidations.length, 3, 'a still-missing file does not re-report');
+    assert.equal(invalidations.length, 4, 'a still-missing file does not re-report');
+
+    missing = false;
+    await tick();
+    assert.equal(invalidations.length, 5, 'a re-appearance is detected');
 
     assert.equal(subscriptions.length, 0, 'a file target never reaches the tree backend');
   } finally {
@@ -269,4 +278,40 @@ test('close unsubscribes trees and leaves no timers behind', async () => {
   assert.equal(subscriptions[0].unsubscribed, true, 'the tree subscription is released');
   assert.equal(timers.pendingCount, 0, 'no retry or poll timer survives close');
   timers.flush();
+});
+
+
+test('close waits for an in-flight subscribe, and no invalidation fires after close', async () => {
+  const root = makeTempDir('obelisk-adw-inflight-');
+  const invalidations = [];
+  let resolveSubscribe = null;
+  let capturedCallback = null;
+  let unsubscribed = false;
+  const subscribe = (_root, callback) => {
+    capturedCallback = callback;
+    return new Promise((resolve) => { resolveSubscribe = resolve; });
+  };
+  const watcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: root }],
+    onInvalidate: (inv) => invalidations.push(inv),
+    subscribe,
+    logger: { warn: () => {} },
+  });
+
+  assert.ok(await waitFor(() => resolveSubscribe !== null), 'the root probe reached subscribe');
+  const closePromise = watcher.close();
+
+  // The subscribe settles after close() began: close() must not complete
+  // while that subscription is alive.
+  resolveSubscribe({
+    unsubscribe() {
+      unsubscribed = true;
+      return Promise.resolve();
+    },
+  });
+  await closePromise;
+  assert.ok(unsubscribed, 'the late-settling subscription is unsubscribed before close completes');
+
+  capturedCallback(null, [{ type: 'update', path: join(root, 'late.jsonl') }]);
+  assert.deepEqual(invalidations, [], 'no invalidation fires after close');
 });

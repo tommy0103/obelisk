@@ -115,6 +115,7 @@ export function createAdaptiveWatcher({
 
   const subscriptions = new Map<string, { unsubscribe(): Promise<void> }>();
   const pending = new Set<string>();
+  const inflightSubscribes = new Set<Promise<unknown>>();
   let retryTimer: unknown = null;
   // The first wave of establishments is quiet — the caller's startup build
   // already covers roots present at creation. Once the initial pass settles,
@@ -146,6 +147,7 @@ export function createAdaptiveWatcher({
     let result: ReturnType<ParcelSubscribe>;
     try {
       result = subscribe(root, (err, events) => {
+        if (closed) return;
         if (err) {
           warnOnce(root, err, `Obelisk watcher failed for ${root}: ${errorMessage(err)}`);
           dropRoot(root);
@@ -161,27 +163,32 @@ export function createAdaptiveWatcher({
       if (!closed) scheduleRetry();
       return;
     }
-    Promise.resolve(result).then((sub) => {
+    // Tracked so close() can wait for in-flight subscribes: on settle after
+    // close they unsubscribe here, and `tracked` only completes afterwards.
+    const tracked = Promise.resolve(result).then((sub) => {
+      inflightSubscribes.delete(tracked);
       const wasPending = pending.delete(root);
       const duringInitialPass = !initialPassDone;
       noteSettled();
       if (closed || !wasPending) {
         // The watcher was closed, or the subscription errored while it was
         // still being established (dropRoot already ran) — don't leak it.
-        void sub.unsubscribe().catch(() => {});
-        return;
+        return sub.unsubscribe().catch(() => {});
       }
       subscriptions.set(root, sub);
       lastWarned.delete(root);
       if (!duringInitialPass) {
         onInvalidate({ type: 'rescan', roots: [root], reason: 'root-established' });
       }
+      return undefined;
     }, (error) => {
+      inflightSubscribes.delete(tracked);
       pending.delete(root);
       noteSettled();
       warnOnce(root, error, `Obelisk watcher failed to subscribe ${root}: ${errorMessage(error)}`);
       if (!closed) scheduleRetry();
     });
+    inflightSubscribes.add(tracked);
   };
 
   const addRoot = (root: string) => {
@@ -205,10 +212,13 @@ export function createAdaptiveWatcher({
     for (const root of treeRoots) addRoot(root);
   };
 
-  // ------------------------------------------------------------ file poller
+  // ---------------------------------------------------------- file poller
 
-  // undefined = not yet observed (first tick only sets the baseline — the
-  // caller's startup build already covers that state), null = missing.
+  // undefined = never observed. The first observation of an EXISTING file
+  // emits an appearance invalidation on purpose: a redundant incremental
+  // build at startup is cheap (the cursor is already there), while a
+  // silently baselined appearance is a missed event. Only missing-at-first-
+  // observation is quiet.
   const baselines = new Map<string, FileSignature | null | undefined>();
   let pollTimer: unknown = null;
   let polling = false;
@@ -241,6 +251,7 @@ export function createAdaptiveWatcher({
         const next = await statFile(file);
         if (prev === undefined) {
           baselines.set(file, next);
+          if (next !== null) changed.push(file);
           continue;
         }
         if (signatureChanged(prev ?? null, next)) {
@@ -273,7 +284,13 @@ export function createAdaptiveWatcher({
       pollTimer = null;
       const subs = [...subscriptions.values()];
       subscriptions.clear();
-      return Promise.all(subs.map((sub) => sub.unsubscribe().catch(() => {})));
+      // In-flight subscribes unsubscribe themselves when they settle (they
+      // observe closed); awaiting their tracked promises means close() does
+      // not complete while a subscription can still outlive it.
+      return Promise.all([
+        ...subs.map((sub) => sub.unsubscribe().catch(() => {})),
+        ...inflightSubscribes,
+      ]);
     },
   };
 }
