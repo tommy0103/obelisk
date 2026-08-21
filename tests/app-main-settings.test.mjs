@@ -96,6 +96,30 @@ function electronNamespace({ app, BrowserWindow, ipcMain }) {
   };
 }
 
+// Assigning undefined to process.env leaves the literal string "undefined"
+// instead of removing the variable — restore must delete in that case.
+function restoreEnvVar(name, value) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+// Captures app event handlers so a test can fire window-all-closed, which is
+// what makes the main module close its database handle.
+function captureAppHandlers(map) {
+  return {
+    whenReady: () => Promise.resolve(),
+    on(event, handler) { map.set(event, handler); },
+    quit() {},
+  };
+}
+
+// Windows refuses to unlink an open SQLite file; fire window-all-closed and
+// let the async close land before removing the temp home.
+async function closeMainProcessDb(appHandlers) {
+  appHandlers.get('window-all-closed')?.();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
 function noopWatcher() {
   return {
     createAdaptiveWatcher: () => ({
@@ -187,8 +211,8 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   } finally {
     restore();
     process.argv = originalArgv;
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 }
@@ -304,8 +328,8 @@ test('main process watches every root declared by the built-in provider registry
     assert.deepEqual(workerCalls[0].providerSettings, {});
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -416,8 +440,8 @@ test('main process forwards committed IDs without reopening after a deferred bui
     });
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -511,8 +535,8 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
     );
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -577,6 +601,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   setup.close();
 
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
@@ -592,6 +617,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -632,8 +658,9 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     assert.equal(piOnly.totalTokens, 35);
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -676,6 +703,7 @@ test('main process migrates an existing app database before source-filtered IPC 
   legacy.close();
 
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
@@ -691,6 +719,7 @@ test('main process migrates an existing app database before source-filtered IPC 
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -719,8 +748,9 @@ test('main process migrates an existing app database before source-filtered IPC 
     });
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -745,6 +775,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   });
   assert.ok(holder);
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
@@ -760,6 +791,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) { ipcHandlers.set(channel, handler); },
@@ -786,8 +818,9 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   } finally {
     restore();
     holder.release();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -902,8 +935,8 @@ test('closing the last macOS window releases background resources until activati
     assert.equal(serviceEvents.filter(e => e === 'service-start').length, 2);
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     rmSync(home, { recursive: true, force: true });
   }
@@ -1092,8 +1125,8 @@ test('settings rebuild reopens the database from the configured Claude path', as
     postRebuildLease.release();
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1206,8 +1239,8 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
     assert.ok(serviceEvents.lastIndexOf('start') > serviceEvents.indexOf('build'));
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1313,8 +1346,8 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
     assert.ok(serviceEvents.some(event => event.startsWith('build-')));
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1425,8 +1458,8 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
     assert.equal(services[1].stops, 0);
   } finally {
     restore();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1513,8 +1546,8 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
   } finally {
     restore();
     mock.timers.reset();
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalProfile;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
