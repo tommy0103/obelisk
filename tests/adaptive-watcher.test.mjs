@@ -73,6 +73,7 @@ test('tree events arrive as batched path invalidations, duplicate roots subscrib
       { kind: 'tree', path: root },
       { kind: 'tree', path: root },
     ],
+    hotPolling: false,
     onInvalidate: (inv) => invalidations.push(inv),
     subscribe,
     logger: { warn: () => {} },
@@ -104,6 +105,7 @@ test('a missing tree root is retried quietly and repeatedly, then established wi
   const { subscriptions, subscribe } = fakeSubscribeStore();
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'tree', path: root }],
+    hotPolling: false,
     onInvalidate: (inv) => invalidations.push(inv),
     subscribe,
     // The real fs probe through the injection point: ENOENT is genuine.
@@ -153,6 +155,7 @@ test('an inaccessible tree root warns once per failure, and again after a recurr
   };
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'tree', path: root }],
+    hotPolling: false,
     onInvalidate: () => {},
     subscribe,
     access,
@@ -210,6 +213,7 @@ test('file targets are polled for appearance, append, replacement, and disappear
   };
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'file', path: file }],
+    hotPolling: false,
     onInvalidate: (inv) => invalidations.push(inv),
     subscribe,
     stat,
@@ -264,6 +268,7 @@ test('close unsubscribes trees and leaves no timers behind', async () => {
   const { subscriptions, subscribe } = fakeSubscribeStore();
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'tree', path: root }, { kind: 'file', path: file }],
+    hotPolling: false,
     onInvalidate: () => {},
     subscribe,
     stat: async () => ({ dev: 1, ino: 1, size: 1, mtimeMs: 1 }),
@@ -293,6 +298,7 @@ test('close waits for an in-flight subscribe, and no invalidation fires after cl
   };
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'tree', path: root }],
+    hotPolling: false,
     onInvalidate: (inv) => invalidations.push(inv),
     subscribe,
     logger: { warn: () => {} },
@@ -329,6 +335,7 @@ test('close awaits the unsubscribe of a subscription dropped by a stream error',
   };
   const watcher = createAdaptiveWatcher({
     targets: [{ kind: 'tree', path: root }],
+    hotPolling: false,
     onInvalidate: () => {},
     subscribe,
     logger: { warn: () => {} },
@@ -350,4 +357,198 @@ test('close awaits the unsubscribe of a subscription dropped by a stream error',
   releaseUnsubscribe();
   await closePromise;
   assert.ok(closeResolved, 'close completes once the cleanup lands');
+});
+
+
+// ---------------------------------------------------------------- hot overlay
+
+test('a promoted hot file baselines silently, then later appends are detected', async () => {
+  const root = makeTempDir('obelisk-adw-hot-');
+  const file = join(root, 'active.jsonl');
+  const timers = fakeTimers();
+  const invalidations = [];
+  let state = { dev: 1, ino: 11, size: 100, mtimeMs: 1000 };
+  const statCalls = [];
+  const watcher = createAdaptiveWatcher({
+    targets: [],
+    onInvalidate: (inv) => invalidations.push(inv),
+    hotPolling: true,
+    stat: async (p) => { statCalls.push(p); return { ...state }; },
+    timers,
+    logger: { warn: () => {} },
+  });
+
+  const tick = async () => {
+    timers.flush();
+    assert.ok(await waitFor(() => timers.pendingCount === 1), 'the next poll tick is scheduled');
+  };
+
+  try {
+    watcher.promote(file);
+    await tick();
+    assert.deepEqual(invalidations, [], 'promotion baselines silently — the promoting signal already delivered the change');
+
+    state = { ...state, size: 180, mtimeMs: 2000 };
+    await tick();
+    assert.deepEqual(invalidations, [{ type: 'paths', paths: [file] }], 'a post-promotion append is detected');
+    assert.ok(statCalls.every((p) => p === file), 'only the hot file is polled');
+  } finally {
+    await watcher.close();
+  }
+});
+
+test('the hot set never exceeds its cap and evicted files stop being polled', async () => {
+  const root = makeTempDir('obelisk-adw-cap-');
+  const timers = fakeTimers();
+  const statCalls = [];
+  const watcher = createAdaptiveWatcher({
+    targets: [],
+    onInvalidate: () => {},
+    hotPolling: true,
+    maxHotFiles: 2,
+    stat: async (p) => { statCalls.push(p); return { dev: 1, ino: 1, size: 1, mtimeMs: 1 }; },
+    timers,
+    logger: { warn: () => {} },
+  });
+
+  const tick = async () => {
+    timers.flush();
+    assert.ok(await waitFor(() => timers.pendingCount === 1), 'the next poll tick is scheduled');
+  };
+
+  try {
+    const files = ['a', 'b', 'c', 'd'].map((name) => join(root, `${name}.jsonl`));
+    for (const file of files) watcher.promote(file);
+    await tick();
+    const polled = new Set(statCalls);
+    assert.deepEqual([...polled].sort(), [files[2], files[3]].sort(),
+      'only the two most recently promoted files are polled');
+
+    statCalls.length = 0;
+    await tick();
+    assert.ok(!statCalls.includes(files[0]) && !statCalls.includes(files[1]),
+      'evicted files are never polled again');
+
+    // Re-promoting an existing hot file only refreshes its LRU position.
+    watcher.promote(files[3]);
+    watcher.promote(files[2]);
+    watcher.promote(files[0]);
+    statCalls.length = 0;
+    await tick();
+    assert.deepEqual(new Set(statCalls), new Set([files[2], files[0]]),
+      're-promotion evicts the least recently active, not the just-refreshed');
+  } finally {
+    await watcher.close();
+  }
+});
+
+test('native events promote matching paths before delivering the invalidation', async () => {
+  const root = makeTempDir('obelisk-adw-promote-');
+  const timers = fakeTimers();
+  const { subscriptions, subscribe } = fakeSubscribeStore();
+  const statCalls = [];
+  const watcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: root }],
+    onInvalidate: () => {},
+    hotPolling: true,
+    shouldPromote: (p) => p.endsWith('.jsonl'),
+    subscribe,
+    stat: async (p) => { statCalls.push(p); return { dev: 1, ino: 1, size: 1, mtimeMs: 1 }; },
+    timers,
+    logger: { warn: () => {} },
+  });
+
+  try {
+    assert.ok(await waitFor(() => subscriptions.length === 1), 'the tree root is subscribed');
+    subscriptions[0].callback(null, [
+      { type: 'create', path: join(root, 'new-session.jsonl') },
+      { type: 'create', path: join(root, 'notes.txt') },
+    ]);
+    timers.flush();
+    assert.ok(await waitFor(() => statCalls.length > 0), 'the promoted path is polled');
+    assert.deepEqual([...new Set(statCalls)], [join(root, 'new-session.jsonl')],
+      'only shouldPromote-matching paths enter the hot set');
+  } finally {
+    await watcher.close();
+  }
+});
+
+test('hotPolling disabled makes promote and initialHotFiles no-ops', async () => {
+  const root = makeTempDir('obelisk-adw-disabled-');
+  const file = join(root, 'active.jsonl');
+  const timers = fakeTimers();
+  const statCalls = [];
+  const watcher = createAdaptiveWatcher({
+    targets: [],
+    onInvalidate: () => {},
+    hotPolling: false,
+    initialHotFiles: [file],
+    stat: async (p) => { statCalls.push(p); return { dev: 1, ino: 1, size: 1, mtimeMs: 1 }; },
+    timers,
+    logger: { warn: () => {} },
+  });
+
+  try {
+    watcher.promote(file);
+    timers.flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(statCalls.length, 0, 'nothing is polled while the overlay is disabled');
+    assert.equal(timers.pendingCount, 0, 'no poll timer is scheduled at all');
+  } finally {
+    await watcher.close();
+  }
+});
+
+test('a transcript opened before watching and appended without close is detected by polling', async () => {
+  // The production Codex write pattern (docs/watcher-backend-options-research.md):
+  // one fd opened before subscription, appended continuously, never closed
+  // during the session. FSEvents delivers nothing until close; the poller
+  // must still see the growth. Uses the real fs stat against a real file —
+  // only Parcel is faked (it stays silent, worst case).
+  const root = makeTempDir('obelisk-adw-longopen-');
+  const file = join(root, 'live-session.jsonl');
+  fs.writeFileSync(file, '{"line":0}\n');
+  const fd = fs.openSync(file, 'a');
+
+  const timers = fakeTimers();
+  const invalidations = [];
+  const { subscriptions, subscribe } = fakeSubscribeStore();
+  const watcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: root }],
+    onInvalidate: (inv) => invalidations.push(inv),
+    hotPolling: true,
+    initialHotFiles: [file],
+    subscribe,
+    pollIntervalMs: 40,
+    stat: fs.promises.stat,
+    access: fs.promises.access,
+    timers,
+    logger: { warn: () => {} },
+  });
+
+  const tick = async () => {
+    timers.flush();
+    assert.ok(await waitFor(() => timers.pendingCount > 0), 'the next tick is scheduled');
+  };
+
+  try {
+    assert.ok(await waitFor(() => subscriptions.length === 1), 'the tree root is subscribed');
+    await tick(); // silent baseline for the seeded hot file
+    const baselineCount = invalidations.length;
+
+    // Append through the still-open descriptor — no close, no FSEvents.
+    for (let i = 1; i <= 5; i++) fs.writeSync(fd, `{"line":${i}}\n`);
+    fs.fsyncSync(fd);
+
+    let detected = false;
+    for (let attempt = 0; attempt < 10 && !detected; attempt++) {
+      await tick();
+      detected = invalidations.slice(baselineCount)
+        .some((inv) => inv.type === 'paths' && inv.paths.includes(file));
+    }
+    assert.ok(detected, 'appends through the long-open fd are detected within a few poll ticks');
+  } finally {
+    fs.closeSync(fd);
+    await watcher.close();
+  }
 });

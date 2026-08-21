@@ -13,6 +13,10 @@
 //   mis-cover them. Exact files are also the only way to reliably observe a
 //   writer that appends through a long-lived file descriptor: FSEvents
 //   delivers no event for such appends until the descriptor closes.
+// - A bounded LRU hot set extends the poller to recently active transcripts
+//   (promoted from native events via `shouldPromote`, seeded by
+//   `initialHotFiles` or `promote()` from caller build hints). macOS only by
+//   default; eviction degrades to the caller's periodic reconcile.
 // - Reliability lives inside the package: async existence probes, error
 //   classification (ENOENT/ENOTDIR is a quiet steady state, everything else
 //   warns once per root-and-failure), and a self-rescheduling retry loop.
@@ -34,6 +38,10 @@ export type WatchInvalidation =
   | { type: 'rescan'; roots: string[]; reason: string };
 
 export interface AdaptiveWatcher {
+  /** Move a path into the bounded hot set (LRU-refreshed if already hot).
+   * No-op when the hot overlay is disabled, the path is a pinned `file`
+   * target, or the watcher is closed. */
+  promote(path: string): void;
   close(): Promise<unknown>;
 }
 
@@ -58,6 +66,23 @@ export interface AdaptiveWatcherOptions {
   pollIntervalMs?: number;
   /** Delay before re-probing a missing or lost tree root. Default 5000 ms. */
   retryDelayMs?: number;
+  /**
+   * Enable the bounded hot-file overlay: promoted paths are polled like
+   * pinned `file` targets. Closes the macOS gap where FSEvents delivers no
+   * event for appends through a long-lived descriptor. Defaults to
+   * `process.platform === 'darwin'` (ADR-0009 platform policy: macOS first,
+   * other platforms only after their long-lived-writer matrix proves a need).
+   */
+  hotPolling?: boolean;
+  /** Hard cap on hot (non-pinned) polled files. Default 64. */
+  maxHotFiles?: number;
+  /** Seeds the hot set at creation — covers transcripts already open before
+   * the watcher started. */
+  initialHotFiles?: string[];
+  /** Decides whether a native tree event path enters the hot set (the
+   * package has no domain knowledge — the caller knows its transcripts).
+   * Promotion happens before the path invalidation is delivered. */
+  shouldPromote?: (path: string) => boolean;
   /** Injection point for @parcel/watcher.subscribe (tests). */
   subscribe?: ParcelSubscribe;
   /** Injection point for the root existence probe (tests). */
@@ -70,6 +95,7 @@ export interface AdaptiveWatcherOptions {
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_RETRY_DELAY_MS = 5000;
+const DEFAULT_MAX_HOT_FILES = 64;
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException)?.code;
@@ -84,6 +110,10 @@ export function createAdaptiveWatcher({
   onInvalidate,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+  hotPolling,
+  maxHotFiles = DEFAULT_MAX_HOT_FILES,
+  initialHotFiles = [],
+  shouldPromote,
   subscribe = parcelWatcher.subscribe as ParcelSubscribe,
   access = fs.promises.access,
   stat = fs.promises.stat,
@@ -97,6 +127,10 @@ export function createAdaptiveWatcher({
   // A file covered by a tree target stays in the poller: polling is not
   // there to extend directory coverage but to close the update-latency gap.
   const fileTargets = [...new Set(targets.filter((t) => t.kind === 'file').map((t) => t.path))];
+  const pinnedFiles = new Set(fileTargets);
+  const hotEnabled = hotPolling ?? process.platform === 'darwin';
+  // Insertion-ordered LRU of hot (non-pinned) polled paths. Values unused.
+  const hotFiles = new Map<string, null>();
 
   let closed = false;
 
@@ -161,7 +195,16 @@ export function createAdaptiveWatcher({
           return;
         }
         const paths = (events ?? []).map((event) => event?.path).filter(Boolean);
-        if (paths.length) onInvalidate({ type: 'paths', paths });
+        if (paths.length) {
+          // Promotion precedes delivery: the caller's catch-up build reads
+          // content written before promotion, polling covers later appends.
+          if (hotEnabled && shouldPromote) {
+            for (const eventPath of paths) {
+              if (shouldPromote(eventPath)) promote(eventPath);
+            }
+          }
+          onInvalidate({ type: 'paths', paths });
+        }
       });
     } catch (error) {
       pending.delete(root);
@@ -253,18 +296,31 @@ export function createAdaptiveWatcher({
     polling = true;
     try {
       const changed: string[] = [];
-      for (const file of fileTargets) {
+      // Pinned first (never evicted), then hot files in LRU order.
+      const observed: Array<readonly [string, boolean]> = [
+        ...fileTargets.map((file) => [file, false] as const),
+        ...[...hotFiles.keys()].map((file) => [file, true] as const),
+      ];
+      for (const [file, isHot] of observed) {
         const prev = baselines.get(file);
         const next = await statFile(file);
         if (prev === undefined) {
           baselines.set(file, next);
-          if (next !== null) changed.push(file);
+          // Pinned: first observation of an existing file IS an appearance —
+          // a redundant incremental build beats a missed event. Hot: silent
+          // baseline, because promotion always follows a signal (a native
+          // event or a build hint) that already delivered the change.
+          if (!isHot && next !== null) changed.push(file);
           continue;
         }
         if (signatureChanged(prev ?? null, next)) {
           baselines.set(file, next);
           if (next !== null) lastWarned.delete(file);
           changed.push(file);
+          if (isHot) {
+            hotFiles.delete(file);
+            hotFiles.set(file, null);
+          }
         }
       }
       if (changed.length && !closed) onInvalidate({ type: 'paths', paths: changed });
@@ -274,15 +330,35 @@ export function createAdaptiveWatcher({
     }
   };
 
+  const promote = (path: string) => {
+    if (!hotEnabled || closed || pinnedFiles.has(path)) return;
+    if (hotFiles.has(path)) {
+      // LRU refresh; the baseline survives.
+      hotFiles.delete(path);
+      hotFiles.set(path, null);
+      return;
+    }
+    while (hotFiles.size >= maxHotFiles) {
+      const oldest = hotFiles.keys().next().value;
+      if (oldest === undefined) break;
+      hotFiles.delete(oldest);
+      baselines.delete(oldest);
+    }
+    hotFiles.set(path, null);
+    baselines.set(path, undefined);
+  };
+
   // ------------------------------------------------------------- lifecycle
 
   refreshTrees();
-  if (fileTargets.length) {
+  for (const file of initialHotFiles) promote(file);
+  if (fileTargets.length || hotEnabled) {
     for (const file of fileTargets) baselines.set(file, undefined);
     pollTimer = timers.setTimeout(pollTick, pollIntervalMs);
   }
 
   return {
+    promote,
     close() {
       closed = true;
       if (retryTimer !== null) timers.clearTimeout(retryTimer);

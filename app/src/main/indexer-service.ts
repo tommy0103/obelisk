@@ -29,12 +29,16 @@ interface Timers {
 
 interface Watcher {
   close(): unknown;
+  promote?(path: string): void;
   refreshMissingRoots?(): boolean;
 }
 
 interface IndexerBuildResult {
   deferred?: boolean;
   complete?: boolean;
+  /** Recently written transcripts, most recent first — seeded into the
+   * watcher's hot set (ADR-0009). */
+  watchHints?: string[];
   inventoryIssues?: Array<{
     provider: string;
     path: string;
@@ -64,6 +68,10 @@ interface IndexerServiceOptions {
   watchProjects?: (onChange: (changedPath?: string) => void) => Watcher | null;
   /** Injection point for the default watcher's @parcel/watcher subscribe (tests). */
   subscribe?: ParcelSubscribe;
+  /** Hot-overlay gate passthrough (tests); defaults to macOS-only. */
+  hotPolling?: boolean;
+  /** Poll interval passthrough for the watcher's file poller (tests). */
+  watchPollMs?: number;
   timers?: Timers;
   logger?: { warn?: (msg: string) => void };
 }
@@ -81,6 +89,8 @@ function createIndexerService({
   writeHeartbeat = () => {},
   watchProjects,
   subscribe,
+  hotPolling,
+  watchPollMs,
   timers = {
     setTimeout,
     clearTimeout,
@@ -99,6 +109,11 @@ function createIndexerService({
       logger,
       timers,
       retryDelayMs: watchRetryMs,
+      hotPolling,
+      pollIntervalMs: watchPollMs,
+      // The caller knows its transcripts; the package does not. Native events
+      // for transcripts promote the path into the hot set before delivery.
+      shouldPromote: (targetPath) => targetPath.endsWith('.jsonl') || targetPath.endsWith('.json'),
       onInvalidate: (invalidation) => {
         // A rescan means anything under the root may have changed — full
         // inventory. Path invalidations filter to transcripts here, at the
@@ -177,6 +192,9 @@ function createIndexerService({
     const buildChangedPaths = takeChangedPaths();
     idlePromise = (async () => {
       const result = await buildIndex({ reason, changedPaths: buildChangedPaths });
+      // Seed the watcher's hot set with the transcripts the build just saw
+      // as recently active (ADR-0009 hot-set closure, startup/reconcile leg).
+      for (const hint of result?.watchHints ?? []) watcher?.promote?.(hint);
       if (result?.complete === false) {
         for (const issue of result.inventoryIssues ?? []) {
           logger.warn?.(

@@ -209,3 +209,50 @@ test('silently missed watcher events are reconciled by a periodic full-inventory
     service.stop();
   }
 });
+
+
+test('build watchHints are promoted into the hot set and polled for later appends', async () => {
+  const root = makeTempDir('obelisk-hints-');
+  const hinted = join(root, 'live-session.jsonl');
+  fs.writeFileSync(hinted, '{"line":0}\n');
+  const timers = manualTimers();
+  const builds = [];
+  const service = createIndexerService({
+    watchTargets: [{ kind: 'tree', path: root }],
+    buildIndex: async (args) => { builds.push(args); return { watchHints: [hinted] }; },
+    subscribe: () => Promise.resolve({ unsubscribe: () => Promise.resolve() }),
+    writeHeartbeat: () => {},
+    logger: { warn: () => {} },
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+    watchRetryMs: 0,
+    hotPolling: true,
+  });
+
+  try {
+    service.start({ buildOnStart: false });
+    await service.runBuildNow('startup');
+    // Poll timers live in the manual set alongside service timers; drive
+    // ticks and let microtasks settle between them.
+    timers.flush();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // The hint was promoted (silently baselined); a later append — possibly
+    // invisible to the tree backend — must surface through the poller.
+    fs.appendFileSync(hinted, '{"line":1}\n');
+    let detected = false;
+    for (let attempt = 0; attempt < 20 && !detected; attempt++) {
+      timers.flush();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await service.idle();
+      detected = builds.some((b) => (b.changedPaths ?? []).includes(hinted));
+    }
+    assert.ok(detected, 'the hinted transcript is polled and its append schedules a build');
+    const hit = builds.find((b) => (b.changedPaths ?? []).includes(hinted));
+    assert.equal(hit.reason, 'watch');
+  } finally {
+    service.stop();
+    await service.idle();
+  }
+});

@@ -30,6 +30,19 @@ interface SkippedFile {
   diagnostics?: unknown;
 }
 
+// Hot-file seeding for the adaptive watcher (ADR-0009): after a build, the
+// most recently written transcripts are the best guess for what is still
+// being appended through long-lived descriptors. index_state.mtime holds the
+// source file mtime per unit; marker rows carry `__` prefixes and are not
+// transcripts. Cheap because the build already persisted every cursor.
+const WATCH_HINT_LIMIT = 64;
+
+function readWatchHints(db: SqliteDb): string[] {
+  return db.prepare(
+    "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC LIMIT ?",
+  ).all(WATCH_HINT_LIMIT).map((row: SqliteRow) => String(row.jsonl_path));
+}
+
 interface BuildCheckOptions {
   now?: number;
   ignoreRecentBuild?: boolean;
@@ -287,6 +300,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           inventoryIssues,
           skipped: 0,
           skippedFiles,
+          watchHints: readWatchHints(db),
         };
       }
 
@@ -352,6 +366,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         inventoryIssues,
         skipped: skippedFiles.length,
         skippedFiles,
+        watchHints: readWatchHints(db),
       };
     } finally {
       db.close();
