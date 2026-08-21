@@ -1,0 +1,20 @@
+{
+  "name": "@obelisk-apps/adaptive-watcher",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Adaptive file watcher: recursive tree subscriptions plus an exact-file metadata poller, with explicit invalidation semantics (ADR-0009).",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@parcel/watcher": "^2.6.0"
+  }
+}

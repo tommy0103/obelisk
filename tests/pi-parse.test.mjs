@@ -142,7 +142,7 @@ test('Pi root resolution follows official precedence and rejects ambiguous relat
   try {
     const unresolved = createPiProvider();
     assert.equal(unresolved.descriptor.requiresExplicitRoot, true);
-    assert.deepEqual(unresolved.watchRoots(unresolved.descriptor.defaultRoot), []);
+    assert.deepEqual(unresolved.watchTargets(unresolved.descriptor.defaultRoot), []);
     assert.deepEqual(unresolved.discover({ lastCursor: () => null }), []);
 
     const explicitlySelected = createPiProvider({

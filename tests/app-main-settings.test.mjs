@@ -59,7 +59,7 @@ function esmResolve(specifier) {
 
 const ELECTRON_URL = esmResolve('electron');
 const DATABASE_URL = esmResolve('better-sqlite3');
-const WATCHER_URL = new URL('./watcher.ts', mainUrl).href;
+const WATCHER_URL = new URL('../../../packages/adaptive-watcher/src/index.ts', mainUrl).href;
 const INDEXER_URL = new URL('./indexer.ts', mainUrl).href;
 const INDEXER_SERVICE_URL = new URL('./indexer-service.ts', mainUrl).href;
 const INDEXER_WORKER_URL = new URL('./indexer-worker-client.ts', mainUrl).href;
@@ -98,9 +98,8 @@ function electronNamespace({ app, BrowserWindow, ipcMain }) {
 
 function noopWatcher() {
   return {
-    createRecursiveWatcher: () => ({
+    createAdaptiveWatcher: () => ({
       close() { return Promise.resolve(); },
-      refreshMissingRoots() { return true; },
     }),
   };
 }
@@ -285,17 +284,17 @@ test('main process watches every root declared by the built-in provider registry
     await importMain();
 
     assert.equal(serviceOptions.length, 1);
-    assert.deepEqual(serviceOptions[0].watchDirs, [
-      join(claudeDir, 'projects'),
-      join(claudeDir, 'history.jsonl'),
-      join(codexDir, 'sessions'),
-      join(codexDir, 'archived_sessions'),
-      join(codexDir, 'session_index.jsonl'),
-      join(home, '.kimi-code', 'sessions'),
-      join(home, '.kimi-code', 'session_index.jsonl'),
-      join(home, '.pi', 'agent', 'sessions'),
+    assert.deepEqual(serviceOptions[0].watchTargets, [
+      { kind: 'tree', path: join(claudeDir, 'projects') },
+      { kind: 'file', path: join(claudeDir, 'history.jsonl') },
+      { kind: 'tree', path: join(codexDir, 'sessions') },
+      { kind: 'tree', path: join(codexDir, 'archived_sessions') },
+      { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
+      { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
     ]);
-    assert.equal(serviceOptions[0].watchDirs.includes(codexDir), false);
+    assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
     assert.deepEqual(workerCalls[0].providerSettings, {});
   } finally {
@@ -823,10 +822,9 @@ test('closing the last macOS window releases background resources until activati
     [DATABASE_URL, { defaultExport: FakeDatabase }],
     [WATCHER_URL, {
       namedExports: {
-        createRecursiveWatcher: () => {
+        createAdaptiveWatcher: () => {
           const watcher = {
             close() { serviceEvents.push('watcher-close'); return Promise.resolve(); },
-            refreshMissingRoots() { return true; },
           };
           watchers.push(watcher);
           return watcher;
@@ -1386,7 +1384,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
 });
 
 
-test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async () => {
+test('main process watches OBELISK_DIR as a tree target and debounces recap notifications', async () => {
   const originalHome = process.env.HOME;
   const home = makeTempDir(`obelisk-watch-retry-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
@@ -1394,7 +1392,8 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
   process.env.HOME = home;
 
   let watcherOptions = null;
-  let refreshCalls = 0;
+  const windows = [];
+  const sent = [];
 
   class FakeDatabase {
     pragma() {}
@@ -1407,27 +1406,18 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = {
+        on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {},
+        send(channel, payload) { sent.push({ channel, payload }); },
+      };
+      windows.push(this);
     }
     loadFile() {}
     loadURL() {}
     close() {}
-    static getAllWindows() { return []; }
+    static getAllWindows() { return windows; }
     static fromWebContents() { return null; }
   }
-
-  // Model the real adapter's contract: refreshMissingRoots re-pends the
-  // missing root and returns true (it is attaching, not watched); the async
-  // probe then fails and reports through onRootLost — that callback, not a
-  // false return, is what drives the next retry in production.
-  const fakeWatcher = {
-    close() { return Promise.resolve(); },
-    refreshMissingRoots() {
-      refreshCalls += 1;
-      watcherOptions.onRootLost('still-gone');
-      return true;
-    },
-  };
 
   mock.timers.enable({ apis: ['setTimeout'] });
   const restore = registerMocks([
@@ -1435,9 +1425,9 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
     [DATABASE_URL, { defaultExport: FakeDatabase }],
     [WATCHER_URL, {
       namedExports: {
-        createRecursiveWatcher: (options) => {
+        createAdaptiveWatcher: (options) => {
           watcherOptions = options;
-          return fakeWatcher;
+          return { close() { return Promise.resolve(); } };
         },
       },
     }],
@@ -1449,17 +1439,27 @@ test('the OBELISK_DIR watch retry repeats while the root stays unwatched', async
   try {
     await importMain();
     assert.ok(watcherOptions, 'the OBELISK_DIR watcher was created');
+    // Retry/recovery lives inside the package now; the app only declares the
+    // target. The package's own tests prove the retry loop repeats.
+    assert.deepEqual(watcherOptions.targets, [{ kind: 'tree', path: join(home, '.obelisk') }]);
 
-    // CONTRIBUTING: a periodic refresh point must be proven to actually fire
-    // repeatedly, not once. The chain under test is the real one:
-    // onRootLost → retry timer → refresh → probe fails → onRootLost → …
-    watcherOptions.onRootLost('gone');
-    mock.timers.tick(5000);
-    assert.equal(refreshCalls, 1, 'a lost root schedules a retry');
-    mock.timers.tick(5000);
-    assert.equal(refreshCalls, 2, 'the retry repeats while the root stays unwatched');
-    mock.timers.tick(5000);
-    assert.equal(refreshCalls, 3, 'and keeps repeating');
+    // A recap markdown invalidation notifies windows after the writes settle:
+    // true trailing debounce — the timer resets on every event.
+    const recapFile = join(home, '.obelisk', 'recap', 'week.md');
+    watcherOptions.onInvalidate({ type: 'paths', paths: [recapFile] });
+    mock.timers.tick(200);
+    watcherOptions.onInvalidate({ type: 'paths', paths: [recapFile] });
+    mock.timers.tick(299);
+    assert.equal(sent.length, 0, 'a continuous write burst has not notified yet');
+    mock.timers.tick(1);
+    assert.equal(sent.length, 1, 'notification fires 300 ms after the LAST event, not the first');
+    assert.equal(sent[0].channel, 'obelisk:recap-updated');
+    assert.equal(sent[0].payload, recapFile);
+
+    // Non-recap extensions never notify.
+    watcherOptions.onInvalidate({ type: 'paths', paths: [join(home, '.obelisk', 'notes.txt')] });
+    mock.timers.tick(1000);
+    assert.equal(sent.length, 1, 'a .txt change does not notify');
   } finally {
     restore();
     mock.timers.reset();

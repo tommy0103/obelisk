@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
-import { createRecursiveWatcher } from './watcher.ts';
+import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
@@ -279,7 +279,7 @@ function startIndexerService({ buildOnStart = false } = {}) {
   migrateLegacyDbIfNeeded(paths);
   const service = createIndexerService({
     projectsDir: paths.projectsDir,
-    watchDirs: paths.providerRegistry.watchRoots(paths.providerRoots),
+    watchTargets: paths.providerRegistry.watchTargets(paths.providerRoots),
     buildIndex: async ({ reason, changedPaths }) => {
       const result = await indexerWorker.buildIndex({
         reason,
@@ -342,7 +342,6 @@ async function stopBackgroundResources({ stopWorker = false } = {}) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
-    if (obeliskRetryTimer) { clearTimeout(obeliskRetryTimer); obeliskRetryTimer = null; }
     pendingObeliskChanges.clear();
     if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
   }
@@ -431,9 +430,8 @@ function createWindow() {
 
 const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
 const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
-let obeliskWatcher: ReturnType<typeof createRecursiveWatcher> = null;
+let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
 let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
-let obeliskRetryTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingObeliskChanges = new Set<string>();
 
 function flushObeliskChanges() {
@@ -443,36 +441,27 @@ function flushObeliskChanges() {
   for (const changedPath of changedPaths) onObeliskChange(changedPath);
 }
 
-function scheduleObeliskWatchRetry() {
-  if (obeliskRetryTimer) return;
-  obeliskRetryTimer = setTimeout(() => {
-    obeliskRetryTimer = null;
-    // Mirror the indexer service's retry loop: keep retrying while any root
-    // is unwatched, so a deleted-and-recreated OBELISK_DIR is picked up too.
-    if (obeliskWatcher?.refreshMissingRoots() === false) scheduleObeliskWatchRetry();
-  }, 5000);
-}
-
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
   // Idempotent ensure, off the main thread (mkdir recursive does not need an
   // existence check). The watcher tolerates the directory appearing late —
-  // that is what the probe + retry loop is for — so there is no ordering
-  // dependency between the two.
+  // that is what the probe + retry loop inside the package is for — so there
+  // is no ordering dependency between the two.
   void fs.promises.mkdir(OBELISK_DIR, { recursive: true }).catch(() => {});
-  obeliskWatcher = createRecursiveWatcher({
-    roots: [OBELISK_DIR],
-    filter: (targetPath) => targetPath.endsWith('.md') || targetPath.endsWith('.json'),
-    onChange: (changedPath) => {
-      // True trailing debounce — reset on every event so an actively written
-      // file notifies only after its writes settle (the awaitWriteFinish
-      // replacement). Without the reset this would be a throttle.
-      if (!changedPath) return;
-      pendingObeliskChanges.add(changedPath);
-      if (obeliskNotifyTimer) clearTimeout(obeliskNotifyTimer);
-      obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
+  obeliskWatcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: OBELISK_DIR }],
+    onInvalidate: (invalidation) => {
+      if (invalidation.type !== 'paths') return;
+      for (const changedPath of invalidation.paths) {
+        if (!changedPath.endsWith('.md') && !changedPath.endsWith('.json')) continue;
+        // True trailing debounce — reset on every event so an actively written
+        // file notifies only after its writes settle (the awaitWriteFinish
+        // replacement). Without the reset this would be a throttle.
+        pendingObeliskChanges.add(changedPath);
+        if (obeliskNotifyTimer) clearTimeout(obeliskNotifyTimer);
+        obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
+      }
     },
-    onRootLost: () => scheduleObeliskWatchRetry(),
   });
   return obeliskWatcher;
 }

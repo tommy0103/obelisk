@@ -438,9 +438,9 @@ export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: {
     name,
     descriptor: { id: name, name: 'Claude Code', vendor: 'Anthropic', defaultRoot: rootDir, color: '#d97757' },
     indexVersionMarker: CLAUDE_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [
-      join(configuredRoot, 'projects'),
-      join(configuredRoot, 'history.jsonl'),
+    watchTargets: (configuredRoot) => [
+      { kind: 'tree', path: join(configuredRoot, 'projects') },
+      { kind: 'file', path: join(configuredRoot, 'history.jsonl') },
     ],
     discover: (ctx) => discoverAt(rootDir, ctx),
     parse,

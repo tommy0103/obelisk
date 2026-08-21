@@ -496,7 +496,7 @@ test('indexer service watches Claude projects and Codex sessions for app-side in
 
   const service = createIndexerService({
     projectsDir: claudeProjectsDir,
-    watchDirs: [claudeProjectsDir, codexSessionsDir],
+    watchTargets: [{ kind: 'tree', path: claudeProjectsDir }, { kind: 'tree', path: codexSessionsDir }],
     buildIndex: async (args) => calls.push(args),
     subscribe,
     writeHeartbeat: () => {},
@@ -536,7 +536,7 @@ test('indexer service starts watching a configured root that appears after start
     return Promise.resolve({ unsubscribe: () => Promise.resolve() });
   };
   const service = createIndexerService({
-    watchDirs: [existingRoot, lateRoot],
+    watchTargets: [{ kind: 'tree', path: existingRoot }, { kind: 'tree', path: lateRoot }],
     buildIndex: async (args) => calls.push(args),
     subscribe,
     writeHeartbeat: () => {},

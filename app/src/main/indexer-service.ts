@@ -3,7 +3,11 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import { createRecursiveWatcher, type ParcelSubscribe } from './watcher.ts';
+import {
+  createAdaptiveWatcher,
+  type ParcelSubscribe,
+  type WatchTarget,
+} from '../../../packages/adaptive-watcher/src/index.ts';
 
 const DEFAULT_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const DEFAULT_DEBOUNCE_MS = 2000;
@@ -45,7 +49,8 @@ type IndexerBuild = (args: {
 
 interface IndexerServiceOptions {
   projectsDir?: string;
-  watchDirs?: string | string[];
+  /** Typed watch targets (ADR-0009); defaults to the Claude projects tree. */
+  watchTargets?: WatchTarget[];
   debounceMs?: number;
   stabilityMs?: number;
   heartbeatMs?: number;
@@ -65,7 +70,7 @@ interface IndexerServiceOptions {
 
 function createIndexerService({
   projectsDir = DEFAULT_PROJECTS_DIR,
-  watchDirs = [projectsDir],
+  watchTargets,
   debounceMs = DEFAULT_DEBOUNCE_MS,
   stabilityMs = DEFAULT_STABILITY_MS,
   heartbeatMs = DEFAULT_HEARTBEAT_MS,
@@ -86,16 +91,26 @@ function createIndexerService({
 }: IndexerServiceOptions = {}) {
   if (typeof buildIndex !== 'function') throw new Error('createIndexerService() requires buildIndex');
   const watch = watchProjects || ((onChange) => {
-    const roots = [...new Set((Array.isArray(watchDirs) ? watchDirs : [watchDirs]).filter(Boolean))];
-    return createRecursiveWatcher({
-      roots,
-      filter: (targetPath) => targetPath.endsWith('.jsonl') || targetPath.endsWith('.json'),
+    const targets = watchTargets ?? [{ kind: 'tree' as const, path: projectsDir }];
+    if (!targets.length) return null;
+    return createAdaptiveWatcher({
+      targets,
       subscribe,
       logger,
-      onChange,
-      // A subscription that died (async error) is re-attached through the
-      // same retry loop that picks up late-appearing roots.
-      onRootLost: () => scheduleWatchRetry(),
+      timers,
+      retryDelayMs: watchRetryMs,
+      onInvalidate: (invalidation) => {
+        // A rescan means anything under the root may have changed — full
+        // inventory. Path invalidations filter to transcripts here, at the
+        // caller, per the package's no-domain-knowledge boundary.
+        if (invalidation.type === 'rescan') {
+          onChange();
+          return;
+        }
+        for (const changedPath of invalidation.paths) {
+          if (changedPath.endsWith('.jsonl') || changedPath.endsWith('.json')) onChange(changedPath);
+        }
+      },
     });
   });
 
