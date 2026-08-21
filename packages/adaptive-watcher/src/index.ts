@@ -116,6 +116,9 @@ export function createAdaptiveWatcher({
   const subscriptions = new Map<string, { unsubscribe(): Promise<void> }>();
   const pending = new Set<string>();
   const inflightSubscribes = new Set<Promise<unknown>>();
+  // Unsubscribes of dropped subscriptions (stream errors) — fire-and-forget
+  // per tick, but tracked so close() waits for them too.
+  const pendingUnsubscribes = new Set<Promise<unknown>>();
   let retryTimer: unknown = null;
   // The first wave of establishments is quiet — the caller's startup build
   // already covers roots present at creation. Once the initial pass settles,
@@ -139,7 +142,11 @@ export function createAdaptiveWatcher({
     subscriptions.delete(root);
     pending.delete(root);
     noteSettled();
-    if (sub) void sub.unsubscribe().catch(() => {});
+    if (sub) {
+      const release = sub.unsubscribe().catch(() => {});
+      pendingUnsubscribes.add(release);
+      void release.then(() => pendingUnsubscribes.delete(release));
+    }
     if (!closed) scheduleRetry();
   };
 
@@ -290,6 +297,7 @@ export function createAdaptiveWatcher({
       return Promise.all([
         ...subs.map((sub) => sub.unsubscribe().catch(() => {})),
         ...inflightSubscribes,
+        ...pendingUnsubscribes,
       ]);
     },
   };

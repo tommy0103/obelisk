@@ -315,3 +315,39 @@ test('close waits for an in-flight subscribe, and no invalidation fires after cl
   capturedCallback(null, [{ type: 'update', path: join(root, 'late.jsonl') }]);
   assert.deepEqual(invalidations, [], 'no invalidation fires after close');
 });
+
+
+test('close awaits the unsubscribe of a subscription dropped by a stream error', async () => {
+  const root = makeTempDir('obelisk-adw-dropclose-');
+  let capturedCallback = null;
+  let releaseUnsubscribe = null;
+  const subscribe = (_root, callback) => {
+    capturedCallback = callback;
+    return Promise.resolve({
+      unsubscribe: () => new Promise((resolve) => { releaseUnsubscribe = resolve; }),
+    });
+  };
+  const watcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: root }],
+    onInvalidate: () => {},
+    subscribe,
+    logger: { warn: () => {} },
+  });
+
+  assert.ok(await waitFor(() => capturedCallback !== null), 'the root is subscribed');
+  // Let the establishment microtask land so the subscription is in the map.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // The stream dies; dropRoot unsubscribes fire-and-forget. close() called
+  // in that window must still wait for the cleanup.
+  capturedCallback(new Error('stream died'), []);
+  assert.ok(releaseUnsubscribe !== null, 'the dropped subscription is being unsubscribed');
+  let closeResolved = false;
+  const closePromise = watcher.close().then(() => { closeResolved = true; });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(closeResolved, false, 'close waits for the dropped subscription cleanup');
+  releaseUnsubscribe();
+  await closePromise;
+  assert.ok(closeResolved, 'close completes once the cleanup lands');
+});
