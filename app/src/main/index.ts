@@ -1076,6 +1076,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
   }
   cleanupDbFiles(tempDbPath);
   let writerLease: ReturnType<typeof acquireWriterLease> = null;
+  let rebuildWatchHints: string[] = [];
   try {
     const writerLeasePath = writerLockPathFor(paths.dbPath);
     writerLease = acquireWriterLease({
@@ -1112,6 +1113,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });
+    rebuildWatchHints = result?.watchHints ?? [];
     if (result?.deferred || result?.complete !== true) {
       notifyIndexUpdated(result);
       return result;
@@ -1136,7 +1138,11 @@ ipcMain.handle('settings:rebuildIndex', async () => {
     } finally {
       writerLease?.release();
       if (loadPersistedSettings().autoRefresh !== false) {
-        startIndexerService({ buildOnStart: false });
+        const service = startIndexerService({ buildOnStart: false });
+        // The rebuild bypassed the service's own build path, so seed the hot
+        // set from its hints here — otherwise already-open transcripts would
+        // wait for the next reconcile to be re-seeded.
+        service?.promoteWatchHints?.(rebuildWatchHints);
       }
     }
   }

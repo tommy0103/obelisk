@@ -358,8 +358,18 @@ export function createAdaptiveWatcher({
           if (next !== null) lastWarned.delete(file);
           changed.push(file);
           if (isHot) {
-            hotFiles.delete(file);
-            hotFiles.set(file, null);
+            if (next === null) {
+              // A hot file that disappeared reports once and releases its
+              // slot — recreation is a directory-level event and will
+              // re-promote it; otherwise deleted transcripts would fill the
+              // hot set over the app's lifetime.
+              hotFiles.delete(file);
+              baselines.delete(file);
+              silentFirstBaseline.delete(file);
+            } else {
+              hotFiles.delete(file);
+              hotFiles.set(file, null);
+            }
           }
         }
       }

@@ -180,6 +180,15 @@ function createIndexerService({
     }
   };
 
+  const promoteWatchHints = (hints: string[] | undefined) => {
+    // Seed the watcher's hot set with the transcripts a build just saw as
+    // recently active (ADR-0009 hot-set closure, startup/reconcile leg).
+    // Hints arrive newest-first; promote oldest-first so the Map's insertion
+    // order leaves the NEWEST hint as the most-recently-used — otherwise the
+    // next promotion would evict the freshest transcript.
+    for (const hint of [...(hints ?? [])].reverse()) watcher?.promote?.(hint);
+  };
+
   const runBuildNow = (reason = "manual", paths: string[] | undefined = undefined) => {
     addChangedPath(paths);
     if (stopped) return idlePromise;
@@ -192,13 +201,7 @@ function createIndexerService({
     const buildChangedPaths = takeChangedPaths();
     idlePromise = (async () => {
       const result = await buildIndex({ reason, changedPaths: buildChangedPaths });
-      // Seed the watcher's hot set with the transcripts the build just saw
-      // as recently active (ADR-0009 hot-set closure, startup/reconcile leg).
-      // Hints arrive newest-first; promote oldest-first so the Map's
-      // insertion order leaves the NEWEST hint as the most-recently-used —
-      // otherwise the next promotion would evict the freshest transcript.
-      const hints = result?.watchHints ?? [];
-      for (const hint of [...hints].reverse()) watcher?.promote?.(hint);
+      promoteWatchHints(result?.watchHints);
       if (result?.complete === false) {
         for (const issue of result.inventoryIssues ?? []) {
           logger.warn?.(
@@ -337,6 +340,7 @@ function createIndexerService({
     stop,
     scheduleBuild,
     runBuildNow,
+    promoteWatchHints,
     idle: () => idlePromise,
   };
 }

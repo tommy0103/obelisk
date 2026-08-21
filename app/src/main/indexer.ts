@@ -503,6 +503,7 @@ function buildIndex({
           complete: true,
           incompleteProviders,
           inventoryIssues,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 

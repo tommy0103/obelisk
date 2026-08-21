@@ -230,27 +230,102 @@ test('build watchHints are promoted into the hot set and polled for later append
     hotPolling: true,
   });
 
-  try {
-    service.start({ buildOnStart: false });
-    await service.runBuildNow('startup');
-    // Poll timers live in the manual set alongside service timers; drive
-    // ticks and let microtasks settle between them.
-    timers.flush();
-    await new Promise((resolve) => setTimeout(resolve, 30));
-
-    // The hint was promoted (silently baselined); a later append — possibly
-    // invisible to the tree backend — must surface through the poller.
-    fs.appendFileSync(hinted, '{"line":1}\n');
-    let detected = false;
-    for (let attempt = 0; attempt < 20 && !detected; attempt++) {
+  const drive = async (rounds) => {
+    for (let i = 0; i < rounds; i++) {
       timers.flush();
       await new Promise((resolve) => setTimeout(resolve, 30));
       await service.idle();
-      detected = builds.some((b) => (b.changedPaths ?? []).includes(hinted));
     }
-    assert.ok(detected, 'the hinted transcript is polled and its append schedules a build');
-    const hit = builds.find((b) => (b.changedPaths ?? []).includes(hinted));
-    assert.equal(hit.reason, 'watch');
+  };
+
+  try {
+    service.start({ buildOnStart: false });
+    await service.runBuildNow('startup');
+    // Hint promotion is report-first: the first poll fires an appearance
+    // build. Drain those before appending, so the assertion below can only
+    // be satisfied by detecting the append itself.
+    await drive(3);
+    const beforeAppend = builds.length;
+    assert.ok(beforeAppend > 0, 'the hint-driven first-observation build happened');
+
+    fs.appendFileSync(hinted, '{"line":1}\n');
+    let appended = false;
+    for (let attempt = 0; attempt < 20 && !appended; attempt++) {
+      timers.flush();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await service.idle();
+      appended = builds.slice(beforeAppend).some((b) => (b.changedPaths ?? []).includes(hinted));
+    }
+    assert.ok(appended, 'the append — possibly invisible to the tree backend — is detected by polling');
+  } finally {
+    service.stop();
+    await service.idle();
+  }
+});
+
+test('an evicted hot file is re-seeded by a later reconcile hint', async () => {
+  const root = makeTempDir('obelisk-reseed-');
+  const hinted = join(root, 'live.jsonl');
+  fs.writeFileSync(hinted, '{"line":0}\n');
+  const fillers = Array.from({ length: 64 }, (_, i) => join(root, `filler-${i}.jsonl`));
+  for (const filler of fillers) fs.writeFileSync(filler, '{}\n');
+  const timers = manualTimers();
+  const builds = [];
+  let nextHints = [hinted];
+  const service = createIndexerService({
+    watchTargets: [{ kind: 'tree', path: root }],
+    buildIndex: async (args) => { builds.push(args); return { watchHints: nextHints }; },
+    subscribe: () => Promise.resolve({ unsubscribe: () => Promise.resolve() }),
+    writeHeartbeat: () => {},
+    logger: { warn: () => {} },
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+    watchRetryMs: 0,
+    hotPolling: true,
+  });
+
+  const drive = async (rounds) => {
+    for (let i = 0; i < rounds; i++) {
+      timers.flush();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await service.idle();
+    }
+  };
+
+  try {
+    service.start({ buildOnStart: false });
+    await service.runBuildNow('startup');
+    await drive(3);
+    assert.ok(
+      builds.some((b) => (b.changedPaths ?? []).includes(hinted)),
+      'the hinted file is hot after seeding',
+    );
+
+    // Evict it by filling the 64-slot hot set with fillers.
+    nextHints = fillers;
+    await service.runBuildNow('reconcile');
+    const afterEvict = builds.length;
+    await drive(3);
+    fs.appendFileSync(hinted, '{"line":1}\n');
+    await drive(6);
+    assert.ok(
+      !builds.slice(afterEvict).some((b) => (b.changedPaths ?? []).includes(hinted)),
+      'the evicted file is no longer polled',
+    );
+
+    // The periodic reconcile returns it as a hint: it is re-seeded and its
+    // first observation reports again — the degradation loop closes.
+    nextHints = [hinted];
+    await service.runBuildNow('reconcile');
+    let reseeded = false;
+    for (let attempt = 0; attempt < 20 && !reseeded; attempt++) {
+      timers.flush();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await service.idle();
+      reseeded = builds.slice(afterEvict).some((b) => (b.changedPaths ?? []).includes(hinted));
+    }
+    assert.ok(reseeded, 'a reconcile hint re-seeds the evicted file into the hot set');
   } finally {
     service.stop();
     await service.idle();

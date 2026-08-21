@@ -1,6 +1,9 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { readdirSync, statSync, type Dirent } from 'node:fs';
+import { join } from 'node:path';
+
 import { persist } from './persist.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type {
@@ -57,15 +60,60 @@ export class ProviderIndexFailure extends Error {
 // most recently written transcripts are the best guess for what is still
 // being appended through long-lived descriptors. index_state.mtime holds the
 // source file mtime per unit; marker rows carry `__` prefixes and are not
-// transcripts. Unit keys are not always files (Kimi's key is a session
-// directory) — the watcher drops non-file hints itself. Keep the limit in
-// sync with the watcher's DEFAULT_MAX_HOT_FILES.
+// transcripts. Keep the limit in sync with the watcher's DEFAULT_MAX_HOT_FILES.
+//
+// Unit keys are not always files: Kimi's key is the session directory, whose
+// mtime does not track appends to the wire files inside. Directory keys are
+// expanded to the transcripts they contain (bounded); missing keys are
+// dropped. Both run in the indexer worker, never on the Electron main thread.
 const WATCH_HINT_LIMIT = 64;
+const HINT_DIRECTORY_FILE_LIMIT = 4;
+
+function expandHintDirectory(dir: string): string[] {
+  const found: string[] = [];
+  const walk = (current: string, depth: number) => {
+    if (found.length >= HINT_DIRECTORY_FILE_LIMIT || depth > 4) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (found.length >= HINT_DIRECTORY_FILE_LIMIT) return;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name.endsWith('.jsonl')) found.push(full);
+    }
+  };
+  walk(dir, 0);
+  return found;
+}
 
 export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT): string[] {
-  return db.prepare(
+  const rows = db.prepare(
     "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC LIMIT ?",
-  ).all(limit).map((row) => String(row.jsonl_path));
+  ).all(limit * 4);
+  const hints: string[] = [];
+  for (const row of rows) {
+    if (hints.length >= limit) break;
+    const key = String(row.jsonl_path);
+    let isDirectory = false;
+    try {
+      isDirectory = statSync(key).isDirectory();
+    } catch {
+      continue; // deleted between build and hint collection
+    }
+    if (!isDirectory) {
+      hints.push(key);
+      continue;
+    }
+    for (const file of expandHintDirectory(key)) {
+      if (hints.length >= limit) break;
+      hints.push(file);
+    }
+  }
+  return hints;
 }
 
 export function storedProviderCursor(db: SqliteDb, key: string): Cursor {  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
