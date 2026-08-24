@@ -66,9 +66,13 @@ const child = spawn(electronBin, [
 let ws;
 let writer;
 let cursorProbe;
+let writerStopTimeout;
+let cursorDb;
 const cleanup = () => {
   if (writer) clearInterval(writer);
   if (cursorProbe) clearInterval(cursorProbe);
+  if (writerStopTimeout) clearTimeout(writerStopTimeout);
+  try { cursorDb?.close(); } catch {}
   try { ws?.close(); } catch {}
   try { child.kill('SIGTERM'); } catch {}
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -89,8 +93,11 @@ async function cdpConnect() {
     && typeof t.url === 'string'
     && (t.url.includes('out/renderer/index.html') || t.url === 'about:blank'));
   if (!page) throw new Error(`no matching CDP page target (got ${targets.map((t) => t.url).join(', ')})`);
-  ws = new WebSocket(page.webSocketDebuggerUrl);
-  ws.onmessage = (event) => {
+  // Never leak a socket: close any previous connection before replacing it,
+  // and close the new one if the open handshake fails.
+  try { ws?.close(); } catch {}
+  const next = new WebSocket(page.webSocketDebuggerUrl);
+  next.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     const pending = cdpPending.get(msg.id);
     if (!pending) return;
@@ -100,10 +107,18 @@ async function cdpConnect() {
     if (typeof pending.resolve === 'function') pending.resolve(msg.result?.result?.value);
   };
   await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('cdp websocket open timeout')), 5000);
-    ws.onopen = () => { clearTimeout(timeout); resolve(); };
-    ws.onerror = (error) => { clearTimeout(timeout); reject(error); };
+    const timeout = setTimeout(() => {
+      try { next.close(); } catch {}
+      reject(new Error('cdp websocket open timeout'));
+    }, 5000);
+    next.onopen = () => { clearTimeout(timeout); resolve(); };
+    next.onerror = (error) => {
+      clearTimeout(timeout);
+      try { next.close(); } catch {}
+      reject(error);
+    };
   });
+  ws = next;
 }
 
 function cdpEvaluate(expression) {
@@ -175,7 +190,7 @@ try {
   const indexedAt = new Map();
   const visibleAt = new Map();
   const t0 = performance.now();
-  const cursorDb = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  cursorDb = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
   cursorProbe = setInterval(() => {
     try {
       const row = cursorDb
@@ -199,7 +214,7 @@ try {
   const WRITE_MS = 10000;
   const DRAIN_MS = 15000;
   const drainDeadline = t0 + WRITE_MS + DRAIN_MS;
-  setTimeout(() => clearInterval(writer), WRITE_MS);
+  writerStopTimeout = setTimeout(() => clearInterval(writer), WRITE_MS);
   while (performance.now() < drainDeadline
     && (appended.length === 0
       || performance.now() < t0 + WRITE_MS
@@ -234,7 +249,6 @@ try {
   } else {
     console.log('B cohort complete: every appended line indexed and renderer-visible after writer stop');
   }
-  cursorDb.close();
 } finally {
   cleanup();
 }
