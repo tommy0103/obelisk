@@ -2,17 +2,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // #86 renderer-visible latency probe: boots the REAL app (out/main/index.js)
-// against a synthetic HOME, appends to a live transcript every 200 ms, and
-// measures append -> text visible in the real renderer DOM via CDP.
+// against a synthetic HOME and measures append -> text-visible in the real
+// renderer DOM over CDP, under two workloads:
+//
+//   A. Isolated bursts (quiet-tail): one append at a time, waiting for each
+//      to become visible before the next — measures the trailing path.
+//   B. Continuous writes: a strict 200 ms append schedule independent of
+//      visibility, with visibility sampled asynchronously — measures the
+//      max-wait ceiling path (the trailing timer never settles).
 //
 // Usage: node scripts/bench-renderer-latency.mjs
-// Requires app/out (electron-vite build) and a free ~2 GiB of /tmp.
+// Requires app/out (electron-vite build).
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 
 const appRoot = fileURLToPath(new URL('../app', import.meta.url));
 const electronBin = path.join(appRoot, 'node_modules', '.bin', 'electron');
@@ -32,10 +39,21 @@ const line = (i) => JSON.stringify({
 });
 fs.writeFileSync(liveFile, `${line(0)}\n`);
 
-const CDP_PORT = 9333;
-// The session shell may export ELECTRON_RUN_AS_NODE=1 (harness); the real app
-// must run as Electron, not as Node — Chromium flags would be rejected.
-const { ELECTRON_RUN_AS_NODE: _drop, ...inheritedEnv } = process.env;
+// Random CDP port in a private range; verified against the app's own window
+// below (a fixed port could collide with another debugger on this machine).
+const CDP_PORT = 9200 + Math.floor(Math.random() * 600);
+
+// The session shell may export ELECTRON_RUN_AS_NODE (harness: makes Electron
+// run as Node and reject Chromium flags) and ELECTRON_RENDERER_URL /
+// OBELISK_DEV_SERVER_URL (would load a dev server instead of the built
+// renderer). All three must be stripped for a faithful production boot.
+const {
+  ELECTRON_RUN_AS_NODE: _drop1,
+  ELECTRON_RENDERER_URL: _drop2,
+  OBELISK_DEV_SERVER_URL: _drop3,
+  ...inheritedEnv
+} = process.env;
+
 const child = spawn(electronBin, [
   `--remote-debugging-port=${CDP_PORT}`,
   '--no-sandbox',
@@ -45,34 +63,56 @@ const child = spawn(electronBin, [
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
+let ws;
 const cleanup = () => {
+  try { ws?.close(); } catch {}
   try { child.kill('SIGTERM'); } catch {}
   fs.rmSync(tmp, { recursive: true, force: true });
 };
 process.on('exit', cleanup);
 
-async function cdpEvaluate(expression) {
-  const targets = await fetch(`http://127.0.0.1:${CDP_PORT}/json`).then((r) => r.json());
-  const page = targets.find((t) => t.type === 'page');
-  if (!page) throw new Error('no CDP page target');
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
-  const id = Math.floor(Math.random() * 1e9);
-  const result = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('cdp timeout')), 10000);
-    ws.onopen = () => ws.send(JSON.stringify({
-      id, method: 'Runtime.evaluate',
-      params: { expression, returnByValue: true },
-    }));
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.id !== id) return;
-      clearTimeout(timeout);
-      ws.close();
-      resolve(msg.result?.result?.value);
-    };
-    ws.onerror = (error) => { clearTimeout(timeout); reject(error); };
+let cdpId = 0;
+const cdpPending = new Map();
+
+async function cdpConnect() {
+  const targets = await fetch(
+    `http://127.0.0.1:${CDP_PORT}/json`,
+    { signal: AbortSignal.timeout(5000) },
+  ).then((r) => r.json());
+  // Verify the target is THIS app's window (built renderer), not some other
+  // debugger page that happens to share the port.
+  const page = targets.find((t) => t.type === 'page'
+    && typeof t.url === 'string'
+    && (t.url.includes('out/renderer/index.html') || t.url === 'about:blank'));
+  if (!page) throw new Error(`no matching CDP page target (got ${targets.map((t) => t.url).join(', ')})`);
+  ws = new WebSocket(page.webSocketDebuggerUrl);
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    const pending = cdpPending.get(msg.id);
+    if (!pending) return;
+    cdpPending.delete(msg.id);
+    pending(msg.result?.result?.value);
+  };
+  await new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = reject;
   });
-  return result;
+}
+
+function cdpEvaluate(expression) {
+  cdpId += 1;
+  const id = cdpId;
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cdpPending.delete(id);
+      reject(new Error('cdp evaluate timeout'));
+    }, 10000);
+    cdpPending.set(id, (value) => {
+      clearTimeout(timeout);
+      resolve(value);
+    });
+    ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }));
+  });
 }
 
 async function waitFor(cond, label, timeoutMs = 30000) {
@@ -91,32 +131,86 @@ function percentile(values, p) {
   return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
 }
 
+const visibleNow = (text) => cdpEvaluate(`document.body.textContent.includes(${JSON.stringify(text)})`);
+
 try {
-  // Boot: window exists, session list shows the seeded session.
-  await waitFor(async () => (await cdpEvaluate('document.readyState')) === 'complete', 'renderer boot', 30000);
-  await waitFor(async () => (await cdpEvaluate('document.body.textContent.length')) > 0, 'renderer content', 30000);
-
-  // Navigate to the session detail and confirm the seed line is visible.
+  await waitFor(async () => {
+    await cdpConnect();
+    return (await cdpEvaluate('document.readyState')) === 'complete';
+  }, 'renderer boot', 30000);
   await cdpEvaluate(`window.location.hash = '#/sessions/live-session'`);
-  await waitFor(async () => (await cdpEvaluate(
-    `document.body.textContent.includes('gui append 0')`)), 'seed message visible', 30000);
+  await waitFor(async () => visibleNow('gui append 0'), 'seed message visible', 30000);
 
-  // Continuous appends; measure append -> renderer-visible for samples.
-  const samples = [];
-  const N = 8;
-  for (let i = 1; i <= N; i++) {
-    const appendStart = performance.now();
+  // ---- Workload A: isolated bursts (quiet-tail) ----
+  const isolated = [];
+  for (let i = 1; i <= 5; i++) {
+    const text = `gui append ${i}`;
+    const start = performance.now();
     fs.appendFileSync(liveFile, `${line(i)}\n`);
     // eslint-disable-next-line no-await-in-loop
-    await waitFor(async () => (await cdpEvaluate(
-      `document.body.textContent.includes(${JSON.stringify(`gui append ${i}`)})`)),
-      `gui append ${i} visible`, 20000);
-    samples.push(performance.now() - appendStart);
-    console.log(`append ${i} -> renderer-visible: ${samples[samples.length - 1].toFixed(0)} ms`);
+    await waitFor(async () => visibleNow(text), `${text} visible`, 20000);
+    isolated.push(performance.now() - start);
+    console.log(`A append ${i} -> visible: ${isolated[isolated.length - 1].toFixed(0)} ms`);
     // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 200));
   }
-  console.log(`renderer-visible latency ms: p50=${percentile(samples, 50).toFixed(0)} p95=${percentile(samples, 95).toFixed(0)}`);
+  console.log(`A isolated-burst latency ms: p50=${percentile(isolated, 50).toFixed(0)} p95=${percentile(isolated, 95).toFixed(0)}`);
+
+  // ---- Workload B: continuous writes on a strict 200 ms schedule ----
+  // The trailing timer never settles, so builds must come from the ceiling.
+  // Two pollers split the latency: append -> indexed (db row present) and
+  // append -> renderer-visible (DOM text present).
+  const appended = [];
+  const cursorLog = [];
+  const indexedAt = new Map();
+  const visibleAt = new Map();
+  const t0 = performance.now();
+  const cursorProbe = setInterval(() => {
+    try {
+      const row = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true })
+        .prepare('SELECT mtime, lines_processed FROM index_state WHERE jsonl_path = ?').get(liveFile);
+      if (row && (cursorLog.length === 0 || cursorLog[cursorLog.length - 1].lines !== row.lines_processed)) {
+        const now = performance.now();
+        cursorLog.push({ t: now, lines: row.lines_processed });
+        console.log(`  [build] lines_processed -> ${row.lines_processed} at t≈${(now - t0).toFixed(0)} ms`);
+      }
+    } catch { /* db not created yet */ }
+  }, 400);
+  const writer = setInterval(() => {
+    const i = appended.length === 0 ? 100 : appended[appended.length - 1].i + 1;
+    fs.appendFileSync(liveFile, `${line(i)}\n`);
+    appended.push({ i, text: `gui append ${i}`, at: performance.now() });
+  }, 200);
+
+  // Poll db + DOM concurrently with the writer, from t0 — first-seen times
+  // are the real latency; a poll that starts after the window would invent
+  // latency for everything indexed before it began.
+  const db = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  const pollEnd = t0 + 10000 + 4000;
+  while (performance.now() < pollEnd
+    && (appended.length === 0 || visibleAt.size < appended.length || indexedAt.size < appended.length)) {
+    const missing = appended.filter((a) => !visibleAt.has(a.i) || !indexedAt.has(a.i));
+    for (const a of missing) {
+      if (!indexedAt.has(a.i)
+        && db.prepare('SELECT 1 FROM messages WHERE uuid = ?').get(`gui-bench-${a.i}`)) {
+        indexedAt.set(a.i, performance.now());
+      }
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const hits = await Promise.all(missing.map(async (a) => ((await visibleNow(a.text)) ? a.i : null)));
+    for (const hit of hits) if (hit !== null) visibleAt.set(hit, performance.now());
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  clearInterval(writer);
+  clearInterval(cursorProbe);
+  db.close();
+  const toStats = (map) => {
+    const lat = appended.map((a) => (map.get(a.i) ?? pollEnd) - a.at);
+    return `p50=${percentile(lat, 50).toFixed(0)} p95=${percentile(lat, 95).toFixed(0)} max=${Math.max(...lat).toFixed(0)} (${map.size}/${appended.length})`;
+  };
+  console.log(`B append -> indexed: ${toStats(indexedAt)}`);
+  console.log(`B append -> renderer-visible: ${toStats(visibleAt)}`);
 } finally {
   cleanup();
 }
