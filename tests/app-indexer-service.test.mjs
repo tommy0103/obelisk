@@ -701,20 +701,58 @@ test('each burst re-arms the max-wait ceiling after the previous build', async (
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
-    debounceMs: 0,
+    debounceMs: 5000,
     maxWaitMs: 1500,
   });
 
   service.scheduleBuild('watch', 'a.jsonl');
-  timers.flush();
+  timers.tick(1499);
+  assert.deepEqual(calls, []);
+  timers.tick(1);
   await service.idle();
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 1, 'the first burst builds at its ceiling');
 
   service.scheduleBuild('watch', 'b.jsonl');
-  timers.flush();
+  timers.tick(1499);
   await service.idle();
-  assert.equal(calls.length, 2, 'a new burst builds again');
+  assert.equal(calls.length, 1, 'the second burst is still inside its own ceiling');
+  timers.tick(1);
+  await service.idle();
+  assert.equal(calls.length, 2, 'the second burst builds at its own ceiling');
   assert.deepEqual(calls[1].changedPaths, ['b.jsonl']);
+});
+
+test('sustained activity converges to periodic builds instead of postponing forever', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => calls.push(args),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+    debounceMs: 5000,
+    maxWaitMs: 1500,
+  });
+
+  // One event every 300 ms for 4.5 s — far beyond the legacy 2 s trailing
+  // window, which would never fire at all. The ceiling must release builds
+  // periodically and cover every event.
+  for (let t = 0; t < 15; t++) {
+    service.scheduleBuild('watch', `session-${t}.jsonl`);
+    timers.tick(300);
+    await service.idle();
+  }
+  timers.tick(600);
+  await service.idle();
+
+  assert.equal(calls.length, 3, 'periodic builds at the 1.5 s ceiling');
+  const covered = [...new Set(calls.flatMap((c) => c.changedPaths ?? []))];
+  assert.deepEqual(
+    covered,
+    Array.from({ length: 15 }, (_, i) => `session-${i}.jsonl`),
+    'every event is batched into a build — nothing is dropped or deferred forever',
+  );
 });
 
 test('maxWaitMs 0 keeps the legacy unbounded trailing debounce', async () => {
@@ -726,14 +764,16 @@ test('maxWaitMs 0 keeps the legacy unbounded trailing debounce', async () => {
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
-    debounceMs: 0,
+    debounceMs: 250,
     maxWaitMs: 0,
   });
 
   service.scheduleBuild('watch', 'a.jsonl');
   service.scheduleBuild('watch', 'b.jsonl');
-  timers.flush();
+  timers.tick(249);
+  assert.deepEqual(calls, [], 'no ceiling fires while disabled');
+  timers.tick(1);
   await service.idle();
-  assert.equal(calls.length, 1, 'the trailing path alone still coalesces the burst');
+  assert.equal(calls.length, 1, 'the trailing path alone coalesces the burst');
   assert.deepEqual(calls[0].changedPaths, ['a.jsonl', 'b.jsonl']);
 });

@@ -79,15 +79,16 @@ const changed = path.join(
   fs.readdirSync(path.join(CLAUDE_PROJECTS, project)).find((name) => name.endsWith('.jsonl')),
 );
 const idleTimes = [];
+const staleness = new DatabaseSync(corpusDb);
 for (let i = 0; i < 10; i++) {
-  // Force the file stale so the build does real changed-path work (the
-  // signature gate must reselect it); content is untouched.
-  const now = new Date();
-  fs.utimesSync(changed, now, now);
+  // Force the file stale by rolling back the CLONE's cursor (never touch the
+  // real transcript's mtime — and never poke the running daemon's watcher).
+  staleness.prepare('UPDATE index_state SET mtime = 0, cursor = NULL WHERE jsonl_path = ?').run(changed);
   const start = performance.now();
   await worker.buildIndex({ ...corpusArgs, reason: 'bench', changedPaths: [changed] });
   idleTimes.push(performance.now() - start);
 }
+staleness.close();
 console.log('idle changed-path build (real corpus, ms):');
 console.log(`  n=${idleTimes.length} p50=${percentile(idleTimes, 50).toFixed(0)} p95=${percentile(idleTimes, 95).toFixed(0)} mean=${(idleTimes.reduce((a, b) => a + b, 0) / idleTimes.length).toFixed(0)}`);
 
@@ -134,7 +135,7 @@ await service.runBuildNow('startup');
 
 const DURATION_MS = 20000;
 const APPEND_INTERVAL_MS = 200;
-const appendTimes = [performance.now()];
+const appendTimes = [];
 let appends = 1;
 const appendTimer = setInterval(() => {
   fs.appendFileSync(liveFile, `${claudeLine(appends++)}\n`);
@@ -163,7 +164,7 @@ console.log('continuous writes (200 ms append interval, 20 s window, synthetic c
 console.log(`  lines=${appends} indexed=${indexed} (${indexed === appends ? 'ALL — end-to-end confirmed' : 'MISSING LINES!'})`);
 console.log(`  builds=${watchBuilds.length} (${(watchBuilds.length / (DURATION_MS / 1000)).toFixed(2)}/s), duration p50=${percentile(durations, 50).toFixed(0)} ms`);
 if (firstWatchBuild) {
-  console.log(`  first-append -> first build containing it: ${(firstWatchBuild.end - appendTimes[0]).toFixed(0)} ms`);
+  console.log(`  first-append -> first build indexing it: ${(firstWatchBuild.end - appendTimes[0]).toFixed(0)} ms (append->indexed; renderer-visible latency needs a GUI probe)`);
 }
 if (lastBuild) {
   console.log(`  last-append -> last build completing it: ${(lastBuild.end - lastAppendTs).toFixed(0)} ms (bounded; legacy trailing debounce would still be pending)`);

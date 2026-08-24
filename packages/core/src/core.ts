@@ -201,11 +201,12 @@ export function resolveInvokingSessionId(
 }
 
 // Poll bounds for the nonce freshness fallback. The poll runs only when the
-// incremental recovery build loses the writer lease (writer_busy) — i.e. only
-// while the daemon is running, so the db is warm in the OS page cache and the
-// concurrent build is in the warm ~60–1500 ms band (PR #103 benchmark). A 4 s
-// cap could return null before the daemon publishes the nonce and silently
-// drop is_invoking; 8 s leaves headroom for cache pressure.
+// incremental recovery build loses the writer lease (writer_busy) — held by
+// the daemon OR a concurrent CLI build. While the daemon runs, the db is
+// warm in the OS page cache and a concurrent build lands in the warm
+// ~60–1500 ms band (PR #103 benchmark); a cold CLI-held build can be slower
+// on large corpora (#105). A 4 s cap could return null before the nonce is
+// published and silently drop is_invoking; 8 s covers the warm band.
 const INVOCATION_POLL_INTERVAL_MS = 300;
 const INVOCATION_POLL_CAP_MS = 8000;
 
