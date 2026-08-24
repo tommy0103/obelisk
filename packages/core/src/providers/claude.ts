@@ -280,10 +280,18 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   };
 
   let lineNum = 0;
-  readLines(unit.key, (line: string) => {
+  // Lines the cursor may safely skip on the next parse. A line only counts
+  // when it parsed, or when it is newline-terminated (mid-file garbage keeps
+  // the legacy count). An unterminated tail that fails to parse may still be
+  // growing — counting it would permanently skip the completed line.
+  let cursorLines = 0;
+  readLines(unit.key, (line: string, terminated: boolean) => {
     lineNum++;
     let obj: any;
-    try { obj = JSON.parse(line); } catch { return; }
+    let parsed = true;
+    try { obj = JSON.parse(line); } catch { parsed = false; }
+    if (parsed || terminated) cursorLines = lineNum;
+    if (!parsed) return;
     const sid = unit.sessionId;
     const ts = obj.timestamp || null;
     const msg = obj.message || {};
@@ -392,7 +400,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   }
 
   yield* records;
-  return `${mtime}:${lineNum}`;
+  return `${mtime}:${cursorLines}`;
 }
 
 function rawClaude(input: RawLookup): RawRecord | null {

@@ -211,3 +211,58 @@ test('claude links repeated workflow names by unique run id', () => {
   assert.equal(parentByRun.get('old-run'), 'old-call');
   assert.equal(parentByRun.get('new-run'), 'new-call');
 });
+
+
+// ---- torn-tail cursor safety (#102) ----
+// A build can land while the writer is mid-line. readLines reports the
+// unterminated EOF tail with terminated=false; the Claude cursor must not
+// count a tail that failed to parse, or the completed line is never re-read.
+
+function writeTornFixture() {
+  const dir = makeTempDir('obelisk-claude-torn-');
+  const path = join(dir, 'sid-torn.jsonl');
+  const head = [
+    JSON.stringify({ uuid: 'u1', type: 'user', timestamp: '2026-06-10T10:00:00Z', message: { role: 'user', content: 'hi' } }),
+    JSON.stringify({ uuid: 'a1', type: 'assistant', timestamp: '2026-06-10T10:00:05Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }),
+  ];
+  return { path, head };
+}
+
+const COMPLETED_TAIL = JSON.stringify({
+  uuid: 'u2', type: 'user', timestamp: '2026-06-10T10:00:10Z', message: { role: 'user', content: 'done' },
+});
+
+test('a torn unterminated tail line does not advance the Claude cursor', () => {
+  const { path, head } = writeTornFixture();
+  writeFileSync(path, `${head.join('\n')}\n{"uuid":"u2","type":"user","mes`);
+  const { ret } = drain(parse({ key: path, sessionId: 'sid-torn' }, null));
+  assert.equal(ret.split(':')[1], '2', 'the unparseable unterminated tail is not counted');
+});
+
+test('a completed tail line is indexed exactly once after a torn parse', () => {
+  const { path, head } = writeTornFixture();
+  writeFileSync(path, `${head.join('\n')}\n{"uuid":"u2","type":"user","mes`);
+  const torn = drain(parse({ key: path, sessionId: 'sid-torn' }, null));
+
+  // The writer finishes the line (a later build sees it complete).
+  writeFileSync(path, `${head.join('\n')}\n${COMPLETED_TAIL}\n`);
+  const healed = drain(parse({ key: path, sessionId: 'sid-torn' }, torn.ret));
+
+  const u2 = healed.values.filter((r) => r.kind === 'message' && r.uuid === 'u2');
+  assert.equal(u2.length, 1, 'the completed line is indexed exactly once');
+  assert.equal(healed.ret.split(':')[1], '3', 'the cursor now covers the completed line');
+});
+
+test('a newline-terminated malformed line advances the Claude cursor', () => {
+  const { path, head } = writeTornFixture();
+  writeFileSync(path, `${head.join('\n')}\nnot-json-at-all\n`);
+  const { ret } = drain(parse({ key: path, sessionId: 'sid-torn' }, null));
+  assert.equal(ret.split(':')[1], '3', 'terminated garbage keeps the legacy count');
+});
+
+test('a legal unterminated final JSON line advances the Claude cursor', () => {
+  const { path, head } = writeTornFixture();
+  writeFileSync(path, `${head.join('\n')}\n${COMPLETED_TAIL}`);
+  const { ret } = drain(parse({ key: path, sessionId: 'sid-torn' }, null));
+  assert.equal(ret.split(':')[1], '3', 'a parseable unterminated final line is counted');
+});
