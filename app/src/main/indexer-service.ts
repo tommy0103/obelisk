@@ -12,7 +12,12 @@ import {
 const DEFAULT_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 // Bounded batching (#86): a short trailing debounce coalesces one filesystem
 // burst; maxWait bounds how long sustained activity can postpone a build.
-// Candidate values pending the benchmark merge gate in PR #103.
+// Values from the PR #103 merge-gate benchmark on the real ~18.7k-transcript
+// corpus: the ceiling releases builds correctly and the queue converges.
+// Steady-state changed-path builds are ~60 ms warm; the remaining latency is
+// the cold first-build finalize (refreshSessionProjectPaths does one
+// unindexed per-session scan of the messages table — seconds on this corpus),
+// tracked as issue #105.
 const DEFAULT_DEBOUNCE_MS = 250;
 const DEFAULT_STABILITY_MS = 500;
 const DEFAULT_MAX_WAIT_MS = 1500;

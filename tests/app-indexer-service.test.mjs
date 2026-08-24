@@ -12,20 +12,33 @@ const require = createRequire(import.meta.url);
 import { createIndexerService } from '../app/src/main/indexer-service.ts';
 
 function manualTimers() {
-  const timers = new Set();
+  // A mock clock: setTimeout records the fn with its due time; tick(ms)
+  // advances the clock and fires due timers in due order. flush() fires
+  // everything pending — fine for tests that do not care about ordering, but
+  // meaningless for proving a ceiling, since it ignores delays entirely.
+  let now = 0;
+  const timers = new Map();
   const delays = [];
   return {
     delays,
-    setTimeout(fn, ms) {
-      timers.add(fn);
+    setTimeout(fn, ms = 0) {
       delays.push(ms);
+      timers.set(fn, now + ms);
       return fn;
     },
     clearTimeout(fn) {
       timers.delete(fn);
     },
+    tick(ms) {
+      now += ms;
+      for (const [fn, due] of [...timers.entries()].sort((a, b) => a[1] - b[1])) {
+        if (due > now) continue;
+        timers.delete(fn);
+        fn();
+      }
+    },
     flush() {
-      const pending = [...timers];
+      const pending = [...timers.keys()];
       timers.clear();
       for (const fn of pending) fn();
     },
@@ -583,25 +596,64 @@ test('sustained events cannot postpone a build past the max-wait ceiling', async
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 0,
-    debounceMs: 0,
+    // Trailing is set far beyond the ceiling so the ceiling is the only
+    // timer that can fire inside the test window.
+    debounceMs: 5000,
     maxWaitMs: 1500,
   });
 
-  // Every event resets the trailing timer; the max-wait ceiling still
-  // releases exactly one build with the whole accumulated batch.
+  // t=0: first event arms trailing (250 ms) and the ceiling (1500 ms).
   service.scheduleBuild('watch', 'a.jsonl');
+  timers.tick(1499);
+  assert.deepEqual(calls, [], 'neither timer is due yet');
+
+  // t=1499: another event resets ONLY the trailing timer. If the ceiling
+  // were (incorrectly) reset too, it would not be due for another 1500 ms.
   service.scheduleBuild('watch', 'b.jsonl');
-  service.scheduleBuild('watch', 'c.jsonl');
-  timers.flush();
+  timers.tick(1);
   await service.idle();
 
-  assert.equal(calls.length, 1, 'sustained events coalesce into one bounded build');
-  assert.deepEqual(calls[0].changedPaths, ['a.jsonl', 'b.jsonl', 'c.jsonl']);
+  assert.equal(calls.length, 1, 'the ceiling fires at t=1500 despite the fresh event');
+  assert.deepEqual(calls[0].changedPaths, ['a.jsonl', 'b.jsonl']);
   assert.equal(calls[0].reason, 'watch');
 
   timers.flush();
   await service.idle();
   assert.equal(calls.length, 1, 'no second build fires from a cleared or stale timer');
+});
+
+test('the final write is indexed by the trailing build after the source goes quiet', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => calls.push(args),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 500,
+    debounceMs: 250,
+    maxWaitMs: 1500,
+  });
+
+  service.scheduleBuild('watch', 'a.jsonl');
+  service.scheduleBuild('watch', 'b.jsonl');
+  timers.tick(1500);
+  await service.idle();
+  assert.equal(calls.length, 1, 'the burst builds once');
+
+  // The last write: only the trailing path may release this build.
+  service.scheduleBuild('watch', 'c.jsonl');
+  timers.tick(249);
+  await service.idle();
+  assert.equal(calls.length, 1, 'still inside the trailing debounce');
+  timers.tick(1); // t=250: debounce elapses, stability starts
+  timers.tick(499);
+  await service.idle();
+  assert.equal(calls.length, 1, 'still inside the stability window');
+  timers.tick(1); // t=500: stability elapses
+  await service.idle();
+  assert.equal(calls.length, 2, 'the trailing build runs after the source goes quiet');
+  assert.deepEqual(calls[1].changedPaths, ['c.jsonl'], 'the final write is indexed');
 });
 
 test('events during a build produce exactly one follow-up and no ghost build', async () => {

@@ -201,12 +201,13 @@ export function resolveInvokingSessionId(
 }
 
 // Poll bounds for the nonce freshness fallback. The poll runs only when the
-// incremental recovery build loses the writer lease (writer_busy); the cap
-// gives a concurrent build — the daemon's watcher-driven build (bounded
-// batching: ~250 ms trailing debounce, 0.5 s stability, 1.5 s max wait) —
-// time to publish the nonce.
+// incremental recovery build loses the writer lease (writer_busy) — i.e. only
+// while the daemon is running, so the db is warm in the OS page cache and the
+// concurrent build is in the warm ~60–1500 ms band (PR #103 benchmark). A 4 s
+// cap could return null before the daemon publishes the nonce and silently
+// drop is_invoking; 8 s leaves headroom for cache pressure.
 const INVOCATION_POLL_INTERVAL_MS = 300;
-const INVOCATION_POLL_CAP_MS = 4000;
+const INVOCATION_POLL_CAP_MS = 8000;
 
 interface InvocationWaitOptions {
   openRead?: () => SqliteDb;

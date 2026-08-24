@@ -1,18 +1,24 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// #86 merge-gate benchmark: measures the app daemon's real build latency on
-// the real indexed corpus, and the bounded scheduler's behavior under
-// continuous transcript writes. Runs the production worker
-// (app/out/main/indexer-worker.js, built by electron-vite) against a throwaway
-// COPY of the index database — the live database is never touched.
+// #86 merge-gate benchmark, two independent measurements:
 //
-// Usage: node tmp/bench-scheduler.mjs
+//   1. Idle changed-path build cost on the REAL indexed corpus (~18.7k
+//      transcripts), against a throwaway COPY of the index DB.
+//   2. End-to-end scheduling latency under continuous writes on a SYNTHETIC
+//      corpus (own root, own fresh DB), verifying the appended lines actually
+//      land in the index — not just that builds fire.
+//
+// Both run the production worker (app/out/main/indexer-worker.js, built by
+// electron-vite). The live database is never touched.
+//
+// Usage: node scripts/bench-scheduler.mjs
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { DatabaseSync } from 'node:sqlite';
 
 const require = createRequire(import.meta.url);
 const { createWorkerBuildIndex } = await import('../app/src/main/indexer-worker-client.ts');
@@ -22,55 +28,85 @@ const HOME = os.homedir();
 const LIVE_DB = path.join(HOME, '.obelisk', 'obelisk.sqlite');
 const CLAUDE_PROJECTS = path.join(HOME, '.claude', 'projects');
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'obelisk-bench-'));
-const dbPath = path.join(tmp, 'bench.sqlite');
-fs.copyFileSync(LIVE_DB, dbPath);
+const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'obelisk-bench-')));
 
 function percentile(values, p) {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
 }
 
-// ---- metric 1: idle changed-path build time on the real corpus ----
-
 const worker = createWorkerBuildIndex({
   workerPath: new URL('../app/out/main/indexer-worker.js', import.meta.url).pathname,
 });
-const benchClaudeDir = path.join(HOME, '.claude');
 
-// Pick a real transcript to feed as a changed path.
-function pickTranscript() {
-  const project = fs.readdirSync(CLAUDE_PROJECTS)[0];
-  const file = fs.readdirSync(path.join(CLAUDE_PROJECTS, project))
-    .find((name) => name.endsWith('.jsonl'));
-  return path.join(CLAUDE_PROJECTS, project, file);
+// ---- metric 1: idle changed-path build time on the real corpus ----
+
+// The measured cost is filesystem discovery over the real transcript tree,
+// not DB size — so a small clone carrying schema + index_state + sessions is
+// enough (the full 1 GB messages/FTS content is irrelevant to the walk).
+const corpusDb = path.join(tmp, 'corpus.sqlite');
+const schema = fs.readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+const clone = new DatabaseSync(corpusDb);
+clone.exec(schema);
+clone.exec(`ATTACH DATABASE '${LIVE_DB.replace(/'/g, "''")}' AS live`);
+// The measured finalize cost scales with the messages tables (per-session
+// cwd queries in refreshSessionProjectPaths); FTS content is not needed.
+for (const table of ['index_state', 'sessions', 'messages', 'tool_calls', 'tool_results']) {
+  clone.exec(`INSERT INTO ${table} SELECT * FROM live.${table}`);
 }
-
-const idleArgs = {
+clone.exec('DETACH DATABASE live');
+clone.close();
+const corpusArgs = {
   providerRoots: {},
-  claudeDir: benchClaudeDir,
+  claudeDir: path.join(HOME, '.claude'),
   codexDir: path.join(HOME, '.codex'),
   projectsDir: CLAUDE_PROJECTS,
-  dbPath,
+  dbPath: corpusDb,
 };
 
-// Warm-up (opens db, migrates, loads plan caches).
-await worker.buildIndex({ ...idleArgs, reason: 'warmup' });
-const changed = pickTranscript();
+{
+  const markerCheck = new DatabaseSync(corpusDb, { readOnly: true });
+  const ftsReady = markerCheck.prepare('SELECT COUNT(*) AS n FROM index_state WHERE jsonl_path = ?').get('__fts_triggers_ready__').n;
+  markerCheck.close();
+  const warmupStart = performance.now();
+  await worker.buildIndex({ ...corpusArgs, reason: 'warmup' });
+  console.log(`first build after open (cold, fts marker present: ${ftsReady > 0}): ${(performance.now() - warmupStart).toFixed(0)} ms`);
+}
+const project = fs.readdirSync(CLAUDE_PROJECTS)[0];
+const changed = path.join(
+  CLAUDE_PROJECTS,
+  project,
+  fs.readdirSync(path.join(CLAUDE_PROJECTS, project)).find((name) => name.endsWith('.jsonl')),
+);
 const idleTimes = [];
 for (let i = 0; i < 10; i++) {
+  // Force the file stale so the build does real changed-path work (the
+  // signature gate must reselect it); content is untouched.
+  const now = new Date();
+  fs.utimesSync(changed, now, now);
   const start = performance.now();
-  await worker.buildIndex({ ...idleArgs, reason: 'bench', changedPaths: [changed] });
+  await worker.buildIndex({ ...corpusArgs, reason: 'bench', changedPaths: [changed] });
   idleTimes.push(performance.now() - start);
 }
 console.log('idle changed-path build (real corpus, ms):');
 console.log(`  n=${idleTimes.length} p50=${percentile(idleTimes, 50).toFixed(0)} p95=${percentile(idleTimes, 95).toFixed(0)} mean=${(idleTimes.reduce((a, b) => a + b, 0) / idleTimes.length).toFixed(0)}`);
 
-// ---- metric 2+3: bounded scheduler under continuous writes ----
+// ---- metric 2: end-to-end latency under continuous writes (synthetic corpus) ----
 
-const liveRoot = path.join(tmp, 'projects', '-bench');
-fs.mkdirSync(liveRoot, { recursive: true });
-const liveFile = path.join(liveRoot, 'live-session.jsonl');
+const benchClaudeDir = path.join(tmp, 'bench-claude');
+const benchProjects = path.join(benchClaudeDir, 'projects');
+const liveDir = path.join(benchProjects, '-bench');
+fs.mkdirSync(liveDir, { recursive: true });
+const liveFile = path.join(liveDir, 'live-session.jsonl');
+const benchDb = path.join(tmp, 'bench.sqlite');
+const benchArgs = {
+  providerRoots: {},
+  claudeDir: benchClaudeDir,
+  codexDir: path.join(tmp, 'bench-codex'),
+  projectsDir: benchProjects,
+  dbPath: benchDb,
+};
+
 const claudeLine = (i) => JSON.stringify({
   uuid: `bench-${i}`,
   type: 'user',
@@ -81,12 +117,12 @@ fs.writeFileSync(liveFile, `${claudeLine(0)}\n`);
 
 const builds = [];
 const service = createIndexerService({
-  watchTargets: [{ kind: 'tree', path: path.join(tmp, 'projects') }],
+  watchTargets: [{ kind: 'tree', path: benchProjects }],
   hotPolling: false,
   buildIndex: async (args) => {
     const start = performance.now();
-    builds.push({ reason: args.reason, paths: args.changedPaths?.length, start });
-    await worker.buildIndex({ ...idleArgs, reason: args.reason, changedPaths: args.changedPaths });
+    builds.push({ reason: args.reason, paths: args.changedPaths, start });
+    await worker.buildIndex({ ...benchArgs, reason: args.reason, changedPaths: args.changedPaths });
     builds[builds.length - 1].end = performance.now();
   },
   writeHeartbeat: () => {},
@@ -98,26 +134,40 @@ await service.runBuildNow('startup');
 
 const DURATION_MS = 20000;
 const APPEND_INTERVAL_MS = 200;
+const appendTimes = [performance.now()];
 let appends = 1;
 const appendTimer = setInterval(() => {
   fs.appendFileSync(liveFile, `${claudeLine(appends++)}\n`);
+  appendTimes.push(performance.now());
 }, APPEND_INTERVAL_MS);
 await new Promise((resolve) => setTimeout(resolve, DURATION_MS));
 clearInterval(appendTimer);
-await new Promise((resolve) => setTimeout(resolve, 3000));
+await new Promise((resolve) => setTimeout(resolve, 4000));
 service.stop();
 await service.idle();
 
+// End-to-end proof: every appended line must be in the index.
+const check = new DatabaseSync(benchDb, { readOnly: true });
+const indexed = check.prepare(
+  "SELECT COUNT(*) AS n FROM messages WHERE uuid LIKE 'bench-%'",
+).get().n;
+check.close();
+
 const watchBuilds = builds.filter((b) => b.reason === 'watch' || b.reason === 'pending');
-const firstWatchTs = watchBuilds[0]?.start;
-const rate = watchBuilds.length / (DURATION_MS / 1000);
-const gaps = watchBuilds.slice(1).map((b, i) => b.start - watchBuilds[i].start);
+const firstWatchBuild = watchBuilds[0];
+const lastBuild = watchBuilds[watchBuilds.length - 1];
 const durations = watchBuilds.map((b) => (b.end ?? b.start) - b.start);
-console.log('continuous writes (200 ms append interval, 20 s window):');
-console.log(`  appends=${appends - 1} builds=${watchBuilds.length} (${rate.toFixed(2)}/s)`);
-console.log(`  build duration ms: p50=${percentile(durations, 50).toFixed(0)} p95=${percentile(durations, 95).toFixed(0)}`);
-console.log(`  inter-build gap ms: p50=${percentile(gaps, 50).toFixed(0)} p95=${percentile(gaps, 95).toFixed(0)} max=${Math.max(...gaps).toFixed(0)}`);
-console.log(`  first-change-to-first-build ms: ${firstWatchTs === undefined ? 'n/a' : (firstWatchTs - builds[0].end).toFixed(0)}`);
+const lastAppendTs = appendTimes[appendTimes.length - 1];
+
+console.log('continuous writes (200 ms append interval, 20 s window, synthetic corpus):');
+console.log(`  lines=${appends} indexed=${indexed} (${indexed === appends ? 'ALL — end-to-end confirmed' : 'MISSING LINES!'})`);
+console.log(`  builds=${watchBuilds.length} (${(watchBuilds.length / (DURATION_MS / 1000)).toFixed(2)}/s), duration p50=${percentile(durations, 50).toFixed(0)} ms`);
+if (firstWatchBuild) {
+  console.log(`  first-append -> first build containing it: ${(firstWatchBuild.end - appendTimes[0]).toFixed(0)} ms`);
+}
+if (lastBuild) {
+  console.log(`  last-append -> last build completing it: ${(lastBuild.end - lastAppendTs).toFixed(0)} ms (bounded; legacy trailing debounce would still be pending)`);
+}
 
 worker.stop();
 fs.rmSync(tmp, { recursive: true, force: true });
