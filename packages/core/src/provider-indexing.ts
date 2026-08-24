@@ -120,7 +120,7 @@ export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT
   for (const row of rows) {
     if (hints.length >= limit) break;
     const key = String(row.jsonl_path);
-    let isDirectory = false;
+    let isDirectory: boolean;
     try {
       isDirectory = statSync(key).isDirectory();
     } catch {

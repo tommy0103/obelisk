@@ -37,6 +37,21 @@ function cursorToSkip(cursor: Cursor): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
+// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
+// same-millisecond rewrites) lets a same-mtime tail completion or a
+// same-mtime replacement back into discovery. Legacy `${mtime}:${lines}`
+// cursors keep the mtime-only gate and upgrade on the next parse.
+function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
+  const stat = statSync(filePath);
+  const parts = cursor.split(':');
+  if (parts.length < 5) return Number(parts[0]) < stat.mtimeMs;
+  return Number(parts[0]) !== stat.mtimeMs
+    || Number(parts[2]) !== stat.size
+    || Number(parts[3]) !== stat.ctimeMs
+    || Number(parts[4]) !== stat.ino;
+}
+
 export const name = 'claude';
 export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v2__';
 
@@ -108,7 +123,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     return historyChanged
       || forcedPaths.has(normalizedPath)
       || cursor === null
-      || Number(cursor.split(':')[0]) < statSync(file.path).mtimeMs;
+      || cursorSignatureDiffers(cursor, file.path);
   }).map((f: any) => ({
     key: f.path,
     sessionId: f.sessionId,
@@ -262,7 +277,8 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     return yield* parseWorkflow(unit);
   }
   const skip = cursorToSkip(cursor);
-  const mtime = statSync(unit.key).mtimeMs;
+  const stat = statSync(unit.key);
+  const mtime = stat.mtimeMs;
   const isSubagent = unit.isSubagent === true;
   const records: TranscriptRecord[] = [];
   const sm = {
@@ -400,7 +416,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   }
 
   yield* records;
-  return `${mtime}:${cursorLines}`;
+  return `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
 }
 
 function rawClaude(input: RawLookup): RawRecord | null {

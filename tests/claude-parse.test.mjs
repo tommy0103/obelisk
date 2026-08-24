@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -81,8 +81,9 @@ test('claude parse() yields the expected record stream for a main session', () =
   assert.deepEqual(detail.messages.map((message) => message.text), ['hi', 'ok']);
   assert.equal(detail.messages[1].tool_calls[0].result.content, 'file body');
 
-  // Cursor encodes mtime:lines (6 lines consumed).
-  assert.equal(ret, `${statSync(path).mtimeMs}:6`);
+  // Cursor encodes mtime:lines:signature (6 lines consumed).
+  const stat = statSync(path);
+  assert.equal(ret, `${stat.mtimeMs}:6:${stat.size}:${stat.ctimeMs}:${stat.ino}`);
 });
 
 test('claude parse() emits no session record for a subagent transcript', () => {
@@ -265,4 +266,70 @@ test('a legal unterminated final JSON line advances the Claude cursor', () => {
   writeFileSync(path, `${head.join('\n')}\n${COMPLETED_TAIL}`);
   const { ret } = drain(parse({ key: path, sessionId: 'sid-torn' }, null));
   assert.equal(ret.split(':')[1], '3', 'a parseable unterminated final line is counted');
+});
+
+
+// ---- cursor signature: same-millisecond recovery through discover ----
+// The production self-heal path is discover → parse, not parse alone: after a
+// torn parse, the completed tail must be reselected even when the file's
+// mtime did not move (same-millisecond append, coarse or network filesystems).
+
+test('a same-mtime tail completion is rediscovered through the cursor signature', () => {
+  const root = makeTempDir('obelisk-claude-signature-');
+  const projectDir = join(root, 'projects', '-proj');
+  mkdirSync(projectDir, { recursive: true });
+  const path = join(projectDir, 'sid-torn.jsonl');
+  const head = [
+    JSON.stringify({ uuid: 'u1', type: 'user', timestamp: '2026-06-10T10:00:00Z', message: { role: 'user', content: 'hi' } }),
+    JSON.stringify({ uuid: 'a1', type: 'assistant', timestamp: '2026-06-10T10:00:05Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }),
+  ];
+  writeFileSync(path, `${head.join('\n')}\n{"uuid":"u2","type":"user","mes`);
+  const provider = createClaudeProvider({ rootDir: root });
+
+  // First production cycle: discover → parse the torn file.
+  let units = provider.discover({ lastCursor: () => null });
+  assert.equal(units.length, 1);
+  const tornCursor = drain(provider.parse(units[0], null)).ret;
+  assert.equal(tornCursor.split(':')[1], '2', 'the torn tail is not counted');
+
+  // The writer completes the line with the mtime pinned to the parse-time
+  // value — an mtime-only gate would never reselect this file.
+  writeFileSync(path, `${head.join('\n')}\n${COMPLETED_TAIL}\n`);
+  const pinnedMtime = new Date(Number(tornCursor.split(':')[0]));
+  utimesSync(path, pinnedMtime, pinnedMtime);
+
+  // The signature (size/ctime moved) reselects it anyway, and the completed
+  // line is indexed exactly once through the full discover → parse cycle.
+  units = provider.discover({ lastCursor: () => tornCursor });
+  assert.equal(units.length, 1, 'a same-mtime completion is rediscovered');
+  const healed = drain(provider.parse(units[0], tornCursor));
+  assert.equal(
+    healed.values.filter((r) => r.kind === 'message' && r.uuid === 'u2').length,
+    1,
+    'the completed line is indexed exactly once',
+  );
+});
+
+test('a legacy two-part cursor keeps the mtime-only gate until it upgrades', () => {
+  const root = makeTempDir('obelisk-claude-legacy-cursor-');
+  const projectDir = join(root, 'projects', '-proj');
+  mkdirSync(projectDir, { recursive: true });
+  const path = join(projectDir, 'sid-legacy.jsonl');
+  writeFileSync(path, [
+    JSON.stringify({ uuid: 'u1', type: 'user', timestamp: '2026-06-10T10:00:00Z', message: { role: 'user', content: 'hi' } }),
+    JSON.stringify({ uuid: 'a1', type: 'assistant', timestamp: '2026-06-10T10:00:05Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }),
+  ].join('\n') + '\n');
+  const provider = createClaudeProvider({ rootDir: root });
+  const mtime = statSync(path).mtimeMs;
+
+  assert.equal(
+    provider.discover({ lastCursor: () => `${mtime}:2` }).length,
+    0,
+    'a legacy cursor at the current mtime is not reselected',
+  );
+  assert.equal(
+    provider.discover({ lastCursor: () => `${mtime - 1000}:2` }).length,
+    1,
+    'a legacy cursor behind the current mtime is reselected',
+  );
 });
