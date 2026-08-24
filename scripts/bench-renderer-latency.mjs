@@ -64,7 +64,11 @@ const child = spawn(electronBin, [
 });
 
 let ws;
+let writer;
+let cursorProbe;
 const cleanup = () => {
+  if (writer) clearInterval(writer);
+  if (cursorProbe) clearInterval(cursorProbe);
   try { ws?.close(); } catch {}
   try { child.kill('SIGTERM'); } catch {}
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -91,11 +95,14 @@ async function cdpConnect() {
     const pending = cdpPending.get(msg.id);
     if (!pending) return;
     cdpPending.delete(msg.id);
-    pending(msg.result?.result?.value);
+    // Stored as an object and invoked through a typed method so dynamic-call
+    // analyzers (CodeQL) see a constrained call, not a map value invoked blindly.
+    if (typeof pending.resolve === 'function') pending.resolve(msg.result?.result?.value);
   };
   await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
+    const timeout = setTimeout(() => reject(new Error('cdp websocket open timeout')), 5000);
+    ws.onopen = () => { clearTimeout(timeout); resolve(); };
+    ws.onerror = (error) => { clearTimeout(timeout); reject(error); };
   });
 }
 
@@ -107,9 +114,11 @@ function cdpEvaluate(expression) {
       cdpPending.delete(id);
       reject(new Error('cdp evaluate timeout'));
     }, 10000);
-    cdpPending.set(id, (value) => {
-      clearTimeout(timeout);
-      resolve(value);
+    cdpPending.set(id, {
+      resolve: (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
     });
     ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }));
   });
@@ -158,16 +167,18 @@ try {
 
   // ---- Workload B: continuous writes on a strict 200 ms schedule ----
   // The trailing timer never settles, so builds must come from the ceiling.
-  // Two pollers split the latency: append -> indexed (db row present) and
-  // append -> renderer-visible (DOM text present).
+  // The writer runs exactly 10 s, then a drain window polls until EVERY line
+  // is both indexed and renderer-visible — the cohort must be complete, and
+  // missing lines fail the probe rather than being disguised as samples.
   const appended = [];
   const cursorLog = [];
   const indexedAt = new Map();
   const visibleAt = new Map();
   const t0 = performance.now();
-  const cursorProbe = setInterval(() => {
+  const cursorDb = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  cursorProbe = setInterval(() => {
     try {
-      const row = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true })
+      const row = cursorDb
         .prepare('SELECT mtime, lines_processed FROM index_state WHERE jsonl_path = ?').get(liveFile);
       if (row && (cursorLog.length === 0 || cursorLog[cursorLog.length - 1].lines !== row.lines_processed)) {
         const now = performance.now();
@@ -176,7 +187,7 @@ try {
       }
     } catch { /* db not created yet */ }
   }, 400);
-  const writer = setInterval(() => {
+  writer = setInterval(() => {
     const i = appended.length === 0 ? 100 : appended[appended.length - 1].i + 1;
     fs.appendFileSync(liveFile, `${line(i)}\n`);
     appended.push({ i, text: `gui append ${i}`, at: performance.now() });
@@ -185,14 +196,19 @@ try {
   // Poll db + DOM concurrently with the writer, from t0 — first-seen times
   // are the real latency; a poll that starts after the window would invent
   // latency for everything indexed before it began.
-  const db = new DatabaseSync(path.join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
-  const pollEnd = t0 + 10000 + 4000;
-  while (performance.now() < pollEnd
-    && (appended.length === 0 || visibleAt.size < appended.length || indexedAt.size < appended.length)) {
+  const WRITE_MS = 10000;
+  const DRAIN_MS = 15000;
+  const drainDeadline = t0 + WRITE_MS + DRAIN_MS;
+  setTimeout(() => clearInterval(writer), WRITE_MS);
+  while (performance.now() < drainDeadline
+    && (appended.length === 0
+      || performance.now() < t0 + WRITE_MS
+      || visibleAt.size < appended.length
+      || indexedAt.size < appended.length)) {
     const missing = appended.filter((a) => !visibleAt.has(a.i) || !indexedAt.has(a.i));
     for (const a of missing) {
       if (!indexedAt.has(a.i)
-        && db.prepare('SELECT 1 FROM messages WHERE uuid = ?').get(`gui-bench-${a.i}`)) {
+        && cursorDb.prepare('SELECT 1 FROM messages WHERE uuid = ?').get(`gui-bench-${a.i}`)) {
         indexedAt.set(a.i, performance.now());
       }
     }
@@ -202,15 +218,23 @@ try {
     // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 100));
   }
-  clearInterval(writer);
   clearInterval(cursorProbe);
-  db.close();
+
   const toStats = (map) => {
-    const lat = appended.map((a) => (map.get(a.i) ?? pollEnd) - a.at);
-    return `p50=${percentile(lat, 50).toFixed(0)} p95=${percentile(lat, 95).toFixed(0)} max=${Math.max(...lat).toFixed(0)} (${map.size}/${appended.length})`;
+    const seen = appended.filter((a) => map.has(a.i)).map((a) => map.get(a.i) - a.at);
+    return `p50=${percentile(seen, 50).toFixed(0)} p95=${percentile(seen, 95).toFixed(0)} max=${seen.length ? Math.max(...seen).toFixed(0) : 'n/a'} (${map.size}/${appended.length})`;
   };
   console.log(`B append -> indexed: ${toStats(indexedAt)}`);
   console.log(`B append -> renderer-visible: ${toStats(visibleAt)}`);
+  const missingIndexed = appended.filter((a) => !indexedAt.has(a.i)).map((a) => a.i);
+  const missingVisible = appended.filter((a) => !visibleAt.has(a.i)).map((a) => a.i);
+  if (missingIndexed.length || missingVisible.length) {
+    console.error(`FAIL: incomplete cohort after writer stop + drain — missing indexed: [${missingIndexed}], missing visible: [${missingVisible}]`);
+    process.exitCode = 1;
+  } else {
+    console.log('B cohort complete: every appended line indexed and renderer-visible after writer stop');
+  }
+  cursorDb.close();
 } finally {
   cleanup();
 }
