@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "erasableSyntaxOnly": false,
+    "jsx": "react-jsx",
+    "lib": ["ES2023", "DOM"]
+  },
+  "include": ["src/**/*"]
+}

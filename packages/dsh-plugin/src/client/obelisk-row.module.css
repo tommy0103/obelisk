@@ -1,0 +1,202 @@
+/* Obelisk toolview: shared ToolRow geometry/tokens, with the monolith glyph
+   and QUERY/RESULT sections as the distinctive chrome. All theme-adaptive
+   colors come from the dsw alias tokens so light/dark themes stay intact. */
+
+.card {
+  display: flex;
+  flex-direction: column;
+}
+
+.root {
+  position: relative; /* sweep-glare overlay anchor */
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  height: 24px;
+  min-width: 0;
+}
+
+.root[data-expandable] {
+  cursor: pointer;
+}
+
+/* Running sweep glare — same pattern as the shipped bash row. */
+.root[data-state='running']::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 300px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--dsw-alias-bg-base) 60%, transparent) 55%,
+    transparent 100%
+  );
+  animation: dsh-obelisk-row-sweep 2.6s ease-out infinite;
+  pointer-events: none;
+}
+
+@keyframes dsh-obelisk-row-sweep {
+  0% { left: -300px; }
+  90%, 100% { left: 100%; }
+}
+
+.leading {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  color: #c9a35b; /* brand accent, fixed across themes */
+}
+
+.glyph {
+  display: block;
+}
+
+.title {
+  flex: none;
+  font-size: 14px;
+  line-height: 24px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.sep {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  border-radius: 1px;
+  margin: 0 8px;
+  background: var(--dsw-alias-label-caption);
+}
+
+.summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 24px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.summary[data-error] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  background: #c9a35b;
+}
+
+.dot[data-state='error'] {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+.dot[data-state='running'] {
+  animation: dsh-obelisk-dot-pulse 1.6s ease-out infinite;
+}
+
+@keyframes dsh-obelisk-dot-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.chevron,
+.chevronOpen {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  color: var(--dsw-alias-label-caption);
+  transition: transform 120ms ease;
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+.bodyWrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.ioCard {
+  display: flex;
+  flex-direction: column;
+  margin: 4px 0 4px 4px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-markdown-code-block);
+}
+
+.ioSection {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 14px;
+  align-items: baseline;
+  padding: 12px 16px;
+  max-height: 224px;
+  overflow-y: auto;
+}
+
+.ioLabel {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  color: var(--dsw-alias-label-caption);
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 0.08em;
+}
+
+.ioText {
+  margin: 0;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: var(--dsw-font-markdown-code-block-small);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.ioText[data-error] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+/* Hover-revealed Inspect pill, same treatment as the shipped bash row. */
+.inspectButton {
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0 2px 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.card:hover .inspectButton,
+.inspectButton:focus-visible {
+  opacity: 1;
+}
+
+.inspectButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover-solid);
+}
