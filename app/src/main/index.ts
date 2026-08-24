@@ -280,10 +280,11 @@ function startIndexerService({ buildOnStart = false } = {}) {
   const service = createIndexerService({
     projectsDir: paths.projectsDir,
     watchDirs: paths.providerRegistry.watchRoots(paths.providerRoots),
-    buildIndex: async ({ reason, changedPaths }) => {
+    buildIndex: async ({ reason, changedPaths, retrySessionIds }) => {
       const result = await indexerWorker.buildIndex({
         reason,
         changedPaths,
+        retrySessionIds,
         providerRoots: paths.providerRoots,
         providerSettings: paths.providerSettings,
         claudeDir: paths.claudeDir,

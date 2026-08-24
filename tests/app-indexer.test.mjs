@@ -64,6 +64,16 @@ test('app indexer records build success without claiming daemon ownership', () =
   assert.equal(db.prepare("SELECT jsonl_path FROM index_state WHERE jsonl_path='__app_heartbeat__'").get(), undefined);
   assert.equal(db.prepare("SELECT jsonl_path FROM index_state WHERE jsonl_path='__app_last_successful_build__'").get().jsonl_path, '__app_last_successful_build__');
   assert.equal(db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, '/tmp/obelisk-app');
+  db.prepare('UPDATE sessions SET project_path=? WHERE id=?').run('/tmp/stale-affected', sessionId);
+  db.prepare('INSERT INTO sessions (id,project,project_path,source) VALUES (?,?,?,?)')
+    .run('session-app-unaffected', '-tmp-unaffected', '/tmp/stale-unaffected', 'claude');
+  db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,timestamp,role,text,content_type,cwd,source)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `).run(
+    'msg-app-unaffected', 'session-app-unaffected', 'user', '2026-06-13T09:00:00Z',
+    'user', 'unrelated session', 'text', '/tmp/unaffected', 'claude',
+  );
   db.close();
 
   appendFileSync(jsonlPath, [
@@ -90,7 +100,36 @@ test('app indexer records build success without claiming daemon ownership', () =
   const db2 = new TestDatabase(dbPath);
   assert.equal(db2.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'companion'").get().uuid, 'msg-app-2');
   assert.equal(db2.prepare('SELECT message_count FROM sessions WHERE id=?').get(sessionId).message_count, 2);
+  assert.equal(db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, '/tmp/obelisk-app');
+  assert.equal(
+    db2.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
+    '/tmp/stale-unaffected',
+  );
   db2.close();
+
+  buildIndex({
+    claudeDir,
+    dbPath,
+    DatabaseImpl: TestDatabase,
+    changedPaths: [],
+    retrySessionIds: ['session-app-unaffected'],
+  });
+  const retryDb = new TestDatabase(dbPath);
+  assert.equal(
+    retryDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
+    '/tmp/unaffected',
+  );
+  retryDb.prepare('UPDATE sessions SET project_path=? WHERE id=?')
+    .run('/tmp/stale-unaffected', 'session-app-unaffected');
+  retryDb.close();
+
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+  const repairedDb = new TestDatabase(dbPath);
+  assert.equal(
+    repairedDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
+    '/tmp/unaffected',
+  );
+  repairedDb.close();
 });
 
 test('app indexer refreshes unchanged Claude usage when input token semantics change', () => {

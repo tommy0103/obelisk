@@ -79,14 +79,16 @@ test('indexer service runs one pending build after an in-flight build finishes',
   assert.deepEqual(calls, ['first', 'pending']);
 });
 
-test('indexer service reschedules a writer-lease deferral without publishing a heartbeat', async () => {
+test('indexer service carries committed sessions across a deferred retry', async () => {
   const timers = manualTimers();
   const calls = [];
   let heartbeats = 0;
   const service = createIndexerService({
-    buildIndex: async ({ reason, changedPaths }) => {
-      calls.push({ reason, changedPaths });
-      return calls.length === 1 ? { deferred: true, reason: 'writer_busy' } : { deferred: false };
+    buildIndex: async (args) => {
+      calls.push(args);
+      return calls.length === 1
+        ? { deferred: true, reason: 'database_busy', affectedSessionIds: ['session-a'] }
+        : { deferred: false };
     },
     watchProjects: () => null,
     writeHeartbeat: () => { heartbeats += 1; },
@@ -102,9 +104,19 @@ test('indexer service reschedules a writer-lease deferral without publishing a h
   await service.idle();
   assert.deepEqual(calls, [
     { reason: 'watch', changedPaths: ['project/session.jsonl'] },
-    { reason: 'writer-lease', changedPaths: ['project/session.jsonl'] },
+    {
+      reason: 'writer-lease',
+      changedPaths: ['project/session.jsonl'],
+      retrySessionIds: ['session-a'],
+    },
   ]);
   assert.equal(heartbeats, 1);
+
+  await service.runBuildNow('manual', ['project/next.jsonl']);
+  assert.deepEqual(calls.at(-1), {
+    reason: 'manual',
+    changedPaths: ['project/next.jsonl'],
+  });
 });
 
 test('a deferred full-inventory build stays full when retried', async () => {

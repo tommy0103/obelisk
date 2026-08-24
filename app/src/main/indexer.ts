@@ -146,8 +146,13 @@ function sessionIdFromChangedPath(projectsDir, changedPath) {
   return null;
 }
 
-function refreshSessionProjectPaths(db) {
-  const sessions = db.prepare('SELECT id, project FROM sessions').all();
+function refreshSessionProjectPaths(db, sessionIds: ReadonlySet<string> | null = null) {
+  const sessionById = db.prepare('SELECT id, project FROM sessions WHERE id = ?');
+  const sessions = sessionIds === null
+    ? db.prepare('SELECT id, project FROM sessions').all()
+    : [...sessionIds]
+      .map(sessionId => sessionById.get(sessionId))
+      .filter(Boolean);
   const cwdStmt = db.prepare(`
     SELECT cwd FROM messages
     WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
@@ -241,6 +246,7 @@ interface BuildIndexOptions {
   LockDatabaseImpl?: new (dbPath: string) => any;
   force?: boolean;
   changedPaths?: string[];
+  retrySessionIds?: string[];
   preserveDbPath?: string | null;
   writerLeasePath?: string;
   writerLeaseWaitMs?: number;
@@ -301,6 +307,7 @@ function buildIndex({
   LockDatabaseImpl = DatabaseImpl,
   force = false,
   changedPaths = undefined,
+  retrySessionIds = [],
   preserveDbPath = null,
   writerLeasePath = writerLockPathFor(dbPath),
   writerLeaseWaitMs = 2000,
@@ -418,7 +425,10 @@ function buildIndex({
         for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
       };
       const finalize = (providerResult) => {
-        refreshSessionProjectPaths(db);
+        const projectPathSessionIds = !force && Array.isArray(changedPaths)
+          ? new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds])
+          : null;
+        refreshSessionProjectPaths(db, projectPathSessionIds);
         healWorkflowParentLinks(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });

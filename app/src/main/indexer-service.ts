@@ -31,6 +31,7 @@ interface Watcher {
 interface IndexerBuildResult {
   deferred?: boolean;
   complete?: boolean;
+  affectedSessionIds?: string[];
   inventoryIssues?: Array<{
     provider: string;
     path: string;
@@ -41,6 +42,7 @@ interface IndexerBuildResult {
 type IndexerBuild = (args: {
   reason?: string;
   changedPaths?: string[];
+  retrySessionIds?: string[];
 }) => IndexerBuildResult | void | Promise<IndexerBuildResult | void>;
 
 interface IndexerServiceOptions {
@@ -147,6 +149,7 @@ function createIndexerService({
   let pending = false;
   let lastReason: string | null = null;
   let changedPaths = new Set<string>();
+  const deferredSessionIds = new Set<string>();
   let fullInventoryPending = false;
   let nextInventoryRetryMs = heartbeatMs;
   let idlePromise = Promise.resolve();
@@ -197,7 +200,19 @@ function createIndexerService({
     pending = false;
     const buildChangedPaths = takeChangedPaths();
     idlePromise = (async () => {
-      const result = await buildIndex({ reason, changedPaths: buildChangedPaths });
+      const retrySessionIds = [...deferredSessionIds];
+      const result = await buildIndex({
+        reason,
+        changedPaths: buildChangedPaths,
+        ...(retrySessionIds.length ? { retrySessionIds } : {}),
+      });
+      if (result?.deferred) {
+        for (const sessionId of result.affectedSessionIds ?? []) {
+          deferredSessionIds.add(sessionId);
+        }
+      } else {
+        deferredSessionIds.clear();
+      }
       if (result?.complete === false) {
         for (const issue of result.inventoryIssues ?? []) {
           logger.warn?.(
