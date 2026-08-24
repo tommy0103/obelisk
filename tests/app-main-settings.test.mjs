@@ -589,6 +589,16 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run('pi-hidden-agent', 'pi:session', 'assistant', 'assistant', 'inactive agent', '2026-07-10T12:02:00Z', 'inactive', 'pi', 'pi:hidden-agent');
   setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-visible-main', 'pi:session', 'assistant', 'assistant', 'visible main', '2026-07-10T12:03:00Z', 'visible', 'pi');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source, agent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-visible-agent', 'pi:session', 'assistant', 'assistant', 'visible agent', '2026-07-10T12:04:00Z', 'visible', 'pi', 'pi:visible-agent');
+  setup.prepare(`
     INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
     VALUES (?, ?, ?, ?, ?)
   `).run('pi-hidden-main-call', 'pi-hidden-main', 'pi:session', 'read', '{"path":"secret"}');
@@ -597,6 +607,14 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     VALUES (?, ?, ?, ?, ?)
   `).run('pi-hidden-agent-call', 'pi-hidden-agent', 'pi:session', 'read', '{"path":"secret"}');
   setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-visible-main-call', 'pi-visible-main', 'pi:session', 'read', '{"path":"main"}');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-visible-agent-call', 'pi-visible-agent', 'pi:session', 'read', '{"path":"agent"}');
+  setup.prepare(`
     INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
     VALUES (?, ?, ?, ?)
   `).run('pi-hidden-main-call', 'pi-hidden-main', 'pi:session', 'hidden result');
@@ -604,6 +622,14 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
     VALUES (?, ?, ?, ?)
   `).run('pi-hidden-agent-call', 'pi-hidden-agent', 'pi:session', 'hidden result');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-visible-main-call', 'pi-visible-main', 'pi:session', 'main result');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-visible-agent-call', 'pi-visible-agent', 'pi:session', 'agent result');
   setup.close();
 
   const ipcHandlers = new Map();
@@ -643,12 +669,36 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     await importMain();
 
     assert.deepEqual(ipcHandlers.get('db:getSessionSummaries')(null, 'pi:session'), []);
-    assert.deepEqual(ipcHandlers.get('db:getSessionMessages')(null, 'pi:session'), []);
-    assert.deepEqual(ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session'), []);
-    assert.deepEqual(ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session'), []);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionMessages')(null, 'pi:session').map(row => row.uuid),
+      ['pi-visible-main'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session').map(row => row.id),
+      ['pi-visible-main-call'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session').map(row => row.tool_use_id),
+      ['pi-visible-main-call'],
+    );
     assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
     assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
     assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentMessages')(null, 'pi:visible-agent').map(row => row.uuid),
+      ['pi-visible-agent'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:visible-agent').map(row => row.id),
+      ['pi-visible-agent-call'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:visible-agent').map(row => row.tool_use_id),
+      ['pi-visible-agent-call'],
+    );
+    const patch = ipcHandlers.get('db:getSessionPatch')(null, 'pi:session', {});
+    assert.equal(patch.changes.messages[0].tool_calls[0].result.content, 'main result');
+    assert.equal(JSON.stringify(patch).includes('agent result'), false);
     assert.equal(ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
 
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});

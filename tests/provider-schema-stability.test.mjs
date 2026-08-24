@@ -12,8 +12,8 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    // 2026-08-24: indexed usage-day and longest-turn Activity queries.
-    'a3ddd5450fcf3e0bb481fcd75c3a988dea430647548c8736523769ce1046d2d3',
+    // 2026-08-24: indexed Activity queries and the visible main session timeline.
+    '0417d1a044a574a9adc8f347db5f46428a984e89900504bb082ce7366ebb1d4a',
   );
 });
 

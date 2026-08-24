@@ -514,19 +514,23 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
 function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   if (!db) return [];
   return db.prepare(`
-    SELECT tc.* FROM tool_calls tc
-    JOIN messages m ON m.uuid = tc.message_uuid
-    WHERE tc.session_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-  `).all(sessionId) as SessionToolCallRow[];
+    SELECT tc.* FROM messages m
+    CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+    WHERE m.session_id = ? AND m.agent_id IS NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+      AND tc.session_id = ?
+  `).all(sessionId, sessionId) as SessionToolCallRow[];
 }
 
 function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   if (!db) return [];
   return db.prepare(`
-    SELECT tr.* FROM tool_results tr
-    JOIN messages m ON m.uuid = tr.message_uuid
-    WHERE tr.session_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-  `).all(sessionId) as SessionToolResultRow[];
+    SELECT tr.* FROM messages m
+    CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
+    WHERE m.session_id = ? AND m.agent_id IS NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+      AND tr.session_id = ?
+  `).all(sessionId, sessionId) as SessionToolResultRow[];
 }
 
 function querySessionSubagents(sessionId: string): SessionSubagentRow[] {
