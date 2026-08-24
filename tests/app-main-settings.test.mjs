@@ -519,6 +519,12 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       input_tokens, output_tokens, source
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run('codex-message', 'codex:session', 'assistant', '2026-07-10T11:00:00Z', 'assistant', 'ok', 100, 10, 'codex');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text,
+      input_tokens, output_tokens, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('claude-undated-message', 'claude-session', 'assistant', 'assistant', 'ok', 7, 0, 'claude');
   setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
     .run('pi:session', 'pi');
   setup.prepare(`
@@ -598,11 +604,11 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     assert.equal(ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
 
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
-    assert.equal(claudeOnly.totalTokens, 65);
+    assert.equal(claudeOnly.totalTokens, 72);
     assert.equal(claudeOnly.daily[0].tokens, 65);
 
     const allSources = ipcHandlers.get('db:getUsageStats')(null, { source: 'all' });
-    assert.equal(allSources.totalTokens, 210);
+    assert.equal(allSources.totalTokens, 217);
     assert.equal(allSources.daily[0].tokens, 210);
     assert.equal(allSources.peakDay.tokens, 210);
 

@@ -56,6 +56,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source);
+CREATE INDEX IF NOT EXISTS idx_messages_usage_day
+  ON messages(timestamp, COALESCE(source, 'claude'), input_tokens, output_tokens)
+  WHERE input_tokens IS NOT NULL OR output_tokens IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_turn_duration
+  ON messages(turn_duration_ms DESC, COALESCE(source, 'claude'))
+  WHERE turn_duration_ms IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tc_session_name ON tool_calls(session_id, name);
 CREATE INDEX IF NOT EXISTS idx_tc_message ON tool_calls(message_uuid);
 CREATE INDEX IF NOT EXISTS idx_tc_file ON tool_calls(file_path);

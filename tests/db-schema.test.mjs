@@ -46,9 +46,29 @@ test('messages schema stores the raw content block type', async () => {
 
   assert.match(source, /content_type TEXT/);
   assert.match(source, /is_meta INTEGER DEFAULT 0/);
+  assert.match(source, /CREATE INDEX IF NOT EXISTS idx_messages_usage_day/);
+  assert.match(source, /CREATE INDEX IF NOT EXISTS idx_messages_turn_duration/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages/);
+});
+
+test('usage indexes accept provider timestamps without normalizing them', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    db.prepare(`
+      INSERT INTO messages (uuid, timestamp, input_tokens, source)
+      VALUES (?, ?, ?, ?)
+    `).run('raw-timestamp', 'now', 1, 'claude');
+
+    assert.equal(
+      db.prepare("SELECT timestamp FROM messages WHERE uuid='raw-timestamp'").get().timestamp,
+      'now',
+    );
+  } finally {
+    db.close();
+  }
 });
 
 test('summaries preserve usage from provider-owned summary model calls', async () => {
