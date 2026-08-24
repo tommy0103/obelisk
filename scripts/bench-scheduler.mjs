@@ -40,6 +40,9 @@ const worker = createWorkerBuildIndex({
 });
 
 // ---- metric 1: idle changed-path build time on the real corpus ----
+const SKIP_CORPUS = process.env.BENCH_SKIP_CORPUS === '1';
+if (SKIP_CORPUS) console.log('[metric 1 skipped: BENCH_SKIP_CORPUS=1]');
+if (!SKIP_CORPUS) {
 
 // The measured cost is filesystem discovery over the real transcript tree,
 // not DB size — so a small clone carrying schema + index_state + sessions is
@@ -91,6 +94,7 @@ for (let i = 0; i < 10; i++) {
 staleness.close();
 console.log('idle changed-path build (real corpus, ms):');
 console.log(`  n=${idleTimes.length} p50=${percentile(idleTimes, 50).toFixed(0)} p95=${percentile(idleTimes, 95).toFixed(0)} mean=${(idleTimes.reduce((a, b) => a + b, 0) / idleTimes.length).toFixed(0)}`);
+}
 
 // ---- metric 2: end-to-end latency under continuous writes (synthetic corpus) ----
 
@@ -117,9 +121,12 @@ const claudeLine = (i) => JSON.stringify({
 fs.writeFileSync(liveFile, `${claudeLine(0)}\n`);
 
 const builds = [];
+const MAX_WAIT = Number(process.env.BENCH_MAX_WAIT_MS ?? 1500);
+console.log(`[metric 2 variant] maxWaitMs=${MAX_WAIT}`);
 const service = createIndexerService({
   watchTargets: [{ kind: 'tree', path: benchProjects }],
   hotPolling: false,
+  maxWaitMs: MAX_WAIT,
   buildIndex: async (args) => {
     const start = performance.now();
     builds.push({ reason: args.reason, paths: args.changedPaths, start });
@@ -165,6 +172,7 @@ console.log(`  lines=${appends} indexed=${indexed} (${indexed === appends ? 'ALL
 console.log(`  builds=${watchBuilds.length} (${(watchBuilds.length / (DURATION_MS / 1000)).toFixed(2)}/s), duration p50=${percentile(durations, 50).toFixed(0)} ms`);
 if (firstWatchBuild) {
   console.log(`  first-append -> first build indexing it: ${(firstWatchBuild.end - appendTimes[0]).toFixed(0)} ms (append->indexed; renderer-visible latency needs a GUI probe)`);
+console.log('  trigger attribution: run again with BENCH_MAX_WAIT_MS=0 — identical first-build timing means the trailing path fired, an earlier build means the ceiling fired.');
 }
 if (lastBuild) {
   console.log(`  last-append -> last build completing it: ${(lastBuild.end - lastAppendTs).toFixed(0)} ms (bounded; legacy trailing debounce would still be pending)`);

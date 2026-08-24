@@ -768,12 +768,22 @@ test('maxWaitMs 0 keeps the legacy unbounded trailing debounce', async () => {
     maxWaitMs: 0,
   });
 
-  service.scheduleBuild('watch', 'a.jsonl');
-  service.scheduleBuild('watch', 'b.jsonl');
-  timers.tick(249);
-  assert.deepEqual(calls, [], 'no ceiling fires while disabled');
-  timers.tick(1);
+  // Events every 100 ms for 1.8 s — faster than the 250 ms trailing
+  // debounce, and past the would-be 1500 ms ceiling. With the cap disabled
+  // there must be NO build while events keep coming...
+  for (let t = 0; t < 18; t++) {
+    service.scheduleBuild('watch', `session-${t}.jsonl`);
+    timers.tick(100);
+    await service.idle();
+  }
+  assert.deepEqual(calls, [], 'no ceiling fires while disabled, even past 1500 ms');
+
+  // ...and once the source goes quiet, the trailing path coalesces them all.
+  timers.tick(250);
   await service.idle();
   assert.equal(calls.length, 1, 'the trailing path alone coalesces the burst');
-  assert.deepEqual(calls[0].changedPaths, ['a.jsonl', 'b.jsonl']);
+  assert.deepEqual(
+    [...new Set(calls[0].changedPaths)],
+    Array.from({ length: 18 }, (_, i) => `session-${i}.jsonl`),
+  );
 });
