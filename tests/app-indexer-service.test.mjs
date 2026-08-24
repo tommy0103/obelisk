@@ -349,6 +349,9 @@ test('indexer service waits for a stability window before building', async () =>
     writeHeartbeat: () => {},
     timers,
     stabilityMs: 500,
+    // This test pins the trailing two-stage path; the manual timers flush
+    // every delay together, which would fire the max-wait timer early.
+    maxWaitMs: 0,
   });
 
   service.scheduleBuild('jsonl-change');
@@ -566,4 +569,119 @@ test('indexer service starts watching a configured root that appears after start
   } finally {
     service.stop();
   }
+});
+
+
+// ---- bounded scheduling (#86) ----
+
+test('sustained events cannot postpone a build past the max-wait ceiling', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => calls.push(args),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+    maxWaitMs: 1500,
+  });
+
+  // Every event resets the trailing timer; the max-wait ceiling still
+  // releases exactly one build with the whole accumulated batch.
+  service.scheduleBuild('watch', 'a.jsonl');
+  service.scheduleBuild('watch', 'b.jsonl');
+  service.scheduleBuild('watch', 'c.jsonl');
+  timers.flush();
+  await service.idle();
+
+  assert.equal(calls.length, 1, 'sustained events coalesce into one bounded build');
+  assert.deepEqual(calls[0].changedPaths, ['a.jsonl', 'b.jsonl', 'c.jsonl']);
+  assert.equal(calls[0].reason, 'watch');
+
+  timers.flush();
+  await service.idle();
+  assert.equal(calls.length, 1, 'no second build fires from a cleared or stale timer');
+});
+
+test('events during a build produce exactly one follow-up and no ghost build', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  let finishFirst;
+  const service = createIndexerService({
+    buildIndex: async (args) => {
+      calls.push(args);
+      if (args.reason === 'first') await new Promise((resolve) => { finishFirst = resolve; });
+    },
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+  });
+
+  const first = service.runBuildNow('first');
+  service.scheduleBuild('watch', 'a.jsonl');
+  service.scheduleBuild('watch', 'b.jsonl');
+  timers.flush();
+  assert.deepEqual(calls.map((c) => c.reason), ['first'],
+    'burst timers are not armed while a build is running');
+
+  finishFirst();
+  await first;
+  await service.idle();
+  assert.deepEqual(calls.map((c) => c.reason), ['first', 'pending'],
+    'exactly one follow-up build runs');
+  assert.deepEqual(calls[1].changedPaths, ['a.jsonl', 'b.jsonl'],
+    'the follow-up carries the accumulated batch — not an accidental full inventory');
+
+  timers.flush();
+  await service.idle();
+  assert.equal(calls.length, 2, 'no ghost build fires afterwards');
+});
+
+test('each burst re-arms the max-wait ceiling after the previous build', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => calls.push(args),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+    maxWaitMs: 1500,
+  });
+
+  service.scheduleBuild('watch', 'a.jsonl');
+  timers.flush();
+  await service.idle();
+  assert.equal(calls.length, 1);
+
+  service.scheduleBuild('watch', 'b.jsonl');
+  timers.flush();
+  await service.idle();
+  assert.equal(calls.length, 2, 'a new burst builds again');
+  assert.deepEqual(calls[1].changedPaths, ['b.jsonl']);
+});
+
+test('maxWaitMs 0 keeps the legacy unbounded trailing debounce', async () => {
+  const timers = manualTimers();
+  const calls = [];
+  const service = createIndexerService({
+    buildIndex: async (args) => calls.push(args),
+    watchProjects: () => null,
+    writeHeartbeat: () => {},
+    timers,
+    stabilityMs: 0,
+    debounceMs: 0,
+    maxWaitMs: 0,
+  });
+
+  service.scheduleBuild('watch', 'a.jsonl');
+  service.scheduleBuild('watch', 'b.jsonl');
+  timers.flush();
+  await service.idle();
+  assert.equal(calls.length, 1, 'the trailing path alone still coalesces the burst');
+  assert.deepEqual(calls[0].changedPaths, ['a.jsonl', 'b.jsonl']);
 });

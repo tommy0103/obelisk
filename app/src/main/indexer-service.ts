@@ -10,8 +10,12 @@ import {
 } from '../../../packages/adaptive-watcher/src/index.ts';
 
 const DEFAULT_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
-const DEFAULT_DEBOUNCE_MS = 2000;
+// Bounded batching (#86): a short trailing debounce coalesces one filesystem
+// burst; maxWait bounds how long sustained activity can postpone a build.
+// Candidate values pending the benchmark merge gate in PR #103.
+const DEFAULT_DEBOUNCE_MS = 250;
 const DEFAULT_STABILITY_MS = 500;
+const DEFAULT_MAX_WAIT_MS = 1500;
 const DEFAULT_HEARTBEAT_MS = 30000;
 const DEFAULT_WATCH_RETRY_MS = 5000;
 const DEFAULT_DEFERRED_RETRY_MS = 250;
@@ -57,6 +61,10 @@ interface IndexerServiceOptions {
   watchTargets?: WatchTarget[];
   debounceMs?: number;
   stabilityMs?: number;
+  /** Maximum delay from the first event of an idle burst to a build, no
+   * matter how sustained the event stream is (#86). <= 0 disables the cap
+   * (legacy unbounded trailing debounce). */
+  maxWaitMs?: number;
   heartbeatMs?: number;
   watchRetryMs?: number;
   deferredRetryMs?: number;
@@ -81,6 +89,7 @@ function createIndexerService({
   watchTargets,
   debounceMs = DEFAULT_DEBOUNCE_MS,
   stabilityMs = DEFAULT_STABILITY_MS,
+  maxWaitMs = DEFAULT_MAX_WAIT_MS,
   heartbeatMs = DEFAULT_HEARTBEAT_MS,
   watchRetryMs = DEFAULT_WATCH_RETRY_MS,
   deferredRetryMs = DEFAULT_DEFERRED_RETRY_MS,
@@ -131,6 +140,7 @@ function createIndexerService({
 
   let buildTimer: TimerHandle | null = null;
   let stabilityTimer: TimerHandle | null = null;
+  let maxWaitTimer: TimerHandle | null = null;
   let heartbeatTimer: TimerHandle | null = null;
   let reconcileTimer: TimerHandle | null = null;
   let watchRetryTimer: TimerHandle | null = null;
@@ -159,16 +169,21 @@ function createIndexerService({
     if (name && !fullInventoryPending) changedPaths.add(name);
   };
 
-  const takeChangedPaths = () => {
+  // Typed batches (#86): a full-inventory request and "no work" are NOT the
+  // same value, so a stale burst callback no-ops instead of accidentally
+  // launching a full scan (the root cause of the old ghost-build bug).
+  type BuildBatch = { kind: 'full' } | { kind: 'paths'; paths: string[] };
+
+  const takeBatch = (): BuildBatch | null => {
     if (fullInventoryPending) {
       fullInventoryPending = false;
       changedPaths.clear();
-      return undefined;
+      return { kind: 'full' };
     }
-    if (!changedPaths.size) return undefined;
+    if (!changedPaths.size) return null;
     const paths = [...changedPaths];
     changedPaths = new Set();
-    return paths;
+    return { kind: 'paths', paths };
   };
 
   const publishHeartbeat = () => {
@@ -189,16 +204,22 @@ function createIndexerService({
     for (const hint of [...(hints ?? [])].reverse()) watcher?.promote?.(hint);
   };
 
-  const runBuildNow = (reason = "manual", paths: string[] | undefined = undefined) => {
-    addChangedPath(paths);
+  const clearBurstTimers = () => {
+    if (buildTimer) timers.clearTimeout(buildTimer);
+    if (stabilityTimer) timers.clearTimeout(stabilityTimer);
+    if (maxWaitTimer) timers.clearTimeout(maxWaitTimer);
+    buildTimer = null;
+    stabilityTimer = null;
+    maxWaitTimer = null;
+  };
+
+  const startBuild = (reason: string, batch: BuildBatch) => {
     if (stopped) return idlePromise;
-    if (running) {
-      pending = true;
-      return idlePromise;
-    }
+    // Invariant: consuming a batch leaves no armed burst timers.
+    clearBurstTimers();
     running = true;
     pending = false;
-    const buildChangedPaths = takeChangedPaths();
+    const buildChangedPaths = batch.kind === 'full' ? undefined : batch.paths;
     idlePromise = (async () => {
       const result = await buildIndex({ reason, changedPaths: buildChangedPaths });
       promoteWatchHints(result?.watchHints);
@@ -210,12 +231,12 @@ function createIndexerService({
         }
       }
       const incompleteInventory = (result?.inventoryIssues?.length ?? 0) > 0;
-      if (!result?.deferred && !incompleteInventory && buildChangedPaths === undefined) {
+      if (!result?.deferred && !incompleteInventory && batch.kind === 'full') {
         nextInventoryRetryMs = heartbeatMs;
       }
       if (result?.deferred || incompleteInventory) {
-        if (incompleteInventory || buildChangedPaths === undefined) requestFullInventory();
-        else addChangedPath(buildChangedPaths);
+        if (incompleteInventory || batch.kind === 'full') requestFullInventory();
+        else addChangedPath(batch.paths);
         if (!stopped && !retryTimer) {
           const retryReason = result?.deferred ? 'writer-lease' : 'incomplete-inventory';
           const retryMs = result?.deferred ? deferredRetryMs : nextInventoryRetryMs;
@@ -243,10 +264,34 @@ function createIndexerService({
         running = false;
         if (pending && !stopped) {
           pending = false;
-          runBuildNow('pending');
+          // The follow-up consumes the batch accumulated during the previous
+          // build — immediately, with build duration as the throttle. A null
+          // batch means there is nothing to do (no ghost full inventory).
+          const followUp = takeBatch();
+          if (followUp) startBuild('pending', followUp);
         }
       });
     return idlePromise;
+  };
+
+  const runBuildNow = (reason = "manual", paths: string[] | undefined = undefined) => {
+    addChangedPath(paths);
+    if (stopped) return idlePromise;
+    if (running) {
+      pending = true;
+      return idlePromise;
+    }
+    // An explicit call with no accumulated work is a full build (startup,
+    // manual rebuild, reconcile) — unchanged from the legacy contract.
+    return startBuild(reason, takeBatch() ?? { kind: 'full' });
+  };
+
+  const fireBurst = () => {
+    // Take the batch first: a stale burst callback must never launch work.
+    const batch = takeBatch();
+    clearBurstTimers();
+    if (!batch) return;
+    startBuild(lastReason || 'watch', batch);
   };
 
   const scheduleBuild = (reason = "change", changedPath: string | undefined = undefined) => {
@@ -254,20 +299,34 @@ function createIndexerService({
     if (changedPath === undefined) requestFullInventory();
     else addChangedPath(changedPath);
     lastReason = reason;
-    if (running) pending = true;
     if (retryTimer) timers.clearTimeout(retryTimer);
     retryTimer = null;
+    if (running) {
+      // Single-flight: only aggregate. The in-flight build's follow-up
+      // consumes this batch — burst timers are never armed while running,
+      // which is what makes ghost builds structurally impossible.
+      pending = true;
+      return;
+    }
+    // Trailing timers reset on every event; the max-wait ceiling arms once
+    // per burst and never resets, so sustained activity cannot postpone the
+    // build past maxWaitMs (#86).
     if (buildTimer) timers.clearTimeout(buildTimer);
     if (stabilityTimer) timers.clearTimeout(stabilityTimer);
+    buildTimer = null;
+    stabilityTimer = null;
+    if (maxWaitMs > 0 && !maxWaitTimer) {
+      maxWaitTimer = timers.setTimeout(fireBurst, maxWaitMs);
+    }
     buildTimer = timers.setTimeout(() => {
       buildTimer = null;
       if (stabilityMs <= 0) {
-        runBuildNow(lastReason || reason);
+        fireBurst();
         return;
       }
       stabilityTimer = timers.setTimeout(() => {
         stabilityTimer = null;
-        runBuildNow(lastReason || reason);
+        fireBurst();
       }, stabilityMs);
     }, debounceMs);
   };
@@ -316,10 +375,7 @@ function createIndexerService({
   const stop = () => {
     stopped = true;
     pending = false;
-    if (buildTimer) timers.clearTimeout(buildTimer);
-    buildTimer = null;
-    if (stabilityTimer) timers.clearTimeout(stabilityTimer);
-    stabilityTimer = null;
+    clearBurstTimers();
     if (watchRetryTimer) timers.clearTimeout(watchRetryTimer);
     watchRetryTimer = null;
     if (retryTimer) timers.clearTimeout(retryTimer);
