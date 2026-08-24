@@ -212,6 +212,7 @@ test('malformed settings keep the desktop recovery window available', async () =
 
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
+  const originalDshHome = process.env.DSH_HOME;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -221,6 +222,9 @@ test('main process watches every root declared by the built-in provider registry
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  // The deepseek provider prefers $DSH_HOME over ~/.dsh; clear a harness-set
+  // DSH_HOME so the deepseek root follows the temp HOME like the others.
+  delete process.env.DSH_HOME;
 
   const serviceOptions = [];
   const workerCalls = [];
@@ -286,6 +290,7 @@ test('main process watches every root declared by the built-in provider registry
       join(codexDir, 'sessions'),
       join(codexDir, 'archived_sessions'),
       join(codexDir, 'session_index.jsonl'),
+      join(home, '.dsh', 'sessions'),
       join(home, '.kimi-code', 'sessions'),
       join(home, '.kimi-code', 'session_index.jsonl'),
       join(home, '.pi', 'agent', 'sessions'),
@@ -296,6 +301,8 @@ test('main process watches every root declared by the built-in provider registry
   } finally {
     restore();
     process.env.HOME = originalHome;
+    if (originalDshHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = originalDshHome;
     rmSync(home, { recursive: true, force: true });
   }
 });
