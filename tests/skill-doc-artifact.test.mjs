@@ -30,6 +30,8 @@ test('build:skill produces a docs-only skill that delegates execution to the CLI
   assert.match(skill, /Bash\(obelisk:\*\)/);
   assert.match(skill, /obelisk --query "\$qfile"/);
   assert.match(skill, /obelisk --attune \/tmp\/register-memory\.mjs/);
+  assert.match(skill, /sandbox_permissions: "require_escalated"/);
+  assert.match(skill, /Never\s+degrade to a stale, read-only index/);
   assert.doesNotMatch(skill, /\$SKILL_DIR\/scripts\/runtime\.js/);
   assert.doesNotMatch(`${skill}\n${schema}`, /scripts\//);
 });
