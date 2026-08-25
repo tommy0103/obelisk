@@ -193,9 +193,13 @@ function incrementalWindow(path: string, cursor: Cursor): IncrementalWindow {
     const { frames } = scanZstdFrames(buffer);
     const totalCount = frames.length;
     const cursorCount = full ? 0 : (Number(cursor.split(':')[1]) || 0);
-    // Equal frame count is only "nothing to do" when the signature matches:
-    // an equal-count replacement must be reparsed, not accepted as-is.
-    const replaced = !full && totalCount === cursorCount && !cursorSignatureMatches(cursor, mtime, size, ctimeMs, ino);
+    // An append keeps the inode; only a replacement changes it. With a legacy
+    // cursor (no inode), fall back to treating an equal-count signature
+    // mismatch as a replacement. A larger file with a new inode is also a
+    // replacement — treating it as an append would splice OLD_PREFIX+NEW_SUFFIX.
+    const parts = cursor === null ? [] : cursor.split(':');
+    const inodeChanged = parts.length >= 5 && Number(parts[4]) !== ino;
+    const replaced = !full && (inodeChanged || (totalCount === cursorCount && !cursorSignatureMatches(cursor, mtime, size, ctimeMs, ino)));
     const fullReparse = full || totalCount < cursorCount || replaced;
     const fromFrame = fullReparse ? 0 : cursorCount;
     if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, nextPriorText: () => null };
@@ -220,7 +224,9 @@ function incrementalWindow(path: string, cursor: Cursor): IncrementalWindow {
   const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.trim().length > 0);
   const totalCount = lines.length;
   const cursorCount = full ? 0 : (Number(cursor.split(':')[1]) || 0);
-  const replaced = !full && totalCount === cursorCount && !cursorSignatureMatches(cursor, mtime, size, ctimeMs, ino);
+  const parts = cursor === null ? [] : cursor.split(':');
+  const inodeChanged = parts.length >= 5 && Number(parts[4]) !== ino;
+  const replaced = !full && (inodeChanged || (totalCount === cursorCount && !cursorSignatureMatches(cursor, mtime, size, ctimeMs, ino)));
   const fullReparse = full || totalCount < cursorCount || replaced;
   const fromLine = fullReparse ? 0 : cursorCount;
   if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, nextPriorText: () => null };
@@ -459,7 +465,9 @@ function changedSessionFiles(sessionsDir: string, changedPaths: string[]): Set<s
   return result;
 }
 
-function resolveRootSessionId(rawId: string, header: DshHeader, headersByRawId: Map<string, DshHeader>): string {
+function resolveRootSessionId(rawId: string, header: DshHeader, headersByScopedId: Map<string, DshHeader>): string {
+  // The parent chain stays inside the session's own project scope.
+  const scope = projectScope(header.cwd);
   let root = rawId;
   const seen = new Set<string>();
   let current: DshHeader | undefined = header;
@@ -471,7 +479,7 @@ function resolveRootSessionId(rawId: string, header: DshHeader, headersByRawId: 
   ) {
     seen.add(current.parentSession);
     root = current.parentSession;
-    current = headersByRawId.get(root);
+    current = headersByScopedId.get(`${scope}\0${root}`);
   }
   return root;
 }
@@ -501,11 +509,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     ? null
     : changedSessionFiles(sessionsDir, ctx.changedPaths);
 
-  const headersByRawId = new Map<string, DshHeader>();
+  // Raw ids may collide across projects, so ancestry is tracked per project
+  // scope — otherwise a nested subagent could fold along another project's
+  // chain into a phantom root.
+  const headersByScopedId = new Map<string, DshHeader>();
   for (const file of files) {
     const header = readDshHeader(file.path);
     const rawId = header && typeof header.id === 'string' ? header.id : file.sessionDir.split(sep).pop() ?? '';
-    if (rawId) headersByRawId.set(rawId, header ?? {});
+    if (rawId) headersByScopedId.set(`${projectScope(header?.cwd)}\0${rawId}`, header ?? {});
   }
 
   const units: IndexUnit[] = [];
@@ -518,13 +529,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     const rawId = typeof header.id === 'string' ? header.id : file.sessionDir.split(sep).pop() ?? '';
     if (!rawId) continue;
     const isSubagent = typeof header.parentSession === 'string' && header.parentSession.length > 0;
-    const rootRawId = resolveRootSessionId(rawId, header, headersByRawId);
+    const rootRawId = resolveRootSessionId(rawId, header, headersByScopedId);
     // The scope comes from the session's own cwd (subagent sessions inherit
     // their parent's cwd upstream, so a delegation tree shares one
-    // namespace); the map lookup is only a fallback for a missing cwd, and
-    // must not be keyed by raw id alone — raw ids can collide across projects.
-    const rootCwd = header.cwd ?? (rootRawId === rawId ? undefined : headersByRawId.get(rootRawId)?.cwd);
-    const scope = projectScope(rootCwd);
+    // namespace); the scoped map lookup is only a fallback for a missing cwd.
+    const scope = projectScope(header.cwd ?? (rootRawId === rawId ? undefined : headersByScopedId.get(`${projectScope(header.cwd)}\0${rootRawId}`)?.cwd));
     units.push({
       key: file.path,
       sessionId: dshDbId(scope, rootRawId),
@@ -566,6 +575,17 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   const newCursor = `${mtime}:${totalCount}:${size}:${ctimeMs}:${ino}`;
   if (window === null) return newCursor;
   const records = readLogRecords(window.text);
+  // Steps whose assistant/message is inside this window emit their own
+  // canonical tool_use anchor; a durable tool/call for such a step must not
+  // emit a provisional anchor over it (the canonical row carries model/usage).
+  const stepsWithCanonicalAnchor = new Set<string>();
+  for (const record of records) {
+    if (record.type !== 'assistant/message') continue;
+    const message = isRecord(record.data.message) ? record.data.message : {};
+    if (classifyAssistantContent(message.content).hasToolCalls) {
+      stepsWithCanonicalAnchor.add(`${record.data.turn}:${record.data.step}`);
+    }
+  }
 
   const recordsOut: TranscriptRecord[] = [];
   if (fullReparse && cursor !== null) {
@@ -609,7 +629,11 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     if (record.parent_uuid === record.uuid) record.parent_uuid = null;
     recordsOut.push(record);
     lastMessageUuid = record.uuid;
-    if (agentId === null && record.visibility === 'visible') mainMessageCount++;
+    // Synthetic tool_use anchors are structural, not transcript content, and
+    // are re-emittable across runs (tool/call and assistant/message of one
+    // step can land in different windows): counting them would inflate
+    // message_count on every boundary straddle.
+    if (agentId === null && record.visibility === 'visible' && record.content_type !== 'tool_use') mainMessageCount++;
     updateEndedAt(record.timestamp);
   };
 
@@ -721,8 +745,10 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         // The anchor message must exist even when this step's assistant/message
         // has no tool-call part (or never landed): tool_calls and tool_results
         // are filtered by message_uuid downstream, and the ADR-0008 nonce
-        // resolver walks this anchor to the session.
-        if (!emittedAnchors.has(anchor)) {
+        // resolver walks this anchor to the session. Steps whose assistant/
+        // message is inside this window emit the canonical anchor themselves,
+        // so a provisional one here would only downgrade it on re-persist.
+        if (!emittedAnchors.has(anchor) && !stepsWithCanonicalAnchor.has(`${data.turn}:${data.step}`)) {
           emittedAnchors.add(anchor);
           pushMessage({
             kind: 'message', uuid: anchor, session_id: sessionId, type: 'assistant',

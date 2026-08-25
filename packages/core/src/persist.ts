@@ -83,6 +83,12 @@ function retractScope(db: SqliteDb, sessionId: string, agentId: string | null) {
   db.prepare(`DELETE FROM tool_results WHERE message_uuid IN (SELECT uuid FROM messages WHERE ${scope.clause})`).run(...scope.params);
   db.prepare(`DELETE FROM tool_calls WHERE message_uuid IN (SELECT uuid FROM messages WHERE ${scope.clause})`).run(...scope.params);
   db.prepare(`DELETE FROM messages WHERE ${scope.clause}`).run(...scope.params);
+  if (agentId === null) {
+    // The parent session contributes parent_tool_use_id via the spawn tool's
+    // result text; once the parent's own rows are retracted, any such link may
+    // point at a deleted tool call. Child-contributed columns stay.
+    db.prepare('UPDATE subagents SET parent_tool_use_id=NULL WHERE session_id=?').run(sessionId);
+  }
 }
 
 // Cascade-delete every row belonging to a session/thread (guardian retraction).
@@ -149,7 +155,10 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
           r.project ?? prev?.project ?? null,
           prev?.project_path ?? null, // authoritative project_path is set by refreshSessionProjectPaths
           minStr(prev?.started_at ?? null, r.started_at),
-          maxStr(prev?.ended_at ?? null, r.ended_at),
+          // A full reparse ('total') is authoritative for the whole file: its
+          // ended_at replaces the stored one so a truncated tail does not keep
+          // the session's end stuck at a time that no longer exists.
+          r.countMode === 'total' ? r.ended_at : maxStr(prev?.ended_at ?? null, r.ended_at),
           r.git_branch ?? prev?.git_branch ?? null,
           r.version ?? prev?.version ?? null,
           message_count,

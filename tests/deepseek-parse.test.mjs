@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -154,7 +154,7 @@ test('deepseek provider folds a session log into the canonical transcript langua
     : record);
   assert.equal(
     createHash('sha256').update(JSON.stringify(goldenRecords)).digest('hex'),
-    'aebeeec7aeac2c2114ca29de1a8043c250b13fb1967dd6b246aac2ac58cca040',
+    'bbb7fa7a1b7090ad8c70641f50ba0d1ca6982dca3b81d1795251d1e9c4c429dc',
     'complete yielded record sequence changed',
   );
 
@@ -169,7 +169,7 @@ test('deepseek provider folds a session log into the canonical transcript langua
       project: '-tmp-dsh-project',
       source: 'deepseek',
       countMode: 'total',
-      message_count: 7,
+      message_count: 5, // synthetic tool_use anchors are structural, not counted
     },
   );
 
@@ -950,4 +950,144 @@ test('deepseek provider seeds the parent chain beyond chunk-only frames', () => 
   const late = values.find((record) => record.kind === 'message' && record.text === 'late');
   const scope = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
   assert.equal(late.parent_uuid, `deepseek:deep-seed-session:${scope}:um-1`);
+});
+
+// Regression: a step straddling runs (provisional anchor from a durable
+// tool/call, canonical anchor from the assistant/message in a later window)
+// must converge to the canonical row — model/usage survive and the anchor is
+// not double-counted.
+test('deepseek provider converges a straddled anchor to its canonical row', () => {
+  const root = makeTempDir('obelisk-deepseek-straddle-');
+  const sessionDir = join(root, 'sessions', '--tmp-dsh-project--', 'straddle-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const header = { type: 'session', version: 0, id: 'straddle-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 };
+  const first = [
+    header,
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'go' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+    { type: 'tool/call', seq: 2, time: 1753005601100, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } },
+  ];
+  writeFileSync(path, first.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const cursor = persist(db, unit, provider.parse(unit, null));
+
+  const second = [
+    { type: 'tool/call', seq: 3, time: 1753005601200, data: { turn: 1, step: 1, callId: 'c2', name: 'bash', arguments: '{}' } },
+    { type: 'assistant/message', seq: 4, time: 1753005602000, data: {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [
+        { type: 'text', text: 'done' },
+        { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' },
+        { type: 'tool-call', id: 'c2', name: 'bash', arguments: '{}' },
+      ], source: { kind: 'model', model: 'deepseek-v4-flash' }, id: 'a-1' },
+      usage: { inputTokens: 9, outputTokens: 3 },
+    } },
+  ];
+  writeFileSync(path, [...first, ...second].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  persist(db, unit, provider.parse(unit, cursor));
+
+  const scope = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
+  const anchorUuid = `deepseek:straddle-session:${scope}:t1:s1:tool_use`;
+  const anchor = db.prepare('SELECT * FROM messages WHERE uuid=?').get(anchorUuid);
+  assert.equal(anchor.model, 'deepseek-v4-flash'); // canonical row survived
+  assert.notEqual(anchor.parent_uuid, anchor.uuid);
+  // user + text message only: the anchor is structural and never double-counted.
+  assert.equal(db.prepare('SELECT message_count AS c FROM sessions').get().c, 2);
+  db.close();
+});
+
+// Regression: a replacement with MORE lines but a new inode is a replacement,
+// not an append (no OLD_PREFIX + NEW_SUFFIX splicing).
+test('deepseek provider reparses an inode-changed file even when it grew', () => {
+  const root = makeTempDir('obelisk-deepseek-inode-');
+  const sessionDir = join(root, 'sessions', '--proj--', 'inode-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const header = { type: 'session', version: 0, id: 'inode-session', createdAt: 1753005600000, cwd: '/proj', delegationDepth: 0 };
+  const event = (seq, text) => ({ type: 'user/message', seq, time: 1753005601000 + seq, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: `m-${seq}` } });
+  writeFileSync(path, [header, event(1, 'OLD_PREFIX')].map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const cursor = persist(db, unit, provider.parse(unit, null));
+
+  // Replace via rename (new inode) with a LONGER file of different content.
+  const tmpPath = join(sessionDir, 'session.jsonl.tmp');
+  writeFileSync(tmpPath, [header, event(1, 'NEW_A'), event(2, 'NEW_B'), event(3, 'NEW_C')].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  renameSync(tmpPath, path);
+  persist(db, unit, provider.parse(unit, cursor));
+  const texts = db.prepare('SELECT text FROM messages ORDER BY timestamp').all().map((row) => row.text);
+  assert.deepEqual(texts, ['NEW_A', 'NEW_B', 'NEW_C']);
+  db.close();
+});
+
+// Regression: a root shrink that removes a spawn clears the now-dangling
+// parent_tool_use_id, and ended_at is replaced (not max-merged) on 'total'.
+test('deepseek provider clears stale aggregates on a root shrink', () => {
+  const root = makeTempDir('obelisk-deepseek-aggregates-');
+  const sessionsDir = join(root, 'sessions');
+  const sessionDir = join(sessionsDir, '--proj--', 'agg-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const header = { type: 'session', version: 0, id: 'agg-session', createdAt: 1753005600000, cwd: '/proj', delegationDepth: 0 };
+  const spawnEvents = [
+    { type: 'assistant/message', seq: 1, time: 1753005601000, data: {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'tool-call', id: 'sp', name: 'subagent', arguments: '{}' }], source: { kind: 'model', model: 'm' }, id: 'a-1' },
+      usage: { inputTokens: 1, outputTokens: 1 },
+    } },
+    { type: 'tool/call', seq: 2, time: 1753005601100, data: { turn: 1, step: 1, callId: 'sp', name: 'subagent', arguments: '{}' } },
+    { type: 'tool/result', seq: 3, time: 1753005601200, data: { turn: 1, step: 1, message: { source: { kind: 'tool', callId: 'sp' }, content: [{ type: 'tool-result', toolCallId: 'sp', content: [{ type: 'text', text: 'started subagent kid-1' }] }], role: 'user', id: 'r-1' } } },
+  ];
+  const lateEvent = { type: 'user/message', seq: 4, time: 1753005699000, data: { content: [{ type: 'text', text: 'late' }], source: { kind: 'user' }, role: 'user', id: 'm-9' } };
+  writeFileSync(path, [header, ...spawnEvents, lateEvent].map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const cursor = persist(db, unit, provider.parse(unit, null));
+  assert.ok(db.prepare('SELECT parent_tool_use_id AS p FROM subagents').get().p);
+  assert.equal(db.prepare('SELECT ended_at AS e FROM sessions').get().e, new Date(1753005699000).toISOString()); // late event time
+
+  // Truncation removes BOTH the spawn and the late event.
+  writeFileSync(path, [header].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  persist(db, unit, provider.parse(unit, cursor));
+  assert.equal(db.prepare('SELECT parent_tool_use_id AS p FROM subagents').get()?.p ?? null, null);
+  // Header-only file: no event timestamps remain, so the authoritative total reparse clears ended_at.
+  assert.equal(db.prepare('SELECT ended_at AS e FROM sessions').get().e, null);
+  db.close();
+});
+
+// Regression: a nested subagent whose intermediate parent raw id exists in
+// ANOTHER project must not fold along that project's chain.
+test('deepseek provider resolves ancestry within the project scope only', () => {
+  const root = makeTempDir('obelisk-deepseek-ancestry-');
+  const sessionsDir = join(root, 'sessions');
+  // Project A has a session 'mid-1' (a root there).
+  const dirA = join(sessionsDir, '--proj-a--', 'mid-1');
+  mkdirSync(dirA, { recursive: true });
+  writeFileSync(join(dirA, 'session.jsonl'), [
+    JSON.stringify({ type: 'session', version: 0, id: 'mid-1', createdAt: 1753005600000, cwd: '/proj/a', delegationDepth: 0 }),
+  ].join('\n') + '\n');
+  // Project B: grandchild -> parent 'mid-1' — but B has no 'mid-1'; it must
+  // NOT fold into A's session.
+  const dirB = join(sessionsDir, '--proj-b--', 'grandchild-1');
+  mkdirSync(dirB, { recursive: true });
+  writeFileSync(join(dirB, 'session.jsonl'), [
+    JSON.stringify({ type: 'session', version: 0, id: 'grandchild-1', createdAt: 1753005600000, cwd: '/proj/b', parentSession: 'mid-1', origin: 'subagent', delegationDepth: 2 }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'gc' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+  ].join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const units = provider.discover({ lastCursor: () => null });
+  const a = units.find((u) => u.key.includes('--proj-a--'));
+  const b = units.find((u) => u.key.includes('--proj-b--'));
+  assert.notEqual(b.sessionId, a.sessionId); // no phantom fold across projects
+  assert.ok(b.sessionId.includes('mid-1')); // folds to its OWN scope's (missing) parent id, not A's row
 });
