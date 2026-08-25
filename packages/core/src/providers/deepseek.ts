@@ -6,7 +6,7 @@
 // Pure: discovers DeepSeek Harness session logs and parses one into a record
 // stream. It never touches the Obelisk database.
 //
-// Source layout (~/.dsh/sessions by default):
+// Source layout ($DSH_HOME/sessions, default ~/.dsh/sessions):
 //   <root>/--<normalized-cwd>--/<session-id>/session.jsonl.zstd   (default)
 //   <root>/--<normalized-cwd>--/<session-id>/session.jsonl        (compression: none)
 //
@@ -224,7 +224,15 @@ function readLogRecords(plaintext: string): LogRecord[] {
     if (!isRecord(value) || typeof value.type !== 'string') continue;
     // Expand packed chunk rows so the event stream is faithful; parse skips
     // the reconstructed assistant/chunk deltas (final messages carry content).
-    for (const event of decodeStorageRecord(value)) {
+    // A malformed row must not abort the whole session: its members only ever
+    // duplicate content the step's final assistant/message already carries.
+    let events: ReturnType<typeof decodeStorageRecord>;
+    try {
+      events = decodeStorageRecord(value);
+    } catch {
+      continue;
+    }
+    for (const event of events) {
       records.push({
         seq: event.seq,
         type: event.type,
@@ -253,6 +261,16 @@ function parseToolArguments(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+/** DeepSeek Harness tool names whose arguments name a local file (lowercase, unlike Claude's). */
+const DSH_FILE_TOOLS = new Set(['read', 'edit', 'write']);
+
+function dshToolFilePath(name: string, input: Record<string, unknown> | null): string | null {
+  if (input !== null && DSH_FILE_TOOLS.has(name) && typeof input.file_path === 'string') {
+    return input.file_path;
+  }
+  return filePath(name, input);
 }
 
 function toolResultContent(content: unknown): string {
@@ -549,8 +567,8 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         recordsOut.push({
           kind: 'tool_call', id: callId(rawSessionId, nativeCallId),
           message_uuid: toolUseUuid(rawSessionId, data.turn, data.step), session_id: sessionId,
-          name: toolName, presentation: toolName === 'Skill' ? 'skill' : 'default',
-          input_json: truncJson(args) ?? '{}', file_path: filePath(toolName, isRecord(args) ? args : null),
+          name: toolName, presentation: toolName === 'skill' ? 'skill' : 'default',
+          input_json: truncJson(args) ?? '{}', file_path: dshToolFilePath(toolName, isRecord(args) ? args : null),
         });
         break;
       }
@@ -585,11 +603,15 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
 
   if (isSubagent) {
     const descriptor = subagentDescriptor ?? {};
+    // Continuable-mode descriptors carry agentProvider/agentModel; one-shot
+    // descriptors only carry `provider` (the subagents provider name).
     const agentType = typeof descriptor.agentProvider === 'string'
       ? descriptor.agentProvider
       : typeof descriptor.agentModel === 'string'
         ? descriptor.agentModel
-        : null;
+        : typeof descriptor.provider === 'string'
+          ? descriptor.provider
+          : null;
     const description = typeof descriptor.label === 'string' ? descriptor.label : null;
     const startedMs = typeof header.createdAt === 'number' ? header.createdAt : null;
     const endedMs = endedAt !== null ? new Date(endedAt).getTime() : null;
@@ -692,7 +714,14 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   return { text: found, totalLength: found.length, offset: 0, limit: found.length, hasMore: false, messageText };
 }
 
-export function createDeepseekProvider({ rootDir = join(homedir(), '.dsh', 'sessions') }: { rootDir?: string } = {}): ProviderAdapter {
+/** Resolve the DeepSeek Harness sessions root: `$DSH_HOME/sessions` or `~/.dsh/sessions`. */
+function deepseekSessionsRoot(): string {
+  const env = process.env.DSH_HOME;
+  const home = env !== undefined && env.trim().length > 0 ? env : join(homedir(), '.dsh');
+  return join(home, 'sessions');
+}
+
+export function createDeepseekProvider({ rootDir = deepseekSessionsRoot() }: { rootDir?: string } = {}): ProviderAdapter {
   return {
     name,
     descriptor: {

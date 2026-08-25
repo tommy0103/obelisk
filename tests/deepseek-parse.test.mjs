@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { constants, zstdCompressSync } from 'node:zlib';
 
@@ -463,4 +464,93 @@ test('vendored zstd decoder scans multi-frame logs and tolerates a torn tail', (
   // Invalid frame magic is corrupt storage, not a torn tail.
   const corrupt = Buffer.from('not-a-zstd-frame');
   assert.throws(() => scanZstdFrames(corrupt), /invalid frame magic/);
+});
+
+// Regression: upstream tool names are lowercase ('read'/'edit'/'write'/'skill'),
+// unlike Claude's capitalized names the shared parsing.ts helpers recognize.
+test('deepseek provider maps lowercase dsh tool names to file_path and skill presentation', () => {
+  const root = makeTempDir('obelisk-deepseek-lowercase-');
+  const sessionDir = join(root, 'sessions', '--proj--', 'lc-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const events = [
+    { type: 'session', version: 0, id: 'lc-session', createdAt: 1753005600000, cwd: '/proj', delegationDepth: 0 },
+    { type: 'tool/call', seq: 1, time: 1753005601000, data: { turn: 1, step: 1, callId: 'c1', name: 'read', arguments: '{"file_path":"/proj/x.ts"}' } },
+    { type: 'tool/call', seq: 2, time: 1753005602000, data: { turn: 1, step: 2, callId: 'c2', name: 'skill', arguments: '{"name":"pdf"}' } },
+  ];
+  writeFileSync(join(sessionDir, 'session.jsonl'), events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+  const calls = values.filter((record) => record.kind === 'tool_call');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].name, 'read');
+  assert.equal(calls[0].file_path, '/proj/x.ts');
+  assert.equal(calls[0].presentation, 'default');
+  assert.equal(calls[1].name, 'skill');
+  assert.equal(calls[1].presentation, 'skill');
+});
+
+// Regression: a malformed packed chunk row must not abort the whole session's
+// parse — its members only duplicate content the final assistant/message holds.
+test('deepseek provider tolerates a malformed packed chunk row', () => {
+  const root = makeTempDir('obelisk-deepseek-badchunk-');
+  const sessionDir = join(root, 'sessions', '--proj--', 'bad-chunk-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const events = [
+    { type: 'session', version: 0, id: 'bad-chunk-session', createdAt: 1753005600000, cwd: '/proj', delegationDepth: 0 },
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'before' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+    // dt length (1) does not match members (3): malformed storage row.
+    { type: 'text-chunks', seq0: 10, time0: 1753005601500, data: { turn: 1, step: 1, index: 0, dt: [5], texts: ['a', 'b', 'c'] } },
+    { type: 'assistant/message', seq: 2, time: 1753005602000, data: {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'after' }], source: { kind: 'model', model: 'deepseek-v4-flash' }, id: 'm-2' },
+      usage: { inputTokens: 1, outputTokens: 1 },
+    } },
+  ];
+  writeFileSync(join(sessionDir, 'session.jsonl'), events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+  const texts = values.filter((record) => record.kind === 'message').map((record) => record.text);
+  assert.deepEqual(texts, ['before', 'after']);
+});
+
+// Regression: one-shot subagent descriptors carry only `provider`/`label`
+// (agentProvider/agentModel exist only in continuable mode).
+test('deepseek provider falls back to descriptor.provider for one-shot subagent agent_type', () => {
+  const root = makeTempDir('obelisk-deepseek-oneshot-');
+  const sessionDir = join(root, 'sessions', '--proj--', 'one-shot-child');
+  mkdirSync(sessionDir, { recursive: true });
+  const events = [
+    { type: 'session', version: 0, id: 'one-shot-child', createdAt: 1753005600000, cwd: '/proj', parentSession: 'root-x', origin: 'subagent', delegationDepth: 1 },
+    { type: 'subagent/descriptor', seq: 0, time: 1753005600100, data: { version: 2, mode: 'one-shot', provider: 'code', label: 'fix the bug' } },
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'do it' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+  ];
+  writeFileSync(join(sessionDir, 'session.jsonl'), events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+  const subagent = values.find((record) => record.kind === 'subagent');
+  assert.equal(subagent.agent_type, 'code');
+  assert.equal(subagent.description, 'fix the bug');
+});
+
+// Regression: the sessions root honors $DSH_HOME (blank counts as unset),
+// matching upstream resolveDshHome semantics.
+test('deepseek provider resolves the sessions root from $DSH_HOME', () => {
+  const original = process.env.DSH_HOME;
+  try {
+    process.env.DSH_HOME = '/tmp/custom-dsh-home';
+    assert.equal(createDeepseekProvider().descriptor.defaultRoot, join('/tmp/custom-dsh-home', 'sessions'));
+    process.env.DSH_HOME = '   ';
+    assert.equal(createDeepseekProvider().descriptor.defaultRoot, join(homedir(), '.dsh', 'sessions'));
+    delete process.env.DSH_HOME;
+    assert.equal(createDeepseekProvider().descriptor.defaultRoot, join(homedir(), '.dsh', 'sessions'));
+  } finally {
+    if (original === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = original;
+  }
 });
