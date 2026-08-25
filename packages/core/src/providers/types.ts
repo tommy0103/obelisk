@@ -295,6 +295,17 @@ export interface RawRecord {
   readonly messageText?: string | null;
 }
 
+/**
+ * A watchable provider source: a directory `tree` (recursive subscription)
+ * or an exact `file` (metadata polling). Structurally identical to the
+ * adaptive-watcher package's WatchTarget (ADR-0009); duplicated here so
+ * @obelisk/core carries no watcher dependency.
+ */
+export interface WatchTarget {
+  readonly kind: 'tree' | 'file';
+  readonly path: string;
+}
+
 /** Complete adapter interface used by every indexing and presentation caller. */
 export interface ProviderAdapter extends Provider {
   readonly descriptor: ProviderDescriptor;
@@ -305,6 +316,6 @@ export interface ProviderAdapter extends Provider {
    * canonical source path. File-backed providers normally omit this.
    */
   sessionUnitKey?(session: IndexedSession): string;
-  watchRoots(configuredRoot: string): string[];
+  watchTargets(configuredRoot: string): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }

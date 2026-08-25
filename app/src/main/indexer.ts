@@ -18,6 +18,7 @@ import {
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readRecentTranscriptHints,
   writeProviderIndexMarkers,
   type ProviderInventoryIssue,
   type ProviderSessionProvenance,
@@ -265,6 +266,8 @@ interface BuildIndexResult {
   complete: boolean;
   incompleteProviders: string[];
   inventoryIssues: ProviderInventoryIssue[];
+  /** Most recently written transcripts (ADR-0009 hot-set seeding). */
+  watchHints?: string[];
   reason?: string;
 }
 
@@ -500,6 +503,7 @@ function buildIndex({
           complete: true,
           incompleteProviders,
           inventoryIssues,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 
@@ -561,6 +565,7 @@ function buildIndex({
         complete: providerResult.complete,
         incompleteProviders,
         inventoryIssues,
+        watchHints: readRecentTranscriptHints(db),
       };
     } finally {
       if (messageFtsTriggersDropped) {

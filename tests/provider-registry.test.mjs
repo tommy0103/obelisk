@@ -17,8 +17,11 @@ function fakeProvider(id, root) {
       defaultRoot: root,
       color: '#123456',
     },
-    watchRoots(configuredRoot) {
-      return [`${configuredRoot}/sessions`, `${configuredRoot}/session-index`];
+    watchTargets(configuredRoot) {
+      return [
+        { kind: 'tree', path: `${configuredRoot}/sessions` },
+        { kind: 'file', path: `${configuredRoot}/session-index` },
+      ];
     },
     discover() {
       return [];
@@ -43,11 +46,11 @@ test('provider registry drives source catalog, watch roots, and raw lookup', () 
     { id: 'alpha', name: 'alpha display', vendor: 'alpha vendor', defaultRoot: '/default/alpha', color: '#123456' },
     { id: 'beta', name: 'beta display', vendor: 'beta vendor', defaultRoot: '/default/beta', color: '#123456' },
   ]);
-  assert.deepEqual(registry.watchRoots({ alpha: '/custom/alpha' }), [
-    '/custom/alpha/sessions',
-    '/custom/alpha/session-index',
-    '/default/beta/sessions',
-    '/default/beta/session-index',
+  assert.deepEqual(registry.watchTargets({ alpha: '/custom/alpha' }), [
+    { kind: 'tree', path: '/custom/alpha/sessions' },
+    { kind: 'file', path: '/custom/alpha/session-index' },
+    { kind: 'tree', path: '/default/beta/sessions' },
+    { kind: 'file', path: '/default/beta/session-index' },
   ]);
   assert.deepEqual(
     registry.raw({ source: 'beta', messageUuid: 'message-1', session: null, agentId: null }),
@@ -73,14 +76,14 @@ test('built-in provider registry exposes every source without caller-side branch
     { id: 'kimi', name: 'Kimi Code' },
     { id: 'pi', name: 'Pi' },
   ]);
-  assert.deepEqual(registry.watchRoots(), [
-    '/sources/claude/projects',
-    '/sources/claude/history.jsonl',
-    '/sources/codex/sessions',
-    '/sources/codex/archived_sessions',
-    '/sources/codex/session_index.jsonl',
-    '/sources/kimi/sessions',
-    '/sources/kimi/session_index.jsonl',
-    '/sources/pi',
+  assert.deepEqual(registry.watchTargets(), [
+    { kind: 'tree', path: '/sources/claude/projects' },
+    { kind: 'file', path: '/sources/claude/history.jsonl' },
+    { kind: 'tree', path: '/sources/codex/sessions' },
+    { kind: 'tree', path: '/sources/codex/archived_sessions' },
+    { kind: 'file', path: '/sources/codex/session_index.jsonl' },
+    { kind: 'tree', path: '/sources/kimi/sessions' },
+    { kind: 'file', path: '/sources/kimi/session_index.jsonl' },
+    { kind: 'tree', path: '/sources/pi' },
   ]);
 });
