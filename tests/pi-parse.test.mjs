@@ -1,8 +1,10 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   renameSync,
   statSync,
@@ -11,7 +13,6 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -24,6 +25,7 @@ import { createProviderRegistry } from '../packages/core/src/providers/registry.
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 const FIXTURES = new URL('./fixtures/pi/', import.meta.url);
@@ -43,7 +45,7 @@ function fixture(name) {
 }
 
 function writeSession(content, { root, relativePath = 'project/session.jsonl' } = {}) {
-  const sessionRoot = root ?? mkdtempSync(join(tmpdir(), 'obelisk-pi-'));
+  const sessionRoot = root ?? makeTempDir('obelisk-pi-');
   const path = join(sessionRoot, relativePath);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, content);
@@ -83,7 +85,7 @@ function userEntry(id, parentId, text, timestamp = '2026-08-02T10:00:01.000Z') {
 }
 
 test('Pi root resolution follows official precedence and rejects ambiguous relative roots', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-home-'));
+  const home = makeTempDir('obelisk-pi-home-');
   const projectCwd = join(home, 'project');
   mkdirSync(projectCwd, { recursive: true });
   assert.deepEqual(resolveDefaultPiRoot({ env: {}, homeDir: home, cwd: projectCwd }), {
@@ -140,7 +142,7 @@ test('Pi root resolution follows official precedence and rejects ambiguous relat
   try {
     const unresolved = createPiProvider();
     assert.equal(unresolved.descriptor.requiresExplicitRoot, true);
-    assert.deepEqual(unresolved.watchRoots(unresolved.descriptor.defaultRoot), []);
+    assert.deepEqual(unresolved.watchTargets(unresolved.descriptor.defaultRoot), []);
     assert.deepEqual(unresolved.discover({ lastCursor: () => null }), []);
 
     const explicitlySelected = createPiProvider({
@@ -154,7 +156,7 @@ test('Pi root resolution follows official precedence and rejects ambiguous relat
 });
 
 test('Pi project settings override global sessionDir using the official launch cwd', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-project-settings-'));
+  const home = makeTempDir('obelisk-pi-project-settings-');
   const agentDir = join(home, 'agent');
   const projectCwd = join(home, 'project');
   const globalSessions = join(home, 'global-sessions');
@@ -189,7 +191,7 @@ test('Pi project settings override global sessionDir using the official launch c
 });
 
 test('malformed Pi settings fall back to the remaining official settings scope', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-malformed-settings-'));
+  const home = makeTempDir('obelisk-pi-malformed-settings-');
   const agentDir = join(home, 'agent');
   const projectCwd = join(home, 'project');
   const projectSettingsDir = join(projectCwd, '.pi');
@@ -236,7 +238,7 @@ test('malformed Pi settings fall back to the remaining official settings scope',
 });
 
 test('non-string Pi sessionDir values never select the default corpus', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-invalid-settings-'));
+  const home = makeTempDir('obelisk-pi-invalid-settings-');
   const agentDir = join(home, 'agent');
   const projectCwd = join(home, 'project');
   mkdirSync(join(projectCwd, '.pi'), { recursive: true });
@@ -256,7 +258,7 @@ test('non-string Pi sessionDir values never select the default corpus', () => {
 });
 
 test('Pi discovery never certifies an invalid session root as empty', () => {
-  const parent = mkdtempSync(join(tmpdir(), 'obelisk-pi-invalid-root-'));
+  const parent = makeTempDir('obelisk-pi-invalid-root-');
   const root = join(parent, 'sessions');
   writeFileSync(root, 'not a directory');
   let status = 'unknown';
@@ -1735,7 +1737,7 @@ test('missing parents form official Pi orphan roots without exposing inactive br
 });
 
 test('discovery deduplicates identical same-project copies and rejects divergent copies', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-copies-'));
+  const root = makeTempDir('obelisk-pi-copies-');
   const original = fixture('tool-session.jsonl');
   writeSession(original, { root, relativePath: 'a/session.jsonl' });
   writeSession(original, { root, relativePath: 'b/session.jsonl' });
@@ -1764,7 +1766,7 @@ test('discovery follows readable Pi JSONL file symlinks without retracting prove
   const provider = createPiProvider({ rootDir: written.root });
   const original = provider.discover({ lastCursor: () => null })[0];
   const parsed = drain(provider.parse(original, null));
-  const targetDir = mkdtempSync(join(tmpdir(), 'obelisk-pi-symlink-target-'));
+  const targetDir = makeTempDir('obelisk-pi-symlink-target-');
   const target = join(targetDir, 'session.jsonl');
   renameSync(written.path, target);
   symlinkSync(target, written.path);
@@ -1789,7 +1791,7 @@ test('discovery follows readable Pi JSONL file symlinks without retracting prove
 });
 
 test('a malformed Pi file does not force unrelated unchanged sessions to reparse', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-bad-file-scope-'));
+  const root = makeTempDir('obelisk-pi-bad-file-scope-');
   const damaged = writeSession(jsonl([
     header({ id: 'damaged-session' }),
     userEntry('damaged-user', null, 'damaged source'),
@@ -1848,7 +1850,7 @@ test('a moved session with an unreadable identity cannot retract its last good s
 });
 
 test('a bad selected copy forces an unchanged valid duplicate to refresh provenance', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-bad-copy-'));
+  const root = makeTempDir('obelisk-pi-bad-copy-');
   const content = fixture('tool-session.jsonl');
   const second = writeSession(content, { root, relativePath: 'b/session.jsonl' });
   const provider = createPiProvider({ rootDir: root });
@@ -1884,7 +1886,7 @@ test('a bad selected copy forces an unchanged valid duplicate to refresh provena
 });
 
 test('the same official project-local session id remains distinct across cwd namespaces', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-project-ids-'));
+  const root = makeTempDir('obelisk-pi-project-ids-');
   const firstHeader = header({ id: 'shared-custom-id', cwd: '/tmp/pi-project-a' });
   const secondHeader = header({ id: 'shared-custom-id', cwd: '/tmp/pi-project-b' });
   writeSession(jsonl([
@@ -1916,7 +1918,7 @@ test('the same official project-local session id remains distinct across cwd nam
 });
 
 test('identity migration retracts a legacy row attached to a non-selected identical copy', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-identity-migration-'));
+  const root = makeTempDir('obelisk-pi-identity-migration-');
   const content = fixture('tool-session.jsonl');
   const first = writeSession(content, { root, relativePath: 'a/session.jsonl' });
   const second = writeSession(content, { root, relativePath: 'b/session.jsonl' });
@@ -1938,12 +1940,12 @@ test('identity migration retracts a legacy row attached to a non-selected identi
     drain(provider.parse(migration[0], null)).values
       .filter(record => record.kind === 'delete-session')
       .map(record => record.sessionId),
-    [legacyId, piSessionId(sourceHeader)],
+    [piSessionId(sourceHeader)],
   );
 });
 
 test('unlinking a deduplicated Pi copy reparses the surviving source instead of deleting the session', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-copy-move-'));
+  const root = makeTempDir('obelisk-pi-copy-move-');
   const content = fixture('tool-session.jsonl');
   const first = writeSession(content, { root, relativePath: 'a/session.jsonl' });
   const second = writeSession(content, { root, relativePath: 'b/session.jsonl' });
@@ -1967,7 +1969,7 @@ test('unlinking a deduplicated Pi copy reparses the surviving source instead of 
 });
 
 test('replacing one Pi copy preserves the original identity when another copy survives', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-pi-copy-replace-'));
+  const root = makeTempDir('obelisk-pi-copy-replace-');
   const content = fixture('tool-session.jsonl');
   const first = writeSession(content, { root, relativePath: 'a/session.jsonl' });
   const second = writeSession(content, { root, relativePath: 'b/session.jsonl' });
@@ -2055,7 +2057,7 @@ test('Pi snapshot cursors detect same-identity and replacement writes that prese
 });
 
 test('incomplete Pi inventories never infer deletion from changed paths', () => {
-  const parent = mkdtempSync(join(tmpdir(), 'obelisk-pi-incomplete-'));
+  const parent = makeTempDir('obelisk-pi-incomplete-');
   const unreadableRoot = join(parent, 'sessions');
   writeFileSync(unreadableRoot, 'not a directory');
   const indexedPath = join(unreadableRoot, 'project', 'session.jsonl');
@@ -2108,7 +2110,7 @@ test('indexed provenance retracts a replaced identity and emits an unlink tombst
   assert.notEqual(afterSession, beforeSession);
   assert.deepEqual(
     after.values.filter(record => record.kind === 'delete-session').map(record => record.sessionId),
-    [beforeSession, afterSession],
+    [afterSession],
   );
 
   unlinkSync(written.path);
@@ -2120,7 +2122,7 @@ test('indexed provenance retracts a replaced identity and emits an unlink tombst
   assert.equal(tombstones.length, 1);
   assert.deepEqual(tombstones[0].retractSessionIds, [afterSession]);
   const tombstone = drain(provider.parse(tombstones[0], after.cursor));
-  assert.deepEqual(tombstone.values, [{ kind: 'delete-session', sessionId: afterSession }]);
+  assert.deepEqual(tombstone.values, []);
   assert.equal(tombstone.cursor, '0:0');
 });
 

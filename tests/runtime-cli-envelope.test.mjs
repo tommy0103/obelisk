@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Tier 1 contract golden tests (see docs/adr/0002-two-tier-runtime-contract.md).
 //
 // These lock the four-verb CLI I/O envelope at the process boundary so the
@@ -14,14 +17,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli as runRuntime } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 function tempHome() {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-cli-envelope-'));
+  const home = makeTempDir('obelisk-cli-envelope-');
   mkdirSync(join(home, '.claude'), { recursive: true });
   return home;
 }
@@ -77,6 +80,12 @@ test('--query surfaces a throw as { error, stack } and exits 1', () => {
 
 test('--attune surfaces a throw as { error, stack } and exits 1', () => {
   const home = tempHome();
+  // Attune requires an initialized index; bring one up so the script's own
+  // throw is what surfaces.
+  const initPath = join(home, 'init.mjs');
+  writeFileSync(initPath, "return 'init';");
+  const init = runRuntime(['--query', initPath], { home });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
   const scriptPath = join(home, 'attune-boom.mjs');
   writeFileSync(scriptPath, "throw new Error('attune-envelope');");
 

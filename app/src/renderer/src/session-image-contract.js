@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Shared constants for the session image element. Kept free of the component
 // import so the Markdown renderer (and its tests) do not have to pull a .vue
 // module into scope just to know the tag name.

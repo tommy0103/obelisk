@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5c-2 golden test: pins the codex adapter's parse() record stream.
 // Binding-independent (no database). Covers the event_msg↔response_item dedup,
 // tool call/result, token patching, turn-duration, the 'total' session count,
@@ -5,14 +8,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 function writeFixture(lines) {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-codex-parse-'));
+  const dir = makeTempDir('obelisk-codex-parse-');
   const path = join(dir, 'rollout.jsonl');
   writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
   return path;
@@ -86,7 +89,7 @@ test('codex parse() retracts a guardian thread via delete-session and emits noth
 });
 
 test('codex provider folds session_index metadata into its canonical session record', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-codex-index-meta-'));
+  const root = makeTempDir('obelisk-codex-index-meta-');
   const sessionsDir = join(root, 'sessions', '2026', '06', '10');
   mkdirSync(sessionsDir, { recursive: true });
   const path = join(sessionsDir, `rollout-${META.id}.jsonl`);
@@ -105,4 +108,34 @@ test('codex provider folds session_index metadata into its canonical session rec
   const session = values.find(record => record.kind === 'session');
   assert.equal(session.title, 'Indexed title');
   assert.equal(session.ended_at, '2026-06-10T11:00:00Z');
+});
+
+test('codex provider discovers, watches, and reads archived sessions', () => {
+  const root = makeTempDir('obelisk-codex-archive-');
+  const archiveDir = join(root, 'archived_sessions');
+  mkdirSync(archiveDir, { recursive: true });
+  const path = join(archiveDir, `rollout-${META.id}.jsonl`);
+  writeFileSync(path, [
+    JSON.stringify({ type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META }),
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'archived Codex sentinel' } }),
+    '',
+  ].join('\n'));
+
+  const provider = createCodexProvider({ rootDir: root });
+  const units = provider.discover({
+    lastCursor: () => '9999999999999:1',
+    changedPaths: [path],
+  });
+
+  assert.deepEqual(units.map(unit => unit.key), [path]);
+  assert.deepEqual(provider.watchTargets(root), [
+    { kind: 'tree', path: join(root, 'sessions') },
+    { kind: 'tree', path: archiveDir },
+    { kind: 'file', path: join(root, 'session_index.jsonl') },
+  ]);
+  const raw = provider.raw({
+    messageUuid: `codex:${META.id}:000002`,
+    agentId: 'codex:archive-agent',
+  });
+  assert.match(raw.text, /archived Codex sentinel/);
 });

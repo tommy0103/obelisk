@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Passive-pull indexing orchestration for the Core package.
 import { existsSync } from 'node:fs';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts } from './db.ts';
@@ -7,6 +10,7 @@ import {
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readRecentTranscriptHints,
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
@@ -16,8 +20,9 @@ import {
   createConfiguredBuiltinProviderRuntime,
   readPersistedProviderSettings,
 } from './provider-settings.ts';
+import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { NodeSqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { NodeSqliteDb, SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 interface SkippedFile {
   provider: string;
@@ -29,10 +34,21 @@ interface SkippedFile {
 interface BuildCheckOptions {
   now?: number;
   ignoreRecentBuild?: boolean;
+  ignoreDaemonOwnership?: boolean;
 }
 
 interface BuildIndexOptions {
   force?: boolean;
+  // Bypass the recent-build debounce without selecting the force full-republish
+  // path: the build stays incremental. Used by the invocation-nonce freshness
+  // recovery, which needs the just-written transcript indexed cheaply.
+  ignoreRecentBuild?: boolean;
+  // Bypass the daemon-ownership policy check (fresh __app_heartbeat__). Narrow
+  // carve-out for the invocation-nonce freshness build: the writer lease
+  // remains the sole write arbitrator, and the build stays incremental so
+  // daemon and CLI cursors in index_state stay consistent. force does NOT
+  // imply this; the carve-out is always explicit (ADR 0006 amendment).
+  ignoreDaemonOwnership?: boolean;
   providerRegistry?: ProviderRegistry;
 }
 
@@ -57,13 +73,48 @@ function refreshSessionProjectPaths(db: NodeSqliteDb): void {
   }
 }
 
+// A workflow unit links to its parent Workflow tool call by matching the unique
+// run id in the tool_result text — but the run json can reach the index before
+// that tool_result lands in the main transcript, leaving parent_tool_use_id
+// null with no later re-parse to fix it (the run json's mtime no longer moves).
+// Once every unit is persisted the tool_results table holds the result text, so
+// the match can be completed in SQL. Runs at every finalize: missed links heal
+// on the next refresh instead of waiting for a force rebuild. instr() is exact
+// substring matching (no LIKE wildcards); unresolvable rows stay null.
+function healWorkflowParentLinks(db: SqliteDb): void {
+  db.prepare(`
+    UPDATE workflows
+    SET parent_tool_use_id = (
+      SELECT tr.tool_use_id
+      FROM tool_results tr
+      JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
+      WHERE tr.session_id = workflows.session_id
+        AND tc.name = 'Workflow'
+        AND instr(tr.content, workflows.run_id) > 0
+      ORDER BY tr.rowid
+      LIMIT 1
+    )
+    WHERE parent_tool_use_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM tool_results tr
+        JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
+        WHERE tr.session_id = workflows.session_id
+          AND tc.name = 'Workflow'
+          AND instr(tr.content, workflows.run_id) > 0
+      )
+  `).run();
+}
+
 const BUILD_DEBOUNCE_MS = 30000;
 const APP_HEARTBEAT_FRESH_MS = 60000;
 
-function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false }: BuildCheckOptions = {}) {
-  const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
-  if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
-    return { skip: true, reason: 'daemon_active' };
+function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ignoreDaemonOwnership = false }: BuildCheckOptions = {}) {
+  if (!ignoreDaemonOwnership) {
+    const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
+    if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
+      return { skip: true, reason: 'daemon_active' };
+    }
   }
   if (!ignoreRecentBuild) {
     const last = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__last_build__'").get();
@@ -79,11 +130,13 @@ function isMissingIndexStateTable(error: unknown): boolean {
   return /no such table:\s*(?:main\.)?index_state\b/i.test(message);
 }
 
-function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
+function inspectBuildOwnership({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false }: { force?: boolean; ignoreRecentBuild?: boolean; ignoreDaemonOwnership?: boolean } = {}) {
   if (!existsSync(DB_PATH)) return { skip: false };
   const db = openReadDb();
   try {
-    return shouldSkipBuild(db, { ignoreRecentBuild: force });
+    const ownership = shouldSkipBuild(db, { ignoreRecentBuild: force || ignoreRecentBuild, ignoreDaemonOwnership });
+    if (!ownership.skip || ownership.reason === 'daemon_active') return ownership;
+    return coreSchemaNeedsMigration(db) ? { skip: false } : ownership;
   } catch (error) {
     // A missing table means the write path must initialize a new/legacy index.
     // Any other read failure leaves daemon ownership unknown, so fail closed.
@@ -94,8 +147,46 @@ function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
   }
 }
 
-function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {}) {
-  const ownership = inspectBuildOwnership({ force });
+function ensureReadableSchema(): { ready: boolean; reason?: string } {
+  const inspect = () => {
+    if (!existsSync(DB_PATH)) return { ready: false };
+    const db = openReadDb();
+    try {
+      if (!coreSchemaNeedsMigration(db)) return { ready: true };
+      try {
+        if (shouldSkipBuild(db, { ignoreRecentBuild: true }).reason === 'daemon_active') {
+          return { ready: false, reason: 'daemon_active' };
+        }
+      } catch (error) {
+        if (!isMissingIndexStateTable(error)) throw error;
+      }
+      return { ready: false };
+    } finally {
+      db.close();
+    }
+  };
+
+  let state = inspect();
+  if (state.ready || state.reason) return state;
+  const lease = acquireWriterLease({
+    lockPath: writerLockPathFor(DB_PATH),
+    openDb: openWriterLeaseDb,
+    waitMs: 1000,
+  });
+  if (!lease) return { ready: false, reason: 'writer_busy' };
+  try {
+    state = inspect();
+    if (state.ready || state.reason) return state;
+    const db = openDb();
+    db.close();
+    return { ready: true };
+  } finally {
+    lease.release();
+  }
+}
+
+function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false, providerRegistry }: BuildIndexOptions = {}) {
+  const ownership = inspectBuildOwnership({ force, ignoreRecentBuild, ignoreDaemonOwnership });
   if (ownership.skip) return ownership;
   const lease = acquireWriterLease({
     lockPath: writerLockPathFor(DB_PATH),
@@ -104,7 +195,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
   if (!lease) return { skip: true, reason: 'writer_busy' };
   try {
     // Ownership may change between the first read and lease acquisition.
-    const ownershipAfterLease = inspectBuildOwnership({ force });
+    const ownershipAfterLease = inspectBuildOwnership({ force, ignoreRecentBuild, ignoreDaemonOwnership });
     if (ownershipAfterLease.skip) return ownershipAfterLease;
     let registry = providerRegistry;
     if (registry === undefined) {
@@ -149,6 +240,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
               plan: providerPlan,
             });
             refreshSessionProjectPaths(db);
+            healWorkflowParentLinks(db);
             db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
             rebuildMemoryFts(db);
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -171,8 +263,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
               provider: error.item.provider.name,
               path: error.item.unit.key,
               error: errorMessage(error.sourceError),
-              diagnostics: (error as { obelisk?: unknown }).obelisk
-                ?? (error.sourceError as { obelisk?: unknown } | null)?.obelisk,
+              diagnostics: (error as { obelisk?: unknown }).obelisk,
             };
             skippedFiles.push(skippedFile);
             process.stderr.write(
@@ -197,6 +288,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
           inventoryIssues,
           skipped: 0,
           skippedFiles,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 
@@ -235,6 +327,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
       try {
         runRetryableWriteTransaction(txDb, () => {
           refreshSessionProjectPaths(db);
+          healWorkflowParentLinks(db);
           db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
           rebuildMemoryFts(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -261,6 +354,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
         inventoryIssues,
         skipped: skippedFiles.length,
         skippedFiles,
+        watchHints: readRecentTranscriptHints(db),
       };
     } finally {
       db.close();
@@ -270,4 +364,4 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
   }
 }
 
-export { buildIndex, inferProjectPath, refreshSessionProjectPaths, shouldSkipBuild };
+export { buildIndex, ensureReadableSchema, healWorkflowParentLinks, inferProjectPath, refreshSessionProjectPaths, shouldSkipBuild };

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
@@ -120,15 +123,17 @@ export function createConfiguredBuiltinProviderRuntime(
           requiresExplicitRoot: true,
           rootResolutionReason: reason,
         },
-        watchRoots: () => [],
+        watchTargets: () => [],
         discover: (ctx) => {
-          ctx.reportIncompleteInventory?.({
-            path: provider.descriptor.defaultRoot,
-            error: reason,
-          });
+          const indexed = ctx.indexedSessions?.()[0];
+          if (indexed) {
+            ctx.reportIncompleteInventory?.({
+              path: indexed.jsonlPath,
+              error: reason,
+            });
+          }
           return [];
         },
-        raw: () => null,
       };
     })),
   };

@@ -12,6 +12,45 @@ Query scripts run inside an async IIFE with a 30-second timeout. Use `return` to
 emit JSON. `--query` scripts are read-only. `--attune` scripts expose only
 memory mutation helpers.
 
+## Invocation Identity
+
+Obelisk refreshes the index before each query, so the invoking agent's own live
+session appears in results. The CLI carries an invocation nonce to identify it:
+
+- `obelisk --search "text" --nonce <token>` — pass a unique token, for example
+  `--nonce "$(uuidgen 2>/dev/null || echo "$$.$RANDOM.$RANDOM")"` (prefers
+  `uuidgen`, falls back to shell builtins). The nonce is never part of the FTS
+  search text.
+- `obelisk --query <file>` — the nonce is the query file path as typed, so use
+  unique temp names such as
+  `qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; }) && qfile="$qdir/query.mjs"`
+  (a unique directory per query; the `mktemp` template always ends in the `X` run).
+
+Resolution is newest-wins within a ~15-minute recency window (both the
+message-text and tool-call legs are bounded to it, which keeps weeks-old
+fixed-path reuse such as `/tmp/q.mjs` out of the candidate set). The session
+whose newest matching record is the overall newest is the invoking session:
+`search()` hit sessions and `sessions()` rows for it carry
+`is_invoking: true`, and `overview().current.session_id` holds its id. Treat
+an `is_invoking` session as your own current context, not independent
+historical evidence. Matches far apart in time are unrelated history (an old
+session quoting the same command line loses naturally); only two newest
+records within ~10 seconds of each other count as a genuine concurrent
+collision.
+
+A nonce-carrying query may take a moment to resolve: if the nonce is not yet
+indexed, the runtime runs one incremental recovery build (bypassing the
+recent-build debounce and, as a narrow carve-out, daemon ownership — the writer
+lease stays the sole write arbitrator), then re-checks. Typical recovery is a
+fast incremental build, whether or not the app daemon owns the index. Only when
+the recovery build loses the lease to a concurrent writer does the runtime fall
+back to polling freshly published snapshots, about every 300ms up to a ~4s cap.
+This latency applies only to nonce-carrying queries whose first lookup misses;
+other queries are unaffected. When nothing matches after the cap — or the
+newest records collide within the ~10s epsilon — nothing is marked and
+`current.session_id` is null: invocation identity is honestly unknown, with no
+further fallback.
+
 ## Query API Reference
 
 ### Read Helpers
@@ -40,6 +79,11 @@ remember, forget
 `--attune` does not expose `search()`, `sql()`, `memories()`, or other read
 helpers. If you need IDs, discover them first with a normal `--query` script.
 
+Memory writes are independent of index writes: `--attune` does not refresh the
+index, does not read provider settings, and works while the app daemon owns
+index writes. It requires an already-initialized index (run any query or
+`obelisk --build` once first) and fails honestly otherwise.
+
 ---
 
 ## Core Helpers
@@ -66,11 +110,14 @@ Returns:
 ```js
 Array<{
   message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, visibility, source },
-  session: { id, title, project, started_at, source },
+  session: { id, title, project, started_at, source, is_invoking? },
   rank,
   context
 }>
 ```
+
+`session.is_invoking` is `true` when the hit belongs to the invoking session
+(see Invocation Identity) and omitted otherwise.
 
 `context` is temporal neighbor context in the same session, not a parent chain.
 Hits and neighbors carry `visibility`.
@@ -139,7 +186,8 @@ Passing a string is treated as `project`. Passing a number is treated as
 
 If `opts.project` is absent, `overview()` tries to identify the current project
 from `process.cwd()` against `sessions.project_path`, then from exact
-`messages.cwd` matches. It does not guess the current session.
+`messages.cwd` matches. The current session is identified only through the
+invocation nonce (see Invocation Identity), never guessed from recency.
 
 Returns:
 
@@ -152,7 +200,8 @@ Returns:
       project_path,
       source: 'opts' | 'cwd_project_path' | 'cwd_messages',
       confidence: 'exact' | 'inferred' | 'unknown'
-    } | null
+    } | null,
+    session_id: string | null
   },
   current_project: {
     project,
@@ -206,7 +255,8 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 
 Returns `Array<session_row>`.
 `message_count` describes the visible canonical transcript; inactive and hidden
-records do not increase it.
+records do not increase it. The invoking session row carries
+`is_invoking: true` (see Invocation Identity); other rows omit the field.
 
 #### `recent(n?)`
 
@@ -334,6 +384,8 @@ Subagent metadata plus message counts. Passing a string is treated as
 | --- | --- | --- |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over source session project |
+| `opts.after` | `string` | ISO lower bound; matches subagents still active past it (latest message) |
+| `opts.before` | `string` | ISO upper bound; matches subagents already started by it (earliest message) |
 | `opts.source` | `string` | Provider filter |
 | `opts.limit` | `number` | Max rows, default 100 |
 

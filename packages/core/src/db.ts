@@ -1,4 +1,8 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // node:sqlite lifecycle and migrations for the Core package.
+import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -39,6 +43,94 @@ function openReadDb(): NodeSqliteDb {
   return db;
 }
 
+// Memory mutations (remember/forget) touch only memories/memories_fts, which
+// index builds never delete from — so attune is independent of daemon write
+// ownership and the writer lease (ADR 0006 amendment). It must still never
+// migrate or configure the index: it opens the existing database as-is and
+// fails honestly when the memory layer is not there yet. The expected layer
+// shape is derived from the shared schema.sql, not restated, so the two can
+// never drift apart.
+const ATTUNE_MEMORY_COLUMNS = Object.freeze(
+  (/CREATE TABLE IF NOT EXISTS memories \(([^;]+)\);/s.exec(SCHEMA)?.[1] ?? '')
+    .split(',').map(part => part.trim().split(/\s+/)[0]).filter(Boolean),
+);
+
+const ATTUNE_MEMORY_TRIGGERS = Object.freeze(
+  [...SCHEMA.matchAll(/CREATE TRIGGER IF NOT EXISTS (memories_fts_\w+)/g)].map(match => match[1]),
+);
+
+function openAttuneDb(): NodeSqliteDb {
+  if (!existsSync(DB_PATH)) {
+    throw new Error('Obelisk index is not initialized; run an index build (obelisk --build) before writing memories');
+  }
+  const db = new DatabaseSync(DB_PATH);
+  // Kept short on purpose: lock waiting is owned by the retry layer in
+  // executeAttune (ADR 0006 uses the same 250 ms for index-writer/CLI
+  // connections), so each BEGIN fails fast and retries within that budget.
+  db.exec('PRAGMA busy_timeout=250');
+  const info = db.prepare('PRAGMA table_info(memories)').all();
+  const columns = new Set(info.map((row) => String(row.name)));
+  // Column names alone are not enough: id must be the ONLY primary-key
+  // column. A composite PRIMARY KEY (id, project) still lets duplicate ids
+  // in, so remember ids lose uniqueness and forget() can update several
+  // rows at once.
+  const pkColumns = info.filter((row) => Number(row.pk ?? 0) > 0).map((row) => String(row.name));
+  const columnsOk = ATTUNE_MEMORY_COLUMNS.length > 0
+    && ATTUNE_MEMORY_COLUMNS.every((column) => columns.has(column))
+    && pkColumns.length === 1 && pkColumns[0] === 'id';
+  if (!columnsOk) {
+    db.close();
+    throw new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
+  }
+  return db;
+}
+
+// The FTS table and its maintenance triggers are the recall half of the
+// memory layer: without them a write "succeeds" but can never be found.
+// Names and SQL text prove nothing — a trigger's own name contains
+// 'memories_fts', and a lookalike table can borrow the right DDL — so
+// validate to executability instead. Must run inside a write transaction
+// (executeAttune's retryable mutation wrapper). The probe body is wrapped in
+// a SAVEPOINT that is always rolled back, so even a successful probe leaves
+// no persistent trace — not just no logical row, but no FTS5 shadow-table
+// churn either. Id and tokens are random per probe: fixed values could match
+// a legitimate memory and produce a false "incomplete layer" verdict.
+function probeAttuneMemoryLayer(db: SqliteDb): void {
+  const layerError = new Error('Obelisk index predates the memory layer; run an index build (obelisk --build) before writing memories');
+  const probeId = `__attune_probe_${randomUUID()}`;
+  const insertToken = `pins${randomUUID().replaceAll('-', '')}`;
+  const updateToken = `pupd${randomUUID().replaceAll('-', '')}`;
+  // FTS MATCH on the random token, filtered by the probe id: pre-existing
+  // memories can never interfere either way.
+  const matches = (token: string) => db.prepare('SELECT id FROM memories_fts WHERE memories_fts MATCH ? AND id = ?').all(token, probeId).length;
+  db.exec('SAVEPOINT attune_probe');
+  try {
+    db.prepare('INSERT INTO memories (id, path, summary, created_at) VALUES (?, ?, ?, ?)').run(probeId, '/probe', `${insertToken} marker`, '1970-01-01T00:00:00Z');
+    if (matches(insertToken) !== 1) throw layerError;
+    db.prepare('UPDATE memories SET summary=? WHERE id=?').run(`${updateToken} marker`, probeId);
+    if (matches(insertToken) !== 0 || matches(updateToken) !== 1) throw layerError;
+    db.prepare('DELETE FROM memories WHERE id=?').run(probeId);
+    if (matches(updateToken) !== 0) throw layerError;
+  } catch (error) {
+    // Failure path: the probe throws, so the outer transaction rolls back
+    // regardless — a cleanup error here may be swallowed to keep the primary
+    // error (ADR 0006: cleanup never masks the primary exception).
+    try { db.exec('ROLLBACK TO attune_probe'); db.exec('RELEASE attune_probe'); } catch { /* the outer transaction's rollback cleans up */ }
+    // Translate only the expected schema defects into the honest layer
+    // error; real I/O failures (disk full, SQLITE_IOERR, corruption) must
+    // surface as themselves.
+    if (error !== layerError
+      && !(error instanceof Error && /no such table|no such column|unable to use function MATCH/i.test(error.message))) {
+      throw error;
+    }
+    throw layerError;
+  }
+  // Success path: a cleanup failure MUST propagate — otherwise the outer
+  // transaction would commit the probe writes it was meant to discard.
+  db.exec('ROLLBACK TO attune_probe');
+  db.exec('RELEASE attune_probe');
+}
+
 function openWriterLeaseDb(lockPath: string): NodeSqliteDb {
   return new DatabaseSync(lockPath);
 }
@@ -48,4 +140,4 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, openDb, openReadDb, openAttuneDb, probeAttuneMemoryLayer, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };

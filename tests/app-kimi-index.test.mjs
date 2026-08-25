@@ -1,12 +1,15 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
 import { createKimiProvider } from '../packages/core/src/providers/kimi.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -88,7 +91,7 @@ function writePlaceholderSession(kimiDir, { userPrompt = false } = {}) {
 }
 
 test('app build indexes Kimi sessions through the provider registry without changing schema', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-index-'));
+  const home = makeTempDir('obelisk-kimi-index-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const kimiDir = join(home, '.kimi-code');
@@ -128,7 +131,7 @@ test('app build indexes Kimi sessions through the provider registry without chan
 });
 
 test('app build excludes never-started Kimi placeholder sessions', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-placeholder-'));
+  const home = makeTempDir('obelisk-kimi-placeholder-');
   const kimiDir = join(home, '.kimi-code');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   writePlaceholderSession(kimiDir);
@@ -150,7 +153,7 @@ test('app build excludes never-started Kimi placeholder sessions', () => {
 });
 
 test('app build keeps a prompted Kimi session while placeholder metadata catches up', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-prompted-placeholder-'));
+  const home = makeTempDir('obelisk-kimi-prompted-placeholder-');
   const kimiDir = join(home, '.kimi-code');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   writePlaceholderSession(kimiDir, { userPrompt: true });
@@ -172,7 +175,7 @@ test('app build keeps a prompted Kimi session while placeholder metadata catches
 });
 
 test('Kimi marker upgrade retracts previously indexed placeholder sessions', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-placeholder-replay-'));
+  const home = makeTempDir('obelisk-kimi-placeholder-replay-');
   const kimiDir = join(home, '.kimi-code');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
   const { wirePath } = writePlaceholderSession(kimiDir);
@@ -207,7 +210,7 @@ test('Kimi marker upgrade retracts previously indexed placeholder sessions', () 
 });
 
 test('Kimi undo and clear replace the indexed session instead of leaving stale rows', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-replay-'));
+  const home = makeTempDir('obelisk-kimi-replay-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const kimiDir = join(home, '.kimi-code');
@@ -250,7 +253,7 @@ test('Kimi undo and clear replace the indexed session instead of leaving stale r
 });
 
 test('Kimi canonical transcript marker replays unchanged sessions once', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-kimi-prompt-marker-'));
+  const home = makeTempDir('obelisk-kimi-prompt-marker-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const kimiDir = join(home, '.kimi-code');
@@ -267,7 +270,7 @@ test('Kimi canonical transcript marker replays unchanged sessions once', () => {
   buildIndex(options);
   let db = new TestDatabase(dbPath);
   const marker = createKimiProvider({ rootDir: kimiDir }).indexVersionMarker;
-  assert.equal(marker, '__kimi_canonical_transcript_v4__');
+  assert.equal(marker, '__kimi_canonical_transcript_v6__');
   db.prepare("UPDATE messages SET text='stale expanded instructions', is_meta=1 WHERE source='kimi'").run();
   db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(marker);
   db.close();

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -1331,12 +1334,8 @@ function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string
   const meta = unit.meta as PiSessionUnitMeta | undefined;
   if (meta?.kind === 'pi-tombstone') {
     return {
-      records: (unit.retractSessionIds ?? [unit.sessionId]).map((sessionId) => ({
-        kind: 'delete-session',
-        sessionId,
-      })),
-      // A zero watermark keeps recreation discoverable even if no watcher
-      // event is available, without teaching persist about provider tombstones.
+      records: [],
+      // A zero watermark keeps recreation discoverable even if no watcher event is available.
       cursor: '0:0',
     };
   }
@@ -1375,10 +1374,6 @@ function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string
   };
   return {
     records: [
-      ...(unit.retractSessionIds ?? []).map((staleSessionId) => ({
-        kind: 'delete-session' as const,
-        sessionId: staleSessionId,
-      })),
       { kind: 'delete-session', sessionId },
       session,
       ...projected.records,
@@ -1557,10 +1552,10 @@ export function createPiProvider({
     },
     indexVersionMarker: PI_CANONICAL_TRANSCRIPT_MARKER,
     rootResolution,
-    watchRoots: (configuredRoot) => {
+    watchTargets: (configuredRoot) => {
       if (rootResolution.requiresExplicitRoot) return [];
       const absolute = configuredAbsolutePath(configuredRoot, homedir());
-      return absolute === null ? [] : [absolute];
+      return absolute === null ? [] : [{ kind: 'tree', path: absolute }];
     },
     discover(ctx: DiscoverContext): IndexUnit[] {
       if (rootResolution.requiresExplicitRoot) {

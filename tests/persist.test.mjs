@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5b-2a: unit-tests the shared persist layer in isolation (no buildIndex).
 // Feeds claude.parse output into persist against an in-memory node:sqlite db and
 // asserts rows + the drift-fixed session merge semantics.
@@ -5,20 +8,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { parse } from '../packages/core/src/providers/claude.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { storedProviderCursor } from '../packages/core/src/provider-indexing.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
 function fixtureUnit() {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-persist-'));
+  const dir = makeTempDir('obelisk-persist-');
   const path = join(dir, 'sid-p.jsonl');
   const lines = [
     { type: 'ai-title', aiTitle: 'Persist Session' },
@@ -138,4 +141,21 @@ test('delete-session cascades across tables', () => {
   assert.equal(db.prepare('SELECT COUNT(*) c FROM tool_calls WHERE session_id=?').get('sid-p').c, 0);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM workflows WHERE session_id=?').get('sid-p').c, 0);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM workflow_agents WHERE session_id=?').get('sid-p').c, 0);
+});
+
+test('IndexUnit retracts a previously indexed session without adapter delete records', () => {
+  const db = freshDb();
+  const unit = fixtureUnit();
+  persist(db, unit, parse(unit, null));
+
+  function* tombstone() { yield* []; return '0:0'; }
+  persist(db, {
+    key: 'tombstone',
+    sessionId: unit.sessionId,
+    retractSessionIds: [unit.sessionId],
+  }, tombstone());
+
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM sessions WHERE id=?').get(unit.sessionId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM messages WHERE session_id=?').get(unit.sessionId).c, 0);
+  assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get('tombstone').cursor, '0:0');
 });

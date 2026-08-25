@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Core's pure parse/discover helpers — node:sqlite-free by construction, so the compiled
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
@@ -110,7 +113,7 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
-function readLines(filePath: string, callback: (line: string) => boolean | void): void {
+function readLines(filePath: string, callback: (line: string, terminated: boolean) => boolean | void): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
@@ -118,14 +121,17 @@ function readLines(filePath: string, callback: (line: string) => boolean | void)
   let bytesRead;
   try {
     while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
-      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
-      const lines = chunk.split('\n');
+      const lines = buf.toString('utf8', 0, bytesRead).split('\n');
+      lines[0] = remainder + lines[0];
       remainder = lines.pop() ?? '';
       for (const line of lines) {
-        if (line && callback(line) === false) return;
+        if (line && callback(line, true) === false) return;
       }
     }
-    if (remainder) callback(remainder);
+    // `terminated: false` — the final chunk had no trailing newline, so this
+    // tail may still be growing (or may simply be an unterminated last line;
+    // the caller cannot tell, and must decide what that means).
+    if (remainder) callback(remainder, false);
   } finally {
     closeSync(fd);
   }

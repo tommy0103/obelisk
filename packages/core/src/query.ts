@@ -1,11 +1,19 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Query and attune sandbox helpers for the Core package.
 import { statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
+import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 type DbRow = SqliteRow;
+
+// SQLite extended result code for a primary-key uniqueness violation.
+const SQLITE_CONSTRAINT_PRIMARYKEY = 1555;
 
 interface QueryOptions extends Record<string, any> {
   limit?: number;
@@ -28,6 +36,9 @@ interface ColumnAliases {
   sessionId: string;
   project: string;
   timestamp: string;
+  /** Optional per-direction overrides for range-typed rows (activity intervals). */
+  timestampAfter?: string;
+  timestampBefore?: string;
   branch: string;
   source?: string;
 }
@@ -63,8 +74,8 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
     params.push(...opts.sessions);
   }
   if (opts.project) { clauses.push(`${aliases.project} LIKE ?`); params.push(opts.project); }
-  if (opts.after) { clauses.push(`${aliases.timestamp} > ?`); params.push(opts.after); }
-  if (opts.before) { clauses.push(`${aliases.timestamp} < ?`); params.push(opts.before); }
+  if (opts.after) { clauses.push(`${aliases.timestampAfter ?? aliases.timestamp} > ?`); params.push(opts.after); }
+  if (opts.before) { clauses.push(`${aliases.timestampBefore ?? aliases.timestamp} < ?`); params.push(opts.before); }
   if (opts.branch) { clauses.push(`${aliases.branch} = ?`); params.push(opts.branch); }
   if (opts.source && opts.source !== 'all' && aliases.source) {
     clauses.push(`COALESCE(${aliases.source}, 'claude') = ?`);
@@ -134,7 +145,10 @@ function buildSafeFtsQuery(text: unknown): string {
 
 function createQueryApi(
   db: SqliteDb,
-  { providerRegistry = createBuiltinProviderRegistry() }: { providerRegistry?: ProviderRegistry } = {},
+  {
+    providerRegistry = createBuiltinProviderRegistry(),
+    invokingSessionId = null,
+  }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
 ) {
   const q = (sql: string, ...p: any[]) => {
     assertReadOnlySql(sql);
@@ -204,6 +218,10 @@ function createQueryApi(
         .map(withVisibility)
         .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
       const sourceValue = r.m_source || r.s_source || 'claude';
+      const session: DbRow = { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue };
+      // is_invoking marks the session that ran this query; it is the agent's
+      // own live context, not independent historical evidence.
+      if (invokingSessionId && r.s_id === invokingSessionId) session.is_invoking = true;
       return {
         message: {
           uuid: r.uuid,
@@ -217,7 +235,7 @@ function createQueryApi(
           visibility: normalizedVisibility(r.visibility),
           source: sourceValue,
         },
-        session: { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue },
+        session,
         rank: r.rank,
         context: ctx,
       };
@@ -273,7 +291,14 @@ function createQueryApi(
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
     const needsJoin = opts.project || opts.branch || opts.source;
-    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: 'sa.session_id', branch: 's.git_branch', source: 's.source' });
+    // The subagents table has no timestamp column; scope time filters by the
+    // subagent's activity interval instead of comparing session IDs. `after`
+    // matches agents still active past the bound (latest message), `before`
+    // matches agents already started by the bound (earliest message), so
+    // combined bounds select every agent active during the window.
+    const firstMessageAt = '(SELECT MIN(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
+    const lastMessageAt = '(SELECT MAX(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
+    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: firstMessageAt, timestampAfter: lastMessageAt, timestampBefore: firstMessageAt, branch: 's.git_branch', source: 's.source' });
     params.push(limit);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {
@@ -343,11 +368,17 @@ function createQueryApi(
     ].join(' AND ');
     const allParams = [...filterParams, limit];
     const rows = db.prepare(`
-      SELECT tr.*, COALESCE(rm.visibility,'visible') AS visibility
+      SELECT tr.*,
+        CASE
+          WHEN COALESCE(rm.visibility,'visible') = 'inactive'
+            OR COALESCE(cm.visibility,'visible') = 'inactive'
+          THEN 'inactive'
+          ELSE 'visible'
+        END AS visibility
       FROM tool_results tr
-      JOIN messages rm ON rm.uuid=tr.message_uuid
-      JOIN tool_calls tc ON tc.id=tr.tool_use_id
-      JOIN messages cm ON cm.uuid=tc.message_uuid
+      LEFT JOIN messages rm ON rm.uuid=tr.message_uuid
+      LEFT JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      LEFT JOIN messages cm ON cm.uuid=tc.message_uuid
       ${join}
       WHERE ${errorCond} AND ${where}
       ORDER BY rm.timestamp DESC
@@ -380,7 +411,8 @@ function createQueryApi(
     const { limit = 50 } = opts;
     const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
-    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params);
+    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params)
+      .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
   };
 
   const recent = (n = 10) => sessions({ limit: n });
@@ -565,6 +597,9 @@ function createQueryApi(
       current: {
         cwd,
         project: currentProject,
+        // The session that invoked this query, when the invocation nonce
+        // resolved to exactly one indexed session; null when unknown.
+        session_id: invokingSessionId || null,
       },
       current_project,
       projects,
@@ -592,15 +627,12 @@ function createQueryApi(
       ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(message.agent_id) ?? null
       : null;
     const source = message.source || session?.source || 'claude';
-    const cursorRow = typeof session?.jsonl_path === 'string'
-      ? db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path)
-      : undefined;
     const record = providerRegistry.raw({
       source,
       messageUuid,
       session,
       agentId: message.agent_id || null,
-      cursor: typeof cursorRow?.cursor === 'string' ? cursorRow.cursor : null,
+      cursor: storedSessionCursor(db, providerRegistry, session),
       subagent,
       workflowAgent,
     });
@@ -653,7 +685,7 @@ function createQueryApi(
   return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
-function createAttuneApi(db: SqliteDb) {
+function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {
   const resolveMemoryPath = (memoryPath: string, sessionId?: string): string => {
     let base = null;
     if (sessionId) {
@@ -698,25 +730,47 @@ function createAttuneApi(db: SqliteDb) {
     assertEnglishMemoryText(summary, 'remember() summary');
     const normalizedPath = resolveMemoryPath(memoryPath, session_id);
     const normalizedAnchors = normalizeAnchors(anchors);
-    const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const proj = project || db.prepare('SELECT project FROM sessions WHERE id=?').get(session_id)?.project || null;
     const created_at = new Date().toISOString();
-    db.prepare('INSERT OR REPLACE INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
-      id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
+    // Plain INSERT, never OR REPLACE: a memory id must not silently overwrite
+    // an existing memory. Collisions regenerate instead of losing data.
+    let id = `mem-${randomUUID()}`;
+    runMutation(() => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          db.prepare('INSERT INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
+            id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
+          return;
+        } catch (error) {
+          // Primary-key collision: regenerate the id and retry. Any other
+          // constraint or error propagates unchanged.
+          const errcode = (error as { errcode?: unknown })?.errcode;
+          if (attempt < 2 && errcode === SQLITE_CONSTRAINT_PRIMARYKEY) {
+            id = `mem-${randomUUID()}`;
+            continue;
+          }
+          throw error;
+        }
+      }
+    });
     return { id, path: normalizedPath, project: proj, anchors: normalizedAnchors, created_at };
   };
 
   const forget = ({ id, reason }: ForgetInput) => {
     const deletionReason = String(reason || '').trim();
     if (!id || !deletionReason) throw new Error('forget() requires id and reason');
-    const row = db.prepare('SELECT id, deleted_at, deleted_reason FROM memories WHERE id=?').get(id);
-    if (!row) throw new Error(`forget() memory not found: ${id}`);
-    if (row.deleted_at) {
-      return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
-    }
-    const deleted_at = new Date().toISOString();
-    db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id);
-    return { id, deleted_at, deleted_reason: deletionReason };
+    // Read, decide, and update in one write transaction: a concurrent forget
+    // must observe the deleted state, not overwrite another forget's reason.
+    return runMutation(() => {
+      const row = db.prepare('SELECT id, deleted_at, deleted_reason FROM memories WHERE id=?').get(id);
+      if (!row) throw new Error(`forget() memory not found: ${id}`);
+      if (row.deleted_at) {
+        return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
+      }
+      const deleted_at = new Date().toISOString();
+      db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id);
+      return { id, deleted_at, deleted_reason: deletionReason };
+    });
   };
 
   return { remember, forget };

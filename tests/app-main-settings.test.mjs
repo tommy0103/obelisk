@@ -1,13 +1,16 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -37,8 +40,8 @@ class SqliteCompatDatabase {
 // `mock.module` keys mocks by the *resolved* module URL. The app's dependencies
 // live in `app/node_modules`, so they are NOT resolvable from this test file's
 // directory, and bare specifiers ('electron', ...) would either fail to resolve
-// here or resolve to the wrong ESM entry (e.g. chokidar exposes esm/index.js via
-// its "exports" map, which differs from require.resolve's CJS entry). We instead
+// here or resolve to a different entry than the main module sees (a package's
+// "exports" map can give ESM and CJS importers different files). We instead
 // resolve each bare specifier exactly as the main module sees it (ESM resolution
 // relative to the main module's directory) and mock that URL. Relative deps are
 // resolved against the main module URL directly.
@@ -56,7 +59,7 @@ function esmResolve(specifier) {
 
 const ELECTRON_URL = esmResolve('electron');
 const DATABASE_URL = esmResolve('better-sqlite3');
-const CHOKIDAR_URL = esmResolve('chokidar');
+const WATCHER_URL = new URL('../../../packages/adaptive-watcher/src/index.ts', mainUrl).href;
 const INDEXER_URL = new URL('./indexer.ts', mainUrl).href;
 const INDEXER_SERVICE_URL = new URL('./indexer-service.ts', mainUrl).href;
 const INDEXER_WORKER_URL = new URL('./indexer-worker-client.ts', mainUrl).href;
@@ -93,8 +96,36 @@ function electronNamespace({ app, BrowserWindow, ipcMain }) {
   };
 }
 
-function noopChokidar() {
-  return { watch: () => ({ on() { return this; }, close() {} }) };
+// Assigning undefined to process.env leaves the literal string "undefined"
+// instead of removing the variable — restore must delete in that case.
+function restoreEnvVar(name, value) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+// Captures app event handlers so a test can fire window-all-closed, which is
+// what makes the main module close its database handle.
+function captureAppHandlers(map) {
+  return {
+    whenReady: () => Promise.resolve(),
+    on(event, handler) { map.set(event, handler); },
+    quit() {},
+  };
+}
+
+// Windows refuses to unlink an open SQLite file; fire window-all-closed and
+// let the async close land before removing the temp home.
+async function closeMainProcessDb(appHandlers) {
+  appHandlers.get('window-all-closed')?.();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+function noopWatcher() {
+  return {
+    createAdaptiveWatcher: () => ({
+      close() { return Promise.resolve(); },
+    }),
+  };
 }
 
 function defaultIndexerService() {
@@ -120,13 +151,15 @@ function defaultIndexerWorkerClient() {
 async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const originalArgv = process.argv;
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-window-flags-${Date.now()}-${Math.random()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-window-flags-${Date.now()}-${Math.random()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   if (settingsText !== undefined) {
     writeFileSync(join(home, '.obelisk', 'settings.json'), settingsText);
   }
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   process.argv = [originalArgv[0] || 'node', originalArgv[1] || 'electron', ...flags];
 
   const windows = [];
@@ -166,7 +199,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -178,7 +211,8 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   } finally {
     restore();
     process.argv = originalArgv;
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 }
@@ -209,7 +243,8 @@ test('malformed settings keep the desktop recovery window available', async () =
 
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-watch-dirs-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   mkdirSync(join(claudeDir, 'projects'), { recursive: true });
@@ -218,6 +253,7 @@ test('main process watches every root declared by the built-in provider registry
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const serviceOptions = [];
   const workerCalls = [];
@@ -245,7 +281,7 @@ test('main process watches every root declared by the built-in provider registry
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -277,33 +313,37 @@ test('main process watches every root declared by the built-in provider registry
     await importMain();
 
     assert.equal(serviceOptions.length, 1);
-    assert.deepEqual(serviceOptions[0].watchDirs, [
-      join(claudeDir, 'projects'),
-      join(claudeDir, 'history.jsonl'),
-      join(codexDir, 'sessions'),
-      join(codexDir, 'session_index.jsonl'),
-      join(home, '.kimi-code', 'sessions'),
-      join(home, '.kimi-code', 'session_index.jsonl'),
-      join(home, '.pi', 'agent', 'sessions'),
+    assert.deepEqual(serviceOptions[0].watchTargets, [
+      { kind: 'tree', path: join(claudeDir, 'projects') },
+      { kind: 'file', path: join(claudeDir, 'history.jsonl') },
+      { kind: 'tree', path: join(codexDir, 'sessions') },
+      { kind: 'tree', path: join(codexDir, 'archived_sessions') },
+      { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
+      { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
     ]);
-    assert.equal(serviceOptions[0].watchDirs.includes(codexDir), false);
+    assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
     assert.deepEqual(workerCalls[0].providerSettings, {});
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process forwards committed IDs without reopening after a deferred build', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-deferred-build-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-deferred-build-${Date.now()}`);
   mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
   mkdirSync(join(home, '.codex', 'sessions'), { recursive: true });
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   let databaseOpens = 0;
   let serviceOptions;
@@ -341,7 +381,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -400,17 +440,20 @@ test('main process forwards committed IDs without reopening after a deferred bui
     });
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('session IPC hides Codex rows by default and supports explicit source opt-in', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-source-filter-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-source-filter-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const queries = [];
@@ -463,7 +506,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -492,17 +535,20 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
     );
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('usage IPC aggregates normalized tokens across all indexed providers', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-usage-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-usage-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   const setup = new DatabaseSync(dbPath);
@@ -561,6 +607,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   setup.close();
 
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
@@ -576,6 +623,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -585,7 +633,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -616,17 +664,21 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     assert.equal(piOnly.totalTokens, 35);
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process migrates an existing app database before source-filtered IPC queries', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-db-migration-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-db-migration-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const { DatabaseSync } = require('node:sqlite');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
@@ -657,6 +709,7 @@ test('main process migrates an existing app database before source-filtered IPC 
   legacy.close();
 
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
@@ -672,6 +725,7 @@ test('main process migrates an existing app database before source-filtered IPC 
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -681,7 +735,7 @@ test('main process migrates an existing app database before source-filtered IPC 
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -700,18 +754,22 @@ test('main process migrates an existing app database before source-filtered IPC 
     });
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process keeps schema and memory mutations behind the writer lease', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-migration-lease-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-migration-lease-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const legacy = new DatabaseSync(dbPath);
   legacy.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY)');
@@ -723,6 +781,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   });
   assert.ok(holder);
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
@@ -738,6 +797,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) { ipcHandlers.set(channel, handler); },
@@ -745,7 +805,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -764,7 +824,9 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   } finally {
     restore();
     holder.release();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -772,10 +834,12 @@ test('main process keeps schema and memory mutations behind the writer lease', a
 test('closing the last macOS window releases background resources until activation', async () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-window-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-window-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   Object.defineProperty(process, 'platform', { value: 'darwin' });
 
   const appHandlers = new Map();
@@ -818,10 +882,12 @@ test('closing the last macOS window releases background resources until activati
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, {
-      defaultExport: {
-        watch: () => {
-          const watcher = { on() { return this; }, close() { serviceEvents.push('watcher-close'); } };
+    [WATCHER_URL, {
+      namedExports: {
+        createAdaptiveWatcher: () => {
+          const watcher = {
+            close() { serviceEvents.push('watcher-close'); return Promise.resolve(); },
+          };
           watchers.push(watcher);
           return watcher;
         },
@@ -875,14 +941,15 @@ test('closing the last macOS window releases background resources until activati
     assert.equal(serviceEvents.filter(e => e === 'service-start').length, 2);
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('settings rebuild reopens the database from the configured Claude path', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-${Date.now()}`);
   const defaultClaudeDir = join(home, '.claude');
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
@@ -898,13 +965,17 @@ test('settings rebuild reopens the database from the configured Claude path', as
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const openedDbPaths = [];
   const buildCalls = [];
   const serviceEvents = [];
   const sent = [];
+  const promotedHints = [];
   let competingLeaseDuringBuild;
   let publishRebuild = false;
 
@@ -951,7 +1022,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -960,6 +1031,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
           stop() { serviceEvents.push('stop'); },
           idle: async () => { serviceEvents.push('idle'); },
           runBuildNow() { serviceEvents.push('runBuildNow'); return Promise.resolve(); },
+          promoteWatchHints(hints) { promotedHints.push(hints); },
         }),
       },
     }],
@@ -989,6 +1061,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
                     path: '/tmp/pi/structurally-invalid.jsonl',
                     error: 'Malformed Pi message at line 2',
                   }],
+              watchHints: publishRebuild ? ['/hint/live-session.jsonl'] : [],
             };
           },
           stop() { return Promise.resolve(); },
@@ -1006,6 +1079,10 @@ test('settings rebuild reopens the database from the configured Claude path', as
     const beforeIncomplete = require('node:fs').readFileSync(liveDbPath, 'utf8');
     const incomplete = await rebuild();
     assert.equal(incomplete.complete, false);
+    assert.ok(
+      serviceEvents.includes('runBuildNow'),
+      'a rebuild without hints schedules a reconciling build to reseed the hot set',
+    );
     assert.deepEqual(sent.findLast(message => message.channel === 'obelisk:index-updated'), {
       channel: 'obelisk:index-updated',
       payload: {
@@ -1044,6 +1121,8 @@ test('settings rebuild reopens the database from the configured Claude path', as
       'rebuilt temp db',
     );
     assert.ok(serviceEvents.indexOf('build') > serviceEvents.indexOf('stop'));
+    assert.deepEqual(promotedHints, [['/hint/live-session.jsonl']],
+      'a successful rebuild seeds the recreated watcher with its watch hints');
     const postRebuildLease = acquireWriterLease({
       lockPath: join(home, '.obelisk', 'writer.lock.sqlite'),
       openDb: lockPath => new DatabaseSync(lockPath),
@@ -1052,13 +1131,14 @@ test('settings rebuild reopens the database from the configured Claude path', as
     postRebuildLease.release();
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('settings rebuild keeps the existing database after a worker failure', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-failure-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-failure-${Date.now()}`);
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
   mkdirSync(customClaudeDir, { recursive: true });
@@ -1071,7 +1151,10 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const openedDbPaths = [];
@@ -1118,7 +1201,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -1162,13 +1245,14 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
     assert.ok(serviceEvents.lastIndexOf('start') > serviceEvents.indexOf('build'));
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('settings rebuild cancels an in-flight background build instead of waiting for it', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-cancel-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-cancel-${Date.now()}`);
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
   mkdirSync(customClaudeDir, { recursive: true });
@@ -1181,7 +1265,10 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const serviceEvents = [];
@@ -1222,7 +1309,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -1265,7 +1352,208 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
     assert.ok(serviceEvents.some(event => event.startsWith('build-')));
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('settings changes during rebuild keep one watcher and re-enable with a catch-up build', async () => {
+  const home = makeTempDir(`obelisk-main-settings-rebuild-race-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({ autoRefresh: true }));
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+  const services = [];
+  let finishRebuild;
+
+  class FakeDatabase {
+    constructor(dbPath) {
+      this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
+    }
+    pragma() {}
+    exec(sql) { return this.lockDb?.exec(sql); }
+    close() { this.lockDb?.close(); }
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, {
+      namedExports: {
+        createIndexerService: () => {
+          const service = {
+            starts: [],
+            stops: 0,
+            start(options) { this.starts.push(options); },
+            stop() { this.stops += 1; },
+            idle: async () => {},
+            runBuildNow() { return Promise.resolve(); },
+          };
+          services.push(service);
+          return service;
+        },
+      },
+    }],
+    [INDEXER_WORKER_URL, {
+      namedExports: {
+        createWorkerBuildIndex: () => ({
+          buildIndex: () => new Promise(resolve => {
+            finishRebuild = () => resolve({
+              files: 0,
+              affectedSessionIds: [],
+              complete: false,
+              deferred: false,
+              inventoryIssues: [],
+              skippedFiles: [],
+              reason: 'incomplete_snapshot',
+            });
+          }),
+          stop() { return Promise.resolve(); },
+        }),
+      },
+    }],
+  ]);
+
+  try {
+    await importMain();
+    assert.equal(services.length, 1);
+
+    const rebuildPromise = ipcHandlers.get('settings:rebuildIndex')();
+    await new Promise(resolve => setImmediate(resolve));
+    await ipcHandlers.get('settings:set')(null, 'autoRefresh', false);
+    await ipcHandlers.get('settings:set')(null, 'autoRefresh', true);
+
+    assert.equal(services.length, 2);
+    assert.deepEqual(services[1].starts, [{ buildOnStart: true }]);
+    finishRebuild();
+    await rebuildPromise;
+
+    assert.equal(services.length, 2, 'the rebuild finally block reused the current service');
+    assert.equal(services[0].stops, 1);
+    assert.equal(services[1].stops, 0);
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+test('main process watches OBELISK_DIR as a tree target and debounces recap notifications', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-watch-retry-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  let watcherOptions = null;
+  const windows = [];
+  const sent = [];
+
+  class FakeDatabase {
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {},
+        send(channel, payload) { sent.push({ channel, payload }); },
+      };
+      windows.push(this);
+    }
+    loadFile() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return windows; }
+    static fromWebContents() { return null; }
+  }
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, {
+      namedExports: {
+        createAdaptiveWatcher: (options) => {
+          watcherOptions = options;
+          return { close() { return Promise.resolve(); } };
+        },
+      },
+    }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+    assert.ok(watcherOptions, 'the OBELISK_DIR watcher was created');
+    // Retry/recovery lives inside the package now; the app only declares the
+    // target. The package's own tests prove the retry loop repeats.
+    assert.deepEqual(watcherOptions.targets, [{ kind: 'tree', path: join(home, '.obelisk') }]);
+
+    // A recap markdown invalidation notifies windows after the writes settle:
+    // true trailing debounce — the timer resets on every event.
+    const recapFile = join(home, '.obelisk', 'recap', 'week.md');
+    watcherOptions.onInvalidate({ type: 'paths', paths: [recapFile] });
+    mock.timers.tick(200);
+    watcherOptions.onInvalidate({ type: 'paths', paths: [recapFile] });
+    mock.timers.tick(299);
+    assert.equal(sent.length, 0, 'a continuous write burst has not notified yet');
+    mock.timers.tick(1);
+    assert.equal(sent.length, 1, 'notification fires 300 ms after the LAST event, not the first');
+    assert.equal(sent[0].channel, 'obelisk:recap-updated');
+    assert.equal(sent[0].payload, recapFile);
+
+    // Non-recap extensions never notify.
+    watcherOptions.onInvalidate({ type: 'paths', paths: [join(home, '.obelisk', 'notes.txt')] });
+    mock.timers.tick(1000);
+    assert.equal(sent.length, 1, 'a .txt change does not notify');
+  } finally {
+    restore();
+    mock.timers.reset();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });

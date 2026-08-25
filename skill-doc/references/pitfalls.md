@@ -3,6 +3,14 @@
 Use this after a query error, suspicious empty result, over-large output, or
 unclear helper row shape. For query design, read `retrieval-semantics.md` first.
 
+## Empty `--query` After `mktemp`
+
+If stderr starts with `mktemp: mkstemp failed on /tmp/obq.XXXXXX.mjs: File exists`
+and then Obelisk prints usage, the query never started. BSD `mktemp` created the
+literal path `/tmp/obq.XXXXXX.mjs` because the template did not end on the `X`
+run. Recreate the file with `mktemp /tmp/obq.XXXXXX` and remove the leftover
+literal path if it is still present.
+
 ## Missing Columns And Wrong Aliases
 
 Common wrong guesses:

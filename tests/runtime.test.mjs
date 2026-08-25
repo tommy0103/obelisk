@@ -1,17 +1,20 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 
 import { runCli as runRuntime } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
 
 function tempHome() {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-runtime-home-'));
+  const home = makeTempDir('obelisk-runtime-home-');
   mkdirSync(join(home, '.claude'), { recursive: true });
   return home;
 }
@@ -67,6 +70,22 @@ test('malformed Obelisk settings skip refresh without disabling provider-backed 
   assert.equal(rebuild.status, 1);
   assert.match(JSON.parse(rebuild.stdout).error, /settings_unavailable/);
   assert.match(JSON.parse(rebuild.stdout).error, /Unable to read Obelisk settings/);
+
+  const memoryPath = join(home, 'settings-free-memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Settings-free memory\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'runtime-test',
+      summary: 'Decision: memory writes do not depend on provider settings.'
+    });
+  `);
+  // Memory writes touch only the memories table, so they stay available even
+  // while provider settings are unreadable.
+  const attune = runRuntime(['--attune', attunePath], { home });
+  assert.equal(attune.status, 0, attune.stderr || attune.stdout);
+  assert.equal(JSON.parse(attune.stdout).project, 'runtime-test');
 });
 
 test('runtime attune scripts expose only memory mutation helpers', () => {
@@ -74,6 +93,11 @@ test('runtime attune scripts expose only memory mutation helpers', () => {
   const memoryPath = join(home, 'memory.md');
   const scriptPath = join(home, 'attune.mjs');
   writeFileSync(memoryPath, '# Memory\n');
+  // Attune no longer builds the index itself; initialize it with a query first.
+  const initPath = join(home, 'init.mjs');
+  writeFileSync(initPath, "return 'init';");
+  const init = runRuntime(['--query', initPath], { home });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
   writeFileSync(scriptPath, `
     return {
       rememberType: typeof remember,
@@ -137,6 +161,108 @@ test('runtime migrates old memories schema before recall', () => {
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(JSON.parse(result.stdout), [{ id: 'mem-old', rankType: 'number' }]);
+});
+
+test('runtime migrates a recently built legacy schema before honoring the skip window', () => {
+  const home = tempHome();
+  const obeliskDir = join(home, '.obelisk');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(
+    new URL('../packages/core/src/schema.sql', import.meta.url),
+    'utf8',
+  )
+    .replace(', cursor TEXT);', ');')
+    .replace(
+      ", visibility TEXT DEFAULT 'visible',\n  input_tokens INTEGER, output_tokens INTEGER);",
+      ');',
+    );
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare(`
+    INSERT INTO sessions (id,title,jsonl_path,source)
+    VALUES (?,?,?,?)
+  `).run('legacy-session', 'Legacy session', '/missing/session.jsonl', 'claude');
+  db.prepare(`
+    INSERT INTO messages (
+      uuid,session_id,type,role,text,content_type,visibility,source
+    ) VALUES (?,?,?,?,?,?,?,?)
+  `).run('legacy-message', 'legacy-session', 'user', 'user', 'legacy evidence', 'text', 'visible', 'claude');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed)
+    VALUES ('__last_build__',?,0)
+  `).run(Date.now());
+  db.close();
+
+  const scriptPath = join(home, 'legacy-query.mjs');
+  writeFileSync(scriptPath, `
+    return thread('legacy-session').map(message => message.uuid);
+  `);
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), ['legacy-message']);
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  assert.ok(migrated.prepare('PRAGMA table_info(index_state)').all().some(row => row.name === 'cursor'));
+  assert.ok(migrated.prepare('PRAGMA table_info(summaries)').all().some(row => row.name === 'visibility'));
+  migrated.close();
+});
+
+test('malformed settings still allow a legacy query schema to migrate', () => {
+  const home = tempHome();
+  const obeliskDir = join(home, '.obelisk');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(
+    new URL('../packages/core/src/schema.sql', import.meta.url),
+    'utf8',
+  )
+    .replace(', cursor TEXT);', ');')
+    .replace(
+      ", visibility TEXT DEFAULT 'visible',\n  input_tokens INTEGER, output_tokens INTEGER);",
+      ');',
+    );
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare(`
+    INSERT INTO sessions (id,title,jsonl_path,source)
+    VALUES (?,?,?,?)
+  `).run('legacy-recovery', 'Legacy recovery', '/missing/session.jsonl', 'claude');
+  db.prepare(`
+    INSERT INTO messages (
+      uuid,session_id,type,role,text,content_type,visibility,source
+    ) VALUES (?,?,?,?,?,?,?,?)
+  `).run('legacy-recovery-message', 'legacy-recovery', 'user', 'user', 'legacy recovery', 'text', 'visible', 'claude');
+  db.prepare(`
+    INSERT INTO summaries (id,session_id,timestamp,source,content)
+    VALUES (?,?,?,?,?)
+  `).run('legacy-summary', 'legacy-recovery', '2026-08-05T00:00:00Z', 'compaction', 'summary');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed)
+    VALUES ('__last_build__',?,0)
+  `).run(Date.now());
+  db.close();
+  writeFileSync(join(obeliskDir, 'settings.json'), '{broken');
+
+  const scriptPath = join(home, 'legacy-recovery-query.mjs');
+  writeFileSync(scriptPath, `
+    return {
+      summaries: summaries('legacy-recovery').map(summary => summary.id),
+      raw: raw('legacy-recovery-message')
+    };
+  `);
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /index refresh skipped/);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    summaries: ['legacy-summary'],
+    raw: null,
+  });
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  assert.ok(migrated.prepare('PRAGMA table_info(index_state)').all().some(row => row.name === 'cursor'));
+  assert.ok(migrated.prepare('PRAGMA table_info(summaries)').all().some(row => row.name === 'visibility'));
+  migrated.close();
 });
 
 test('runtime indexes Codex root sessions into the shared query helpers', () => {
@@ -244,6 +370,59 @@ test('runtime indexes Codex root sessions into the shared query helpers', () => 
   assert.equal(payload.toolResult.message_uuid, `codex:${codexId}:000005`);
   assert.equal(payload.toolResult.content, '/tmp/obelisk-runtime');
   assert.ok(payload.overviewSources.some(s => s.source === 'codex' && s.session_count === 1));
+});
+
+test('runtime indexes Codex archived sessions into the shared query helpers', () => {
+  const home = tempHome();
+  const archiveDir = join(home, '.codex', 'archived_sessions');
+  mkdirSync(archiveDir, { recursive: true });
+
+  const codexId = '019ec6ee-cebd-7431-9c93-ceec89a98a5e';
+  writeFileSync(join(archiveDir, `rollout-2026-06-15T00-19-59-${codexId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-06-14T16:19:59.842Z',
+      type: 'session_meta',
+      payload: {
+        id: codexId,
+        timestamp: '2026-06-14T16:19:59.842Z',
+        cwd: '/tmp/obelisk-archive-runtime',
+        source: 'cli',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-14T16:20:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'archived runtime indexing sentinel' },
+    }),
+    '',
+  ].join('\n'));
+
+  const scriptPath = join(home, 'query.mjs');
+  writeFileSync(scriptPath, `
+    const sid = ${JSON.stringify(`codex:${codexId}`)};
+    return {
+      session: sessions({ source: 'codex', limit: 5 })
+        .filter(session => session.id === sid)
+        .map(({ id, project, project_path, message_count, source }) => ({ id, project, project_path, message_count, source }))[0],
+      message: thread(sid)[0]?.text,
+      rawHasMessage: raw(${JSON.stringify(`codex:${codexId}:000002`)}, { limit: 1000 })?.text.includes('archived runtime indexing sentinel') || false,
+    };
+  `);
+
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    session: {
+      id: `codex:${codexId}`,
+      project: '-tmp-obelisk-archive-runtime',
+      project_path: normalize('/tmp/obelisk-archive-runtime'),
+      message_count: 1,
+      source: 'codex',
+    },
+    message: 'archived runtime indexing sentinel',
+    rawHasMessage: true,
+  });
 });
 
 test('runtime raw lookup uses the configured Codex root for child sessions', () => {

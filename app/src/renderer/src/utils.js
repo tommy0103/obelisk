@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Utility functions ported from the vanilla JS utils.js.
 // Pure helpers with no side-effects on global state (except formatProjectLabel which reads store).
 

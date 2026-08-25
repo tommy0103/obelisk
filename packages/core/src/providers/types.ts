@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Core provider contract (see docs/adr/0001).
 //
 // The indexing layer splits along two orthogonal axes:
@@ -37,7 +40,7 @@ export interface IndexUnit {
   agentId?: string;
   /** Adapter-private payload, opaque to the orchestration. */
   meta?: unknown;
-  /** Previously indexed sessions this unit atomically supersedes or retracts. */
+  /** Previously indexed sessions atomically retracted by persist before this unit is written. */
   retractSessionIds?: readonly string[];
 }
 
@@ -208,9 +211,9 @@ export interface MessageTurnDurationRecord {
   turn_duration_ms: number | null;
 }
 
-// Retraction op (not a table). The adapter emits this when a previously-indexed
-// session must be removed — e.g. a Codex guardian/auto-review thread. Persist
-// executes the cascade delete across all tables for that session.
+// Retraction op (not a table). An adapter emits this when removal is discovered
+// during parsing, e.g. a Codex guardian thread. Discovery-known retractions use
+// IndexUnit.retractSessionIds instead. Persist cascades either form.
 export interface DeleteSessionRecord {
   kind: 'delete-session';
   sessionId: string;
@@ -292,11 +295,27 @@ export interface RawRecord {
   readonly messageText?: string | null;
 }
 
+/**
+ * A watchable provider source: a directory `tree` (recursive subscription)
+ * or an exact `file` (metadata polling). Structurally identical to the
+ * adaptive-watcher package's WatchTarget (ADR-0009); duplicated here so
+ * @obelisk/core carries no watcher dependency.
+ */
+export interface WatchTarget {
+  readonly kind: 'tree' | 'file';
+  readonly path: string;
+}
+
 /** Complete adapter interface used by every indexing and presentation caller. */
 export interface ProviderAdapter extends Provider {
   readonly descriptor: ProviderDescriptor;
   /** Optional index semantics marker; absence forces one provider-owned replay. */
   readonly indexVersionMarker?: string;
-  watchRoots(configuredRoot: string): string[];
+  /**
+   * Recover the IndexUnit key for a persisted session when it differs from the
+   * canonical source path. File-backed providers normally omit this.
+   */
+  sessionUnitKey?(session: IndexedSession): string;
+  watchTargets(configuredRoot: string): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }

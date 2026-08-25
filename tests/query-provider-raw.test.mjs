@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -15,7 +18,7 @@ test('raw query delegates source semantics to the registered provider', () => {
   const registry = createProviderRegistry([{
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover: () => [],
     *parse() { yield* []; return null; },
     raw(input) {

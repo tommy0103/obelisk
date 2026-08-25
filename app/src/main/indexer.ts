@@ -1,9 +1,13 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
@@ -14,6 +18,7 @@ import {
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readRecentTranscriptHints,
   writeProviderIndexMarkers,
   type ProviderInventoryIssue,
   type ProviderSessionProvenance,
@@ -261,6 +266,8 @@ interface BuildIndexResult {
   complete: boolean;
   incompleteProviders: string[];
   inventoryIssues: ProviderInventoryIssue[];
+  /** Most recently written transcripts (ADR-0009 hot-set seeding). */
+  watchHints?: string[];
   reason?: string;
 }
 
@@ -415,6 +422,7 @@ function buildIndex({
       };
       const finalize = (providerResult) => {
         refreshSessionProjectPaths(db);
+        healWorkflowParentLinks(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
         writeIndexMarker(db, '__last_build__');
@@ -462,8 +470,7 @@ function buildIndex({
               error: error.sourceError instanceof Error
                 ? error.sourceError.message
                 : String(error.sourceError),
-              diagnostics: (error as { obelisk?: unknown }).obelisk
-                ?? (error.sourceError as { obelisk?: unknown } | null)?.obelisk,
+              diagnostics: (error as { obelisk?: unknown }).obelisk,
             });
             console.warn(
               `Warning: failed to index ${error.item.provider.name} unit ${error.item.unit.key}: ${error.message}`,
@@ -496,6 +503,7 @@ function buildIndex({
           complete: true,
           incompleteProviders,
           inventoryIssues,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 
@@ -557,6 +565,7 @@ function buildIndex({
         complete: providerResult.complete,
         incompleteProviders,
         inventoryIssues,
+        watchHints: readRecentTranscriptHints(db),
       };
     } finally {
       if (messageFtsTriggersDropped) {

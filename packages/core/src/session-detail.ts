@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import type {
   TranscriptRecord,
   MessageVisibility,
@@ -206,6 +209,10 @@ function assembleMessages(
       .filter((result) => visibleCallIds.has(result.tool_use_id))
       .map((result) => result.message_uuid),
   );
+  const omitToolResultMessage = (message: SessionDetailMessage) => (
+    message.content_type === 'tool_result'
+    && (attachedResultMessageUuids.has(message.uuid) || !message.text)
+  );
   const resultsByCallId = new Map<string, SessionDetailToolResult>();
   for (const result of visibleToolResults) {
     resultsByCallId.set(result.tool_use_id, withoutKind(result));
@@ -255,10 +262,7 @@ function assembleMessages(
   const output: AssembledMessage[] = [];
   for (let index = 0; index < raw.length; index++) {
     const message = raw[index];
-    if (
-      message.content_type === 'tool_result'
-      && attachedResultMessageUuids.has(message.uuid)
-    ) continue;
+    if (omitToolResultMessage(message)) continue;
 
     if (message.type === 'assistant' && message.content_type === 'thinking') {
       const thinkingParts = [message.text ?? ''];
@@ -296,10 +300,7 @@ function assembleMessages(
       let nextIndex = index + 1;
       while (nextIndex < raw.length) {
         const next = raw[nextIndex];
-        if (
-          next.content_type === 'tool_result'
-          && attachedResultMessageUuids.has(next.uuid)
-        ) {
+        if (omitToolResultMessage(next)) {
           nextIndex++;
           continue;
         }
@@ -330,10 +331,7 @@ function assembleMessages(
       let nextIndex = index + 1;
       while (nextIndex < raw.length) {
         const next = raw[nextIndex];
-        if (
-          next.content_type === 'tool_result'
-          && attachedResultMessageUuids.has(next.uuid)
-        ) {
+        if (omitToolResultMessage(next)) {
           nextIndex++;
           continue;
         }

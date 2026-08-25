@@ -1,9 +1,12 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdtempSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -33,7 +36,7 @@ class TestDatabase {
 }
 
 test('app indexer records build success without claiming daemon ownership', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-'));
+  const home = makeTempDir('obelisk-app-indexer-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -91,7 +94,7 @@ test('app indexer records build success without claiming daemon ownership', () =
 });
 
 test('app indexer refreshes unchanged Claude usage when input token semantics change', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-token-semantics-'));
+  const home = makeTempDir('obelisk-app-indexer-token-semantics-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -146,7 +149,7 @@ test('app indexer refreshes unchanged Claude usage when input token semantics ch
 });
 
 test('force rebuild ignores stale JSONL index_state rows after session tables were cleared', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-force-'));
+  const home = makeTempDir('obelisk-app-indexer-force-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -181,7 +184,7 @@ test('force rebuild ignores stale JSONL index_state rows after session tables we
 });
 
 test('force rebuild bypasses stale message FTS delete triggers', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-force-fts-'));
+  const home = makeTempDir('obelisk-app-indexer-force-fts-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -223,7 +226,7 @@ test('force rebuild bypasses stale message FTS delete triggers', () => {
 });
 
 test('force rebuild into a new database preserves existing memories', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-force-preserve-'));
+  const home = makeTempDir('obelisk-app-indexer-force-preserve-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -279,7 +282,7 @@ test('force rebuild into a new database preserves existing memories', () => {
 });
 
 test('app indexer reports changed workflow JSON as an affected session', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-workflow-'));
+  const home = makeTempDir('obelisk-app-indexer-workflow-');
   const claudeDir = join(home, '.claude');
   const project = '-tmp-obelisk-app';
   const sessionId = 'session-workflow-1';
@@ -319,7 +322,7 @@ test('app indexer reports changed workflow JSON as an affected session', () => {
 });
 
 test('app indexer marks UI-fallback control messages as meta at ingest time', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-meta-'));
+  const home = makeTempDir('obelisk-app-indexer-meta-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -358,7 +361,7 @@ test('app indexer marks UI-fallback control messages as meta at ingest time', ()
 });
 
 test('app indexer loads Codex root sessions into the shared schema', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -449,7 +452,7 @@ test('app indexer loads Codex root sessions into the shared schema', () => {
 });
 
 test('app indexer accepts Codex changed paths relative to the sessions directory', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-sessions-change-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-sessions-change-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -497,7 +500,7 @@ test('app indexer accepts Codex changed paths relative to the sessions directory
 });
 
 test('app indexer uses Codex response_item messages only when no visible event message exists', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-response-message-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-response-message-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -567,7 +570,7 @@ test('app indexer uses Codex response_item messages only when no visible event m
 });
 
 test('app indexer skips Codex guardian review threads', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-guardian-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-guardian-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -619,7 +622,7 @@ test('app indexer skips Codex guardian review threads', () => {
 });
 
 test('app indexer removes stale Codex guardian rows when the JSONL was already indexed', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-guardian-stale-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-guardian-stale-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -679,7 +682,7 @@ test('app indexer removes stale Codex guardian rows when the JSONL was already i
 });
 
 test('app indexer maps Codex subagent threads onto parent sessions', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-subagent-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-subagent-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');

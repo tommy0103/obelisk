@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Codex provider adapter in Core (see docs/adr/0001).
 //
 // Pure: discovers Codex rollout files and parses one into a record stream. It
@@ -36,6 +39,8 @@ import type {
 
 export const name = 'codex';
 const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v2__';
+const CODEX_SESSIONS_DIR = 'sessions';
+const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
 const HIDDEN_CONTEXT_ENVELOPE_RE = /^\s*<(environment_context|codex_internal_context)\b[^>]*>[\s\S]*<\/\1>\s*$/;
 
@@ -45,8 +50,15 @@ function messageVisibility(role: string, text: string | null): 'visible' | 'hidd
     : 'visible';
 }
 
+function codexTranscriptDirs(rootDir: string): string[] {
+  return [
+    join(rootDir, CODEX_SESSIONS_DIR),
+    join(rootDir, CODEX_ARCHIVED_SESSIONS_DIR),
+  ];
+}
+
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
-  const sessionsDir = join(rootDir, 'sessions');
+  const [sessionsDir, archivedSessionsDir] = codexTranscriptDirs(rootDir);
   if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
     ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
   }
@@ -72,44 +84,49 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       ? normalize(changedPath)
       : normalize(join(rootDir, changedPath));
     if (rootRelative === sessionIndexPath) sessionIndexChanged = true;
-    const absolute = isAbsolute(changedPath)
-      ? normalize(changedPath)
-      : normalize(join(sessionsDir, changedPath));
-    const inside = relative(sessionsDir, absolute);
-    if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
-    if (absolute.toLowerCase().endsWith('.jsonl')) changedFiles.add(absolute);
-  }
-  return discoverCodexJsonlFiles(sessionsDir, ctx.reportIncompleteInventory).flatMap((file) => {
-    if (ctx.changedPaths !== undefined && !sessionIndexChanged && !changedFiles.has(normalize(file.path))) return [];
-    const cursor = ctx.lastCursor(file.path);
-    const guardian = readCodexGuardianThreadInfo(file.path);
-    if (!sessionIndexChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs && guardian === null) {
-      return [];
+    for (const transcriptDir of [sessionsDir, archivedSessionsDir]) {
+      const absolute = isAbsolute(changedPath)
+        ? normalize(changedPath)
+        : normalize(join(transcriptDir, changedPath));
+      const inside = relative(transcriptDir, absolute);
+      if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
+      if (absolute.toLowerCase().endsWith('.jsonl')) changedFiles.add(absolute);
     }
-    let meta: any = null;
-    readLines(file.path, (line: string) => {
-      try {
-        const record = JSON.parse(line);
-        if (record?.type === 'session_meta' && record.payload?.id) {
-          meta = record.payload;
-          return false;
-        }
-      } catch { /* malformed source line */ }
-    });
-    const rawId = meta ? codexRawId(meta.id) : null;
-    const parentId = meta ? codexParentThreadId(meta) : null;
-    const indexed = rawId ? sessionIndex.get(rawId) : undefined;
-    return [{
-      key: file.path,
-      sessionId: guardian === null ? codexDbId(parentId || rawId) ?? '' : '',
-      meta: {
-        source: 'codex',
-        guardian: guardian !== null,
-        indexedTitle: indexed?.title,
-        indexedUpdatedAt: indexed?.updatedAt,
-      },
-    }];
-  });
+  }
+  return codexTranscriptDirs(rootDir).flatMap((transcriptDir) => (
+    discoverCodexJsonlFiles(transcriptDir, ctx.reportIncompleteInventory).flatMap((file) => {
+      const fileChanged = changedFiles.has(normalize(file.path));
+      if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
+      const cursor = ctx.lastCursor(file.path);
+      const guardian = readCodexGuardianThreadInfo(file.path);
+      if (!sessionIndexChanged && !fileChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs && guardian === null) {
+        return [];
+      }
+      let meta: any = null;
+      readLines(file.path, (line: string) => {
+        try {
+          const record = JSON.parse(line);
+          if (record?.type === 'session_meta' && record.payload?.id) {
+            meta = record.payload;
+            return false;
+          }
+        } catch { /* malformed source line */ }
+      });
+      const rawId = meta ? codexRawId(meta.id) : null;
+      const parentId = meta ? codexParentThreadId(meta) : null;
+      const indexed = rawId ? sessionIndex.get(rawId) : undefined;
+      return [{
+        key: file.path,
+        sessionId: guardian === null ? codexDbId(parentId || rawId) ?? '' : '',
+        meta: {
+          source: 'codex',
+          guardian: guardian !== null,
+          indexedTitle: indexed?.title,
+          indexedUpdatedAt: indexed?.updatedAt,
+        },
+      }];
+    })
+  ));
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
@@ -314,7 +331,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
 }
 
 function findCodexFile(rootDir: string, rawThreadId: string): string | null {
-  const stack = [join(rootDir, 'sessions')];
+  const stack = codexTranscriptDirs(rootDir);
   while (stack.length > 0) {
     const current = stack.pop()!;
     if (!existsSync(current)) continue;
@@ -369,7 +386,10 @@ export function createCodexProvider({ rootDir = join(homedir(), '.codex') }: { r
     name,
     descriptor: { id: name, name: 'Codex', vendor: 'OpenAI', defaultRoot: rootDir, color: '#10a37f' },
     indexVersionMarker: CODEX_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [join(configuredRoot, 'sessions'), join(configuredRoot, 'session_index.jsonl')],
+    watchTargets: (configuredRoot) => [
+      ...codexTranscriptDirs(configuredRoot).map((dir) => ({ kind: 'tree' as const, path: dir })),
+      { kind: 'file', path: join(configuredRoot, 'session_index.jsonl') },
+    ],
     discover: (ctx) => discoverAt(rootDir, ctx),
     parse,
     raw: (input) => rawCodex(rootDir, input),

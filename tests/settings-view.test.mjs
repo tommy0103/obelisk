@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -19,4 +22,15 @@ test('Editor selector uses the themed Settings control vocabulary', () => {
   assert.match(source, /\.editor-picker\s*\{[^}]*width:\s*180px/s);
   assert.match(source, /aria-haspopup="listbox"/);
   assert.match(source, /role="option"/);
+});
+
+test('background index updates preserve an in-progress Recap path edit', () => {
+  assert.match(source, /loadSettings\(\{\s*preserveRecapPath:\s*true\s*\}\)/);
+  assert.match(source, /if\s*\(!preserveRecapPath\)\s*recapPath\.value\s*=/);
+});
+
+test('rebuild failures are caught and surfaced in Settings', () => {
+  assert.match(source, /catch\s*\(error\)\s*\{[\s\S]*rebuildError\.value\s*=/);
+  assert.match(source, /v-if="rebuildError"/);
+  assert.match(source, /\{\{\s*rebuildError\s*\}\}/);
 });

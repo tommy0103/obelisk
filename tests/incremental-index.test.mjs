@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5b-2b: verifies incremental (resume) indexing through the full rewired
 // buildIndex path (needsReindex → cursor → claude.parse → persist). A force
 // --build re-scans everything (skip=0) and never exercises resume, so this
@@ -8,11 +11,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, utimesSync, statSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, appendFileSync, utimesSync, statSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -39,7 +42,7 @@ function counts(home) {
 }
 
 test('incremental buildIndex resumes from cursor and accumulates message_count', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-incr-'));
+  const home = makeTempDir('obelisk-incr-');
   const projDir = join(home, '.claude', 'projects', '-tmp-proj');
   mkdirSync(projDir, { recursive: true });
   const jsonl = join(projDir, 'sess.jsonl');
@@ -67,7 +70,7 @@ test('incremental buildIndex resumes from cursor and accumulates message_count',
 });
 
 test('force build purges sessions for deleted files and preserves memories', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-force-'));
+  const home = makeTempDir('obelisk-force-');
   const projDir = join(home, '.claude', 'projects', '-tmp-proj');
   mkdirSync(projDir, { recursive: true });
   const keep = join(projDir, 'keep.jsonl');

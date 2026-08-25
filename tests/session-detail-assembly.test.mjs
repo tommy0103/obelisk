@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { assembleSessionDetail } from '../app/src/shared/session-detail-assembly.mjs';
@@ -34,6 +37,32 @@ test('session assembly preserves thinking and attaches tool result and subagent 
   assert.equal(assembled[0]._thinking, 'reasoning');
   assert.deepEqual(assembled[0].tool_calls[0].result.content, 'done');
   assert.equal(assembled[0].tool_calls[0].subagent.agent_id, 'agent-1');
+});
+
+test('orphan tool results stay out of the timeline and do not break assistant merging', () => {
+  const assembled = assembleSessionDetail({
+    messages: [
+      { uuid: 'answer', type: 'assistant', content_type: 'text', text: 'answer' },
+      { uuid: 'orphan-result', type: 'user', content_type: 'tool_result', text: '' },
+      { uuid: 'tool', type: 'assistant', content_type: 'tool_use', text: '' },
+    ],
+    toolCalls: [{
+      id: 'call',
+      message_uuid: 'tool',
+      name: 'Read',
+      input_json: '{"path":"/tmp/file"}',
+    }],
+    toolResults: [{
+      tool_use_id: 'missing-call',
+      message_uuid: '',
+      content: 'orphaned failure',
+      is_error: 1,
+    }],
+  }).messages;
+
+  assert.equal(assembled.length, 1);
+  assert.equal(assembled[0].uuid, 'answer');
+  assert.deepEqual(assembled[0].tool_calls.map(call => call.id), ['call']);
 });
 
 test('session assembly keeps Skill evidence standalone and embeds matching workflow agents', () => {

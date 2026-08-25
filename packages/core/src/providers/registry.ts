@@ -1,15 +1,19 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import type {
   ProviderAdapter,
   ProviderDescriptor,
   RawLookup,
   RawRecord,
+  WatchTarget,
 } from './types.ts';
 
 export interface ProviderRegistry {
   catalog(): ProviderDescriptor[];
   get(source: string): ProviderAdapter | undefined;
   list(): ProviderAdapter[];
-  watchRoots(configuredRoots?: Readonly<Record<string, string>>): string[];
+  watchTargets(configuredRoots?: Readonly<Record<string, string>>): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }
 
@@ -29,13 +33,19 @@ export function createProviderRegistry(providers: readonly ProviderAdapter[]): P
     catalog: () => list().map((provider) => ({ ...provider.descriptor })),
     get: (source) => byId.get(source),
     list,
-    watchRoots: (configuredRoots = {}) => [
-      ...new Set(
-        list().flatMap((provider) =>
-          provider.watchRoots(configuredRoots[provider.name] ?? provider.descriptor.defaultRoot),
-        ),
-      ),
-    ],
+    watchTargets: (configuredRoots = {}) => {
+      const seen = new Set<string>();
+      return list()
+        .flatMap((provider) =>
+          provider.watchTargets(configuredRoots[provider.name] ?? provider.descriptor.defaultRoot),
+        )
+        .filter((target) => {
+          const key = `${target.kind}:${target.path}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+    },
     raw: (input) => byId.get(input.source)?.raw(input) ?? null,
   };
 }

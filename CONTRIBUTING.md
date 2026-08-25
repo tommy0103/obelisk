@@ -10,6 +10,23 @@ bottom applies to every PR.
 
 ---
 
+## Before you open a pull request
+
+- **Bug reports are always welcome** as issues — no permission needed.
+- **Bugfix PRs may be opened directly**, but state the reproduction and the root
+  cause in the description. Review turnaround is not guaranteed for PRs that did
+  not come out of an issue discussion.
+- **Feature or behavior-change PRs require an issue first.** Unsolicited ones
+  are closed without review — not because the code is bad, but because the
+  design conversation has to happen before the implementation, not after.
+- **Absorption is a normal outcome.** Sometimes the maintainer lands an
+  equivalent change directly instead of merging the PR — when the surrounding
+  design is still moving, or the fix touches code with constraints that are
+  faster to apply than to explain. When a change is absorbed this way, the
+  closing comment will say so.
+
+---
+
 ## Six things that decide whether a PR lands
 
 **1. Run every sentence of your PR description end to end.**
@@ -167,8 +184,11 @@ interactions, or the full Electron suites.
 
 - **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
   is read-only: no write connection, no schema migration, no PRAGMA change, no
-  checkpoint, no indexing. Guarded by `tests/daemon-arbitration.test.mjs` and
-  `tests/app-writer-lease.test.mjs`.
+  checkpoint, no indexing. Two narrow carve-outs, both recorded in ADR 0006:
+  the invocation-nonce freshness build, and memory mutations (`--attune`),
+  which write only the memory layer (`memories` + `memories_fts` via triggers)
+  and never migrate or configure the index. Guarded by
+  `tests/daemon-arbitration.test.mjs` and `tests/app-writer-lease.test.mjs`.
 - **If you add something that needs periodic refresh, prove its refresh point is
   actually called repeatedly.** Hanging a full rebuild off a first-run-only gate
   means it runs once and never again — and for existing installations, never at

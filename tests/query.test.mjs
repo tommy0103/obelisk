@@ -1,11 +1,14 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -230,6 +233,36 @@ test('raw rejects hidden targets and labels explicitly included inactive evidenc
   db.close();
 });
 
+test('raw looks up cursors by provider unit identity instead of source path', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,jsonl_path,source) VALUES (?,?,?,?)')
+    .run('sid-raw-key', 'Raw key', '/alpha/agents/main/wire.jsonl', 'alpha');
+  db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,content_type,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `).run('msg-raw-key', 'sid-raw-key', 'user', 'user', 'raw key', 'text', 'visible', 'alpha');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor)
+    VALUES (?,?,?,?)
+  `).run('alpha:unit', 10, 1, '10:1');
+  let cursor;
+  const provider = {
+    sessionUnitKey: () => 'alpha:unit',
+  };
+  const providerRegistry = {
+    get: () => provider,
+    raw(input) {
+      cursor = input.cursor;
+      return { text: 'raw', totalLength: 3 };
+    },
+  };
+
+  assert.equal(createQueryApi(db, { providerRegistry }).raw('msg-raw-key').text, 'raw');
+  assert.equal(cursor, '10:1');
+  db.close();
+});
+
 test('failures nextMessages does not leak hidden branch messages', () => {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
@@ -329,10 +362,32 @@ test('failures gates both result and linked call message visibility', () => {
   );
   assert.deepEqual(
     api.failures({ sessionId: 'sid-edge-visibility', includeInactive: true })
-      .map(record => record.toolCall.id)
+      .map(record => [record.toolCall.id, record.visibility])
       .sort(),
-    ['call-inactive', 'call-visible'],
+    [
+      ['call-inactive', 'inactive'],
+      ['call-visible', 'visible'],
+    ],
   );
+  db.close();
+});
+
+test('failures preserves orphaned error results without linked messages or calls', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-orphan-failure', 'Orphan failure', 'codex');
+  db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `).run('missing-call', '', 'sid-orphan-failure', 'orphaned failure', 1);
+
+  const rows = createQueryApi(db).failures('sid-orphan-failure');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].toolCall, undefined);
+  assert.equal(rows[0].result.content, 'orphaned failure');
+  assert.equal(rows[0].visibility, 'visible');
+  assert.deepEqual(rows[0].nextMessages, []);
   db.close();
 });
 
@@ -489,8 +544,55 @@ test('attune api exposes only memory mutation helpers', () => {
   db.close();
 });
 
+test('remember regenerates the id on a primary-key collision instead of overwriting', () => {
+  const memoryDir = makeTempDir('obelisk-remember-collision-');
+  const memoryPath = join(memoryDir, 'memory.md');
+  writeFileSync(memoryPath, '# Memory\n');
+
+  const inserted = [];
+  const attempted = [];
+  let failFirstInsert = true;
+  const fakeDb = {
+    prepare(sql) {
+      if (sql.startsWith('INSERT INTO memories')) {
+        return {
+          run: (...args) => {
+            attempted.push(args[0]);
+            if (failFirstInsert) {
+              failFirstInsert = false;
+              const error = new Error('UNIQUE constraint failed: memories.id');
+              error.errcode = 1555; // SQLITE_CONSTRAINT_PRIMARYKEY
+              throw error;
+            }
+            inserted.push(args);
+          },
+        };
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    },
+    exec() {},
+    close() {},
+  };
+
+  const result = createAttuneApi(fakeDb).remember({
+    path: memoryPath,
+    project: 'collision-test',
+    summary: 'Decision: memory ids regenerate on collision instead of overwriting.',
+  });
+
+  // The first attempt collided; the persisted row must carry a REGENERATED
+  // id (a retry of the same id would satisfy inserted[0][0] === result.id),
+  // and the existing row was never replaced (plain INSERT, not OR REPLACE).
+  assert.equal(attempted.length, 2);
+  assert.notEqual(attempted[0], attempted[1]);
+  assert.equal(inserted.length, 1);
+  assert.equal(inserted[0][0], result.id);
+  assert.equal(attempted[1], result.id);
+  assert.match(result.id, /^mem-[0-9a-f-]{36}$/);
+});
+
 test('remember stores absolute project-relative memory path', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
   const memoryPath = join(memoryDir, 'decision.md');
@@ -510,7 +612,7 @@ test('remember stores absolute project-relative memory path', () => {
 });
 
 test('remember updates FTS recall for the registered memory immediately', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
   const memoryPath = join(memoryDir, 'query-plan.md');
@@ -552,7 +654,7 @@ test('forget soft-deletes memory records from active recall', () => {
 });
 
 test('remember requires English summaries', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
   const memoryPath = join(memoryDir, 'decision.md');
@@ -573,7 +675,7 @@ test('remember requires English summaries', () => {
 });
 
 test('remember rejects missing memory files', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const db = memoryDb({ projectPath: projectDir });
   const api = createAttuneApi(db);
 
@@ -584,6 +686,54 @@ test('remember rejects missing memory files', () => {
       summary: 'Decision: this should not be registered.',
     }),
     /remember\(\) memory file does not exist/,
+  );
+
+  db.close();
+});
+
+test('subagents after/before narrow by the subagent activity interval, not session IDs', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,started_at) VALUES (?,?,?)')
+    .run('sid-agents', 'Subagent session', '2026-06-01T09:00:00Z');
+  const insertAgent = db.prepare(`
+    INSERT INTO subagents (agent_id,session_id,agent_type,description)
+    VALUES (?,?,?,?)
+  `);
+  insertAgent.run('agent-early', 'sid-agents', 'explore', 'Early agent');
+  insertAgent.run('agent-late', 'sid-agents', 'coder', 'Late agent');
+  insertAgent.run('agent-spanning', 'sid-agents', 'coder', 'Agent active across the bound');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,agent_id)
+    VALUES (?,?,?,?,?,?,?)
+  `);
+  insertMessage.run('m-early-1', 'sid-agents', 'assistant', 'assistant', 'early start', '2026-06-01T10:00:00Z', 'agent-early');
+  insertMessage.run('m-early-2', 'sid-agents', 'assistant', 'assistant', 'early end', '2026-06-01T10:05:00Z', 'agent-early');
+  insertMessage.run('m-late-1', 'sid-agents', 'assistant', 'assistant', 'late start', '2026-06-03T10:00:00Z', 'agent-late');
+  insertMessage.run('m-span-1', 'sid-agents', 'assistant', 'assistant', 'spanning start', '2026-06-01T12:00:00Z', 'agent-spanning');
+  insertMessage.run('m-span-2', 'sid-agents', 'assistant', 'assistant', 'spanning end', '2026-06-03T12:00:00Z', 'agent-spanning');
+  const api = createQueryApi(db);
+
+  // `after` keeps agents still active past the bound: the spanning agent's
+  // interval crosses 06-02 even though it started before it.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-late', 'agent-spanning'],
+  );
+  // `before` keeps agents already started by the bound.
+  assert.deepEqual(
+    api.subagents({ before: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-early', 'agent-spanning'],
+  );
+  // Combined bounds select every agent active during the window.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-01T09:00:00Z', before: '2026-06-04T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-early', 'agent-late', 'agent-spanning'],
+  );
+  // A window inside the spanning agent's interval matches it alone.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-02T00:00:00Z', before: '2026-06-03T00:00:00Z' }).map((row) => row.agent_id),
+    ['agent-spanning'],
   );
 
   db.close();

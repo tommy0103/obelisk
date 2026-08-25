@@ -1,12 +1,32 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
+import { ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS } from '../packages/core/src/db.ts';
+
 test('canonical transcript persistence schema changes only by explicit decision', () => {
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    '12c54c5a75f3feb6b3dcedca9377f45c7746ecbde3d210a2276c14fa7c875e6c',
+    // 2026-08-24: indexed usage-day and longest-turn Activity queries.
+    'a3ddd5450fcf3e0bb481fcd75c3a988dea430647548c8736523769ce1046d2d3',
   );
+});
+
+test('attune memory-layer expectations derive from schema.sql', () => {
+  // The attune compatibility check derives its expected memory-layer shape
+  // from schema.sql at module load. Pin the derivation result so a schema
+  // evolution (or a format change that breaks the derivation) surfaces here
+  // as an explicit decision, never as a silent behavior change.
+  assert.deepEqual([...ATTUNE_MEMORY_COLUMNS], [
+    'id', 'session_id', 'project', 'message_start', 'message_end',
+    'path', 'anchors', 'summary', 'created_at', 'deleted_at', 'deleted_reason',
+  ]);
+  assert.deepEqual([...ATTUNE_MEMORY_TRIGGERS], [
+    'memories_fts_ai', 'memories_fts_ad', 'memories_fts_au',
+  ]);
 });

@@ -1,3 +1,6 @@
+-- Copyright (C) 2026 tommy0103 and contributors.
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 -- Shared Obelisk Core schema.
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, title TEXT, project TEXT, project_path TEXT,
@@ -54,6 +57,7 @@ END;
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source);
 CREATE INDEX IF NOT EXISTS idx_messages_usage_day

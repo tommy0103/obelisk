@@ -1,7 +1,9 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -9,9 +11,10 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { piSessionId } from '../packages/core/src/providers/pi.ts';
 import { runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 test('passive-pull runtime indexes Pi sessions from the default home', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-runtime-'));
+  const home = makeTempDir('obelisk-pi-runtime-');
   const sessionPath = join(
     home,
     '.pi',
@@ -55,7 +58,7 @@ test('passive-pull runtime indexes Pi sessions from the default home', () => {
 });
 
 test('passive-pull runtime honors the same persisted Pi root as the app', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-custom-runtime-'));
+  const home = makeTempDir('obelisk-pi-custom-runtime-');
   const defaultRoot = join(home, '.pi', 'agent', 'sessions');
   const customRoot = join(home, 'custom-pi-sessions');
   const sessionPath = join(customRoot, '--tmp-pi-real-tool--', 'session.jsonl');
@@ -94,18 +97,15 @@ test('passive-pull runtime honors the same persisted Pi root as the app', () => 
 });
 
 test('passive CLI operations report an incomplete Pi inventory without hiding partial results', () => {
-  for (const command of ['search', 'query', 'attune']) {
-    const home = mkdtempSync(join(tmpdir(), `obelisk-pi-partial-${command}-`));
+  // --attune is deliberately absent: memory writes no longer run an index
+  // build, so there is no inventory to report on that path.
+  for (const command of ['search', 'query']) {
+    const home = makeTempDir(`obelisk-pi-partial-${command}-`);
     const piRoot = join(home, '.pi', 'agent', 'sessions');
     mkdirSync(dirname(piRoot), { recursive: true });
     writeFileSync(piRoot, 'not a directory');
     const queryPath = join(home, 'query.mjs');
-    writeFileSync(
-      queryPath,
-      command === 'attune'
-        ? 'return null;'
-        : "return sessions({ source: 'pi', limit: 5 });",
-    );
+    writeFileSync(queryPath, "return sessions({ source: 'pi', limit: 5 });");
     const args = command === 'search'
       ? ['--search', 'partial-probe']
       : [`--${command}`, queryPath];
@@ -116,7 +116,7 @@ test('passive CLI operations report an incomplete Pi inventory without hiding pa
     });
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.deepEqual(JSON.parse(result.stdout), command === 'attune' ? null : []);
+    assert.deepEqual(JSON.parse(result.stdout), []);
     assert.match(result.stderr, /Warning: incomplete pi source inventory/);
     assert.match(
       result.stderr,
@@ -127,7 +127,7 @@ test('passive CLI operations report an incomplete Pi inventory without hiding pa
 });
 
 test('CLI force rebuild rejects a structurally invalid Pi snapshot and preserves the last good index', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-cli-force-'));
+  const home = makeTempDir('obelisk-pi-cli-force-');
   const sessionPath = join(home, '.pi', 'agent', 'sessions', 'project', 'session.jsonl');
   mkdirSync(dirname(sessionPath), { recursive: true });
   const fixture = readFileSync(new URL('./fixtures/pi/tool-session.jsonl', import.meta.url), 'utf8');
@@ -172,8 +172,48 @@ test('CLI force rebuild rejects a structurally invalid Pi snapshot and preserves
   assert.deepEqual(after, before);
 });
 
+test('CLI force rebuild rejects an incomplete provider inventory and preserves the last good index', () => {
+  const home = makeTempDir('obelisk-pi-cli-incomplete-force-');
+  const piRoot = join(home, '.pi', 'agent', 'sessions');
+  const sessionPath = join(piRoot, 'project', 'session.jsonl');
+  mkdirSync(dirname(sessionPath), { recursive: true });
+  writeFileSync(
+    sessionPath,
+    readFileSync(new URL('./fixtures/pi/tool-session.jsonl', import.meta.url)),
+  );
+  const env = { PI_CODING_AGENT_DIR: '', PI_CODING_AGENT_SESSION_DIR: '' };
+  const first = runCli(['--build'], { home, env });
+  assert.equal(first.status, 0, first.stderr || first.stdout);
+
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  let db = new DatabaseSync(dbPath, { readOnly: true });
+  const before = {
+    sessions: db.prepare("SELECT id,title,message_count,jsonl_path FROM sessions WHERE source='pi'").all()
+      .map(row => ({ ...row })),
+    messages: db.prepare("SELECT uuid,text FROM messages WHERE source='pi' ORDER BY uuid").all()
+      .map(row => ({ ...row })),
+  };
+  db.close();
+
+  rmSync(piRoot, { recursive: true, force: true });
+  writeFileSync(piRoot, 'not a directory');
+  const failed = runCli(['--build'], { home, env });
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  assert.match(JSON.parse(failed.stdout).error, /incomplete_snapshot/);
+
+  db = new DatabaseSync(dbPath, { readOnly: true });
+  const after = {
+    sessions: db.prepare("SELECT id,title,message_count,jsonl_path FROM sessions WHERE source='pi'").all()
+      .map(row => ({ ...row })),
+    messages: db.prepare("SELECT uuid,text FROM messages WHERE source='pi' ORDER BY uuid").all()
+      .map(row => ({ ...row })),
+  };
+  db.close();
+  assert.deepEqual(after, before);
+});
+
 test('malformed official Pi settings use Pi 0.83 default-root fallback', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-pi-cli-settings-'));
+  const home = makeTempDir('obelisk-pi-cli-settings-');
   const agentDir = join(home, '.pi', 'agent');
   const customRoot = join(home, 'custom-pi-sessions');
   const customPath = join(customRoot, 'project', 'custom.jsonl');

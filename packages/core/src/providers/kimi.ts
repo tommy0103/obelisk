@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import {
   existsSync,
   readdirSync,
@@ -57,7 +60,7 @@ interface ProjectedSession {
 }
 
 const SOURCE = 'kimi';
-export const KIMI_CANONICAL_TRANSCRIPT_MARKER = '__kimi_canonical_transcript_v4__';
+export const KIMI_CANONICAL_TRANSCRIPT_MARKER = '__kimi_canonical_transcript_v6__';
 
 function defaultKimiRoot(): string {
   return process.env['KIMI_CODE_HOME'] ?? join(homedir(), '.kimi-code');
@@ -282,8 +285,8 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
     const stepStarts = new Map<string, number>();
     const stepMessages = new Map<string, MessageRecord[]>();
     const callMessageUuids = new Map<string, string>();
-    const injectionMessageUuids = new Set<string>();
-    const realUserMessageUuids = new Set<string>();
+    const injectionOwnerPromptIds = new Map<string, string | undefined>();
+    const realUserPromptIds = new Map<string, string | undefined>();
     let undoFloor = wireMessageStart;
 
     const resetOpenState = (): void => {
@@ -296,16 +299,23 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
       if (count <= 0) return;
       const removedMessageUuids = new Set<string>();
       let removedUserCount = 0;
+      let anchorPromptId: string | undefined;
       for (let index = messages.length - 1; index >= undoFloor; index--) {
         const message = messages[index]!;
-        if (injectionMessageUuids.has(message.uuid)) continue;
+        // Once the requested prompts are gone, keep walking back only through the
+        // injections that this last-removed prompt owns and that precede it.
+        if (removedUserCount >= count) {
+          if (anchorPromptId === undefined
+            || injectionOwnerPromptIds.get(message.uuid) !== anchorPromptId) break;
+        }
         messages.splice(index, 1);
         removedMessageUuids.add(message.uuid);
-        injectionMessageUuids.delete(message.uuid);
+        injectionOwnerPromptIds.delete(message.uuid);
         if (wire.main) mainMessageCount--;
-        if (realUserMessageUuids.delete(message.uuid)) {
-          removedUserCount++;
-          if (removedUserCount >= count) break;
+        if (realUserPromptIds.has(message.uuid)) {
+          const promptId = realUserPromptIds.get(message.uuid);
+          realUserPromptIds.delete(message.uuid);
+          if (++removedUserCount >= count) anchorPromptId = promptId;
         }
       }
       const removedToolIds = new Set(
@@ -383,8 +393,8 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
           skill: null,
           source: SOURCE,
         });
-        if (origin?.kind === 'injection') injectionMessageUuids.add(messageUuid);
-        if (isRealUserMessage(source)) realUserMessageUuids.add(messageUuid);
+        if (origin?.kind === 'injection') injectionOwnerPromptIds.set(messageUuid, origin.ownerPromptId);
+        if (isRealUserMessage(source)) realUserPromptIds.set(messageUuid, source.id);
         if (Array.isArray(source.toolCalls)) {
           for (const call of source.toolCalls) {
             if (call === null || typeof call !== 'object' || typeof call.id !== 'string') continue;
@@ -619,6 +629,13 @@ function changedSessionDirectories(rootDir: string, changedPaths: readonly strin
   return result;
 }
 
+function sessionDirectoryFromWirePath(wirePath: string): string {
+  const parent = dirname(wirePath);
+  return basename(parent) === 'main' && basename(dirname(parent)) === 'agents'
+    ? dirname(dirname(parent))
+    : parent;
+}
+
 function rawFromWire(path: string, messageUuid: string): RawRecord | null {
   if (!existsSync(path)) return null;
   const fallbackLine = /:line-(\d+)$/.exec(messageUuid)?.[1];
@@ -664,7 +681,11 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
     name,
     descriptor: { id: name, name: 'Kimi Code', vendor: 'Moonshot AI', defaultRoot: rootDir, color: '#6d6afc' },
     indexVersionMarker: KIMI_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [join(configuredRoot, 'sessions'), join(configuredRoot, 'session_index.jsonl')],
+    sessionUnitKey: ({ jsonlPath }) => sessionDirectoryFromWirePath(jsonlPath),
+    watchTargets: (configuredRoot) => [
+      { kind: 'tree', path: join(configuredRoot, 'sessions') },
+      { kind: 'file', path: join(configuredRoot, 'session_index.jsonl') },
+    ],
     discover(ctx: DiscoverContext): IndexUnit[] {
       const units: IndexUnit[] = [];
       const sessionsDir = join(rootDir, 'sessions');
@@ -739,9 +760,7 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       if (input.agentId === null) return rawFromWire(mainPath, input.messageUuid);
       const rawAgentId = input.agentId.split(':').at(-1);
       if (rawAgentId === undefined) return null;
-      const sessionDir = basename(dirname(mainPath)) === 'main'
-        ? dirname(dirname(dirname(mainPath)))
-        : dirname(mainPath);
+      const sessionDir = sessionDirectoryFromWirePath(mainPath);
       return rawFromWire(join(sessionDir, 'agents', rawAgentId, 'wire.jsonl'), input.messageUuid);
     },
   };

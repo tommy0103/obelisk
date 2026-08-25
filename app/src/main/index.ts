@@ -1,17 +1,21 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { app, BrowserWindow, ipcMain, clipboard, dialog, shell, type IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import chokidar from 'chokidar';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
+import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
+import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
@@ -269,12 +273,13 @@ function appendWhere(sql, params, clause) {
 }
 
 function startIndexerService({ buildOnStart = false } = {}) {
+  if (indexerService) return indexerService;
   const paths = getRuntimePaths();
   if (latestSettingsError !== null) return null;
   migrateLegacyDbIfNeeded(paths);
-  indexerService = createIndexerService({
+  const service = createIndexerService({
     projectsDir: paths.projectsDir,
-    watchDirs: paths.providerRegistry.watchRoots(paths.providerRoots),
+    watchTargets: paths.providerRegistry.watchTargets(paths.providerRoots),
     buildIndex: async ({ reason, changedPaths }) => {
       const result = await indexerWorker.buildIndex({
         reason,
@@ -302,8 +307,9 @@ function startIndexerService({ buildOnStart = false } = {}) {
     },
     writeHeartbeat: () => writeHeartbeat({ dbPath: paths.dbPath }),
   });
-  indexerService.start({ buildOnStart });
-  return indexerService;
+  service.start({ buildOnStart });
+  indexerService = service;
+  return service;
 }
 
 function startBackgroundResources({ runStartupBuild = false } = {}) {
@@ -335,6 +341,8 @@ async function stopBackgroundResources({ stopWorker = false } = {}) {
   if (obeliskWatcher) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
+    if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
+    pendingObeliskChanges.clear();
     if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
   }
   closeDb();
@@ -422,25 +430,39 @@ function createWindow() {
 
 const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
 const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
-let obeliskWatcher: import("chokidar").FSWatcher | null = null;
+let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
+let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingObeliskChanges = new Set<string>();
+
+function flushObeliskChanges() {
+  obeliskNotifyTimer = null;
+  const changedPaths = [...pendingObeliskChanges];
+  pendingObeliskChanges.clear();
+  for (const changedPath of changedPaths) onObeliskChange(changedPath);
+}
 
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
-  if (!fs.existsSync(OBELISK_DIR)) {
-    fs.mkdirSync(OBELISK_DIR, { recursive: true });
-  }
-  obeliskWatcher = chokidar.watch(OBELISK_DIR, {
-    ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
-    ignored: (p, stats) => {
-      if (stats?.isDirectory()) return false;
-      if (!stats) return false;
-      return !p.endsWith('.md') && !p.endsWith('.json');
+  // Idempotent ensure, off the main thread (mkdir recursive does not need an
+  // existence check). The watcher tolerates the directory appearing late —
+  // that is what the probe + retry loop inside the package is for — so there
+  // is no ordering dependency between the two.
+  void fs.promises.mkdir(OBELISK_DIR, { recursive: true }).catch(() => {});
+  obeliskWatcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: OBELISK_DIR }],
+    onInvalidate: (invalidation) => {
+      if (invalidation.type !== 'paths') return;
+      for (const changedPath of invalidation.paths) {
+        if (!changedPath.endsWith('.md') && !changedPath.endsWith('.json')) continue;
+        // True trailing debounce — reset on every event so an actively written
+        // file notifies only after its writes settle (the awaitWriteFinish
+        // replacement). Without the reset this would be a throttle.
+        pendingObeliskChanges.add(changedPath);
+        if (obeliskNotifyTimer) clearTimeout(obeliskNotifyTimer);
+        obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
+      }
     },
   });
-  obeliskWatcher.on('add', onObeliskChange);
-  obeliskWatcher.on('change', onObeliskChange);
-  obeliskWatcher.on('unlink', onObeliskChange);
   return obeliskWatcher;
 }
 
@@ -671,16 +693,13 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
   const workflowAgent = msg.agent_id
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
-  const cursorRow = typeof session?.jsonl_path === 'string'
-    ? db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path)
-    : undefined;
   const paths = getRuntimePaths();
   const raw = paths.providerRegistry.raw({
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
     agentId: msg.agent_id || null,
-    cursor: typeof cursorRow?.cursor === 'string' ? cursorRow.cursor : null,
+    cursor: storedSessionCursor(db, paths.providerRegistry, session),
     subagent,
     workflowAgent,
   });
@@ -997,7 +1016,7 @@ ipcMain.handle('settings:set', async (_, key, value) => {
       await stopIndexerServiceAndWait();
     } else if (value !== false) {
       if (indexerService) await stopIndexerServiceAndWait();
-      startIndexerService({ buildOnStart: false });
+      startIndexerService({ buildOnStart: true });
     }
   }
 
@@ -1039,7 +1058,6 @@ ipcMain.handle('settings:rebuildIndex', async () => {
   if (latestSettingsError !== null) throw new Error(latestSettingsError);
   const paths = getRuntimePaths(persisted);
   const tempDbPath = rebuildTempDbPath(paths.dbPath);
-  const shouldRestartWatcher = persisted.autoRefresh !== false;
   await stopIndexerServiceAndWait({ waitForIdle: false });
   if (indexerWorker) {
     await Promise.resolve(indexerWorker.stop());
@@ -1047,6 +1065,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
   }
   cleanupDbFiles(tempDbPath);
   let writerLease: ReturnType<typeof acquireWriterLease> = null;
+  let rebuildWatchHints: string[] = [];
   try {
     const writerLeasePath = writerLockPathFor(paths.dbPath);
     writerLease = acquireWriterLease({
@@ -1083,6 +1102,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });
+    rebuildWatchHints = result?.watchHints ?? [];
     if (result?.deferred || result?.complete !== true) {
       notifyIndexUpdated(result);
       return result;
@@ -1106,7 +1126,20 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       }
     } finally {
       writerLease?.release();
-      if (shouldRestartWatcher) startIndexerService({ buildOnStart: false });
+      if (loadPersistedSettings().autoRefresh !== false) {
+        const service = startIndexerService({ buildOnStart: false });
+        if (rebuildWatchHints.length) {
+          // The rebuild bypassed the service's own build path, so seed the
+          // hot set from its hints here.
+          service?.promoteWatchHints?.(rebuildWatchHints);
+        } else {
+          // A failed/deferred rebuild produced no hints and the old hot set
+          // died with the old watcher. Run one reconciling build through the
+          // service — its deferral retry absorbs writer-busy — so long-open
+          // transcripts are re-seeded now, not at the next 5-min reconcile.
+          service?.runBuildNow('reconcile');
+        }
+      }
     }
   }
 });

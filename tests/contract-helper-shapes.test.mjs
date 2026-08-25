@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Tier 2 contract golden tests (see docs/adr/0002-two-tier-runtime-contract.md).
 //
 // These lock the *composite return shapes* that agents parse and that
@@ -19,11 +22,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -168,7 +171,8 @@ test('overview() shape matches api-reference.md', () => {
   const view = createQueryApi(db).overview({ limit: 5 });
 
   exactKeys(view, ['current', 'current_project', 'projects', 'totals'], 'overview()');
-  exactKeys(view.current, ['cwd', 'project'], 'overview() current');
+  exactKeys(view.current, ['cwd', 'project', 'session_id'], 'overview() current');
+  assert.equal(view.current.session_id, null, 'no invocation nonce: session_id is null');
   exactKeys(view.totals, ['projects', 'sessions', 'memories', 'sources'], 'overview() totals');
   db.close();
 });
@@ -183,7 +187,7 @@ test('forget() result shape matches api-reference.md', () => {
 });
 
 test('raw() shape matches api-reference.md', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-raw-'));
+  const dir = makeTempDir('obelisk-raw-');
   const jsonlPath = join(dir, 'session.jsonl');
   const line = JSON.stringify({ uuid: 'm-raw', type: 'user', message: { role: 'user', content: 'raw line body' } });
   writeFileSync(jsonlPath, line + '\n');

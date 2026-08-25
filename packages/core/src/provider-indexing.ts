@@ -1,3 +1,9 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import { readdirSync, statSync, type Dirent } from 'node:fs';
+import { join } from 'node:path';
+
 import { persist } from './persist.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type {
@@ -50,12 +56,114 @@ export class ProviderIndexFailure extends Error {
   }
 }
 
-export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
-  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
+// Hot-file seeding for the adaptive watcher (ADR-0009): after a build, the
+// most recently written transcripts are the best guess for what is still
+// being appended through long-lived descriptors. index_state.mtime holds the
+// source file mtime per unit; marker rows carry `__` prefixes and are not
+// transcripts. Keep the limit in sync with the watcher's DEFAULT_MAX_HOT_FILES.
+//
+// Unit keys are not always files: Kimi's key is the session directory, whose
+// mtime does not track appends to the wire files inside. Directory keys are
+// expanded to the transcripts they contain (bounded, mtime-ranked); missing
+// keys are dropped. Both run in the indexer worker, never on the Electron
+// main thread. The authoritative wire-layout knowledge lives in the Kimi
+// provider (kimi.ts sessionDirectoryFromWirePath and its discover walk) —
+// this generic expansion deliberately relies on file mtime instead of
+// duplicating that layout logic; if the Kimi wire layout changes, revisit
+// both.
+const WATCH_HINT_LIMIT = 64;
+const HINT_DIRECTORY_FILE_LIMIT = 4;
+// Candidates collected before ranking by mtime — a Kimi session dir holds
+// several wire files (main + agents), and readdir order says nothing about
+// which one is actively appended.
+const HINT_DIRECTORY_CANDIDATE_LIMIT = 16;
+
+function expandHintDirectory(dir: string): string[] {
+  const candidates: string[] = [];
+  const walk = (current: string, depth: number) => {
+    if (candidates.length >= HINT_DIRECTORY_CANDIDATE_LIMIT || depth > 4) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (candidates.length >= HINT_DIRECTORY_CANDIDATE_LIMIT) return;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name.endsWith('.jsonl')) candidates.push(full);
+    }
+  };
+  walk(dir, 0);
+  // Rank by file mtime: the actively appended wire (the main one in
+  // practice) is the most recently written, while a plain readdir/DFS order
+  // would systematically pick stale agent wires first.
+  return candidates
+    .map((file) => {
+      try {
+        return { file, mtimeMs: statSync(file).mtimeMs };
+      } catch {
+        return { file, mtimeMs: 0 };
+      }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, HINT_DIRECTORY_FILE_LIMIT)
+    .map(({ file }) => file);
+}
+
+export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT): string[] {
+  const rows = db.prepare(
+    "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC LIMIT ?",
+  ).all(limit * 4);
+  const hints: string[] = [];
+  for (const row of rows) {
+    if (hints.length >= limit) break;
+    const key = String(row.jsonl_path);
+    let isDirectory: boolean;
+    try {
+      isDirectory = statSync(key).isDirectory();
+    } catch {
+      continue; // deleted between build and hint collection
+    }
+    if (!isDirectory) {
+      hints.push(key);
+      continue;
+    }
+    for (const file of expandHintDirectory(key)) {
+      if (hints.length >= limit) break;
+      hints.push(file);
+    }
+  }
+  return hints;
+}
+
+export function storedProviderCursor(db: SqliteDb, key: string): Cursor {  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
   if (!row) return null;
   return typeof row.cursor === 'string'
     ? row.cursor
     : `${String(row.mtime)}:${String(row.lines_processed)}`;
+}
+
+export function providerSessionUnitKey(
+  provider: ProviderAdapter | undefined,
+  session: IndexedSession,
+): string {
+  return provider?.sessionUnitKey?.(session) ?? session.jsonlPath;
+}
+
+export function storedSessionCursor(
+  db: SqliteDb,
+  registry: ProviderRegistry,
+  session: Record<string, unknown> | null,
+): Cursor {
+  if (typeof session?.jsonl_path !== 'string') return null;
+  const source = typeof session.source === 'string' ? session.source : 'claude';
+  const unitKey = providerSessionUnitKey(registry.get(source), {
+    sessionId: typeof session.id === 'string' ? session.id : '',
+    jsonlPath: session.jsonl_path,
+  });
+  return storedProviderCursor(db, unitKey);
 }
 
 export function readProviderSessionProvenance(db: SqliteDb): ProviderSessionProvenance[] {
@@ -100,7 +208,9 @@ export function createProviderIndexPlan(
     ).get(marker);
     const fullReindex = force || (markerMissing && indexedSessions.length > 0);
     if (markerMissing && indexedSessions.length > 0) {
-      replayKeys.set(provider.name, [...new Set(indexedSessions.map((session) => session.jsonlPath))]);
+      replayKeys.set(provider.name, [
+        ...new Set(indexedSessions.map((session) => providerSessionUnitKey(provider, session))),
+      ]);
     }
     let inventoryComplete = true;
     let reportedIssue: InventoryIssue | undefined;

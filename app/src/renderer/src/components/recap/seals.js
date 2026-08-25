@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 export const MINI_SEALS = {
   architect: `<svg viewBox="0 0 110 110" fill="none"><circle cx="55" cy="55" r="36" stroke="#a78bfa" stroke-width="4" stroke-opacity="0.7"/><polygon points="55,32 50,42 60,42" fill="#c4b5fd"/><polygon points="50,42 60,42 58,72 52,72" fill="#a78bfa"/></svg>`,
   debugger: `<svg viewBox="0 0 110 110" fill="none"><circle cx="55" cy="55" r="36" stroke="#fbbf24" stroke-width="4" stroke-opacity="0.7"/><path d="M 55 34 A 21 21 0 1 1 34 55 A 16 16 0 1 0 55 39 A 11 11 0 1 1 44 55" stroke="#fde68a" stroke-width="3.5" fill="none" stroke-linecap="round"/></svg>`,

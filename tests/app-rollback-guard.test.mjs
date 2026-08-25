@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Regression tests for the write-transaction runner (docs/adr/0006):
 //  - a transient BUSY (auto-rolled-back txn) is retried and recovers;
 //  - a persistent BUSY exhausts retries without publishing a partial force rebuild;
@@ -5,9 +8,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -57,7 +60,7 @@ function makeDbClass(shouldPoison) {
 }
 
 function twoFileHome(alphaContent, betaContent) {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-tx-'));
+  const home = makeTempDir('obelisk-tx-');
   const projectDir = join(home, '.claude', 'projects', '-tmp-proj');
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(join(home, '.obelisk'), { recursive: true });
@@ -71,7 +74,7 @@ function twoFileHome(alphaContent, betaContent) {
 }
 
 function subagentHome(description = 'first description') {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-meta-tx-'));
+  const home = makeTempDir('obelisk-meta-tx-');
   const projectDir = join(home, '.claude', 'projects', '-tmp-proj');
   const subagentDir = join(projectDir, 'session', 'subagents');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');

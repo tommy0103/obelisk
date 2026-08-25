@@ -74,3 +74,67 @@ overlap when policy information races or is stale. A single bad transcript can
 still be skipped so the index self-heals on a later build; structural/finalize
 failures remain visible. Longer timeouts must not replace the transaction and
 ownership rules recorded here.
+
+**Amendment (2026-08-11): invocation-nonce freshness carve-out.** The original
+decision makes a fresh `__app_heartbeat__` policy ownership for every CLI write
+path. One narrow exception is now granted: the invocation-nonce freshness
+build — the single incremental build a query runs when its invocation nonce is
+not yet indexed (`buildIndex({ ignoreRecentBuild: true, ignoreDaemonOwnership:
+true })`) — may ignore daemon policy ownership. Without the carve-out, nonce
+resolution in daemon mode could never succeed: the pre-query refresh always
+skips with `daemon_active`, and the daemon's watcher-driven build lags the
+just-written tool-call record by seconds.
+
+The heartbeat's job is unchanged; the writer lease remains the sole arbitrator
+of who actually writes. The carve-out build acquires the lease non-blocking, so
+it can never overlap a daemon build. Loser paths are unchanged: on
+`writer_busy` the CLI falls back to the existing bounded poll of freshly opened
+read snapshots and then to honest null, and the daemon's indexer service keeps
+its defer-and-retry on lease contention with changed paths retained.
+Consistency holds because incremental cursors live in `index_state` inside the
+database: a CLI incremental build and later daemon builds read and advance the
+same cursors. The carve-out build never selects the force full-republish path,
+and it runs only against an already-initialized index: schema setup under a
+fresh heartbeat remains the daemon's job, so a CLI query against an
+uninitialized index stays read-only and falls back to the bounded poll. The
+gate enforces this with `coreSchemaNeedsMigration`, so a legacy schema whose
+tables exist but whose columns predate the current version also blocks the
+carve-out build.
+Note that `openDb()` always applies the shared `schema.sql` idempotently, so
+additive `IF NOT EXISTS` statements (for example a new index) may also be
+applied by a carve-out build while holding the lease; this is safe because
+the daemon applies the identical shared schema on its own builds. What the
+carve-out never does is initialize or migrate a missing/legacy schema.
+
+Every other CLI write path keeps the original rule: the regular pre-query
+refresh, `attune`, migrations, schema setup, and checkpoints all remain
+read-only under a fresh heartbeat.
+
+**Amendment (2026-08-11, later the same day): memory-mutation carve-out.** The
+blanket rule above listed `attune` among the paths that stay read-only under a
+fresh heartbeat. That was over-broad: `remember()`/`forget()` write only the
+`memories` table (plus its FTS triggers), which index builds — force rebuilds
+included — never delete from, and a memory mutation carries no multi-transaction
+state for the writer lease to protect. Blocking memory writes while the app ran
+made the CLI memory flow unusable in exactly the configuration where it is most
+used. This paragraph supersedes the "attune remains read-only" rule above.
+
+`executeAttune` therefore no longer reads provider settings, builds the index,
+checks daemon ownership, or acquires the writer lease. This supersedes two more
+remnants of the original decision: the lease bullet that lists attune among its
+participants, and — for this path only — the "BEGIN contention is deferred to
+the build scheduler" policy. Attune has no scheduler; its mutations instead run
+on a connection with the ADR-standard 250 ms busy timeout so a contended BEGIN
+fails fast, and the retry layer owns the waiting (`retryOnBeginBusy`, 5 s
+budget). Builds keep the original defer-to-scheduler policy; the coordinator's
+BEGIN-retry stays opt-in. Attune opens the existing database through
+`openAttuneDb()`, which never creates, migrates, or configures the index and
+fails honestly when the memory layer (`memories`, `memories_fts`, or their
+maintenance triggers) is absent or incomplete. Each mutation runs as one short
+`runRetryableWriteTransaction`. Concurrent mutations need no mutex:
+`remember()` generates unique ids, `forget()` is idempotent and reads, decides,
+and updates in a single transaction, and WAL serializes writers — contention
+surfaces as a bounded busy retry, never as a logical conflict. Index builds and
+memory mutations can still interleave at the SQLite level; both orders are
+consistent because `memories_fts` is maintained either by its triggers (attune
+inserts) or rebuilt from `memories` (index finalize).

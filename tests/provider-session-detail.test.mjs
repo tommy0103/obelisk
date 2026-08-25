@@ -1,18 +1,21 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { parse as parseCodex } from '../packages/core/src/providers/codex.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
 function writeCodexFixture(lines) {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-provider-detail-'));
+  const dir = makeTempDir('obelisk-provider-detail-');
   const path = join(dir, 'rollout.jsonl');
   writeFileSync(path, `${lines.map(line => JSON.stringify(line)).join('\n')}\n`);
   return path;

@@ -1,6 +1,10 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { resolve } from 'node:path';
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import vue from '@vitejs/plugin-vue';
+import { coreSchemaAssetPlugin } from './electron-vite.schema-plugin.mjs';
 
 // The app main/preload/renderer are TypeScript + ESM. Each main-process module
 // is its own rollup input so it is emitted to out/main/<name>.js and the
@@ -8,7 +12,7 @@ import vue from '@vitejs/plugin-vue';
 // resolve to the built .js at runtime.
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin(), coreSchemaAssetPlugin()],
     build: {
       rollupOptions: {
         input: {

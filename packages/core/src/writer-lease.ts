@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Cross-process single-writer lease shared by every Obelisk mutation. The
 // lock lives in a dedicated SQLite database so node:sqlite and better-sqlite3
 // share identical locking semantics on every supported platform.
