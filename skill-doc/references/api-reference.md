@@ -101,7 +101,7 @@ Full-text search across all indexed message text using FTS5.
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"kimi"`, or `"pi"` |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
 
@@ -230,7 +230,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex' | 'kimi' | 'pi', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'pi', session_count, last_session_at }]
   }
 }
 ```
@@ -249,7 +249,7 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"kimi"`, or `"pi"`; omit for all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"`; omit for all |
 | `opts.sessionId` | `string` | Exact session ID |
 | `opts.sessions` | `string[]` | Restrict to session IDs |
 

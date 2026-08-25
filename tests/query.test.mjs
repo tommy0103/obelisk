@@ -835,3 +835,38 @@ test('subagents after/before narrow by the subagent activity interval, not sessi
 
   db.close();
 });
+
+test('subagents() derives total_tokens from sidechain message usage when the provider stored none (ADR-0010)', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title, source) VALUES ('sid-sub', 'sub parent', 'deepseek')").run();
+  // The stored row carries no total_tokens: the value is derived at query time.
+  db.prepare("INSERT INTO subagents (agent_id, session_id, agent_type, description) VALUES ('deepseek:agent-1:scope', 'sid-sub', 'deepseek-official', 'helper')").run();
+  const insertMsg = db.prepare("INSERT INTO messages (uuid, session_id, type, role, text, timestamp, agent_id, input_tokens, output_tokens, source) VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insertMsg.run('sub-m1', 'sid-sub', 'assistant', 'assistant', 'a', '2026-06-01T00:00:00Z', 'deepseek:agent-1:scope', 10, 5, 'deepseek');
+  insertMsg.run('sub-m2', 'sid-sub', 'assistant', 'assistant', 'b', '2026-06-01T00:01:00Z', 'deepseek:agent-1:scope', 3, 2, 'deepseek');
+
+  const api = createQueryApi(db);
+  const row = api.subagents()[0];
+  assert.equal(row.total_tokens, 20); // (10+5) + (3+2)
+  assert.equal(row.messageCount, 2);
+  const ctx = api.context('sub-m1');
+  assert.equal(ctx.subagent.total_tokens, 20);
+  db.close();
+});
+
+test('subagents() never overrides a provider-stored total_tokens', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title, source) VALUES ('sid-codex', 'codex parent', 'codex')").run();
+  // Codex stores total_tokens authoritatively at persist time; the derived
+  // message sum (30) must not replace the stored value (20).
+  db.prepare("INSERT INTO subagents (agent_id, session_id, agent_type, total_tokens) VALUES ('codex:agent-1', 'sid-codex', 'worker', 20)").run();
+  const insertMsg = db.prepare("INSERT INTO messages (uuid, session_id, type, role, text, timestamp, agent_id, input_tokens, output_tokens, source) VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insertMsg.run('cx-m1', 'sid-codex', 'assistant', 'assistant', 'a', '2026-06-01T00:00:00Z', 'codex:agent-1', 10, 5, 'codex');
+
+  const api = createQueryApi(db);
+  assert.equal(api.subagents()[0].total_tokens, 20);
+  assert.equal(api.context('cx-m1').subagent.total_tokens, 20);
+  db.close();
+});

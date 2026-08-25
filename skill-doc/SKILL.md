@@ -238,7 +238,7 @@ identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
 Prefer returned order over manually interpreting numeric rank unless you are
 deliberately using FTS5 semantics.
 
-`source` can be `'claude'`, `'codex'`, `'kimi'`, `'pi'`, or omitted. Omitted
+`source` can be `'claude'`, `'codex'`, `'deepseek'`, `'kimi'`, `'pi'`, or omitted. Omitted
 means search all indexed sources.
 
 ### `context(uuid, opts?)`

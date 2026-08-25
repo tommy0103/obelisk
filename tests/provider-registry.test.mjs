@@ -66,6 +66,7 @@ test('built-in provider registry exposes every source without caller-side branch
   const registry = createBuiltinProviderRegistry({
     claude: '/sources/claude',
     codex: '/sources/codex',
+    deepseek: '/sources/deepseek',
     kimi: '/sources/kimi',
     pi: '/sources/pi',
   });
@@ -73,6 +74,7 @@ test('built-in provider registry exposes every source without caller-side branch
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
     { id: 'claude', name: 'Claude Code' },
     { id: 'codex', name: 'Codex' },
+    { id: 'deepseek', name: 'DeepSeek Harness' },
     { id: 'kimi', name: 'Kimi Code' },
     { id: 'pi', name: 'Pi' },
   ]);
@@ -82,6 +84,7 @@ test('built-in provider registry exposes every source without caller-side branch
     { kind: 'tree', path: '/sources/codex/sessions' },
     { kind: 'tree', path: '/sources/codex/archived_sessions' },
     { kind: 'file', path: '/sources/codex/session_index.jsonl' },
+    { kind: 'tree', path: '/sources/deepseek' },
     { kind: 'tree', path: '/sources/kimi/sessions' },
     { kind: 'file', path: '/sources/kimi/session_index.jsonl' },
     { kind: 'tree', path: '/sources/pi' },

@@ -3,6 +3,7 @@
 
 import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
+import { createDeepseekProvider } from './deepseek.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createPiProvider } from './pi.ts';
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
@@ -16,6 +17,7 @@ export function createBuiltinProviderRegistry(
   return createProviderRegistry([
     createClaudeProvider({ rootDir: roots['claude'] }),
     createCodexProvider({ rootDir: roots['codex'] }),
+    createDeepseekProvider({ rootDir: roots['deepseek'] }),
     createKimiProvider({ rootDir: roots['kimi'] }),
     createPiProvider({ rootDir: roots['pi'], cwd }),
   ]);

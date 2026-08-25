@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, Kimi Code, and Pi sessions -- queryable by your agent, browsable by you.
+Past Claude Code, Codex, Kimi Code, Pi, and DeepSeek Harness sessions -- queryable by your agent, browsable by you.
 
 </div>
 
@@ -25,7 +25,7 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 **App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
 
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), and Pi sessions from `~/.pi/agent/sessions`.
+Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), Pi sessions from `~/.pi/agent/sessions`, and DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`).
 
 ## Multi-provider support
 
@@ -192,10 +192,10 @@ run `npm ci` again.
 
 | Layer | Source | What's captured |
 |-------|--------|----------------|
-| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Kimi session directories; Pi recursive `*.jsonl` | Title, project, timestamps, git branch, source |
+| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Kimi session directories; Pi recursive `*.jsonl`; DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]` | Title, project, timestamps, git branch, source |
 | **Messages** | user + assistant turns | Full text, model, token usage, parent chain |
 | **Tool calls** | every tool invocation | Tool name, input, file paths |
-| **Subagents** | Claude `subagents/agent-<id>.jsonl`; Codex child threads | Agent type, description, full conversation |
+| **Subagents** | Claude `subagents/agent-<id>.jsonl`; Codex child threads; DeepSeek Harness child sessions (folded into the root session) | Agent type, description, full conversation |
 | **Workflows** | Claude `workflows/wf_<runId>.json` | Script, result, agent count |
 | **Workflow agents** | Claude `subagents/workflows/wf_<runId>/` | Per-agent transcripts |
 | **Memories** | registered markdown files | Conclusions linked to source sessions |
