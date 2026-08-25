@@ -438,6 +438,7 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
         break;
       }
       case 'delete-session':
+      case 'retract-scope':
         break;
     }
   }

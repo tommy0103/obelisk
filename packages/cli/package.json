@@ -1,6 +1,6 @@
 {
   "name": "@obelisk-apps/cli",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Local Obelisk runtime for coding agents.",
   "license": "AGPL-3.0",
   "type": "module",

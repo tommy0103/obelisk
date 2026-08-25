@@ -319,6 +319,7 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(codexDir, 'sessions') },
       { kind: 'tree', path: join(codexDir, 'archived_sessions') },
       { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.dsh', 'sessions') },
       { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
