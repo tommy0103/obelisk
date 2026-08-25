@@ -30,6 +30,25 @@ Obelisk is a CodeAct memory layer: write a small JS query, run it locally, read
 the JSON, then answer. Do not turn history into a flat document or browse entire
 sessions by default.
 
+## Fresh Index and Sandbox Permissions
+
+Treat a successful Obelisk invocation as a precondition for using its results.
+Obelisk refreshes `~/.obelisk/obelisk.sqlite` before retrieval so the answer
+includes the latest sessions and can identify the invoking session. Never
+degrade to a stale, read-only index when that refresh cannot write.
+
+In Codex `workspace-write` or managed sandboxes, `~/.obelisk` may be outside the
+writable roots. If an Obelisk command fails with `SQLITE_READONLY`, `EACCES`,
+`EPERM`, `attempt to write a readonly database`, or another permission error for
+`~/.obelisk`, rerun the same command with
+`sandbox_permissions: "require_escalated"`. On another agent host, use its
+equivalent mechanism to grant write access to `~/.obelisk`. Do not replace the
+failed command with direct SQLite, JSONL, or stale-index reads.
+
+If write access is unavailable or the user denies escalation, stop and report
+the permission blocker. Retrieval is complete only when the Obelisk command
+exits successfully and returns its query result.
+
 ## Quick Start
 
 Fast keyword search (pass a unique nonce so Obelisk can recognize your own

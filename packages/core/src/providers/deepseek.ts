@@ -703,7 +703,7 @@ export function createDeepseekProvider({ rootDir = join(homedir(), '.dsh', 'sess
       color: '#4d6bfe',
     },
     indexVersionMarker: DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [configuredRoot],
+    watchTargets: (configuredRoot) => [{ kind: 'tree', path: configuredRoot }],
     discover: (ctx) => discoverAt(rootDir, ctx),
     parse,
     raw: (input) => rawDeepseek(rootDir, input),

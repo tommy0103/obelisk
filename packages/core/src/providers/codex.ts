@@ -386,9 +386,9 @@ export function createCodexProvider({ rootDir = join(homedir(), '.codex') }: { r
     name,
     descriptor: { id: name, name: 'Codex', vendor: 'OpenAI', defaultRoot: rootDir, color: '#10a37f' },
     indexVersionMarker: CODEX_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [
-      ...codexTranscriptDirs(configuredRoot),
-      join(configuredRoot, 'session_index.jsonl'),
+    watchTargets: (configuredRoot) => [
+      ...codexTranscriptDirs(configuredRoot).map((dir) => ({ kind: 'tree' as const, path: dir })),
+      { kind: 'file', path: join(configuredRoot, 'session_index.jsonl') },
     ],
     discover: (ctx) => discoverAt(rootDir, ctx),
     parse,

@@ -22,7 +22,7 @@ function provider(id, defaultRoot, color, descriptor = {}) {
   return {
     name: id,
     descriptor: { id, name: `${id} name`, vendor: `${id} vendor`, defaultRoot, color, ...descriptor },
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover: () => [],
     *parse() { yield* []; return null; },
     raw: () => null,
@@ -188,7 +188,7 @@ test('an invalid persisted root disables that provider instead of selecting its 
 
   assert.equal(runtime.roots.claude, undefined);
   assert.equal(claude.descriptor.requiresExplicitRoot, true);
-  assert.deepEqual(claude.watchRoots('/default/claude'), []);
+  assert.deepEqual(claude.watchTargets('/default/claude'), []);
   let issue;
   assert.deepEqual(claude.discover({
     lastCursor: () => null,
