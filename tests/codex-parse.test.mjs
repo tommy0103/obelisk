@@ -128,10 +128,10 @@ test('codex provider discovers, watches, and reads archived sessions', () => {
   });
 
   assert.deepEqual(units.map(unit => unit.key), [path]);
-  assert.deepEqual(provider.watchRoots(root), [
-    join(root, 'sessions'),
-    archiveDir,
-    join(root, 'session_index.jsonl'),
+  assert.deepEqual(provider.watchTargets(root), [
+    { kind: 'tree', path: join(root, 'sessions') },
+    { kind: 'tree', path: archiveDir },
+    { kind: 'file', path: join(root, 'session_index.jsonl') },
   ]);
   const raw = provider.raw({
     messageUuid: `codex:${META.id}:000002`,

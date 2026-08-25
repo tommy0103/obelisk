@@ -1552,10 +1552,10 @@ export function createPiProvider({
     },
     indexVersionMarker: PI_CANONICAL_TRANSCRIPT_MARKER,
     rootResolution,
-    watchRoots: (configuredRoot) => {
+    watchTargets: (configuredRoot) => {
       if (rootResolution.requiresExplicitRoot) return [];
       const absolute = configuredAbsolutePath(configuredRoot, homedir());
-      return absolute === null ? [] : [absolute];
+      return absolute === null ? [] : [{ kind: 'tree', path: absolute }];
     },
     discover(ctx: DiscoverContext): IndexUnit[] {
       if (rootResolution.requiresExplicitRoot) {
