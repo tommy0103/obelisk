@@ -16,8 +16,9 @@
 //     (prepare dominates: stable microsecond-scale deltas), one realistic
 //     heavy one (sessions listing over 1k rows) shows materiality at real
 //     query scale, where execution noise exceeds the validation cost.
-//   - 12 rounds; within each round the two implementations alternate per
-//     shape (legacy block, then current block) so machine drift cancels.
+//   - 12 rounds; within each round both implementations run one block per
+//     shape, and the block order flips every round (legacy-first, then
+//     current-first) so systematic machine drift cancels.
 //     Per-shape iteration counts keep total runtime under ~10 s.
 //   - Reported: per-shape medians plus the workload median (median of the
 //     per-shape medians). The gate applies to the workload median; per-shape
@@ -123,8 +124,14 @@ for (const [name, sql, params, iterations] of SHAPES) {
   const legacyNs = [];
   const currentNs = [];
   for (let round = 0; round < ROUNDS; round += 1) {
-    legacyNs.push(timeBlock(legacySql, sql, params, iterations));
-    currentNs.push(timeBlock(currentSql, sql, params, iterations));
+    // Block order flips every round so a systematic machine drift cancels
+    // instead of consistently taxing the same implementation.
+    const blocks = round % 2 === 0
+      ? [[legacyNs, legacySql], [currentNs, currentSql]]
+      : [[currentNs, currentSql], [legacyNs, legacySql]];
+    for (const [sink, fn] of blocks) {
+      sink.push(timeBlock(fn, sql, params, iterations));
+    }
   }
   const medLegacy = median(legacyNs);
   const medCurrent = median(currentNs);

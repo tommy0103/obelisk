@@ -169,9 +169,12 @@ const DENIED_SQLITE_ACTIONS: ReadonlySet<number> = new Set([
   sqliteConstants.SQLITE_SAVEPOINT,
 ]);
 
-// Prepare-time semantic classification. node:sqlite exposes the authorizer;
-// better-sqlite3 does not, and there statement classification happens through
-// the statement's readonly flag in assertReadOnlyStatement below.
+// Prepare-time semantic classification. node:sqlite exposes the authorizer
+// (setAuthorizer, Node 24.10+); on older supported runtimes and on drivers
+// without it, classification degrades to the read-only connection, which
+// still fails every write at execute time — the boundary never fails open.
+// better-sqlite3 has no authorizer either; there statement classification
+// happens through the statement's readonly flag in assertReadOnlyStatement.
 function installWriteDenylist(db: SqliteDb): void {
   if (typeof db.setAuthorizer !== 'function') return;
   db.setAuthorizer((action) =>
