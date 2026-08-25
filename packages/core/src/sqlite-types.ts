@@ -11,12 +11,31 @@ export interface SqliteStatement {
   all(...bindings: any[]): SqliteRow[];
   get(...bindings: any[]): SqliteRow | undefined;
   run(...bindings: any[]): unknown;
+  /** better-sqlite3 only: true when the statement has no write effects. */
+  readonly readonly?: boolean;
+  /**
+   * node:sqlite only: the compiled statement text. Trailing text SQLite did
+   * not compile (a second statement) is excluded, which makes multi-statement
+   * detection possible.
+   */
+  readonly sourceSQL?: string;
 }
+
+// Signature shared with node:sqlite's DatabaseSync.setAuthorizer callback.
+export type SqliteAuthorizer = (
+  action: number,
+  p1: string | null,
+  p2: string | null,
+  dbName: string | null,
+  triggerOrView: string | null,
+) => number;
 
 export interface SqliteDb {
   exec(sql: string): unknown;
   prepare(sql: string): SqliteStatement;
   close(): void;
+  /** node:sqlite only; better-sqlite3 does not expose an authorizer. */
+  setAuthorizer?(callback: SqliteAuthorizer): void;
 }
 
 export interface NodeSqliteDb extends SqliteDb {

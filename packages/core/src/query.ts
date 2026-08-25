@@ -5,10 +5,11 @@
 import { statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
+import { constants as sqliteConstants } from 'node:sqlite';
 import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { SqliteDb, SqliteRow, SqliteStatement } from './sqlite-types.ts';
 
 type DbRow = SqliteRow;
 
@@ -114,14 +115,122 @@ function visibilitySql(alias: string, includeInactive = false): string {
     : `COALESCE(${column},'visible')='visible'`;
 }
 
-function assertReadOnlySql(sql: unknown): void {
-  const text = String(sql || '').trim();
-  if (!/^(SELECT|WITH)\b/i.test(text)) {
-    throw new Error('sql() only supports read-only SELECT/WITH queries');
+// #107: the read-only contract follows the statement's actual database
+// effects instead of scanning the SQL text for mutation keywords (which
+// false-positive on literals, comments, and quoted identifiers).
+const READ_ONLY_SQL_MESSAGE = 'sql() only supports read-only SELECT/WITH queries';
+const MULTI_STATEMENT_SQL_MESSAGE =
+  'sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls';
+
+// The lexical prefix check stays: it is the cheap, stable entry contract and
+// it keeps statement-level PRAGMA (allowed by the authorizer for pragma
+// table-valued functions) out of the sandbox.
+function assertReadOnlySqlPrefix(text: string): void {
+  if (!/^\s*(SELECT|WITH)\b/i.test(text)) {
+    throw new Error(READ_ONLY_SQL_MESSAGE);
   }
-  if (/\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM|ATTACH|DETACH)\b/i.test(text)) {
-    throw new Error('sql() only supports read-only SELECT/WITH queries');
+}
+
+// Write and schema-mutation action codes from SQLite's authorizer API
+// (sqlite3_set_authorizer). Everything not listed — SELECT, READ, FUNCTION,
+// TRANSACTION, PRAGMA, RECURSIVE, and any future read action — is allowed by
+// default: a denylist cannot false-positive on read syntax the way the old
+// keyword scan did, and the read-only connection opened by openReadDb()
+// remains the final mutation boundary for anything missed here. DENY is the
+// only correct rejection code: SQLITE_IGNORE on SQLITE_READ would silently
+// null out columns instead of failing.
+const DENIED_SQLITE_ACTIONS: ReadonlySet<number> = new Set([
+  sqliteConstants.SQLITE_INSERT,
+  sqliteConstants.SQLITE_UPDATE,
+  sqliteConstants.SQLITE_DELETE,
+  sqliteConstants.SQLITE_CREATE_INDEX,
+  sqliteConstants.SQLITE_CREATE_TABLE,
+  sqliteConstants.SQLITE_CREATE_TEMP_INDEX,
+  sqliteConstants.SQLITE_CREATE_TEMP_TABLE,
+  sqliteConstants.SQLITE_CREATE_TEMP_TRIGGER,
+  sqliteConstants.SQLITE_CREATE_TEMP_VIEW,
+  sqliteConstants.SQLITE_CREATE_TRIGGER,
+  sqliteConstants.SQLITE_CREATE_VIEW,
+  sqliteConstants.SQLITE_CREATE_VTABLE,
+  sqliteConstants.SQLITE_DROP_INDEX,
+  sqliteConstants.SQLITE_DROP_TABLE,
+  sqliteConstants.SQLITE_DROP_TEMP_INDEX,
+  sqliteConstants.SQLITE_DROP_TEMP_TABLE,
+  sqliteConstants.SQLITE_DROP_TEMP_TRIGGER,
+  sqliteConstants.SQLITE_DROP_TEMP_VIEW,
+  sqliteConstants.SQLITE_DROP_TRIGGER,
+  sqliteConstants.SQLITE_DROP_VIEW,
+  sqliteConstants.SQLITE_DROP_VTABLE,
+  sqliteConstants.SQLITE_ALTER_TABLE,
+  sqliteConstants.SQLITE_REINDEX,
+  sqliteConstants.SQLITE_ANALYZE,
+  sqliteConstants.SQLITE_ATTACH,
+  sqliteConstants.SQLITE_DETACH,
+  sqliteConstants.SQLITE_SAVEPOINT,
+]);
+
+// Prepare-time semantic classification. node:sqlite exposes the authorizer;
+// better-sqlite3 does not, and there statement classification happens through
+// the statement's readonly flag in assertReadOnlyStatement below.
+function installWriteDenylist(db: SqliteDb): void {
+  if (typeof db.setAuthorizer !== 'function') return;
+  db.setAuthorizer((action) =>
+    DENIED_SQLITE_ACTIONS.has(action) ? sqliteConstants.SQLITE_DENY : sqliteConstants.SQLITE_OK);
+}
+
+// better-sqlite3 path: no authorizer, but prepare() already rejected
+// multi-statement input and the readonly flag classifies write effects.
+function assertReadOnlyStatement(stmt: SqliteStatement): void {
+  if (stmt.readonly === false) throw new Error(READ_ONLY_SQL_MESSAGE);
+}
+
+// A tail is inert only when it is whitespace and comments — no quotes to
+// track, because anything else is a second statement SQLite never compiled
+// (node:sqlite prepare compiles the first statement and silently ignores the
+// rest, so this check is what makes multi-statement input fail clearly).
+function isBlankOrCommentTail(text: string): boolean {
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') { i += 1; continue; }
+    if (ch === '-' && text[i + 1] === '-') {
+      const end = text.indexOf('\n', i + 2);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      if (end === -1) return false;
+      i = end + 2;
+      continue;
+    }
+    return false;
   }
+  return true;
+}
+
+function assertSingleStatement(sqlText: string, stmt: SqliteStatement): void {
+  if (typeof stmt.sourceSQL !== 'string') return;
+  if (!isBlankOrCommentTail(sqlText.slice(stmt.sourceSQL.length))) {
+    throw new Error(MULTI_STATEMENT_SQL_MESSAGE);
+  }
+}
+
+function prepareReadOnlyStatement(db: SqliteDb, sqlText: string): SqliteStatement {
+  let stmt: SqliteStatement;
+  try {
+    stmt = db.prepare(sqlText);
+  } catch (error) {
+    // node:sqlite reports an authorizer denial as SQLITE_AUTH ("not
+    // authorized"); surface the sandbox contract instead of the raw code.
+    if (error instanceof Error && /not authorized/i.test(error.message)) {
+      throw new Error(READ_ONLY_SQL_MESSAGE, { cause: error });
+    }
+    throw error;
+  }
+  assertReadOnlyStatement(stmt);
+  assertSingleStatement(sqlText, stmt);
+  return stmt;
 }
 
 const CJK_TEXT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -150,9 +259,11 @@ function createQueryApi(
     invokingSessionId = null,
   }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
 ) {
+  installWriteDenylist(db);
   const q = (sql: string, ...p: any[]) => {
-    assertReadOnlySql(sql);
-    return db.prepare(sql).all(...p);
+    const text = String(sql || '');
+    assertReadOnlySqlPrefix(text);
+    return prepareReadOnlyStatement(db, text).all(...p);
   };
 
   const normalizeOverviewOpts = (optsOrScalar: QueryOptions | string | number | null | undefined): QueryOptions => {

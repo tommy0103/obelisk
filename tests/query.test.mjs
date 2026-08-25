@@ -531,6 +531,72 @@ test('query api is read-only and does not expose attune helpers', () => {
   db.close();
 });
 
+test('sql() accepts blocked keywords in literals, comments, and quoted identifiers', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+
+  // The issue #107 repro: all of these are read-only and must not be
+  // rejected for merely containing a blocked word.
+  assert.equal(api.sql("SELECT 'live update' AS text")[0].text, 'live update');
+  assert.equal(api.sql('SELECT 1 AS "delete"')[0].delete, 1);
+  assert.equal(api.sql('SELECT 1 AS x -- INSERT INTO t')[0].x, 1);
+  assert.equal(api.sql('SELECT 1 AS x /* DROP TABLE memories */')[0].x, 1);
+  // A blocked word inside a LIKE literal: no rows match, and that is the
+  // point — the query executes instead of being rejected.
+  assert.deepEqual(
+    api.sql("SELECT id FROM memories WHERE summary LIKE '%update%' ORDER BY id"),
+    [],
+  );
+  // Recursive CTEs and pragma table-valued functions are read-only too.
+  assert.equal(
+    api.sql('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<3) SELECT x FROM c').length,
+    3,
+  );
+  assert.ok(api.sql("SELECT name FROM pragma_table_info('memories')").length > 0);
+
+  db.close();
+});
+
+test('sql() rejects writes with a SELECT/WITH prefix without mutating the database', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+  const countMemories = () => db.prepare('SELECT COUNT(*) AS c FROM memories').get().c;
+
+  assert.throws(
+    () => api.sql("WITH c AS (SELECT 1) INSERT INTO memories (id, path, summary) SELECT 'mem-x', '/tmp/x.md', 'x' FROM c"),
+    /sql\(\) only supports read-only SELECT\/WITH queries/,
+  );
+  assert.throws(
+    () => api.sql('WITH c AS (SELECT 1) DELETE FROM memories'),
+    /sql\(\) only supports read-only SELECT\/WITH queries/,
+  );
+  assert.throws(
+    () => api.sql("SELECT 1; DROP TABLE memories"),
+    /exactly one SQL statement/,
+  );
+  // The fixture database is writable, so these rows surviving proves the
+  // semantic checks — not the read-only connection — blocked the writes.
+  assert.equal(countMemories(), 3);
+
+  db.close();
+});
+
+test('sql() enforces one statement per call with clear failures', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+
+  assert.throws(() => api.sql('SELECT 1; SELECT 2'), /exactly one SQL statement/);
+  assert.throws(() => api.sql('SELECT 1;; SELECT 2'), /exactly one SQL statement/);
+  assert.throws(() => api.sql('SELECT 1; /* unterminated'), /exactly one SQL statement/);
+
+  // A trailing semicolon and trailing comments are still a single statement.
+  assert.equal(api.sql('SELECT 1;')[0]['1'], 1);
+  assert.equal(api.sql('SELECT 1; -- trailing comment')[0]['1'], 1);
+  assert.equal(api.sql('SELECT 1; /* trailing comment */')[0]['1'], 1);
+
+  db.close();
+});
+
 test('attune api exposes only memory mutation helpers', () => {
   const db = memoryDb();
   const api = createAttuneApi(db);
