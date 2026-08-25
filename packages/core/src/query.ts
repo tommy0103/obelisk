@@ -98,6 +98,15 @@ function withVisibility(row: DbRow): DbRow {
   return { ...row, visibility: normalizedVisibility(row.visibility) };
 }
 
+// Subagent total tokens are derived from the sidechain messages' usage when
+// the provider did not store an authoritative value: incremental indexing may
+// never have seen the full stream, and the message rows always carry the
+// authoritative per-step usage.
+function deriveSubagentTokens(db: SqliteDb, agentId: unknown): number | null {
+  const tokens = db.prepare('SELECT COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS t FROM messages WHERE agent_id=?').get(agentId);
+  return tokens && typeof tokens.t === 'number' && tokens.t > 0 ? tokens.t : null;
+}
+
 function isQueryableMessage(
   row: DbRow | undefined,
   includeInactive = false,
@@ -256,10 +265,9 @@ function createQueryApi(
     }
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
     if (subagent) {
-      // Present query-derived usage like subagents() does (see there).
-      const tokens = db.prepare('SELECT COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS t FROM messages WHERE agent_id=?').get(msg.agent_id);
-      const total = tokens && typeof tokens.t === 'number' && tokens.t > 0 ? tokens.t : null;
-      subagent.total_tokens = total;
+      // Fill in query-derived usage like subagents() does (see there), but
+      // never override a value the provider stored authoritatively.
+      subagent.total_tokens = subagent.total_tokens ?? deriveSubagentTokens(db, msg.agent_id);
     }
     let workflow = null;
     if (msg.agent_id) {
@@ -309,12 +317,9 @@ function createQueryApi(
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {
       const c = db.prepare('SELECT COUNT(*) as c FROM messages WHERE agent_id=?').get(r.agent_id);
-      // Subagent total tokens are derived from the sidechain messages' usage,
-      // not stored: incremental indexing may never have seen the full stream,
-      // and the message rows always carry the authoritative per-step usage.
-      const tokens = db.prepare('SELECT COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS t FROM messages WHERE agent_id=?').get(r.agent_id);
-      const total = tokens && typeof tokens.t === 'number' && tokens.t > 0 ? tokens.t : null;
-      return { ...r, messageCount: c?.c || 0, total_tokens: total };
+      // A provider-stored value (e.g. codex) is authoritative; derive one only
+      // for providers that do not store it (deepseek).
+      return { ...r, messageCount: c?.c || 0, total_tokens: r.total_tokens ?? deriveSubagentTokens(db, r.agent_id) };
     });
   };
 

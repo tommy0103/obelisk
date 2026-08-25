@@ -5,14 +5,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { constants, zstdCompressSync } from 'node:zlib';
 
 import { createDeepseekProvider, decodeChunkRow } from '../packages/core/src/providers/deepseek.ts';
+import { persist } from '../packages/core/src/persist.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+
+const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+
+const SCOPE = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
+const ROOT_ID = `deepseek:root-session-1:${SCOPE}`;
+const CHILD_ID = `deepseek:child-session-1:${SCOPE}`;
 
 function drain(gen) {
   const values = [];
@@ -120,10 +128,10 @@ test('deepseek provider discovers root and subagent session files with stable cu
   const childUnit = units.find((unit) => unit.agentId !== undefined);
   assert.ok(rootUnit);
   assert.ok(childUnit);
-  assert.equal(rootUnit.sessionId, 'deepseek:root-session-1');
+  assert.equal(rootUnit.sessionId, ROOT_ID);
   assert.equal(rootUnit.project, '-tmp-dsh-project');
-  assert.equal(childUnit.sessionId, 'deepseek:root-session-1');
-  assert.equal(childUnit.agentId, 'deepseek:child-session-1');
+  assert.equal(childUnit.sessionId, ROOT_ID);
+  assert.equal(childUnit.agentId, CHILD_ID);
   assert.equal(childUnit.isSubagent, true);
 
   const cursorByKey = new Map(units.map((unit) => {
@@ -146,17 +154,17 @@ test('deepseek provider folds a session log into the canonical transcript langua
     : record);
   assert.equal(
     createHash('sha256').update(JSON.stringify(goldenRecords)).digest('hex'),
-    '6956cf88b3fb37bb106cb4e7a4ea12df7500369c5cd4b90e7c86305eb3d98dd9',
+    'aebeeec7aeac2c2114ca29de1a8043c250b13fb1967dd6b246aac2ac58cca040',
     'complete yielded record sequence changed',
   );
 
-  assert.match(ret, /^\d+(?:\.\d+)?:\d+$/);
+  assert.match(ret, /^\d+(?:\.\d+)?:\d+:\d+:\d+(?:\.\d+)?:\d+$/);
 
   const session = byKind('session')[0];
   assert.deepEqual(
     (({ id, title, project, source, countMode, message_count }) => ({ id, title, project, source, countMode, message_count }))(session),
     {
-      id: 'deepseek:root-session-1',
+      id: ROOT_ID,
       title: 'Fixture title',
       project: '-tmp-dsh-project',
       source: 'deepseek',
@@ -177,8 +185,8 @@ test('deepseek provider folds a session log into the canonical transcript langua
   ]);
   assert.equal(messages[0].parent_uuid, null);
   assert.equal(messages[2].parent_uuid, messages[1].uuid);
-  assert.equal(messages[2].uuid, 'deepseek:root-session-1:t1:s1:text');
-  assert.equal(messages[3].uuid, 'deepseek:root-session-1:t1:s1:tool_use');
+  assert.equal(messages[2].uuid, `${ROOT_ID}:t1:s1:text`);
+  assert.equal(messages[3].uuid, `${ROOT_ID}:t1:s1:tool_use`);
   assert.equal(messages.find((message) => message.text === 'doing it').input_tokens, 13);
   assert.equal(messages.find((message) => message.text === 'doing it').output_tokens, 4);
   assert.equal(messages.find((message) => message.content_type === 'tool_use').input_tokens, null);
@@ -186,15 +194,15 @@ test('deepseek provider folds a session log into the canonical transcript langua
   // tool_calls come from the durable tool/call events and anchor on the
   // deterministic tool_use uuid for the same (turn, step).
   assert.deepEqual(byKind('tool_call').map((record) => [record.id, record.name, record.file_path, record.message_uuid]), [
-    ['deepseek:root-session-1:call-1', 'Read', '/tmp/dsh-project/a.ts', 'deepseek:root-session-1:t1:s1:tool_use'],
-    ['deepseek:root-session-1:call-2', 'subagent', null, 'deepseek:root-session-1:t1:s2:tool_use'],
+    [`${ROOT_ID}:call-1`, 'Read', '/tmp/dsh-project/a.ts', `${ROOT_ID}:t1:s1:tool_use`],
+    [`${ROOT_ID}:call-2`, 'subagent', null, `${ROOT_ID}:t1:s2:tool_use`],
   ]);
   assert.deepEqual(byKind('tool_result').map((record) => [record.tool_use_id, record.content, record.is_error, record.message_uuid]), [
-    ['deepseek:root-session-1:call-1', 'file body', 0, 'deepseek:root-session-1:t1:s1:tool_use'],
-    ['deepseek:root-session-1:call-2', 'started subagent child-session-1', 0, 'deepseek:root-session-1:t1:s2:tool_use'],
+    [`${ROOT_ID}:call-1`, 'file body', 0, `${ROOT_ID}:t1:s1:tool_use`],
+    [`${ROOT_ID}:call-2`, 'started subagent child-session-1', 0, `${ROOT_ID}:t1:s2:tool_use`],
   ]);
   assert.deepEqual(byKind('subagent').map((record) => [record.agent_id, record.session_id, record.parent_tool_use_id]), [
-    ['deepseek:child-session-1', 'deepseek:root-session-1', 'deepseek:root-session-1:call-2'],
+    [CHILD_ID, ROOT_ID, `${ROOT_ID}:call-2`],
   ]);
 });
 
@@ -213,8 +221,8 @@ test('deepseek provider projects a subagent log as sidechain messages plus a sub
   ]);
   for (const message of messages) {
     assert.equal(message.is_sidechain, 1);
-    assert.equal(message.agent_id, 'deepseek:child-session-1');
-    assert.equal(message.session_id, 'deepseek:root-session-1');
+    assert.equal(message.agent_id, CHILD_ID);
+    assert.equal(message.session_id, ROOT_ID);
   }
   assert.equal(messages[2].input_tokens, 20);
   assert.equal(messages[2].output_tokens, 5);
@@ -223,7 +231,7 @@ test('deepseek provider projects a subagent log as sidechain messages plus a sub
   assert.equal(subagents.length, 1);
   assert.deepEqual(
     (({ agent_id, session_id, agent_type, description }) => ({ agent_id, session_id, agent_type, description }))(subagents[0]),
-    { agent_id: 'deepseek:child-session-1', session_id: 'deepseek:root-session-1', agent_type: 'deepseek-official', description: 'review helper' },
+    { agent_id: CHILD_ID, session_id: ROOT_ID, agent_type: 'deepseek-official', description: 'review helper' },
   );
   // total_tokens is derived at query time from the sidechain messages, not stored.
   assert.equal(subagents[0].total_tokens, undefined);
@@ -239,7 +247,7 @@ test('deepseek provider passes the fresh parse through assembleSessionDetail', (
   const { values } = drain(provider.parse(unit, null));
 
   const detail = assembleSessionDetail(values);
-  assert.equal(detail.session.id, 'deepseek:root-session-1');
+  assert.equal(detail.session.id, ROOT_ID);
   assert.equal(detail.session.title, 'Fixture title');
 
   const texts = detail.messages.map((message) => message.text).filter(Boolean);
@@ -256,8 +264,22 @@ test('deepseek provider passes the fresh parse through assembleSessionDetail', (
   // The text message absorbs the tool_use anchor's calls during assembly.
   const subagentCall = detail.messages.flatMap((message) => message.tool_calls ?? []).find((toolCall) => toolCall.name === 'subagent');
   assert.ok(subagentCall);
-  assert.equal(subagentCall.subagent.agent_id, 'deepseek:child-session-1');
+  assert.equal(subagentCall.subagent.agent_id, CHILD_ID);
   assert.equal(subagentCall.result.content, 'started subagent child-session-1');
+
+  // The assembled detail must survive a SQLite persist round-trip unchanged.
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  persist(db, unit, provider.parse(unit, null));
+  const persistedDetail = assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions').get(),
+    messages: db.prepare('SELECT * FROM messages ORDER BY timestamp, uuid').all(),
+    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+    toolResults: db.prepare('SELECT * FROM tool_results').all(),
+    subagents: db.prepare('SELECT * FROM subagents').all(),
+  });
+  assert.deepEqual(persistedDetail, detail);
+  db.close();
 });
 
 test('deepseek provider indexes a durable tool/call event and anchors it on the (turn, step) tool_use uuid', () => {
@@ -281,11 +303,17 @@ test('deepseek provider indexes a durable tool/call event and anchors it on the 
   const toolCalls = values.filter((record) => record.kind === 'tool_call');
 
   assert.equal(toolCalls.length, 1);
-  assert.equal(toolCalls[0].id, 'deepseek:toolcall-session:call-evt-1');
+  const toolCallDbId = `deepseek:toolcall-session:${SCOPE}`;
+  assert.equal(toolCalls[0].id, `${toolCallDbId}:call-evt-1`);
   assert.equal(toolCalls[0].name, 'bash');
   assert.match(toolCalls[0].input_json, new RegExp(marker));
   // The anchor is the deterministic tool_use uuid for the event's own (turn, step).
-  assert.equal(toolCalls[0].message_uuid, 'deepseek:toolcall-session:t1:s1:tool_use');
+  assert.equal(toolCalls[0].message_uuid, `${toolCallDbId}:t1:s1:tool_use`);
+  // Even without a tool-call content part in the assistant/message, the anchor
+  // message itself is emitted so downstream uuid filters and the ADR-0008
+  // nonce resolver never see a dangling reference.
+  const anchors = values.filter((record) => record.kind === 'message' && record.content_type === 'tool_use');
+  assert.deepEqual(anchors.map((record) => record.uuid), [`${toolCallDbId}:t1:s1:tool_use`]);
 });
 
 test('deepseek provider indexes incrementally by frame cursor with delta count mode', () => {
@@ -553,4 +581,138 @@ test('deepseek provider resolves the sessions root from $DSH_HOME', () => {
     if (original === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = original;
   }
+});
+
+// Regression: a delta-window-first message must get the same parent_uuid a
+// full reparse would give it (seeded from the last event before the window).
+test('deepseek provider seeds the parent chain across an incremental window boundary', () => {
+  const root = makeTempDir('obelisk-deepseek-parentseed-');
+  const sessionDir = join(root, 'sessions', '--tmp-dsh-project--', 'seed-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const header = { type: 'session', version: 0, id: 'seed-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 };
+  const first = [
+    header,
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'one' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+  ];
+  const second = [
+    { type: 'assistant/message', seq: 2, time: 1753005602000, data: {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'two' }], source: { kind: 'model', model: 'deepseek-v4-flash' }, id: 'm-2' },
+      usage: { inputTokens: 1, outputTokens: 1 },
+    } },
+  ];
+  writeFileSync(path, first.map((event) => JSON.stringify(event)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = drain(provider.parse(unit, null)).ret;
+
+  writeFileSync(path, [...first, ...second].map((event) => JSON.stringify(event)).join('\n') + '\n');
+  const { values } = drain(provider.parse(unit, cursor));
+  const appended = values.find((record) => record.kind === 'message' && record.text === 'two');
+  const scope = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
+  assert.equal(appended.parent_uuid, `deepseek:seed-session:${scope}:um-1`);
+});
+
+// Regression: a shrink below the cursor forces a full reparse AND retracts the
+// rows projected from the frames that are gone, so no stale messages survive.
+test('deepseek provider retracts stale rows on the shrink fallback', () => {
+  const root = makeTempDir('obelisk-deepseek-retract-');
+  const sessionDir = join(root, 'sessions', '--tmp-dsh-project--', 'retract-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const header = { type: 'session', version: 0, id: 'retract-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 };
+  const event = (seq, text) => ({ type: 'user/message', seq, time: 1753005601000 + seq, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: `m-${seq}` } });
+  writeFileSync(path, [header, event(1, 'keep-1'), event(2, 'stale-2'), event(3, 'stale-3')].map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const cursor = persist(db, unit, provider.parse(unit, null));
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM messages').get().c, 3);
+
+  // The file shrinks below the cursor (repair/replacement): full reparse.
+  writeFileSync(path, [header, event(1, 'keep-1')].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  persist(db, unit, provider.parse(unit, cursor));
+  const remaining = db.prepare('SELECT text FROM messages ORDER BY timestamp').all().map((row) => row.text);
+  assert.deepEqual(remaining, ['keep-1']);
+  db.close();
+});
+
+// Regression: an assistant turn with usage but no text/reasoning/tool-call
+// parts still emits a message so the step's tokens are never dropped.
+test('deepseek provider keeps usage of a parts-less assistant turn', () => {
+  const root = makeTempDir('obelisk-deepseek-usageonly-');
+  const sessionDir = join(root, 'sessions', '--proj--', 'usage-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const events = [
+    { type: 'session', version: 0, id: 'usage-session', createdAt: 1753005600000, cwd: '/proj', delegationDepth: 0 },
+    { type: 'assistant/message', seq: 1, time: 1753005601000, data: {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [], source: { kind: 'model', model: 'deepseek-v4-flash' }, id: 'm-1' },
+      usage: { inputTokens: 42, outputTokens: 7 },
+    } },
+  ];
+  writeFileSync(join(sessionDir, 'session.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+  const messages = values.filter((record) => record.kind === 'message');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].content_type, 'text');
+  assert.equal(messages[0].input_tokens, 42);
+  assert.equal(messages[0].output_tokens, 7);
+});
+
+// Regression (CONTRIBUTING): session identity must not be the source id alone
+// — two projects reusing one raw id must not overwrite each other.
+test('deepseek provider namespaces identity by project scope', () => {
+  const root = makeTempDir('obelisk-deepseek-scope-');
+  const provider0 = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  for (const project of ['--proj-a--', '--proj-b--']) {
+    const sessionDir = join(root, 'sessions', project, 'shared-id');
+    mkdirSync(sessionDir, { recursive: true });
+    const cwd = project === '--proj-a--' ? '/proj/a' : '/proj/b';
+    const events = [
+      { type: 'session', version: 0, id: 'shared-id', createdAt: 1753005600000, cwd, delegationDepth: 0 },
+      { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: `hi from ${cwd}` }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+    ];
+    writeFileSync(join(sessionDir, 'session.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+  const units = provider0.discover({ lastCursor: () => null });
+  assert.equal(units.length, 2);
+  const sessionIds = units.map((unit) => unit.sessionId);
+  assert.notEqual(sessionIds[0], sessionIds[1]);
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  for (const unit of units) persist(db, unit, provider0.parse(unit, null));
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM sessions').get().c, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM messages').get().c, 2);
+  db.close();
+});
+
+// Regression (CONTRIBUTING): the cursor must detect same-millisecond rewrites
+// via the mtime+size+ctime+inode signature, not mtime alone.
+test('deepseek provider re-discovers a same-mtime changed file via the cursor signature', () => {
+  const root = makeTempDir('obelisk-deepseek-cursor-');
+  const sessionDir = join(root, 'sessions', '--proj--', 'cursor-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const header = { type: 'session', version: 0, id: 'cursor-session', createdAt: 1753005600000, cwd: '/proj', delegationDepth: 0 };
+  writeFileSync(path, [header].map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: join(root, 'sessions') });
+  const cursor = drain(provider.parse(provider.discover({ lastCursor: () => null })[0], null)).ret;
+
+  // Same file, unchanged: signature matches, skipped.
+  assert.deepEqual(provider.discover({ lastCursor: () => cursor }), []);
+
+  // Fabricate a cursor with the right mtime/count but wrong size/ctime/ino:
+  // the file must come back into discovery.
+  const [mtime, count] = cursor.split(':');
+  const staleCursor = `${mtime}:${count}:1:1:1`;
+  assert.equal(provider.discover({ lastCursor: () => staleCursor }).length, 1);
 });

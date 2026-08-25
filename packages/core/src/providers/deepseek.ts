@@ -55,10 +55,11 @@
 // assistant messages use `deepseek:<id>:t<turn>:s<step>:<kind>`.
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, sep } from 'node:path';
 
-import { filePath, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
+import { filePath, normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../vendor/dsh-zstd.ts';
 import { decodeStorageRecord } from '../vendor/dsh-chunk-rows.ts';
 
@@ -74,7 +75,7 @@ import type {
 } from './types.ts';
 
 export const name = 'deepseek';
-const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v1__';
+const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v2__';
 
 const SESSION_FILENAMES = ['.jsonl.zstd', '.jsonl'];
 const SUBAGENT_RESULT_RE = /started\s+subagent\s+(\S+)/;
@@ -101,24 +102,35 @@ interface LogRecord {
   data: Record<string, unknown>;
 }
 
-function dshDbId(rawId: string): string {
-  return `deepseek:${rawId}`;
+/**
+ * Deterministic project discriminator for session identity (CONTRIBUTING:
+ * "session identity must not be the source id alone"). Mirrors pi's scheme so
+ * two projects reusing the same raw session id cannot overwrite each other.
+ */
+function projectScope(cwd: unknown): string {
+  const normalized = normalizeObservedCwd(cwd) ?? (typeof cwd === 'string' ? cwd : '');
+  return createHash('sha256').update('deepseek-cwd-v1\0').update(normalized).digest('hex');
 }
 
-function assistantMessageUuid(rawSessionId: string, turn: unknown, step: unknown, kind: 'reasoning' | 'text' | 'tool_use'): string {
-  return `deepseek:${rawSessionId}:t${turn}:s${step}:${kind}`;
+/** Database identity for one raw session id inside one project scope. */
+function dshDbId(scope: string, rawId: string): string {
+  return `deepseek:${encodeURIComponent(rawId)}:${scope}`;
 }
 
-function toolUseUuid(rawSessionId: string, turn: unknown, step: unknown): string {
-  return assistantMessageUuid(rawSessionId, turn, step, 'tool_use');
+function assistantMessageUuid(dbId: string, turn: unknown, step: unknown, kind: 'reasoning' | 'text' | 'tool_use'): string {
+  return `${dbId}:t${turn}:s${step}:${kind}`;
 }
 
-function userMessageUuid(rawSessionId: string, nativeId: unknown, seq: number): string {
-  return `deepseek:${rawSessionId}:u${typeof nativeId === 'string' && nativeId.length > 0 ? nativeId : seq}`;
+function toolUseUuid(dbId: string, turn: unknown, step: unknown): string {
+  return assistantMessageUuid(dbId, turn, step, 'tool_use');
 }
 
-function callId(rawSessionId: string, nativeCallId: string): string {
-  return `deepseek:${rawSessionId}:${nativeCallId}`;
+function userMessageUuid(dbId: string, nativeId: unknown, seq: number): string {
+  return `${dbId}:u${typeof nativeId === 'string' && nativeId.length > 0 ? nativeId : seq}`;
+}
+
+function callId(dbId: string, nativeCallId: string): string {
+  return `${dbId}:${encodeURIComponent(nativeCallId)}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -152,8 +164,21 @@ function decodeFrames(buffer: Buffer, frames: Array<{ start: number; end: number
  * repair truncated committed frames) forces a full reparse. Returns a null
  * window when no new committed events exist.
  */
-function incrementalWindow(path: string, cursor: Cursor): { window: { text: string } | null; fullReparse: boolean; mtime: number; totalCount: number } {
-  const mtime = statSync(path).mtimeMs;
+interface IncrementalWindow {
+  window: { text: string } | null;
+  fullReparse: boolean;
+  mtime: number;
+  totalCount: number;
+  size: number;
+  ctimeMs: number;
+  ino: number;
+  /** Plaintext of the frames/lines just before the window, newest first (parent-chain seeding). */
+  priorTexts: string[];
+}
+
+function incrementalWindow(path: string, cursor: Cursor): IncrementalWindow {
+  const { mtimeMs: mtime, size, ctimeMs, ino } = statSync(path);
+  const base = { mtime, size, ctimeMs, ino };
   const full = cursor === null;
   if (path.endsWith('.jsonl.zstd')) {
     const buffer = readFileSync(path);
@@ -162,8 +187,20 @@ function incrementalWindow(path: string, cursor: Cursor): { window: { text: stri
     const cursorCount = full ? 0 : (Number(cursor.split(':')[1]) || 0);
     const fullReparse = full || totalCount < cursorCount;
     const fromFrame = fullReparse ? 0 : cursorCount;
-    if (!fullReparse && totalCount === cursorCount) return { window: null, fullReparse, mtime, totalCount };
-    return { window: { text: decodeFrames(buffer, frames, fromFrame) }, fullReparse, mtime, totalCount };
+    if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, priorTexts: [] };
+    // A few frames back is enough to find a projectable event for the seed.
+    const priorTexts: string[] = [];
+    for (let f = fromFrame - 1; f >= 0 && priorTexts.length < 4; f--) {
+      const decoder = createZstdFrameDecoder();
+      try {
+        let text = '';
+        for (const decoded of decoder.decode(buffer, [frames[f]!])) text += decoded.toString('utf8');
+        priorTexts.push(text);
+      } finally {
+        decoder.close();
+      }
+    }
+    return { ...base, window: { text: decodeFrames(buffer, frames, fromFrame) }, fullReparse, totalCount, priorTexts };
   }
   // Plaintext logs have no frames; the cursor is the processed line count.
   const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.trim().length > 0);
@@ -171,8 +208,9 @@ function incrementalWindow(path: string, cursor: Cursor): { window: { text: stri
   const cursorCount = full ? 0 : (Number(cursor.split(':')[1]) || 0);
   const fullReparse = full || totalCount < cursorCount;
   const fromLine = fullReparse ? 0 : cursorCount;
-  if (!fullReparse && totalCount === cursorCount) return { window: null, fullReparse, mtime, totalCount };
-  return { window: { text: lines.slice(fromLine).join('\n') }, fullReparse, mtime, totalCount };
+  if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, priorTexts: [] };
+  const priorTexts = fromLine > 0 ? [lines.slice(0, fromLine).join('\n')] : [];
+  return { ...base, window: { text: lines.slice(fromLine).join('\n') }, fullReparse, totalCount, priorTexts };
 }
 
 function firstNonEmptyLine(text: string): string | null {
@@ -389,6 +427,21 @@ function resolveRootSessionId(rawId: string, header: DshHeader, headersByRawId: 
   return root;
 }
 
+// Cursor format: `${mtime}:${frames|lines}:${size}:${ctimeMs}:${ino}`. The
+// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
+// same-millisecond rewrites) lets a same-mtime append or replacement back into
+// discovery. Legacy `${mtime}:${count}` cursors keep the mtime-only gate and
+// upgrade on the next parse.
+function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
+  const stat = statSync(filePath);
+  const parts = cursor.split(':');
+  if (parts.length < 5) return Number(parts[0]) < stat.mtimeMs;
+  return Number(parts[0]) !== stat.mtimeMs
+    || Number(parts[2]) !== stat.size
+    || Number(parts[3]) !== stat.ctimeMs
+    || Number(parts[4]) !== stat.ino;
+}
+
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const sessionsDir = rootDir;
   if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
@@ -409,21 +462,26 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const units: IndexUnit[] = [];
   for (const file of files) {
     if (changedFiles !== null && !changedFiles.has(file.path)) continue;
-    const mtime = statSync(file.path).mtimeMs;
     const cursor = ctx.lastCursor(file.path);
-    if (changedFiles === null && cursor !== null && Number(cursor.split(':')[0]) >= mtime) continue;
+    if (changedFiles === null && cursor !== null && !cursorSignatureDiffers(cursor, file.path)) continue;
     const header = readDshHeader(file.path);
     if (header === null) continue;
     const rawId = typeof header.id === 'string' ? header.id : file.sessionDir.split(sep).pop() ?? '';
     if (!rawId) continue;
     const isSubagent = typeof header.parentSession === 'string' && header.parentSession.length > 0;
     const rootRawId = resolveRootSessionId(rawId, header, headersByRawId);
+    // The scope comes from the session's own cwd (subagent sessions inherit
+    // their parent's cwd upstream, so a delegation tree shares one
+    // namespace); the map lookup is only a fallback for a missing cwd, and
+    // must not be keyed by raw id alone — raw ids can collide across projects.
+    const rootCwd = header.cwd ?? (rootRawId === rawId ? undefined : headersByRawId.get(rootRawId)?.cwd);
+    const scope = projectScope(rootCwd);
     units.push({
       key: file.path,
-      sessionId: dshDbId(rootRawId),
-      ...(isSubagent ? { agentId: dshDbId(rawId), isSubagent: true } : {}),
+      sessionId: dshDbId(scope, rootRawId),
+      ...(isSubagent ? { agentId: dshDbId(scope, rawId), isSubagent: true } : {}),
       project: projectSlugFromPath(typeof header.cwd === 'string' ? header.cwd : null) ?? undefined,
-      meta: { kind: 'session', rawSessionId: rawId, header, isSubagent },
+      meta: { kind: 'session', rawSessionId: rawId, header, isSubagent, scope },
     });
   }
   return units;
@@ -431,26 +489,71 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
 
 // ---- parse ----
 
+/** The uuid a previous run would have emitted for the last message-bearing event in `records`. */
+function lastEmittedUuid(dbId: string, records: LogRecord[]): string | null {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const record = records[i]!;
+    if (record.type === 'user/message') return userMessageUuid(dbId, record.data.id, record.seq);
+    if (record.type === 'tool/call') return toolUseUuid(dbId, record.data.turn, record.data.step);
+    if (record.type === 'assistant/message') {
+      const message = isRecord(record.data.message) ? record.data.message : {};
+      const content = message.content;
+      if (Array.isArray(content) && content.some(part => isRecord(part) && part.type === 'tool-call' && typeof part.id === 'string')) {
+        return toolUseUuid(dbId, record.data.turn, record.data.step);
+      }
+      if (joinPartText(content, 'text') !== null || joinPartText(content, 'reasoning') === null) {
+        return assistantMessageUuid(dbId, record.data.turn, record.data.step, 'text');
+      }
+      return assistantMessageUuid(dbId, record.data.turn, record.data.step, 'reasoning');
+    }
+  }
+  return null;
+}
+
 function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
-  const meta = unit.meta as { rawSessionId: string; header: DshHeader; isSubagent: boolean };
+  const meta = unit.meta as { rawSessionId: string; header: DshHeader; isSubagent: boolean; scope: string };
   const rawSessionId = meta.rawSessionId;
   const header = meta.header;
   const sessionId = unit.sessionId;
   const agentId = unit.agentId ?? null;
   const isSubagent = meta.isSubagent;
   const cwd = typeof header.cwd === 'string' ? header.cwd : null;
+  const dbId = dshDbId(meta.scope, rawSessionId);
 
-  const { window, fullReparse, mtime, totalCount } = incrementalWindow(unit.key, cursor);
-  if (window === null) return `${mtime}:${totalCount}`;
+  const { window, fullReparse, mtime, totalCount, size, ctimeMs, ino, priorTexts } = incrementalWindow(unit.key, cursor);
+  const newCursor = `${mtime}:${totalCount}:${size}:${ctimeMs}:${ino}`;
+  if (window === null) return newCursor;
   const records = readLogRecords(window.text);
 
   const recordsOut: TranscriptRecord[] = [];
+  if (fullReparse && cursor !== null) {
+    // Shrink/replacement fallback: rows projected from frames that are now
+    // gone would stay stale under upsert semantics. Retract this unit's own
+    // scope before re-emitting (a subagent retracts by its agent id, which
+    // cascades to its sidechain messages and subagent row; tool rows keyed
+    // by the shared session id become unreachable but are deliberately left).
+    recordsOut.push({ kind: 'delete-session', sessionId: isSubagent ? (agentId as string) : sessionId });
+  }
   let title: string | null = null;
   const startedAt = typeof header.createdAt === 'number' ? new Date(header.createdAt).toISOString() : null;
   let endedAt: string | null = null;
   let mainMessageCount = 0;
+  // Seed the parent chain from the last message before the window so a
+  // delta-window-first message gets the same parent_uuid a full reparse
+  // would give it (without seeding it would be null and trace() would break
+  // at every window boundary).
   let lastMessageUuid: string | null = null;
+  if (!fullReparse) {
+    for (const priorText of priorTexts) {
+      const seed = lastEmittedUuid(dbId, readLogRecords(priorText));
+      if (seed !== null) {
+        lastMessageUuid = seed;
+        break;
+      }
+    }
+  }
   let currentModel: string | null = null;
+  const emittedAnchors = new Set<string>();
 
   const updateEndedAt = (timestamp: string | null): void => {
     if (timestamp !== null && (endedAt === null || timestamp > endedAt)) endedAt = timestamp;
@@ -494,7 +597,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         const text = joinPartText(content, 'text');
         const sourceKind = isRecord(record.data.source) ? record.data.source.kind : undefined;
         const isMeta = sourceKind !== 'user' ? 1 : 0;
-        const uuid = userMessageUuid(rawSessionId, record.data.id, record.seq);
+        const uuid = userMessageUuid(dbId, record.data.id, record.seq);
         pushMessage({
           kind: 'message', uuid, session_id: sessionId, type: 'user', parent_uuid: lastMessageUuid,
           timestamp, role: 'user', text: trunc(text), content_type: 'text', is_meta: isMeta,
@@ -519,9 +622,13 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           ? message.source.model
           : currentModel;
 
-        const reasoningUuid = reasoningText !== null ? assistantMessageUuid(rawSessionId, turn, step, 'reasoning') : null;
-        const textUuid = visibleText !== null ? assistantMessageUuid(rawSessionId, turn, step, 'text') : null;
-        const toolUseUuid = hasToolCalls ? assistantMessageUuid(rawSessionId, turn, step, 'tool_use') : null;
+        const reasoningUuid = reasoningText !== null ? assistantMessageUuid(dbId, turn, step, 'reasoning') : null;
+        // A step with no projectable parts still emits a (text-less) text
+        // message so its usage is never dropped.
+        const textUuid = visibleText !== null || (reasoningText === null && !hasToolCalls)
+          ? assistantMessageUuid(dbId, turn, step, 'text')
+          : null;
+        const toolUseUuid = hasToolCalls ? assistantMessageUuid(dbId, turn, step, 'tool_use') : null;
         // Usage lands on the primary (visible) message for this step: the text
         // message when present, else the tool_use anchor, else the thinking one.
         const tokensUuid = textUuid ?? toolUseUuid ?? reasoningUuid;
@@ -546,6 +653,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           });
         }
         if (toolUseUuid !== null) {
+          emittedAnchors.add(toolUseUuid);
           pushMessage({
             kind: 'message', uuid: toolUseUuid, parent_uuid: lastMessageUuid, text: null,
             content_type: 'tool_use', input_tokens: tokensFor(toolUseUuid), output_tokens: tokensOutFor(toolUseUuid), ...base,
@@ -564,9 +672,24 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         if (nativeCallId === null) break;
         const toolName = typeof data.name === 'string' ? data.name : 'tool';
         const args = parseToolArguments(data.arguments);
+        const anchor = toolUseUuid(dbId, data.turn, data.step);
+        // The anchor message must exist even when this step's assistant/message
+        // has no tool-call part (or never landed): tool_calls and tool_results
+        // are filtered by message_uuid downstream, and the ADR-0008 nonce
+        // resolver walks this anchor to the session.
+        if (!emittedAnchors.has(anchor)) {
+          emittedAnchors.add(anchor);
+          pushMessage({
+            kind: 'message', uuid: anchor, session_id: sessionId, type: 'assistant',
+            parent_uuid: lastMessageUuid, timestamp, role: 'assistant', text: null,
+            content_type: 'tool_use', is_meta: 0, visibility: 'visible', model: currentModel,
+            is_sidechain: isSubagent ? 1 : 0, agent_id: agentId,
+            input_tokens: null, output_tokens: null, cwd, skill: null, source: 'deepseek',
+          });
+        }
         recordsOut.push({
-          kind: 'tool_call', id: callId(rawSessionId, nativeCallId),
-          message_uuid: toolUseUuid(rawSessionId, data.turn, data.step), session_id: sessionId,
+          kind: 'tool_call', id: callId(dbId, nativeCallId),
+          message_uuid: anchor, session_id: sessionId,
           name: toolName, presentation: toolName === 'skill' ? 'skill' : 'default',
           input_json: truncJson(args) ?? '{}', file_path: dshToolFilePath(toolName, isRecord(args) ? args : null),
         });
@@ -576,11 +699,11 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         const message = isRecord(record.data.message) ? record.data.message : {};
         const source = isRecord(message.source) ? message.source : {};
         if (typeof source.callId !== 'string') break;
-        const toolId = callId(rawSessionId, source.callId);
+        const toolId = callId(dbId, source.callId);
         const content = toolResultContent(message.content);
         recordsOut.push({
           kind: 'tool_result', tool_use_id: toolId,
-          message_uuid: toolUseUuid(rawSessionId, record.data.turn, record.data.step),
+          message_uuid: toolUseUuid(dbId, record.data.turn, record.data.step),
           session_id: sessionId, content: trunc(content), file_path: null,
           is_error: toolResultIsError(record.data, message.content),
         });
@@ -590,7 +713,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         const match = SUBAGENT_RESULT_RE.exec(content);
         if (match !== null && match[1]) {
           recordsOut.push({
-            kind: 'subagent', agent_id: dshDbId(match[1]), session_id: sessionId,
+            kind: 'subagent', agent_id: dshDbId(meta.scope, match[1]), session_id: sessionId,
             parent_tool_use_id: toolId,
           });
         }
@@ -631,7 +754,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   }
 
   yield* recordsOut;
-  return `${mtime}:${totalCount}`;
+  return newCursor;
 }
 
 // ---- raw ----
@@ -640,10 +763,10 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   const uuid = input.messageUuid;
   let rawSessionId: string | null = null;
   let finder: ((value: Record<string, unknown>) => boolean) | null = null;
-  const userMatch = /^deepseek:([^:]+):u(.+)$/.exec(uuid);
-  const assistantMatch = /^deepseek:([^:]+):t(\d+):s(\d+):(reasoning|text|tool_use)$/.exec(uuid);
+  const userMatch = /^deepseek:([^:]+):[0-9a-f]{64}:u(.+)$/.exec(uuid);
+  const assistantMatch = /^deepseek:([^:]+):[0-9a-f]{64}:t(\d+):s(\d+):(reasoning|text|tool_use)$/.exec(uuid);
   if (userMatch !== null) {
-    rawSessionId = userMatch[1];
+    rawSessionId = decodeURIComponent(userMatch[1]);
     const captured = userMatch[2];
     finder = (value) => (
       value.type === 'user/message'
@@ -651,7 +774,7 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
       && (value.data.id === captured || value.seq === Number(captured))
     );
   } else if (assistantMatch !== null) {
-    rawSessionId = assistantMatch[1];
+    rawSessionId = decodeURIComponent(assistantMatch[1]);
     const turn = Number(assistantMatch[2]);
     const step = Number(assistantMatch[3]);
     finder = (value) => (
@@ -663,8 +786,8 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   }
   if (rawSessionId === null || finder === null) return null;
   if (input.agentId !== null && typeof input.agentId === 'string') {
-    const agentMatch = /^deepseek:(.+)$/.exec(input.agentId);
-    if (agentMatch !== null && agentMatch[1]) rawSessionId = agentMatch[1];
+    const agentMatch = /^deepseek:([^:]+):[0-9a-f]{64}$/.exec(input.agentId);
+    if (agentMatch !== null && agentMatch[1]) rawSessionId = decodeURIComponent(agentMatch[1]);
   }
   const path = typeof input.session?.jsonl_path === 'string' && input.agentId === null
     ? input.session.jsonl_path

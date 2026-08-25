@@ -757,3 +757,24 @@ test('subagents() derives total_tokens from sidechain message usage', () => {
 
   db.close();
 });
+
+test('subagents() never overrides a provider-stored total_tokens (codex regression)', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title, source) VALUES ('sid-codex', 'codex parent', 'codex')").run();
+  // Codex stores total_tokens authoritatively at persist time; the derived
+  // message sum (30) must not replace the stored value (20).
+  db.prepare("INSERT INTO subagents (agent_id, session_id, agent_type, total_tokens) VALUES ('codex:agent-1', 'sid-codex', 'worker', 20)").run();
+  const insertMsg = db.prepare("INSERT INTO messages (uuid, session_id, type, role, text, timestamp, agent_id, input_tokens, output_tokens, source) VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insertMsg.run('cx-m1', 'sid-codex', 'assistant', 'assistant', 'a', '2026-06-01T00:00:00Z', 'codex:agent-1', 10, 5, 'codex');
+  insertMsg.run('cx-m2', 'sid-codex', 'assistant', 'assistant', 'b', '2026-06-01T00:01:00Z', 'codex:agent-1', 10, 5, 'codex');
+
+  const api = createQueryApi(db);
+  const row = api.subagents()[0];
+  assert.equal(row.total_tokens, 20);
+
+  const ctx = api.context('cx-m1');
+  assert.equal(ctx.subagent.total_tokens, 20);
+
+  db.close();
+});
