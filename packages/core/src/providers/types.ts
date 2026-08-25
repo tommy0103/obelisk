@@ -81,7 +81,8 @@ export type TranscriptRecord =
   | WorkflowRecord
   | WorkflowAgentRecord
   | MessageTurnDurationRecord
-  | DeleteSessionRecord;
+  | DeleteSessionRecord
+  | RetractScopeRecord;
 
 export type MessageVisibility = 'visible' | 'inactive' | 'hidden';
 
@@ -217,6 +218,21 @@ export interface MessageTurnDurationRecord {
 export interface DeleteSessionRecord {
   kind: 'delete-session';
   sessionId: string;
+}
+
+// Unit-scoped retraction (not a table). An incremental adapter emits this when
+// it must reparse a unit whose previously projected rows may be stale (e.g. a
+// shrink/replacement fallback). Unlike delete-session it never cascades into
+// other units' data: it deletes only the messages the unit itself owns — for a
+// root unit the session's non-sidechain messages, for a subagent unit its
+// sidechain messages (agent_id match) — plus tool rows anchored on them. The
+// subagents and sessions rows are left untouched so cross-unit contributions
+// (e.g. a parent-contributed parent_tool_use_id) survive.
+export interface RetractScopeRecord {
+  kind: 'retract-scope';
+  sessionId: string;
+  /** Null for a root unit; the subagent's own db id for a subagent unit. */
+  agentId: string | null;
 }
 
 // Session-level aggregate. Emitted once, after the unit's records are produced,

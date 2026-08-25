@@ -172,8 +172,16 @@ interface IncrementalWindow {
   size: number;
   ctimeMs: number;
   ino: number;
-  /** Plaintext of the frames/lines just before the window, newest first (parent-chain seeding). */
-  priorTexts: string[];
+  /** Pull the plaintext one frame/chunk before the window, newest first, null when exhausted (parent-chain seeding). */
+  nextPriorText: () => string | null;
+}
+
+/** Whether the cursor's mtime+size+ctime+inode signature still matches the file. */
+function cursorSignatureMatches(cursor: string, mtime: number, size: number, ctimeMs: number, ino: number): boolean {
+  const parts = cursor.split(':');
+  if (parts.length < 5) return Number(parts[0]) === mtime; // legacy mtime-only cursor
+  return Number(parts[0]) === mtime && Number(parts[2]) === size
+    && Number(parts[3]) === ctimeMs && Number(parts[4]) === ino;
 }
 
 function incrementalWindow(path: string, cursor: Cursor): IncrementalWindow {
@@ -185,32 +193,46 @@ function incrementalWindow(path: string, cursor: Cursor): IncrementalWindow {
     const { frames } = scanZstdFrames(buffer);
     const totalCount = frames.length;
     const cursorCount = full ? 0 : (Number(cursor.split(':')[1]) || 0);
-    const fullReparse = full || totalCount < cursorCount;
+    // Equal frame count is only "nothing to do" when the signature matches:
+    // an equal-count replacement must be reparsed, not accepted as-is.
+    const replaced = !full && totalCount === cursorCount && !cursorSignatureMatches(cursor, mtime, size, ctimeMs, ino);
+    const fullReparse = full || totalCount < cursorCount || replaced;
     const fromFrame = fullReparse ? 0 : cursorCount;
-    if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, priorTexts: [] };
-    // A few frames back is enough to find a projectable event for the seed.
-    const priorTexts: string[] = [];
-    for (let f = fromFrame - 1; f >= 0 && priorTexts.length < 4; f--) {
+    if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, nextPriorText: () => null };
+    // Decoded lazily by the seeding loop, which stops at the first frame
+    // holding a projectable event — usually the frame right before the window.
+    let priorFrame = fromFrame - 1;
+    const nextPriorText = (): string | null => {
+      if (priorFrame < 0) return null;
       const decoder = createZstdFrameDecoder();
       try {
         let text = '';
-        for (const decoded of decoder.decode(buffer, [frames[f]!])) text += decoded.toString('utf8');
-        priorTexts.push(text);
+        for (const decoded of decoder.decode(buffer, [frames[priorFrame]!])) text += decoded.toString('utf8');
+        priorFrame--;
+        return text;
       } finally {
         decoder.close();
       }
-    }
-    return { ...base, window: { text: decodeFrames(buffer, frames, fromFrame) }, fullReparse, totalCount, priorTexts };
+    };
+    return { ...base, window: { text: decodeFrames(buffer, frames, fromFrame) }, fullReparse, totalCount, nextPriorText };
   }
   // Plaintext logs have no frames; the cursor is the processed line count.
   const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.trim().length > 0);
   const totalCount = lines.length;
   const cursorCount = full ? 0 : (Number(cursor.split(':')[1]) || 0);
-  const fullReparse = full || totalCount < cursorCount;
+  const replaced = !full && totalCount === cursorCount && !cursorSignatureMatches(cursor, mtime, size, ctimeMs, ino);
+  const fullReparse = full || totalCount < cursorCount || replaced;
   const fromLine = fullReparse ? 0 : cursorCount;
-  if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, priorTexts: [] };
-  const priorTexts = fromLine > 0 ? [lines.slice(0, fromLine).join('\n')] : [];
-  return { ...base, window: { text: lines.slice(fromLine).join('\n') }, fullReparse, totalCount, priorTexts };
+  if (!fullReparse && totalCount === cursorCount) return { ...base, window: null, fullReparse, totalCount, nextPriorText: () => null };
+  // Plaintext lines are already in memory, so a single pull returns them all.
+  const priorJoined = fromLine > 0 ? lines.slice(0, fromLine).join('\n') : null;
+  let priorUsed = false;
+  const nextPriorText = (): string | null => {
+    if (priorUsed || priorJoined === null) return null;
+    priorUsed = true;
+    return priorJoined;
+  };
+  return { ...base, window: { text: lines.slice(fromLine).join('\n') }, fullReparse, totalCount, nextPriorText };
 }
 
 function firstNonEmptyLine(text: string): string | null {
@@ -290,6 +312,30 @@ function joinPartText(content: unknown, partType: string): string | null {
     .filter(part => isRecord(part) && part.type === partType && typeof part.text === 'string')
     .map(part => (part as { text: string }).text);
   return parts.length > 0 ? parts.join('\n') : null;
+}
+
+/** Classify an assistant message's content parts (shared by projection and parent seeding). */
+interface AssistantClassification {
+  reasoningText: string | null;
+  visibleText: string | null;
+  hasToolCalls: boolean;
+}
+
+function classifyAssistantContent(content: unknown): AssistantClassification {
+  return {
+    reasoningText: joinPartText(content, 'reasoning'),
+    visibleText: joinPartText(content, 'text'),
+    hasToolCalls: Array.isArray(content)
+      && content.some(part => isRecord(part) && part.type === 'tool-call' && typeof part.id === 'string'),
+  };
+}
+
+/** The last message uuid an assistant/message with this classification emits. */
+function assistantLastUuid(dbId: string, turn: unknown, step: unknown, c: AssistantClassification): string {
+  if (c.hasToolCalls) return toolUseUuid(dbId, turn, step);
+  // Parts-less turns still emit a (text-less) message so usage is never dropped.
+  if (c.visibleText !== null || c.reasoningText === null) return assistantMessageUuid(dbId, turn, step, 'text');
+  return assistantMessageUuid(dbId, turn, step, 'reasoning');
 }
 
 function parseToolArguments(value: unknown): unknown {
@@ -387,12 +433,15 @@ function collectSessionFiles(sessionsDir: string, reportIssue: ((issue: { path: 
   return result.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function findSessionFile(rootDir: string, rawSessionId: string): string | null {
+function findSessionFile(rootDir: string, rawSessionId: string, scope: string | null): string | null {
   const files = collectSessionFiles(rootDir, undefined);
   for (const file of files) {
-    if (file.sessionDir.endsWith(sep + rawSessionId)) return file.path;
     const header = readDshHeader(file.path);
-    if (header?.id === rawSessionId) return file.path;
+    if (file.sessionDir.endsWith(sep + rawSessionId) || header?.id === rawSessionId) {
+      // Raw ids may collide across projects: disambiguate by scope (cwd hash)
+      // when the caller's identity carries one.
+      if (scope === null || projectScope(header?.cwd) === scope) return file.path;
+    }
   }
   return null;
 }
@@ -497,14 +546,7 @@ function lastEmittedUuid(dbId: string, records: LogRecord[]): string | null {
     if (record.type === 'tool/call') return toolUseUuid(dbId, record.data.turn, record.data.step);
     if (record.type === 'assistant/message') {
       const message = isRecord(record.data.message) ? record.data.message : {};
-      const content = message.content;
-      if (Array.isArray(content) && content.some(part => isRecord(part) && part.type === 'tool-call' && typeof part.id === 'string')) {
-        return toolUseUuid(dbId, record.data.turn, record.data.step);
-      }
-      if (joinPartText(content, 'text') !== null || joinPartText(content, 'reasoning') === null) {
-        return assistantMessageUuid(dbId, record.data.turn, record.data.step, 'text');
-      }
-      return assistantMessageUuid(dbId, record.data.turn, record.data.step, 'reasoning');
+      return assistantLastUuid(dbId, record.data.turn, record.data.step, classifyAssistantContent(message.content));
     }
   }
   return null;
@@ -520,7 +562,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   const cwd = typeof header.cwd === 'string' ? header.cwd : null;
   const dbId = dshDbId(meta.scope, rawSessionId);
 
-  const { window, fullReparse, mtime, totalCount, size, ctimeMs, ino, priorTexts } = incrementalWindow(unit.key, cursor);
+  const { window, fullReparse, mtime, totalCount, size, ctimeMs, ino, nextPriorText } = incrementalWindow(unit.key, cursor);
   const newCursor = `${mtime}:${totalCount}:${size}:${ctimeMs}:${ino}`;
   if (window === null) return newCursor;
   const records = readLogRecords(window.text);
@@ -528,11 +570,11 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   const recordsOut: TranscriptRecord[] = [];
   if (fullReparse && cursor !== null) {
     // Shrink/replacement fallback: rows projected from frames that are now
-    // gone would stay stale under upsert semantics. Retract this unit's own
-    // scope before re-emitting (a subagent retracts by its agent id, which
-    // cascades to its sidechain messages and subagent row; tool rows keyed
-    // by the shared session id become unreachable but are deliberately left).
-    recordsOut.push({ kind: 'delete-session', sessionId: isSubagent ? (agentId as string) : sessionId });
+    // gone would stay stale under upsert semantics. Retract only this unit's
+    // own scope — never a whole-session cascade: a root reparse must not drop
+    // unchanged child units' sidechain data (their cursors stay valid), and a
+    // child reparse must not drop the parent-contributed subagent columns.
+    recordsOut.push({ kind: 'retract-scope', sessionId, agentId });
   }
   let title: string | null = null;
   const startedAt = typeof header.createdAt === 'number' ? new Date(header.createdAt).toISOString() : null;
@@ -544,7 +586,8 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   // at every window boundary).
   let lastMessageUuid: string | null = null;
   if (!fullReparse) {
-    for (const priorText of priorTexts) {
+    let priorText: string | null;
+    while ((priorText = nextPriorText()) !== null) {
       const seed = lastEmittedUuid(dbId, readLogRecords(priorText));
       if (seed !== null) {
         lastMessageUuid = seed;
@@ -560,6 +603,10 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   };
 
   const pushMessage = (record: MessageRecord): void => {
+    // A re-emitted anchor at a frame boundary can be its own seeded parent
+    // (two tool/calls of one step straddling the cursor): never self-link,
+    // or trace()/context() would loop forever.
+    if (record.parent_uuid === record.uuid) record.parent_uuid = null;
     recordsOut.push(record);
     lastMessageUuid = record.uuid;
     if (agentId === null && record.visibility === 'visible') mainMessageCount++;
@@ -600,7 +647,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         const uuid = userMessageUuid(dbId, record.data.id, record.seq);
         pushMessage({
           kind: 'message', uuid, session_id: sessionId, type: 'user', parent_uuid: lastMessageUuid,
-          timestamp, role: 'user', text: trunc(text), content_type: 'text', is_meta: isMeta,
+          timestamp, role: 'user', text: trunc(text), content_type: text !== null ? 'text' : 'unknown', is_meta: isMeta,
           visibility: 'visible', model: null, is_sidechain: isSubagent ? 1 : 0, agent_id: agentId,
           input_tokens: null, output_tokens: null, cwd, skill: null, source: 'deepseek',
         });
@@ -611,10 +658,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         const content = message.content;
         const turn = record.data.turn;
         const step = record.data.step;
-        const reasoningText = joinPartText(content, 'reasoning');
-        const visibleText = joinPartText(content, 'text');
-        const hasToolCalls = Array.isArray(content)
-          && content.some(part => isRecord(part) && part.type === 'tool-call' && typeof part.id === 'string');
+        const { reasoningText, visibleText, hasToolCalls } = classifyAssistantContent(content);
         const usage = record.data.usage;
         const inTokens = totalInputTokens(usage);
         const outTokens = outputTokens(usage);
@@ -649,7 +693,8 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
         if (textUuid !== null) {
           pushMessage({
             kind: 'message', uuid: textUuid, parent_uuid: lastMessageUuid, text: trunc(visibleText),
-            content_type: 'text', input_tokens: tokensFor(textUuid), output_tokens: tokensOutFor(textUuid), ...base,
+            content_type: visibleText !== null ? 'text' : 'unknown',
+            input_tokens: tokensFor(textUuid), output_tokens: tokensOutFor(textUuid), ...base,
           });
         }
         if (toolUseUuid !== null) {
@@ -763,11 +808,13 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   const uuid = input.messageUuid;
   let rawSessionId: string | null = null;
   let finder: ((value: Record<string, unknown>) => boolean) | null = null;
-  const userMatch = /^deepseek:([^:]+):[0-9a-f]{64}:u(.+)$/.exec(uuid);
-  const assistantMatch = /^deepseek:([^:]+):[0-9a-f]{64}:t(\d+):s(\d+):(reasoning|text|tool_use)$/.exec(uuid);
+  let scope: string | null = null;
+  const userMatch = /^deepseek:([^:]+):([0-9a-f]{64}):u(.+)$/.exec(uuid);
+  const assistantMatch = /^deepseek:([^:]+):([0-9a-f]{64}):t(\d+):s(\d+):(reasoning|text|tool_use)$/.exec(uuid);
   if (userMatch !== null) {
     rawSessionId = decodeURIComponent(userMatch[1]);
-    const captured = userMatch[2];
+    scope = userMatch[2];
+    const captured = userMatch[3];
     finder = (value) => (
       value.type === 'user/message'
       && isRecord(value.data)
@@ -775,8 +822,9 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
     );
   } else if (assistantMatch !== null) {
     rawSessionId = decodeURIComponent(assistantMatch[1]);
-    const turn = Number(assistantMatch[2]);
-    const step = Number(assistantMatch[3]);
+    scope = assistantMatch[2];
+    const turn = Number(assistantMatch[3]);
+    const step = Number(assistantMatch[4]);
     finder = (value) => (
       value.type === 'assistant/message'
       && isRecord(value.data)
@@ -786,12 +834,15 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   }
   if (rawSessionId === null || finder === null) return null;
   if (input.agentId !== null && typeof input.agentId === 'string') {
-    const agentMatch = /^deepseek:([^:]+):[0-9a-f]{64}$/.exec(input.agentId);
-    if (agentMatch !== null && agentMatch[1]) rawSessionId = decodeURIComponent(agentMatch[1]);
+    const agentMatch = /^deepseek:([^:]+):([0-9a-f]{64})$/.exec(input.agentId);
+    if (agentMatch !== null && agentMatch[1]) {
+      rawSessionId = decodeURIComponent(agentMatch[1]);
+      scope = agentMatch[2];
+    }
   }
   const path = typeof input.session?.jsonl_path === 'string' && input.agentId === null
     ? input.session.jsonl_path
-    : findSessionFile(rootDir, rawSessionId);
+    : findSessionFile(rootDir, rawSessionId, scope);
   if (path === null || !existsSync(path)) return null;
 
   let found: string | null = null;

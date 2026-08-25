@@ -73,6 +73,18 @@ function statements(db: SqliteDb) {
   };
 }
 
+// Unit-scoped retraction: delete only the rows one unit owns (a root unit's
+// non-sidechain messages, or a subagent unit's sidechain messages), plus the
+// tool rows anchored on them. Sessions/subagents rows are deliberately kept.
+function retractScope(db: SqliteDb, sessionId: string, agentId: string | null) {
+  const scope = agentId === null
+    ? { clause: 'session_id=? AND agent_id IS NULL', params: [sessionId] }
+    : { clause: 'agent_id=?', params: [agentId] };
+  db.prepare(`DELETE FROM tool_results WHERE message_uuid IN (SELECT uuid FROM messages WHERE ${scope.clause})`).run(...scope.params);
+  db.prepare(`DELETE FROM tool_calls WHERE message_uuid IN (SELECT uuid FROM messages WHERE ${scope.clause})`).run(...scope.params);
+  db.prepare(`DELETE FROM messages WHERE ${scope.clause}`).run(...scope.params);
+}
+
 // Cascade-delete every row belonging to a session/thread (guardian retraction).
 function deleteSession(db: SqliteDb, sessionId: string) {
   db.prepare('DELETE FROM tool_results WHERE session_id=? OR message_uuid IN (SELECT uuid FROM messages WHERE session_id=? OR agent_id=?)').run(sessionId, sessionId, sessionId);
@@ -148,6 +160,9 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
       }
       case 'delete-session':
         deleteSession(db, r.sessionId);
+        break;
+      case 'retract-scope':
+        retractScope(db, r.sessionId, r.agentId ?? null);
         break;
       default:
         throw new Error(`persist: unhandled record kind ${(r as { kind: string }).kind}`);
