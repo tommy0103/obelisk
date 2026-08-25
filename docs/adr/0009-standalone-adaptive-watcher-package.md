@@ -1,6 +1,6 @@
 # Package the hybrid watcher as a standalone adaptive watcher
 
-**Status: proposed.**
+**Status: accepted.**
 
 **Context.** Obelisk needs low-latency indexing of agent transcripts without
 making filesystem notifications the source of truth. No single native watcher
