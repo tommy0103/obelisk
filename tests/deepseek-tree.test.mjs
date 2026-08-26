@@ -24,9 +24,6 @@ import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/ven
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
-const SCOPE = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
-const ROOT_ID = `deepseek:root-session-1:${SCOPE}`;
-const CHILD_ID = `deepseek:child-session-1:${SCOPE}`;
 
 function drain(gen) {
   const values = [];
@@ -137,6 +134,19 @@ function cursorStore() {
     ctx: () => ({ lastCursor: (key) => map.get(key) ?? null }),
   };
 }
+
+// Identity is scope-derived and scope normalization is host-specific
+// (node:path normalize differs on Windows), so derive the expected ids from a
+// real discovery probe instead of hardcoding a POSIX hash.
+const PROBE = (() => {
+  const dir = makeTempDir('obelisk-tree-probe-');
+  const provider = createDeepseekProvider({ rootDir: writeTree(dir) });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const child = unit.meta.members.find((m) => m.agentId !== null);
+  return { ROOT: unit.sessionId, CHILD: child.agentId };
+})();
+const ROOT_ID = PROBE.ROOT;
+const CHILD_ID = PROBE.CHILD;
 
 function freshDb() {
   const db = new DatabaseSync(':memory:');
@@ -957,8 +967,7 @@ test('old-path-only move report with a sibling tree still reconciles the moved t
   const movedFrom = join(sessionsDir, '--tmp-dsh-project--', 'root-session-2', 'session.jsonl');
   mkdirSync(join(sessionsDir, '--moved--'), { recursive: true });
   renameSync(join(sessionsDir, '--tmp-dsh-project--', 'root-session-2'), join(sessionsDir, '--moved--', 'root-session-2'));
-  const scope2 = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
-  const id2 = `deepseek:root-session-2:${scope2}`;
+  const id2 = `deepseek:root-session-2:${ROOT_ID.split(':')[2]}`;
   const units = provider.discover({
     ...store.ctx(),
     changedPaths: [movedFrom],
