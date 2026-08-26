@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { constants, zstdCompressSync } from 'node:zlib';
@@ -1034,5 +1034,24 @@ test('changed paths outside the deepseek root never reconcile deepseek trees', (
     changedPaths: ['/Users/someone/.claude/projects/p/session.jsonl'],
   });
   assert.deepEqual(units, [], 'foreign provider paths are ignored entirely');
+  db.close();
+});
+
+test('changed paths under a symlinked root (realpath) still route to the tree', () => {
+  const dir = makeTempDir('obelisk-symlink-');
+  const real = writeTree(dir);
+  const link = join(dir, 'linked-sessions');
+  symlinkSync(real, link);
+  const provider = createDeepseekProvider({ rootDir: link });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  // The watcher reports the REAL path (realpath), not the configured symlink.
+  // The watcher reports the realpath (macOS: /var → /private/var as well).
+  const realChild = join(realpathSync(real), '--tmp-dsh-project--', 'child-session-1', 'session.jsonl.zstd');
+  const units = provider.discover({ ...store.ctx(), changedPaths: [realChild] });
+  assert.equal(units.length, 1, 'realpath event routed to the tree');
   db.close();
 });

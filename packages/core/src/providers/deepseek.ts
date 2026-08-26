@@ -54,7 +54,7 @@
 // codec (../vendor/dsh-chunk-rows.ts) remains available for raw
 // reconstruction but is not on the indexing path.
 
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, sep } from 'node:path';
@@ -382,12 +382,18 @@ function findSessionFile(rootDir: string, rawSessionId: string, scope: string | 
 function splitChangedPaths(sessionsDir: string, changedPaths: string[]): { files: Set<string>; hasDirEvent: boolean } {
   const files = new Set<string>();
   let hasDirEvent = false;
-  const rootPrefix = normalize(sessionsDir) + sep;
+  // Watchers report realpaths: a symlinked $DSH_HOME (or macOS /var →
+  // /private/var) would otherwise make every event look foreign.
+  const rootPrefixes = [normalize(sessionsDir) + sep];
+  try {
+    const resolvedPrefix = normalize(realpathSync(sessionsDir)) + sep;
+    if (resolvedPrefix !== rootPrefixes[0]) rootPrefixes.push(resolvedPrefix);
+  } catch { /* root missing/inaccessible — the inventory path handles it */ }
   for (const changedPath of changedPaths) {
     const absolute = isAbsolute(changedPath)
       ? normalize(changedPath)
       : normalize(join(sessionsDir, changedPath));
-    if (!absolute.startsWith(rootPrefix)) continue; // foreign provider's path
+    if (!rootPrefixes.some((prefix) => absolute.startsWith(prefix))) continue; // foreign provider's path
     if (SESSION_FILENAMES.some((suffix) => absolute.endsWith(suffix))) {
       files.add(absolute);
     } else {
@@ -551,20 +557,36 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // current tree's root (the old path of a move whose old project dir still
   // hosts other trees — the project-prefix fallback alone would route it to
   // the wrong, untouched tree).
+  // Routing compares canonical (realpath) forms on both sides: the watcher
+  // reports realpaths while members may live under a symlinked root.
+  const canon = (p: string): string => {
+    try { return realpathSync(p); } catch { return p; }
+  };
   const groups = [...membersByRootKey.values()];
   const currentRootPaths = new Set(
     groups.map((group) => group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId)).filter((p) => p !== undefined),
   );
   const indexedPaths = new Set((ctx.indexedSessions?.() ?? []).map((session) => session.jsonlPath));
+  const canonicalMembers = new Map<string, number>(); // canon member path -> group index
+  const canonicalProjectDirs = new Map<string, number>();
+  groups.forEach((group, i) => {
+    for (const path of group.paths) canonicalMembers.set(canon(path), i);
+    const projectDir = fileByPath.get(group.paths[0]!)?.projectDir;
+    if (projectDir !== undefined) canonicalProjectDirs.set(canon(join(sessionsDir, projectDir)) + sep, i);
+  });
+  const routesToGroup = (path: string): boolean => {
+    const c = canon(path);
+    if (canonicalMembers.has(c)) return true;
+    for (const dirPrefix of canonicalProjectDirs.keys()) if (c.startsWith(dirPrefix)) return true;
+    return false;
+  };
   const unroutableChange = changed !== null && (changed.hasDirEvent || [...changedFiles!].some((path) => {
     if (indexedPaths.has(path) && !currentRootPaths.has(path)) return true;
-    return !groups.some((group) =>
-      group.paths.includes(path)
-      || path.startsWith(join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '') + sep));
+    return !routesToGroup(path);
   }));
 
   const units: IndexUnit[] = [];
-  for (const [groupKey, group] of membersByRootKey.entries()) {
+  for (const [groupIndex, [groupKey, group]] of [...membersByRootKey.entries()].entries()) {
     if (divergentGroups.has(groupKey)) continue; // divergent copies: fail closed
     if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) continue;
     const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
@@ -598,11 +620,12 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     // A changed path that matches no current member (e.g. a DELETED child
     // file) still belongs to this tree's project directory — route it here so
     // the tree reparses and the stale rows retract.
-    const projectDir = join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '');
     const touched = changedFiles !== null && (
       unroutableChange
-      || group.paths.some((path) => changedFiles.has(path))
-      || [...changedFiles].some((path) => path.startsWith(projectDir + sep))
+      || [...changedFiles].some((path) => routesToGroup(path) && (
+        canonicalMembers.get(canon(path)) === groupIndex
+        || canonicalProjectDirs.get([...canonicalProjectDirs.keys()].find((d) => canon(path).startsWith(d)) ?? '') === groupIndex
+      ))
     );
     if (changedFiles !== null && !touched) continue;
     units.push({
