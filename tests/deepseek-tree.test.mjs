@@ -930,3 +930,71 @@ test('a watcher report of only the OLD path after a move reconciles provenance i
   assert.ok(session.jsonl_path.includes('--moved--'), 'provenance updated immediately');
   db.close();
 });
+
+test('old-path-only move report with a sibling tree still reconciles the moved tree', () => {
+  const dir = makeTempDir('obelisk-movesibling-');
+  const sessionsDir = join(dir, 'sessions');
+  // Two trees in the SAME project dir (same cwd, different session ids).
+  for (const sid of ['root-session-1', 'root-session-2']) {
+    const d = join(sessionsDir, '--tmp-dsh-project--', sid);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'session.jsonl'), [
+      JSON.stringify({ ...HEADER, id: sid }),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: `from ${sid}` }], source: { kind: 'user' }, role: 'user', id: `m-${sid}` } }),
+    ].join('\n') + '\n');
+  }
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  for (const unit of provider.discover({ lastCursor: () => null })) {
+    store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+  }
+  assert.equal(dumpDb(db).sessions.length, 2);
+
+  // Move tree 2 to a new project dir; the watcher reports only the OLD root
+  // path — and the old project dir still hosts tree 1.
+  const movedFrom = join(sessionsDir, '--tmp-dsh-project--', 'root-session-2', 'session.jsonl');
+  mkdirSync(join(sessionsDir, '--moved--'), { recursive: true });
+  renameSync(join(sessionsDir, '--tmp-dsh-project--', 'root-session-2'), join(sessionsDir, '--moved--', 'root-session-2'));
+  const scope2 = createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/dsh-project').digest('hex');
+  const id2 = `deepseek:root-session-2:${scope2}`;
+  const units = provider.discover({
+    ...store.ctx(),
+    changedPaths: [movedFrom],
+    indexedSessions: () => [
+      { sessionId: ROOT_ID, jsonlPath: join(sessionsDir, '--tmp-dsh-project--', 'root-session-1', 'session.jsonl') },
+      { sessionId: id2, jsonlPath: movedFrom },
+    ],
+  });
+  assert.ok(units.some((u) => u.sessionId === id2), 'moved tree reconciled despite the sibling tree in the old dir');
+  assert.ok(!units.some((u) => (u.retractSessionIds ?? []).includes(id2)), 'no tombstone for the moved tree');
+  const movedUnit = units.find((u) => u.sessionId === id2);
+  persist(db, movedUnit, provider.parse(movedUnit, store.ctx().lastCursor(movedUnit.key)));
+  const row = db.prepare('SELECT jsonl_path FROM sessions WHERE id=?').get(id2);
+  assert.ok(row.jsonl_path.includes('--moved--'), 'provenance updated');
+  assert.equal(dumpDb(db).sessions.length, 2);
+  db.close();
+});
+
+test('a directory-level rename event triggers reconciliation (not dropped by the suffix filter)', () => {
+  const dir = makeTempDir('obelisk-direvent-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  renameSync(join(sessionsDir, '--tmp-dsh-project--'), join(sessionsDir, '--renamed--'));
+  // Watcher reports the directory paths, not the files inside.
+  const units = provider.discover({
+    ...store.ctx(),
+    changedPaths: [join(sessionsDir, '--tmp-dsh-project--'), join(sessionsDir, '--tmp-dsh-project--', 'root-session-1')],
+    indexedSessions: () => [{ sessionId: ROOT_ID, jsonlPath: unit.key }],
+  });
+  assert.equal(units.length, 1, 'directory events reconcile the tree');
+  persist(db, units[0], provider.parse(units[0], store.ctx().lastCursor(units[0].key)));
+  const row = db.prepare('SELECT jsonl_path FROM sessions').get();
+  assert.ok(row.jsonl_path.includes('--renamed--'));
+  db.close();
+});

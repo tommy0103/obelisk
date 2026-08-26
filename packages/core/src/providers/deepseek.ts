@@ -375,17 +375,24 @@ function findSessionFile(rootDir: string, rawSessionId: string, scope: string | 
   return null;
 }
 
-function changedSessionFiles(sessionsDir: string, changedPaths: string[]): Set<string> {
-  const result = new Set<string>();
+/** Split watcher paths into session-file paths and directory-level events. */
+function splitChangedPaths(sessionsDir: string, changedPaths: string[]): { files: Set<string>; hasDirEvent: boolean } {
+  const files = new Set<string>();
+  let hasDirEvent = false;
   for (const changedPath of changedPaths) {
     const absolute = isAbsolute(changedPath)
       ? normalize(changedPath)
       : normalize(join(sessionsDir, changedPath));
-    for (const suffix of SESSION_FILENAMES) {
-      if (absolute.endsWith(suffix)) result.add(absolute);
+    if (SESSION_FILENAMES.some((suffix) => absolute.endsWith(suffix))) {
+      files.add(absolute);
+    } else {
+      // A project/session directory rename is reported as the directory path
+      // itself; it cannot be routed to a file, so it must trigger a full
+      // reconcile rather than being dropped.
+      hasDirEvent = true;
     }
   }
-  return result;
+  return { files, hasDirEvent };
 }
 
 /** One member file of a root session tree, with its resolved header. */
@@ -434,14 +441,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     inventoryProblem = true;
     ctx.reportIncompleteInventory?.(issue);
   };
-  const innerCtx = { ...ctx, reportIncompleteInventory: reportIssue };
   if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
     reportIssue({ path: sessionsDir, error: 'Source folder is unavailable' });
   }
   const files = collectSessionFiles(sessionsDir, reportIssue);
-  const changedFiles = ctx.changedPaths === undefined
+  const changed = ctx.changedPaths === undefined
     ? null
-    : changedSessionFiles(sessionsDir, ctx.changedPaths);
+    : splitChangedPaths(sessionsDir, ctx.changedPaths);
+  const changedFiles = changed === null ? null : changed.files;
 
   // Raw ids may collide across projects, so ancestry is tracked per project
   // scope — otherwise a nested subagent could fold along another project's
@@ -527,13 +534,24 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // last-good state) — never publish a partial tree.
   const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
 
-  // A changed path that routes to no current group (e.g. the watcher reported
-  // only the OLD path of a moved tree) means we cannot tell which trees were
+  // A changed path we cannot route means we cannot tell which trees were
   // touched — reconcile all of them rather than leaving provenance stale.
-  const unroutableChange = changedFiles !== null && [...changedFiles].some((path) =>
-    ![...membersByRootKey.values()].some((group) =>
+  // Unroutable = a directory-level event (rename), a path matching no current
+  // group, or a path that IS an indexed session's recorded jsonl_path but no
+  // current tree's root (the old path of a move whose old project dir still
+  // hosts other trees — the project-prefix fallback alone would route it to
+  // the wrong, untouched tree).
+  const groups = [...membersByRootKey.values()];
+  const currentRootPaths = new Set(
+    groups.map((group) => group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId)).filter((p) => p !== undefined),
+  );
+  const indexedPaths = new Set((ctx.indexedSessions?.() ?? []).map((session) => session.jsonlPath));
+  const unroutableChange = changed !== null && (changed.hasDirEvent || [...changedFiles!].some((path) => {
+    if (indexedPaths.has(path) && !currentRootPaths.has(path)) return true;
+    return !groups.some((group) =>
       group.paths.includes(path)
-      || path.startsWith(join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '') + sep)));
+      || path.startsWith(join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '') + sep));
+  }));
 
   const units: IndexUnit[] = [];
   for (const [groupKey, group] of membersByRootKey.entries()) {
@@ -757,7 +775,6 @@ function snapshotMember(path: string): MemberSnapshot | null {
     const header = headerFromBuffer(path, buffer);
     if (header === null) return null;
     if (path.endsWith('.jsonl.zstd')) {
-      const buffer = readFileSync(path);
       const { frames } = scanZstdFrames(buffer);
       const snap: MemberSnapshot = {
         stat: { mtimeMs: stat.mtimeMs, size: stat.size, ctimeMs: stat.ctimeMs, ino: stat.ino },
