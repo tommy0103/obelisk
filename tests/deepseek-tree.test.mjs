@@ -1107,3 +1107,47 @@ test('deleting a child routes to its OWN tree even when a sibling tree shares th
   assert.ok(dump.messages.some((m) => m.text === 'from root-session-2'), 'sibling tree untouched');
   db.close();
 });
+
+test('symlinked root + move reported by old realpath routes to the moved tree', () => {
+  const dir = makeTempDir('obelisk-movealias-');
+  const real = join(dir, 'real-sessions');
+  const hdr = (id) => ({ type: 'session', version: 0, id, createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 });
+  for (const sid of ['root-a', 'root-z']) {
+    const d = join(real, '--tmp-dsh-project--', sid);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'session.jsonl'), [JSON.stringify(hdr(sid))].join('\n') + '\n');
+  }
+  const link = join(dir, 'linked');
+  symlinkSync(real, link);
+  const provider = createDeepseekProvider({ rootDir: link });
+  const store = cursorStore();
+  for (const unit of provider.discover({ lastCursor: () => null })) {
+    store.set(unit.key, drain(provider.parse(unit, null)).ret);
+  }
+  const units0 = provider.discover({ lastCursor: () => null });
+  const idA = units0.find((u) => u.sessionId.includes('root-a')).sessionId;
+
+  mkdirSync(join(real, '--moved--'), { recursive: true });
+  renameSync(join(real, '--tmp-dsh-project--', 'root-a'), join(real, '--moved--', 'root-a'));
+  // Watcher reports only the OLD path, in realpath form (the file is gone).
+  const oldReal = join(realpathSync(join(real, '--tmp-dsh-project--')), 'root-a', 'session.jsonl');
+  const units = provider.discover({
+    ...store.ctx(),
+    changedPaths: [oldReal],
+    indexedSessions: () => units0.map((u) => ({ sessionId: u.sessionId, jsonlPath: u.key })),
+  });
+  assert.ok(units.some((u) => u.sessionId === idA), 'moved tree routed by identity despite the alias mismatch');
+  assert.ok(!units.some((u) => u.sessionId.includes('root-z')), 'sibling untouched');
+});
+
+test('identity is verifiably scoped (not circular with discovery)', () => {
+  const dir = makeTempDir('obelisk-scopeproof-');
+  const provider = createDeepseekProvider({ rootDir: writeTree(dir) });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  // Not just "whatever discover returns": the composite shape must be present.
+  assert.match(unit.sessionId, /^deepseek:root-session-1:[0-9a-f]{64}$/);
+  // And two different cwds must never share a scope (the PROBE constants would
+  // still pass if cwd namespacing were deleted — this assertion would not).
+  const other = `deepseek:root-session-1:${createHash('sha256').update('deepseek-cwd-v1\0').update('/tmp/other-project').digest('hex')}`;
+  assert.notEqual(unit.sessionId, other);
+});

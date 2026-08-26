@@ -560,8 +560,24 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // A path that hits nothing — or any directory-level event — means we cannot
   // tell which trees were touched: reconcile all of them. Multiple trees may
   // share a project directory, so every map value is a SET of group indexes.
+  // Canonicalize via the longest EXISTING ancestor: a deleted or renamed-away
+  // path cannot be realpath'd itself, but its symlink aliases resolve through
+  // the deepest existing ancestor, so the link-spelled and realpath-spelled
+  // forms of the same missing path still converge.
   const canon = (p: string): string => {
-    try { return realpathSync(p); } catch { return p; }
+    let current = p;
+    const missingTail: string[] = [];
+    for (;;) {
+      try {
+        const resolved = realpathSync(current);
+        return missingTail.length === 0 ? resolved : join(resolved, ...missingTail);
+      } catch {
+        const parent = dirname(current);
+        if (parent === current) return p;
+        missingTail.unshift(current.slice(parent.length + 1));
+        current = parent;
+      }
+    }
   };
   type Routing = Set<number> | 'all';
   let routing: Routing | null = null;

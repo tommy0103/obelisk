@@ -58,11 +58,12 @@ parse**.
 - Discovery emits tombstone units (`retractSessionIds`) for indexed deepseek
   sessions whose files have disappeared.
 
-**Changed-path routing.** Watcher events route through a single table, built
-once per discovery: canonicalize each changed path once (realpath when it
-exists), then exact member file → session dir → project dir, where every level
-maps to a SET of trees (multiple trees may share a project directory — no
-key overwrite). Two extra knowledge sources keep the table complete: member
+**Changed-path routing.** Watcher events route through one lookup structure
+built per discovery: every changed path is canonicalized once (realpath,
+resolving through the longest existing ancestor so renamed-away paths still
+converge across symlink aliases), then matched exact member file → session
+dir → project dir — two maps keyed by path, whose values are SETs of trees
+(multiple trees may share a project directory — no key overwrite). Two extra knowledge sources keep the table complete: member
 paths recorded in each tree's cursor checkpoint (a deleted member still
 routes precisely to its tree) and indexed sessions' jsonl_paths (the old path
 of a moved tree routes by identity). A directory-level event or an unroutable
