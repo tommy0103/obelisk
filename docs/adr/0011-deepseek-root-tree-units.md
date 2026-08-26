@@ -31,7 +31,10 @@ parse**.
 - **The cursor is a checkpoint, not a counter.** Alongside the
   persist-compatible `mtime:count` prefix it carries an opaque base64url
   JSON state: per-member `{ agentId, headerHash, inode, count,
-  lastEntryHash }` plus per-member `lastMessageUuid` for parent-chain
+  prefixHash }` (sha256 over ALL committed frames/lines, not just the
+  boundary entry) plus per-member `lastMessageUuid` (and its own parent,
+  so a step straddling the boundary resumes without parent cycles) and the
+  set of steps with an emitted tool_use anchor.
   seeding. What used to be heuristic inference (signature gates, backward
   frame scans) becomes explicit, inspectable state.
 - **Fast path** applies only when every member satisfies strict
@@ -41,8 +44,9 @@ parse**.
   frames/lines are decoded, `lastMessageUuid` is restored from the
   checkpoint, and records emit with `countMode: 'delta'`. Anchor
   canonicality converges via the upstream checkpoint policy (a durable
-  `tool/call` always lands before its step's final `assistant/message`), so
-  a provisional anchor is only ever overwritten by the canonical row.
+  `assistant/message` is persisted at step end, before the durable
+  `tool/call` of the tool it ordered), so a provisional anchor is only ever
+  followed by the canonical row, never the reverse.
 - **Snapshot fallback** covers everything else (member added/removed,
   replacement, truncation, identity change): emit `delete-session` for the
   root — the cascade is safe because the whole tree is re-emitted by the

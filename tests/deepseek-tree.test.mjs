@@ -127,6 +127,16 @@ function writeTree(root, { rootFrameCount = Infinity, childFrameCount = Infinity
   return sessionsDir;
 }
 
+// Production-shaped cursor store: index_state is keyed by unit.key, so tests
+// must look cursors up by key — a global `() => cursor` masks key changes.
+function cursorStore() {
+  const map = new Map();
+  return {
+    set: (key, cursor) => map.set(key, cursor),
+    ctx: () => ({ lastCursor: (key) => map.get(key) ?? null }),
+  };
+}
+
 function freshDb() {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
@@ -238,8 +248,10 @@ test('two-phase incremental parse converges to the full parse at every frame bou
     const provider = createDeepseekProvider({ rootDir: sessionsDir });
     const db = freshDb();
     const phase1 = provider.discover({ lastCursor: () => null });
-    assert.equal(phase1.length, 1, `split ${split}: phase 1 discovers the tree`);
-    const cursor = persist(db, phase1[0], provider.parse(phase1[0], null));
+    // split 0 leaves the root headerless: the whole project suppresses this
+    // round (fail closed), so phase 1 may legitimately emit nothing.
+    assert.ok(phase1.length === 1 || split === 0, `split ${split}: phase 1 discovers the tree`);
+    const cursor = phase1.length === 1 ? persist(db, phase1[0], provider.parse(phase1[0], null)) : null;
     writeTree(dirSplit); // append the remaining root frames
     const phase2 = provider.discover({ lastCursor: () => cursor });
     // split == totalFrames means nothing changed: discovery skips the tree.
@@ -525,46 +537,89 @@ test('a moved root keeps its session (tombstones key on identity, not path)', ()
   const sessionsDir = writeTree(dir);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const db = freshDb();
+  const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
-  const cursor = persist(db, unit, provider.parse(unit, null));
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
 
-  // Move the whole project dir (both members) to a new directory name.
+  // Move the whole project dir (both members) to a new directory name. The
+  // new unit key has NO cursor in production — convergence must not depend on
+  // finding the old one.
   renameSync(join(sessionsDir, '--tmp-dsh-project--'), join(sessionsDir, '--moved--'));
   const units = provider.discover({
-    lastCursor: () => cursor,
+    ...store.ctx(),
     indexedSessions: () => [{ sessionId: ROOT_ID, jsonlPath: unit.key }],
   });
   assert.ok(!units.some((u) => (u.retractSessionIds ?? []).length > 0), 'no tombstone for a moved tree');
   assert.equal(units.length, 1);
-  persist(db, units[0], provider.parse(units[0], cursor));
+  // lastCursor(new key) is null in production; parse must handle it.
+  persist(db, units[0], provider.parse(units[0], store.ctx().lastCursor(units[0].key)));
   assert.equal(dumpDb(db).sessions.length, 1, 'session survives the move');
   assert.equal(dumpDb(db).sessions[0].id, ROOT_ID);
   db.close();
 });
 
-test('an unreadable member fails closed: no retraction, no partial snapshot', () => {
-  const dir = makeTempDir('obelisk-failclosed-');
+test('a moved AND truncated tree converges (stale rows retracted despite the path change)', () => {
+  const dir = makeTempDir('obelisk-movetrunc-');
   const sessionsDir = writeTree(dir);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const db = freshDb();
+  const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
-  const cursor = persist(db, unit, provider.parse(unit, null));
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  renameSync(join(sessionsDir, '--tmp-dsh-project--'), join(sessionsDir, '--moved--'));
+  // Truncate the moved root: drop the last three frames (spawn result + final).
+  const rootPath = join(sessionsDir, '--moved--', 'root-session-1', 'session.jsonl.zstd');
+  const buf = readFileSync(rootPath);
+  const { frames } = scanZstdFrames(buf);
+  writeFileSync(rootPath, buf.subarray(0, frames[frames.length - 3].start));
+
+  // The new path has no cursor — the fallback must still retract stale rows.
+  const units = provider.discover(store.ctx());
+  assert.equal(units.length, 1);
+  persist(db, units[0], provider.parse(units[0], null));
+  const dump = dumpDb(db);
+  assert.ok(!dump.messages.some((m) => m.text === 'final answer'), 'stale rows retracted');
+  assert.ok(dump.messages.some((m) => m.text === 'inspect the project'), 'kept rows intact');
+  assert.equal(
+    dump.sessions[0].message_count,
+    dump.messages.filter((m) => m.agent_id === null && m.content_type !== 'tool_use').length,
+    'message_count matches the actual rows (anchors are structural, not counted)',
+  );
+  db.close();
+});
+
+test('an unreadable member suppresses its whole project (fail closed, no partial snapshot)', () => {
+  const dir = makeTempDir('obelisk-failclosed-');
+  const sessionsDir = writeTree(dir);
+  // A second, unrelated tree in ANOTHER project stays live.
+  const otherDir = join(sessionsDir, '--other--', 'other-session');
+  mkdirSync(otherDir, { recursive: true });
+  writeFileSync(join(otherDir, 'session.jsonl'), [
+    JSON.stringify({ type: 'session', version: 0, id: 'other-session', createdAt: 1753005600000, cwd: '/other', delegationDepth: 0 }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'other' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+  ].join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  for (const unit of provider.discover({ lastCursor: () => null })) {
+    store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+  }
   const before = dumpDb(db);
 
-  // Corrupt the child file so it has a valid header frame but an invalid frame
-  // boundary mid-file (snapshotMember throws on scan).
+  // Corrupt the child file (valid header frame, invalid frame magic later).
   const childPath = join(sessionsDir, '--tmp-dsh-project--', 'child-session-1', 'session.jsonl.zstd');
   writeFileSync(childPath, Buffer.concat([readFileSync(childPath), Buffer.from('%%%not-a-frame%%%')]));
 
-  // Force the unit through parse with the corrupted member: the fallback must
-  // NOT delete the session; the cursor and DB stay at the last-good state.
-  const units = provider.discover({ lastCursor: () => null });
-  const treeUnit = units.find((u) => u.meta && Array.isArray(u.meta.members) && u.meta.members.length > 0);
-  if (treeUnit) {
-    const out = drain(provider.parse(treeUnit, cursor));
-    assert.equal(out.ret, cursor, 'cursor unchanged on member read failure');
-    assert.deepEqual(dumpDb(db), before, 'last-good snapshot preserved');
-  }
+  const issues = [];
+  // Fresh discovery (no cursors): the corrupted project suppresses its tree,
+  // the unrelated tree still yields a unit.
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (issue) => issues.push(issue) });
+  assert.ok(issues.length > 0, 'inventory issue reported');
+  assert.ok(!units.some((u) => u.sessionId === ROOT_ID), 'affected tree suppressed');
+  assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'unrelated tree still discovered');
+  assert.deepEqual(dumpDb(db), before, 'last-good snapshot preserved');
   db.close();
 });
 
@@ -659,4 +714,135 @@ test('fixtures stay free of user-identifying absolute paths', () => {
       }
     }
   }
+});
+
+test('duplicate files with the same scoped identity are one member (no double counting)', () => {
+  const dir = makeTempDir('obelisk-dup-');
+  const sessionsDir = join(dir, 'sessions');
+  for (const name of ['root-session-1', 'root-session-1-copy']) {
+    const d = join(sessionsDir, '--tmp-dsh-project--', name);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'session.jsonl'), [
+      JSON.stringify(HEADER),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'one' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+    ].join('\n') + '\n');
+  }
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  assert.equal(units.length, 1);
+  assert.ok(issues.some((i) => i.error.includes('Duplicate')));
+  persist(db, units[0], provider.parse(units[0], null));
+  const dump = dumpDb(db);
+  assert.equal(dump.messages.length, 1);
+  assert.equal(dump.sessions[0].message_count, 1); // ADR-0007: count matches rows
+  db.close();
+});
+
+test('a step straddling two runs does not create a parent cycle (text <-> tool_use)', () => {
+  const dir = makeTempDir('obelisk-cycle-');
+  const sessionsDir = join(dir, 'sessions');
+  const sessionDir = join(sessionsDir, '--tmp-dsh-project--', 'cycle-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  const first = [
+    { type: 'session', version: 0, id: 'cycle-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 },
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'go' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+    // assistant/message of the step lands in window 1 (canonical anchor)...
+  ];
+  writeFileSync(path, first.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  let unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  // ...the durable tool/call lands in window 2.
+  const second = [{ type: 'tool/call', seq: 2, time: 1753005601100, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } }];
+  writeFileSync(path, first.concat(second).map((e) => JSON.stringify(e)).join('\n') + '\n');
+  unit = provider.discover(store.ctx())[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, store.ctx().lastCursor(unit.key))));
+
+  // Walk every parent chain to the root: no cycles, finite depth.
+  const rows = db.prepare('SELECT uuid, parent_uuid FROM messages').all();
+  const byUuid = new Map(rows.map((r) => [r.uuid, r.parent_uuid]));
+  for (const row of rows) {
+    const seen = new Set();
+    let cur = row.uuid;
+    while (byUuid.get(cur)) {
+      assert.ok(!seen.has(cur), `parent cycle at ${cur}`);
+      seen.add(cur);
+      cur = byUuid.get(cur);
+    }
+  }
+  // And the chain matches the full-parse shape.
+  const dbFull = freshDb();
+  const unitF = provider.discover({ lastCursor: () => null })[0];
+  persist(dbFull, unitF, provider.parse(unitF, null));
+  const chainOf = (dbX) => dbX.prepare('SELECT uuid, parent_uuid FROM messages ORDER BY uuid').all();
+  assert.deepEqual(chainOf(db), chainOf(dbFull));
+  db.close();
+  dbFull.close();
+});
+
+test('an offline source root reports incomplete inventory and emits no tombstones', () => {
+  const dir = makeTempDir('obelisk-offline-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  persist(db, unit, provider.parse(unit, null));
+
+  // Source root goes away entirely (offline/unmounted).
+  rmSync(sessionsDir, { recursive: true, force: true });
+  const issues = [];
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    indexedSessions: () => [{ sessionId: ROOT_ID, jsonlPath: unit.key }],
+  });
+  assert.ok(issues.length > 0, 'offline root reported');
+  assert.ok(!units.some((u) => (u.retractSessionIds ?? []).length > 0), 'no tombstone while inventory is incomplete');
+  assert.equal(dumpDb(db).sessions.length, 1, 'last-good snapshot preserved');
+  db.close();
+});
+
+test('a deleted root with a surviving child becomes a tombstone, not a phantom child-only snapshot', () => {
+  const dir = makeTempDir('obelisk-phantom-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  rmSync(join(sessionsDir, '--tmp-dsh-project--', 'root-session-1', 'session.jsonl.zstd'));
+  const units = provider.discover({
+    ...store.ctx(),
+    indexedSessions: () => [{ sessionId: ROOT_ID, jsonlPath: unit.key }],
+  });
+  assert.ok(!units.some((u) => u.sessionId === ROOT_ID && (u.retractSessionIds ?? []).length === 0),
+    'no live child-only unit for the orphan');
+  const tombstone = units.find((u) => (u.retractSessionIds ?? []).includes(ROOT_ID));
+  assert.ok(tombstone, 'tombstone emitted for the deleted root identity');
+  persist(db, tombstone, provider.parse(tombstone, null));
+  assert.equal(dumpDb(db).sessions.length, 0);
+  db.close();
+});
+
+test('an unknown higher header version is skipped and recorded, never parsed as v0', () => {
+  const dir = makeTempDir('obelisk-version-');
+  const sessionsDir = join(dir, 'sessions');
+  const sessionDir = join(sessionsDir, '--tmp-dsh-project--', 'v99-session');
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(join(sessionDir, 'session.jsonl'), [
+    JSON.stringify({ type: 'session', version: 99, id: 'v99-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'future' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+  ].join('\n') + '\n');
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  assert.equal(units.length, 0);
+  assert.ok(issues.some((i) => i.error.includes('version 99')));
 });

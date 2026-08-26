@@ -41,10 +41,11 @@
 // `<dbId>:u<data.id>`, assistant messages `<dbId>:t<turn>:s<step>:<kind>`,
 // where dbId = `deepseek:<encodeURIComponent(id)>:<sha256(cwd)>` (composite
 // project-scoped identity, mirroring pi — CONTRIBUTING: session identity must
-// not be the source id alone). A durable tool/call always lands before its
-// step's final assistant/message (upstream session-checkpoint-policy), so a
-// provisional tool_use anchor emitted from a tool/call is only ever
-// overwritten by the canonical row.
+// not be the source id alone). Upstream persists a step's assistant/message
+// before the durable tool/call of the tool it ordered (session-checkpoint
+// policy), so a provisional tool_use anchor is only ever followed by the
+// canonical row — and the cursor checkpoints which steps already have an
+// anchor, so a later-window tool/call never rewrites it.
 //
 // Packed chunk rows (`text-chunks`/`reasoning-chunks`/`tool-call-chunks`) are
 // NOT expanded during projection: their members duplicate the step-final
@@ -129,6 +130,13 @@ function userMessageUuid(dbId: string, nativeId: unknown, seq: number): string {
 
 function callId(dbId: string, nativeCallId: string): string {
   return `${dbId}:${encodeURIComponent(nativeCallId)}`;
+}
+
+/** The "t<turn>:s<step>" key encoded in an assistant-family uuid, else null. */
+function stepKeyOf(uuid: string | null): string | null {
+  if (uuid === null) return null;
+  const match = /:t(\d+):s(\d+):(reasoning|text|tool_use)$/.exec(uuid);
+  return match === null ? null : `t${match[1]}:s${match[2]}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -430,6 +438,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       fileByPath.set(file.path, file);
       continue;
     }
+    // Version gate (CONTRIBUTING: tolerate the unknown — skip and record,
+    // never parse a higher format as v0).
+    if (header.version !== undefined && header.version !== 0) {
+      ctx.reportIncompleteInventory?.({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
+      unreadable.push(file);
+      fileByPath.set(file.path, file);
+      continue;
+    }
     const rawId = header.id;
     fileByPath.set(file.path, file);
     rawIdByPath.set(file.path, rawId);
@@ -448,26 +464,39 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     group.paths.push(path);
     membersByRootKey.set(key, group);
   }
-
-  // Unreadable-but-present files stay attached to their project directory's
-  // tree (unique match only), so a transient read failure fails closed in
-  // parse instead of retracting the member's last-good rows.
-  const unreadableByGroup = new Map<string, string[]>();
-  for (const file of unreadable) {
-    const candidates = [...membersByRootKey.entries()].filter(([, group]) =>
-      group.paths.some((path) => fileByPath.get(path)?.projectDir === file.projectDir));
-    if (candidates.length === 1) {
-      const list = unreadableByGroup.get(candidates[0]![0]) ?? [];
-      list.push(file.path);
-      unreadableByGroup.set(candidates[0]![0], list);
-    }
+  // Two files with the SAME scoped identity (e.g. a copied session file) are
+  // one logical member: keeping both would upsert the same uuids twice and
+  // double-count aggregates. Keep the first sorted path; record the anomaly.
+  for (const group of membersByRootKey.values()) {
+    const seen = new Set<string>();
+    group.paths = group.paths.filter((path) => {
+      const rawId = rawIdByPath.get(path)!;
+      const header = headerByPath.get(path)!;
+      const isSub = typeof header.parentSession === 'string' && header.parentSession.length > 0;
+      const identity = `${isSub}\0${rawId}`;
+      if (seen.has(identity)) {
+        ctx.reportIncompleteInventory?.({ path, error: 'Duplicate session artifact (same scoped identity as another file)' });
+        return false;
+      }
+      seen.add(identity);
+      return true;
+    });
   }
+
+  // An unreadable-but-present file cannot prove which tree it belongs to in a
+  // multi-tree project, so attaching it would be a guess. Instead suppress ALL
+  // trees sharing its project directory for this round (their cursors keep the
+  // last-good state) — never publish a partial tree.
+  const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
 
   const units: IndexUnit[] = [];
   for (const group of membersByRootKey.values()) {
-    group.paths.push(...(unreadableByGroup.get(`${group.scope}\0${group.rootRawId}`) ?? []));
-    const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId)
-      ?? group.paths.slice().sort()[0]!;
+    if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) continue;
+    const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
+    // The root file is gone (deleted) while children survive: this tree cannot
+    // emit a valid session row, and promoting a child would publish a phantom
+    // snapshot. Skip the live unit; the tombstone path retracts the identity.
+    if (rootPath === undefined) continue;
     const sessionId = dshDbId(group.scope, group.rootRawId);
     const members: TreeMember[] = group.paths
       .sort((a, b) => (a === rootPath ? -1 : b === rootPath ? 1 : a.localeCompare(b)))
@@ -511,9 +540,12 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // Tombstones: indexed deepseek sessions whose IDENTITY no longer exists on
   // disk. Path alone is not enough — a moved root yields a new unit at a new
   // path with the same session id, and a path-keyed tombstone would delete the
-  // fresh snapshot right after it was written.
+  // fresh snapshot right after it was written. And tombstones are only safe
+  // when the inventory is complete: an unreadable file or an offline source
+  // root must never cascade into deleting last-good snapshots.
+  const inventoryComplete = existsSync(sessionsDir) && unreadable.length === 0;
   const liveSessionIds = new Set(units.map((unit) => unit.sessionId));
-  for (const indexed of ctx.indexedSessions?.() ?? []) {
+  for (const indexed of inventoryComplete ? (ctx.indexedSessions?.() ?? []) : []) {
     if (liveSessionIds.has(indexed.sessionId)) continue; // moved or still indexed
     const jsonlPath = indexed.jsonlPath;
     if (fileByPath.has(jsonlPath)) continue; // still a member of a discovered tree
@@ -549,6 +581,11 @@ interface TreeCursorState {
   members: Record<string, MemberCheckpoint>;
   /** Last message-bearing uuid emitted per member path (parent-chain seed). */
   lastMessageUuid: Record<string, string>;
+  /** The seed's own parent per member path: when the first message of a new
+   * window belongs to the SAME step as the seed (a step straddling the
+   * boundary), its parent is the seed's parent — linking to the seed itself
+   * would create a parent cycle once the step's anchor is re-emitted. */
+  lastMessageParentUuid: Record<string, string | null>;
   /** Per member path, the "turn:step" steps that already have a tool_use
    * anchor message (canonical or provisional). A durable tool/call lands
    * after its step's assistant/message upstream, and an aborted step's
@@ -689,6 +726,12 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       // never trigger the fallback's delete-session. Keep the last-good state.
       return cursor;
     }
+    // TOCTOU guard: the unit's identity was resolved from a header read at
+    // discovery time; if the file was replaced between that read and this
+    // snapshot, mixing the stale identity with fresh content would publish a
+    // mixed-generation snapshot. Bail — the next discovery re-reads headers
+    // and routes the new identity correctly.
+    if (snap.headerHash !== headerHashOf(member.header)) return cursor;
     snaps.set(member.path, snap);
   }
 
@@ -702,13 +745,17 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   });
 
   const recordsOut: TranscriptRecord[] = [];
-  if (!fast && prior !== null) {
-    // Snapshot fallback: retract the checkpoint's identity (which may differ
-    // from the current one when the header's id/cwd changed). The cascade is
-    // safe because this unit re-emits the whole tree below — sidechain
-    // messages and subagent rows included.
-    recordsOut.push({ kind: 'delete-session', sessionId: prior.sessionId });
-    if (prior.sessionId !== sessionId) recordsOut.push({ kind: 'delete-session', sessionId });
+  if (!fast) {
+    // Snapshot fallback always retracts before re-emitting — including the
+    // prior-less case, which covers a MOVED tree (the new path has no cursor,
+    // but the identity's old rows may be stale or truncated-away). The cascade
+    // is safe because this unit re-emits the whole tree below. The prior
+    // identity may differ from the current one when the header's id/cwd
+    // changed; retract both.
+    recordsOut.push({ kind: 'delete-session', sessionId });
+    if (prior !== null && prior.sessionId !== sessionId) {
+      recordsOut.push({ kind: 'delete-session', sessionId: prior.sessionId });
+    }
   }
 
   let title: string | null = null;
@@ -731,7 +778,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   };
   let maxMtime = 0;
   let totalCount = 0;
-  const nextState: TreeCursorState = { sessionId, members: {}, lastMessageUuid: {}, anchorSteps: {} };
+  const nextState: TreeCursorState = { sessionId, members: {}, lastMessageUuid: {}, lastMessageParentUuid: {}, anchorSteps: {} };
 
   for (const member of meta.members) {
     const snap = snaps.get(member.path);
@@ -756,6 +803,14 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     }
 
     let lastMessageUuid: string | null = fast ? (prior!.lastMessageUuid[member.path] ?? null) : null;
+    let lastMessageParentUuid: string | null = fast ? (prior!.lastMessageParentUuid[member.path] ?? null) : null;
+    // The checkpointed seed belongs to the previous window; if the first
+    // message of this window is from the SAME step (a step straddling the
+    // boundary), its parent is the seed's parent — linking to the seed would
+    // create a parent cycle once the step's anchor is re-emitted.
+    let seedPending = fast && lastMessageUuid !== null;
+    const seedUuid = lastMessageUuid;
+    const seedParentUuid = lastMessageParentUuid;
     let currentModel: string | null = null;
     let memberEndedAt: string | null = null;
     const emittedAnchors = new Set<string>();
@@ -767,12 +822,18 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       if (timestamp !== null && (endedAt === null || timestamp > endedAt)) endedAt = timestamp;
     };
     const pushMessage = (record: MessageRecord): void => {
+      if (seedPending && seedUuid !== null && record.parent_uuid === seedUuid
+        && stepKeyOf(record.uuid) !== null && stepKeyOf(record.uuid) === stepKeyOf(seedUuid)) {
+        record.parent_uuid = seedParentUuid;
+      }
+      seedPending = false;
       // A re-emitted anchor can be its own seeded parent (two tool/calls of one
       // step straddling the checkpoint): never self-link, or trace()/context()
       // would loop forever.
       if (record.parent_uuid === record.uuid) record.parent_uuid = null;
       recordsOut.push(record);
       lastMessageUuid = record.uuid;
+      lastMessageParentUuid = record.parent_uuid;
       // Synthetic tool_use anchors are structural, not transcript content, and
       // are re-emittable across runs (a step's tool/call and assistant/message
       // can land in different windows): counting them would inflate
@@ -948,7 +1009,10 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       part.duration_ms = startedMs !== null && endedMs !== null ? Math.max(0, endedMs - startedMs) : null;
       // total_tokens is derived at query time from the sidechain messages (ADR-0010).
     }
-    if (lastMessageUuid !== null) nextState.lastMessageUuid[member.path] = lastMessageUuid;
+    if (lastMessageUuid !== null) {
+      nextState.lastMessageUuid[member.path] = lastMessageUuid;
+      nextState.lastMessageParentUuid[member.path] = lastMessageParentUuid;
+    }
     if (anchorSteps.size > 0) nextState.anchorSteps[member.path] = [...anchorSteps];
     nextState.members[member.path] = {
       agentId: member.agentId,
