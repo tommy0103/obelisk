@@ -129,7 +129,7 @@ function createIndexerService({
       pollIntervalMs: watchPollMs,
       // The caller knows its transcripts; the package does not. Native events
       // for transcripts promote the path into the hot set before delivery.
-      shouldPromote: (targetPath) => targetPath.endsWith('.jsonl') || targetPath.endsWith('.json'),
+      shouldPromote: (targetPath) => targetPath.endsWith('.jsonl') || targetPath.endsWith('.json') || targetPath.endsWith('.jsonl.zstd'),
       onInvalidate: (invalidation) => {
         // A rescan means anything under the root may have changed — full
         // inventory. Path invalidations filter to transcripts here, at the
@@ -139,7 +139,12 @@ function createIndexerService({
           return;
         }
         for (const changedPath of invalidation.paths) {
-          if (changedPath.endsWith('.jsonl') || changedPath.endsWith('.json')) onChange(changedPath);
+          // Transcript files plus directory-level events (a renamed
+          // project/session directory arrives as the bare path): providers
+          // route or full-reconcile on those themselves.
+          const isTranscript = changedPath.endsWith('.jsonl') || changedPath.endsWith('.json') || changedPath.endsWith('.jsonl.zstd');
+          const looksLikeDirectory = !changedPath.split('/').pop()?.includes('.');
+          if (isTranscript || looksLikeDirectory) onChange(changedPath);
         }
       },
     });

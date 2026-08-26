@@ -799,3 +799,4 @@ test('maxWaitMs 0 keeps the legacy unbounded trailing debounce', async () => {
     Array.from({ length: 18 }, (_, i) => `session-${i}.jsonl`),
   );
 });
+

@@ -35,8 +35,8 @@ parse**.
   boundary entry) plus per-member `lastMessageUuid` (and its own parent,
   so a step straddling the boundary resumes without parent cycles) and the
   set of steps with an emitted tool_use anchor.
-  seeding. What used to be heuristic inference (signature gates, backward
-  frame scans) becomes explicit, inspectable state.
+  What used to be heuristic inference (signature gates, backward frame
+  scans) becomes explicit, inspectable state.
 - **Fast path** applies only when every member satisfies strict
   preconditions: identical member set and identities, unchanged inodes,
   counts non-decreasing, and the stored cumulative prefix hash still
@@ -44,10 +44,11 @@ parse**.
   boundary entry). Then only new
   frames/lines are decoded, `lastMessageUuid` is restored from the
   checkpoint, and records emit with `countMode: 'delta'`. Anchor
-  canonicality converges via the upstream checkpoint policy (a durable
+  canonicality converges via the upstream ordering (the step's
   `assistant/message` is persisted at step end, before the durable
-  `tool/call` of the tool it ordered), so a provisional anchor is only ever
-  followed by the canonical row, never the reverse.
+  `tool/call` checkpoint of the tool it ordered) plus the checkpointed
+  anchor-step set: a provisional anchor is only ever followed by the
+  canonical row, and a later-window tool/call never rewrites one.
 - **Snapshot fallback** covers everything else (member added/removed,
   replacement, truncation, identity change): emit `delete-session` for the
   root — the cascade is safe because the whole tree is re-emitted by the

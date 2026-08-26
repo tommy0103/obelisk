@@ -441,7 +441,12 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     inventoryProblem = true;
     ctx.reportIncompleteInventory?.(issue);
   };
-  if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
+  const rootProbe = probePath(sessionsDir);
+  if (rootProbe === 'error') {
+    // Transient permission/mount failure: always visible, even on first index
+    // — silently returning an empty inventory would masquerade as "no data".
+    reportIssue({ path: sessionsDir, error: 'Sessions root is present but not accessible' });
+  } else if (rootProbe === 'gone' && (ctx.indexedSessions?.().length ?? 0) > 0) {
     reportIssue({ path: sessionsDir, error: 'Source folder is unavailable' });
   }
   const files = collectSessionFiles(sessionsDir, reportIssue);
@@ -612,7 +617,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // Identity liveness is computed from ALL groups with a root member —
   // BEFORE the changed-path filter. A cross-directory move reported by the
   // watcher as only the OLD path must not tombstone the moved session.
-  const inventoryComplete = existsSync(sessionsDir) && !inventoryProblem;
+  const inventoryComplete = rootProbe === 'present' && !inventoryProblem;
   const liveSessionIds = new Set(
     [...membersByRootKey.values()]
       .filter((group) => group.paths.some((path) => rawIdByPath.get(path) === group.rootRawId))
