@@ -103,8 +103,9 @@ function withVisibility(row: DbRow): DbRow {
 // provider did not store one (deepseek's incremental adapter cannot), derive
 // it from the sidechain messages' usage as a presentation-layer null-fill.
 function deriveSubagentTokens(db: SqliteDb, agentId: unknown): number | null {
-  const tokens = db.prepare('SELECT COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS t FROM messages WHERE agent_id=?').get(agentId);
-  return tokens && typeof tokens.t === 'number' && tokens.t > 0 ? tokens.t : null;
+  // Null only means "no usage-bearing messages"; a legitimate 0 stays 0.
+  const row = db.prepare('SELECT SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) AS t, COUNT(*) AS n FROM messages WHERE agent_id=? AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)').get(agentId);
+  return row && typeof row.n === 'number' && row.n > 0 && typeof row.t === 'number' ? row.t : null;
 }
 
 function isQueryableMessage(

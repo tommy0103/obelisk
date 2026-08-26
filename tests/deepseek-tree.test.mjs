@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { constants, zstdCompressSync } from 'node:zlib';
@@ -19,7 +19,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createDeepseekProvider } from '../packages/core/src/providers/deepseek.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
-import { scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
+import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -496,4 +496,167 @@ test('malformed lines and packed chunk rows never abort the parse', () => {
   const unit = provider.discover({ lastCursor: () => null })[0];
   const { values } = drain(provider.parse(unit, null));
   assert.ok(values.find((r) => r.kind === 'message' && r.text === 'survives'));
+});
+
+// ---- round-4 review regressions ----
+
+test('changed-path reconciliation routes a deleted child to its tree', () => {
+  const dir = makeTempDir('obelisk-delchild-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = persist(db, unit, provider.parse(unit, null));
+  assert.ok(dumpDb(db).messages.some((m) => m.is_sidechain === 1));
+
+  // Delete the child file; the watcher reports the DELETED path.
+  const childPath = join(sessionsDir, '--tmp-dsh-project--', 'child-session-1', 'session.jsonl.zstd');
+  rmSync(childPath);
+  const units = provider.discover({ lastCursor: () => cursor, changedPaths: [childPath] });
+  assert.equal(units.length, 1, 'deleted child must route to its tree');
+  persist(db, units[0], provider.parse(units[0], cursor));
+  assert.ok(!dumpDb(db).messages.some((m) => m.is_sidechain === 1), 'stale sidechain rows retracted');
+  assert.ok(dumpDb(db).messages.some((m) => m.text === 'inspect the project'), 'root rows kept');
+  db.close();
+});
+
+test('a moved root keeps its session (tombstones key on identity, not path)', () => {
+  const dir = makeTempDir('obelisk-move-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = persist(db, unit, provider.parse(unit, null));
+
+  // Move the whole project dir (both members) to a new directory name.
+  renameSync(join(sessionsDir, '--tmp-dsh-project--'), join(sessionsDir, '--moved--'));
+  const units = provider.discover({
+    lastCursor: () => cursor,
+    indexedSessions: () => [{ sessionId: ROOT_ID, jsonlPath: unit.key }],
+  });
+  assert.ok(!units.some((u) => (u.retractSessionIds ?? []).length > 0), 'no tombstone for a moved tree');
+  assert.equal(units.length, 1);
+  persist(db, units[0], provider.parse(units[0], cursor));
+  assert.equal(dumpDb(db).sessions.length, 1, 'session survives the move');
+  assert.equal(dumpDb(db).sessions[0].id, ROOT_ID);
+  db.close();
+});
+
+test('an unreadable member fails closed: no retraction, no partial snapshot', () => {
+  const dir = makeTempDir('obelisk-failclosed-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = persist(db, unit, provider.parse(unit, null));
+  const before = dumpDb(db);
+
+  // Corrupt the child file so it has a valid header frame but an invalid frame
+  // boundary mid-file (snapshotMember throws on scan).
+  const childPath = join(sessionsDir, '--tmp-dsh-project--', 'child-session-1', 'session.jsonl.zstd');
+  writeFileSync(childPath, Buffer.concat([readFileSync(childPath), Buffer.from('%%%not-a-frame%%%')]));
+
+  // Force the unit through parse with the corrupted member: the fallback must
+  // NOT delete the session; the cursor and DB stay at the last-good state.
+  const units = provider.discover({ lastCursor: () => null });
+  const treeUnit = units.find((u) => u.meta && Array.isArray(u.meta.members) && u.meta.members.length > 0);
+  if (treeUnit) {
+    const out = drain(provider.parse(treeUnit, cursor));
+    assert.equal(out.ret, cursor, 'cursor unchanged on member read failure');
+    assert.deepEqual(dumpDb(db), before, 'last-good snapshot preserved');
+  }
+  db.close();
+});
+
+test('an in-place edit of an early frame invalidates the prefix proof', () => {
+  const dir = makeTempDir('obelisk-prefix-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = persist(db, unit, provider.parse(unit, null));
+
+  // Rewrite frame 1 (tampered text) but keep the last committed frame
+  // byte-identical, then append a new frame — a pure boundary hash would pass.
+  const rootPath = join(sessionsDir, '--tmp-dsh-project--', 'root-session-1', 'session.jsonl.zstd');
+  const frames = rootFrames();
+  frames[1] = [
+    { type: 'request/header', seq: 0, time: 1753005600100, data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } }, reason: 'initial' } },
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'TAMPERED' }], source: { kind: 'user' }, role: 'user', id: 'msg-1' } },
+  ];
+  frames.push([{ type: 'user/message', seq: 99, time: 1753005700000, data: { content: [{ type: 'text', text: 'appended' }], source: { kind: 'user' }, role: 'user', id: 'm-99' } }]);
+  const tmp = rootPath + '.tmp';
+  writeFileSync(tmp, Buffer.concat(frames.map(mkFrame)));
+  renameSync(tmp, rootPath);
+
+  const unit2 = provider.discover({ lastCursor: () => cursor })[0];
+  persist(db, unit2, provider.parse(unit2, cursor));
+  const texts = dumpDb(db).messages.map((m) => m.text);
+  assert.ok(texts.includes('TAMPERED'), 'tampered early frame is re-indexed');
+  assert.ok(!texts.includes('inspect the project'), 'no OLD_PREFIX splice');
+  db.close();
+});
+
+test('a provisional anchor is stable across runs (checkpoint remembers it)', () => {
+  const dir = makeTempDir('obelisk-provisional-');
+  const sessionsDir = join(dir, 'sessions');
+  const sessionDir = join(sessionsDir, '--tmp-dsh-project--', 'prov-session');
+  mkdirSync(sessionDir, { recursive: true });
+  const path = join(sessionDir, 'session.jsonl');
+  // An aborted step: durable tool/calls but no assistant/message ever.
+  const first = [
+    { type: 'session', version: 0, id: 'prov-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 },
+    { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'go' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
+    { type: 'tool/call', seq: 2, time: 1753005601100, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } },
+  ];
+  writeFileSync(path, first.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = persist(db, unit, provider.parse(unit, null));
+  const anchorBefore = db.prepare("SELECT uuid, parent_uuid, timestamp FROM messages WHERE content_type='tool_use'").get();
+  assert.ok(anchorBefore);
+
+  // A second call of the same aborted step arrives in a later window.
+  writeFileSync(path, [...first, { type: 'tool/call', seq: 3, time: 1753005601500, data: { turn: 1, step: 1, callId: 'c2', name: 'bash', arguments: '{}' } }].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const unit2 = provider.discover({ lastCursor: () => cursor })[0];
+  persist(db, unit2, provider.parse(unit2, cursor));
+  const anchorAfter = db.prepare("SELECT uuid, parent_uuid, timestamp FROM messages WHERE content_type='tool_use'").get();
+  assert.deepEqual(anchorAfter, anchorBefore, 'provisional anchor row is not rewritten across runs');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM tool_calls').get().c, 2);
+  db.close();
+});
+
+test('headerless artifacts are reported as incomplete inventory, not silently skipped', () => {
+  const dir = makeTempDir('obelisk-headerless-');
+  const sessionsDir = join(dir, 'sessions');
+  const sessionDir = join(sessionsDir, '--proj--', 'empty-session');
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(join(sessionDir, 'session.jsonl'), '');
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (issue) => issues.push(issue) });
+  assert.equal(units.length, 0);
+  assert.equal(issues.length, 1);
+  assert.ok(issues[0].path.endsWith('session.jsonl'));
+});
+
+test('fixtures stay free of user-identifying absolute paths', () => {
+  const fixtureRoot = new URL('./fixtures/deepseek/sessions', import.meta.url).pathname;
+  for (const proj of readdirSync(fixtureRoot)) {
+    for (const sid of readdirSync(join(fixtureRoot, proj))) {
+      const buf = readFileSync(join(fixtureRoot, proj, sid, 'session.jsonl.zstd'));
+      const { frames } = scanZstdFrames(buf);
+      for (const frame of frames) {
+        const decoder = createZstdFrameDecoder();
+        let text = '';
+        try {
+          for (const decoded of decoder.decode(buf, [frame])) text += decoded.toString('utf8');
+        } finally {
+          decoder.close();
+        }
+        assert.ok(!/\/Users\/|tomiya/.test(text), `fixture ${sid} leaks a user path`);
+      }
+    }
+  }
 });

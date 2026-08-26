@@ -416,12 +416,20 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const fileByPath = new Map<string, SessionFile>();
   const headerByPath = new Map<string, DshHeader>();
   const rawIdByPath = new Map<string, string>();
+  const unreadable: SessionFile[] = [];
   for (const file of files) {
     // A headerless artifact (header frame not yet flushed / corrupt) cannot
-    // establish identity or scope; skip it this round — it reappears once the
-    // header lands (the header is always the first frame upstream).
+    // establish identity or scope — but excluding it from its tree would let a
+    // fallback retract its last-good rows. Defer it: attach it to its project
+    // directory's tree below so parse can fail closed, and always record the
+    // inventory issue (CONTRIBUTING: skip and record, fail closed).
     const header = readDshHeader(file.path);
-    if (header === null || typeof header.id !== 'string' || header.id.length === 0) continue;
+    if (header === null || typeof header.id !== 'string' || header.id.length === 0) {
+      ctx.reportIncompleteInventory?.({ path: file.path, error: 'Session artifact has no readable header' });
+      unreadable.push(file);
+      fileByPath.set(file.path, file);
+      continue;
+    }
     const rawId = header.id;
     fileByPath.set(file.path, file);
     rawIdByPath.set(file.path, rawId);
@@ -441,16 +449,31 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     membersByRootKey.set(key, group);
   }
 
+  // Unreadable-but-present files stay attached to their project directory's
+  // tree (unique match only), so a transient read failure fails closed in
+  // parse instead of retracting the member's last-good rows.
+  const unreadableByGroup = new Map<string, string[]>();
+  for (const file of unreadable) {
+    const candidates = [...membersByRootKey.entries()].filter(([, group]) =>
+      group.paths.some((path) => fileByPath.get(path)?.projectDir === file.projectDir));
+    if (candidates.length === 1) {
+      const list = unreadableByGroup.get(candidates[0]![0]) ?? [];
+      list.push(file.path);
+      unreadableByGroup.set(candidates[0]![0], list);
+    }
+  }
+
   const units: IndexUnit[] = [];
   for (const group of membersByRootKey.values()) {
+    group.paths.push(...(unreadableByGroup.get(`${group.scope}\0${group.rootRawId}`) ?? []));
     const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId)
       ?? group.paths.slice().sort()[0]!;
     const sessionId = dshDbId(group.scope, group.rootRawId);
     const members: TreeMember[] = group.paths
       .sort((a, b) => (a === rootPath ? -1 : b === rootPath ? 1 : a.localeCompare(b)))
       .map((path) => {
-        const header = headerByPath.get(path)!;
-        const rawId = rawIdByPath.get(path)!;
+        const header = headerByPath.get(path) ?? {};
+        const rawId = rawIdByPath.get(path) ?? path.split(sep).slice(-2, -1)[0]!;
         const isSubagent = typeof header.parentSession === 'string' && header.parentSession.length > 0;
         return {
           path,
@@ -468,7 +491,15 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       const state = decodeCursorState(cursor);
       if (state !== null && treeMatchesState(members, state)) continue;
     }
-    if (changedFiles !== null && !group.paths.some((path) => changedFiles.has(path))) continue;
+    // A changed path that matches no current member (e.g. a DELETED child
+    // file) still belongs to this tree's project directory — route it here so
+    // the tree reparses and the stale rows retract.
+    const projectDir = join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '');
+    const touched = changedFiles !== null && (
+      group.paths.some((path) => changedFiles.has(path))
+      || [...changedFiles].some((path) => path.startsWith(projectDir + sep))
+    );
+    if (changedFiles !== null && !touched) continue;
     units.push({
       key: rootPath,
       sessionId,
@@ -477,9 +508,13 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     });
   }
 
-  // Tombstones: indexed deepseek sessions whose root file has disappeared.
-  // (indexedSessions is already scoped to this provider by the caller.)
+  // Tombstones: indexed deepseek sessions whose IDENTITY no longer exists on
+  // disk. Path alone is not enough — a moved root yields a new unit at a new
+  // path with the same session id, and a path-keyed tombstone would delete the
+  // fresh snapshot right after it was written.
+  const liveSessionIds = new Set(units.map((unit) => unit.sessionId));
   for (const indexed of ctx.indexedSessions?.() ?? []) {
+    if (liveSessionIds.has(indexed.sessionId)) continue; // moved or still indexed
     const jsonlPath = indexed.jsonlPath;
     if (fileByPath.has(jsonlPath)) continue; // still a member of a discovered tree
     if (existsSync(jsonlPath)) continue;
@@ -502,8 +537,10 @@ interface MemberCheckpoint {
   inode: number;
   /** Committed frame count (zstd) or non-empty line count (plaintext). */
   count: number;
-  /** sha256 of the committed frame/line bytes at position count-1 (prefix continuity). */
-  lastEntryHash: string;
+  /** sha256 over ALL committed entry bytes [0, count) — prefix continuity must
+   * cover every committed frame, not just the boundary one: an in-place edit
+   * of an earlier frame with an append on top must not read as pure growth. */
+  prefixHash: string;
 }
 
 interface TreeCursorState {
@@ -512,12 +549,13 @@ interface TreeCursorState {
   members: Record<string, MemberCheckpoint>;
   /** Last message-bearing uuid emitted per member path (parent-chain seed). */
   lastMessageUuid: Record<string, string>;
-  /** Per member path, the "turn:step" steps whose tool_use anchor is already
-   * canonical (emitted by the assistant/message). A durable tool/call lands
-   * AFTER its step's assistant/message upstream, so without this checkpoint a
-   * later-window tool/call would re-emit a provisional anchor over the
-   * canonical row, downgrading its model/usage to null. */
-  canonicalAnchors: Record<string, string[]>;
+  /** Per member path, the "turn:step" steps that already have a tool_use
+   * anchor message (canonical or provisional). A durable tool/call lands
+   * after its step's assistant/message upstream, and an aborted step's
+   * provisional anchor may see further tool/calls in later windows — without
+   * this checkpoint both cases re-emit the anchor, downgrading model/usage or
+   * rewriting its parent/timestamp. */
+  anchorSteps: Record<string, string[]>;
 }
 
 function decodeCursorState(cursor: Cursor): TreeCursorState | null {
@@ -540,7 +578,7 @@ function encodeCursor(mtime: number, totalCount: number, state: TreeCursorState)
 interface MemberSnapshot {
   stat: { mtimeMs: number; size: number; ctimeMs: number; ino: number };
   count: number;
-  lastEntryHash: string;
+  prefixHash: string;
   headerHash: string;
   /** zstd buffer + frames, or plaintext lines, loaded once per parse. */
   zstd?: { buffer: Buffer; frames: Array<{ start: number; end: number }> };
@@ -555,6 +593,18 @@ function headerHashOf(header: DshHeader): string {
   return sha256(JSON.stringify([header.id ?? null, header.createdAt ?? null, normalizeObservedCwd(header.cwd) ?? null, header.parentSession ?? null]));
 }
 
+/** sha256 over the committed prefix [0, count) of a snapshot. */
+function prefixHashOf(snap: MemberSnapshot, count: number): string {
+  const hash = createHash('sha256');
+  if (snap.zstd) {
+    const end = count === 0 ? 0 : (snap.zstd.frames[count - 1]?.end ?? 0);
+    hash.update(snap.zstd.buffer.subarray(0, end));
+  } else {
+    hash.update((snap.lines ?? []).slice(0, count).join('\n'));
+  }
+  return hash.digest('hex');
+}
+
 /** Load a member file once and compute its fresh checkpoint fields. */
 function snapshotMember(path: string): MemberSnapshot | null {
   try {
@@ -564,23 +614,26 @@ function snapshotMember(path: string): MemberSnapshot | null {
     if (path.endsWith('.jsonl.zstd')) {
       const buffer = readFileSync(path);
       const { frames } = scanZstdFrames(buffer);
-      const last = frames[frames.length - 1];
-      return {
+      const snap: MemberSnapshot = {
         stat: { mtimeMs: stat.mtimeMs, size: stat.size, ctimeMs: stat.ctimeMs, ino: stat.ino },
         count: frames.length,
-        lastEntryHash: last ? sha256(buffer.subarray(last.start, last.end)) : sha256(''),
+        prefixHash: '',
         headerHash: headerHashOf(header),
         zstd: { buffer, frames },
       };
+      snap.prefixHash = prefixHashOf(snap, snap.count);
+      return snap;
     }
     const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.trim().length > 0);
-    return {
+    const snap: MemberSnapshot = {
       stat: { mtimeMs: stat.mtimeMs, size: stat.size, ctimeMs: stat.ctimeMs, ino: stat.ino },
       count: lines.length,
-      lastEntryHash: lines.length > 0 ? sha256(lines[lines.length - 1]!) : sha256(''),
+      prefixHash: '',
       headerHash: headerHashOf(header),
       lines,
     };
+    snap.prefixHash = prefixHashOf(snap, snap.count);
+    return snap;
   } catch {
     return null;
   }
@@ -591,16 +644,7 @@ function memberMatchesCheckpoint(member: TreeMember, snap: MemberSnapshot, cp: M
   return snap.headerHash === cp.headerHash
     && snap.stat.ino === cp.inode
     && snap.count >= cp.count
-    && (cp.count === 0 || entryHashAt(snap, cp.count - 1) === cp.lastEntryHash);
-}
-
-function entryHashAt(snap: MemberSnapshot, index: number): string {
-  if (snap.zstd) {
-    const frame = snap.zstd.frames[index];
-    return frame ? sha256(snap.zstd.buffer.subarray(frame.start, frame.end)) : '';
-  }
-  const line = snap.lines?.[index];
-  return line !== undefined ? sha256(line) : '';
+    && prefixHashOf(snap, cp.count) === cp.prefixHash;
 }
 
 /** Whether the whole tree matches the checkpoint (used by discovery's skip gate). */
@@ -613,7 +657,7 @@ function treeMatchesState(members: TreeMember[], state: TreeCursorState): boolea
     const snap = snapshotMember(member.path);
     if (snap === null) return false;
     if (snap.headerHash !== cp.headerHash || snap.stat.ino !== cp.inode) return false;
-    if (snap.count !== cp.count || snap.lastEntryHash !== cp.lastEntryHash) return false;
+    if (snap.count !== cp.count || snap.prefixHash !== cp.prefixHash) return false;
     if ((member.agentId ?? null) !== cp.agentId) return false;
   }
   return true;
@@ -639,7 +683,13 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   const snaps = new Map<string, MemberSnapshot>();
   for (const member of meta.members) {
     const snap = snapshotMember(member.path);
-    if (snap !== null) snaps.set(member.path, snap);
+    if (snap === null) {
+      // Fail closed (ADR-0001): a member that exists in discovery but cannot be
+      // read/snapshotted right now must not produce a partial tree — and must
+      // never trigger the fallback's delete-session. Keep the last-good state.
+      return cursor;
+    }
+    snaps.set(member.path, snap);
   }
 
   const priorPaths = prior === null ? [] : Object.keys(prior.members).sort();
@@ -681,7 +731,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   };
   let maxMtime = 0;
   let totalCount = 0;
-  const nextState: TreeCursorState = { sessionId, members: {}, lastMessageUuid: {}, canonicalAnchors: {} };
+  const nextState: TreeCursorState = { sessionId, members: {}, lastMessageUuid: {}, anchorSteps: {} };
 
   for (const member of meta.members) {
     const snap = snaps.get(member.path);
@@ -709,8 +759,8 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     let currentModel: string | null = null;
     let memberEndedAt: string | null = null;
     const emittedAnchors = new Set<string>();
-    const canonicalAnchors = new Set<string>(fast ? (prior!.canonicalAnchors[member.path] ?? []) : []);
-    const canonicalAnchorsFor = (turn: unknown, step: unknown) => canonicalAnchors.has(`${turn}:${step}`);
+    const anchorSteps = new Set<string>(fast ? (prior!.anchorSteps[member.path] ?? []) : []);
+    const hasAnchor = (turn: unknown, step: unknown) => anchorSteps.has(`${turn}:${step}`);
     let subagentDescriptor: Record<string, unknown> | null = null;
 
     const updateEndedAt = (timestamp: string | null): void => {
@@ -810,7 +860,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           }
           if (toolUseAnchor !== null) {
             emittedAnchors.add(toolUseAnchor);
-            canonicalAnchors.add(`${turn}:${step}`);
+            anchorSteps.add(`${turn}:${step}`);
             pushMessage({
               kind: 'message', uuid: toolUseAnchor, parent_uuid: lastMessageUuid, text: null,
               content_type: 'tool_use', input_tokens: tokensFor(toolUseAnchor), output_tokens: tokensOutFor(toolUseAnchor), ...base,
@@ -834,8 +884,9 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           // has no tool-call part (or never landed): tool_calls and tool_results
           // are filtered by message_uuid downstream, and the ADR-0008 nonce
           // resolver walks this anchor to the session.
-          if (!emittedAnchors.has(anchor) && !stepsWithCanonicalAnchor.has(`${data.turn}:${data.step}`) && !canonicalAnchorsFor(data.turn, data.step)) {
+          if (!emittedAnchors.has(anchor) && !stepsWithCanonicalAnchor.has(`${data.turn}:${data.step}`) && !hasAnchor(data.turn, data.step)) {
             emittedAnchors.add(anchor);
+            anchorSteps.add(`${data.turn}:${data.step}`);
             pushMessage({
               kind: 'message', uuid: anchor, session_id: sessionId, type: 'assistant',
               parent_uuid: lastMessageUuid, timestamp, role: 'assistant', text: null,
@@ -898,13 +949,13 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       // total_tokens is derived at query time from the sidechain messages (ADR-0010).
     }
     if (lastMessageUuid !== null) nextState.lastMessageUuid[member.path] = lastMessageUuid;
-    if (canonicalAnchors.size > 0) nextState.canonicalAnchors[member.path] = [...canonicalAnchors];
+    if (anchorSteps.size > 0) nextState.anchorSteps[member.path] = [...anchorSteps];
     nextState.members[member.path] = {
       agentId: member.agentId,
       headerHash: snap.headerHash,
       inode: snap.stat.ino,
       count: snap.count,
-      lastEntryHash: snap.lastEntryHash,
+      prefixHash: snap.prefixHash,
     };
     maxMtime = Math.max(maxMtime, snap.stat.mtimeMs);
     totalCount += snap.count;

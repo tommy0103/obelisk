@@ -17,7 +17,8 @@ authoritative regardless of how indexing was sliced.
   overwrites or re-derives over a stored value.
 - When the stored value is null (deepseek), `subagents()` and `context()`
   derive it at query time as `SUM(input_tokens + output_tokens)` over the
-  subagent's sidechain messages. Derivation is a presentation-layer null-fill,
+  subagent's sidechain messages. The derivation is null only when no
+  usage-bearing message exists; a legitimate zero stays zero. Derivation is a presentation-layer null-fill,
   not a stored aggregate.
 
 **Consequences.** Adding an incremental provider with subagent folding does not
