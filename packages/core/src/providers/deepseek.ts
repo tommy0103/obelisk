@@ -375,14 +375,19 @@ function findSessionFile(rootDir: string, rawSessionId: string, scope: string | 
   return null;
 }
 
-/** Split watcher paths into session-file paths and directory-level events. */
+/** Split watcher paths into session-file paths and directory-level events.
+ * Paths outside this provider's root are other providers' business and are
+ * ignored entirely — they must not become unroutable changes that rescan
+ * every tree. */
 function splitChangedPaths(sessionsDir: string, changedPaths: string[]): { files: Set<string>; hasDirEvent: boolean } {
   const files = new Set<string>();
   let hasDirEvent = false;
+  const rootPrefix = normalize(sessionsDir) + sep;
   for (const changedPath of changedPaths) {
     const absolute = isAbsolute(changedPath)
       ? normalize(changedPath)
       : normalize(join(sessionsDir, changedPath));
+    if (!absolute.startsWith(rootPrefix)) continue; // foreign provider's path
     if (SESSION_FILENAMES.some((suffix) => absolute.endsWith(suffix))) {
       files.add(absolute);
     } else {

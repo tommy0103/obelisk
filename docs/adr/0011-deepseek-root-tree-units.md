@@ -43,12 +43,13 @@ parse**.
   matches the current committed prefix (every frame/line, not just the
   boundary entry). Then only new
   frames/lines are decoded, `lastMessageUuid` is restored from the
-  checkpoint, and records emit with `countMode: 'delta'`. Anchor
-  canonicality converges via the upstream ordering (the step's
-  `assistant/message` is persisted at step end, before the durable
-  `tool/call` checkpoint of the tool it ordered) plus the checkpointed
-  anchor-step set: a provisional anchor is only ever followed by the
-  canonical row, and a later-window tool/call never rewrites one.
+  checkpoint, and records emit with `countMode: 'delta'`. In real logs the
+  step's `assistant/message` is persisted at step end — before the durable
+  `tool/call` checkpoint of the tool it ordered — so the canonical anchor
+  normally exists first, and the checkpointed anchor-step set keeps a
+  later-window tool/call from rewriting it. A provisional anchor arises only
+  for steps whose assistant/message never lands (crash/abort); it may never
+  be followed by a canonical row, and the checkpoint keeps it stable.
 - **Snapshot fallback** covers everything else (member added/removed,
   replacement, truncation, identity change): emit `delete-session` for the
   root — the cascade is safe because the whole tree is re-emitted by the

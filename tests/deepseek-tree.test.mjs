@@ -998,3 +998,41 @@ test('a directory-level rename event triggers reconciliation (not dropped by the
   assert.ok(row.jsonl_path.includes('--renamed--'));
   db.close();
 });
+
+test('a permission-denied root on FIRST index reports an inventory issue (no silent empty)', () => {
+  const dir = makeTempDir('obelisk-rooteacces-');
+  const sessionsDir = join(dir, 'sessions');
+  mkdirSync(sessionsDir, { recursive: true });
+  chmodSync(sessionsDir, 0o000); // readdir will fail with EACCES
+  try {
+    const issues = [];
+    const provider = createDeepseekProvider({ rootDir: sessionsDir });
+    const units = provider.discover({
+      lastCursor: () => null,
+      reportIncompleteInventory: (i) => issues.push(i),
+      // zero indexed sessions — the first-index case
+    });
+    assert.equal(units.length, 0);
+    assert.ok(issues.length > 0, 'inaccessible root is reported even with zero history');
+  } finally {
+    chmodSync(sessionsDir, 0o755);
+  }
+});
+
+test('changed paths outside the deepseek root never reconcile deepseek trees', () => {
+  const dir = makeTempDir('obelisk-foreign-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  // A Claude transcript write elsewhere: must not reschedule or rescan us.
+  const units = provider.discover({
+    ...store.ctx(),
+    changedPaths: ['/Users/someone/.claude/projects/p/session.jsonl'],
+  });
+  assert.deepEqual(units, [], 'foreign provider paths are ignored entirely');
+  db.close();
+});

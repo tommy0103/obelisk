@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import os from 'node:os';
+import { statSync } from 'node:fs';
 import path from 'node:path';
 import {
   createAdaptiveWatcher,
@@ -91,6 +92,23 @@ interface IndexerServiceOptions {
   logger?: { warn?: (msg: string) => void };
 }
 
+const TRANSCRIPT_SUFFIXES = ['.jsonl.zstd', '.jsonl', '.json'] as const;
+
+function isTranscriptPath(targetPath: string): boolean {
+  return TRANSCRIPT_SUFFIXES.some((suffix) => targetPath.endsWith(suffix));
+}
+
+function isTranscriptOrDirectoryEvent(changedPath: string): boolean {
+  if (isTranscriptPath(changedPath)) return true;
+  try {
+    return statSync(changedPath).isDirectory();
+  } catch {
+    // Missing path: the old side of a rename (or a deletion). Forward it —
+    // providers treat unroutable paths as a reconcile signal.
+    return true;
+  }
+}
+
 function createIndexerService({
   projectsDir = DEFAULT_PROJECTS_DIR,
   watchTargets,
@@ -129,7 +147,7 @@ function createIndexerService({
       pollIntervalMs: watchPollMs,
       // The caller knows its transcripts; the package does not. Native events
       // for transcripts promote the path into the hot set before delivery.
-      shouldPromote: (targetPath) => targetPath.endsWith('.jsonl') || targetPath.endsWith('.json') || targetPath.endsWith('.jsonl.zstd'),
+      shouldPromote: (targetPath) => isTranscriptPath(targetPath),
       onInvalidate: (invalidation) => {
         // A rescan means anything under the root may have changed — full
         // inventory. Path invalidations filter to transcripts here, at the
@@ -141,10 +159,12 @@ function createIndexerService({
         for (const changedPath of invalidation.paths) {
           // Transcript files plus directory-level events (a renamed
           // project/session directory arrives as the bare path): providers
-          // route or full-reconcile on those themselves.
-          const isTranscript = changedPath.endsWith('.jsonl') || changedPath.endsWith('.json') || changedPath.endsWith('.jsonl.zstd');
-          const looksLikeDirectory = !changedPath.split('/').pop()?.includes('.');
-          if (isTranscript || looksLikeDirectory) onChange(changedPath);
+          // route or full-reconcile on those themselves. Directory detection
+          // uses the filesystem, not name heuristics — dotted directory names
+          // (repo.v2) and Windows separators defeat basename guessing, and a
+          // missing path (the old side of a rename) is exactly the case that
+          // must be forwarded.
+          if (isTranscriptOrDirectoryEvent(changedPath)) onChange(changedPath);
         }
       },
     });
