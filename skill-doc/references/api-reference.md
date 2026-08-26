@@ -17,7 +17,7 @@ memory mutation helpers.
 Obelisk refreshes the index before each query, so the invoking agent's own live
 session appears in results. The CLI carries an invocation nonce to identify it:
 
-- `obelisk --search "text" --nonce <token>` — pass a unique token, for example
+- `obelisk --search "text" --compact --limit 8 --context 0 --snippet-length 240 --nonce <token>` — pass a unique token, for example
   `--nonce "$(uuidgen 2>/dev/null || echo "$$.$RANDOM.$RANDOM")"` (prefers
   `uuidgen`, falls back to shell builtins). The nonce is never part of the FTS
   search text.
@@ -64,7 +64,7 @@ subagents, workflows, workflowTree, fileHistory, failures
 ```
 
 All list helpers accept bounded `limit` options. Many helpers also accept
-`project`, `sessionId`, `sessions`, `after`, `before`, `branch`, and `source`
+`project`, `projectPath`, `excludeInvoking`, `sessionId`, `sessions`, `after`, `before`, `branch`, and `source`
 when the underlying table can express that scope. Passing a string to many list
 helpers is treated as `sessionId`; passing a number is treated as `limit`.
 
@@ -96,11 +96,16 @@ Full-text search across all indexed message text using FTS5.
 | --- | --- | --- |
 | `text` | `string` | FTS5 query string |
 | `opts.limit` | `number` | Max results, default 20 |
+| `opts.contextLimit` | `number` | Max neighboring messages per hit, default 6; accepts 0 |
 | `opts.sessionId` | `string` | Restrict to one session |
+| `opts.sessions` | `string[]` | Restrict to session IDs |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
+| `opts.projectPath` | `string` | Exact match on `sessions.project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude the invoking session when the nonce resolves |
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
+| `opts.branch` | `string` | Exact source session branch |
 | `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
@@ -245,6 +250,8 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | Param | Type | Description |
 | --- | --- | --- |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
+| `opts.projectPath` | `string` | Exact match on `sessions.project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude the invoking session when the nonce resolves |
 | `opts.after` | `string` | ISO lower bound on `started_at` |
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
@@ -274,6 +281,8 @@ is treated as `sessionId`; passing a number is treated as `limit`.
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.sessions` | `string[]` | Restrict to session IDs |
 | `opts.project` | `string` | SQL `LIKE` pattern over source session project |
+| `opts.projectPath` | `string` | Exact match on the source session's `project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude summaries associated with the invoking session |
 | `opts.after` | `string` | ISO lower bound on summary timestamp |
 | `opts.before` | `string` | ISO upper bound on summary timestamp |
 | `opts.branch` | `string` | Exact source session branch |
@@ -302,6 +311,8 @@ Active registered markdown memory records. Passing a string is treated as
 | --- | --- | --- |
 | `opts.query` | `string` | English recall query over `summary` and `path` |
 | `opts.project` | `string` | SQL `LIKE` pattern over `memories.project` |
+| `opts.projectPath` | `string` | Exact match on the source session's `project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude memories associated with the invoking session; unattributed memories remain included |
 | `opts.sessionId` | `string` | Restrict to one source session |
 | `opts.sessions` | `string[]` | Restrict to source session IDs |
 | `opts.after` | `string` | ISO lower bound on `created_at` |
@@ -384,6 +395,8 @@ Subagent metadata plus message counts. Passing a string is treated as
 | --- | --- | --- |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over source session project |
+| `opts.projectPath` | `string` | Exact match on the source session's `project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude subagents from the invoking session |
 | `opts.after` | `string` | ISO lower bound; matches subagents still active past it (latest message) |
 | `opts.before` | `string` | ISO upper bound; matches subagents already started by it (earliest message) |
 | `opts.source` | `string` | Provider filter |
@@ -404,6 +417,8 @@ Workflow run rows ordered newest first. Passing a string is treated as
 | --- | --- | --- |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over source session project |
+| `opts.projectPath` | `string` | Exact match on the source session's `project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude workflows from the invoking session |
 | `opts.after` | `string` | ISO lower bound on workflow timestamp |
 | `opts.before` | `string` | ISO upper bound on workflow timestamp |
 | `opts.source` | `string` | Provider filter |
@@ -437,6 +452,8 @@ well as `Edit`/`Write`.
 | `opts.after` | `string` | ISO lower bound |
 | `opts.before` | `string` | ISO upper bound |
 | `opts.source` | `string` | Provider filter |
+| `opts.projectPath` | `string` | Exact match on the source session's `project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude file operations from the invoking session |
 | `opts.limit` | `number` | Max rows, default 200 |
 | `opts.includeInactive` | `boolean` | Include superseded tool evidence, default false |
 
@@ -463,6 +480,8 @@ the failure. Passing a string is treated as `sessionId`.
 | --- | --- | --- |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over source session project |
+| `opts.projectPath` | `string` | Exact match on the source session's `project_path` |
+| `opts.excludeInvoking` | `boolean` | Exclude failures from the invoking session |
 | `opts.after` | `string` | ISO lower bound on result message timestamp |
 | `opts.before` | `string` | ISO upper bound on result message timestamp |
 | `opts.source` | `string` | Provider filter |

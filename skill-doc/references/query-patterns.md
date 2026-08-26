@@ -21,13 +21,17 @@ or terms.
 const topic = 'English topic terms translated from the user request';
 const map = overview({ limit: 6 });
 const project = map.current.project?.project;
-const scoped = project ? { project } : {};
+const projectPath = map.current.project?.project_path;
+const scoped = projectPath
+  ? { projectPath, excludeInvoking: true }
+  : project ? { project, excludeInvoking: true } : { excludeInvoking: true };
 
 return {
   query_plan: {
     mode: 'first_pass',
     topic,
     project: project || null,
+    project_path: projectPath || null,
     limits: { sessions: 6, memories: 5, search: 8 },
   },
   orientation: map.current_project && {
