@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { constants, zstdCompressSync } from 'node:zlib';
@@ -758,6 +758,10 @@ test('divergent copies of one identity fail closed (no arbitrary winner overwrit
   assert.ok(issues.some((i) => i.error.includes('Divergent')));
 });
 
+// NOTE: this uses a SYNTHETIC event order (durable tool/call before the step's
+// assistant/message). Real dsh logs persist the assistant/message first; the
+// synthetic order is a robustness check for the seed-parent rule, not evidence
+// of real-order coverage (that is covered by the split-point equivalence test).
 test('a step straddling two runs does not create a parent cycle (text <-> tool_use)', () => {
   const dir = makeTempDir('obelisk-cycle-');
   const sessionsDir = join(dir, 'sessions');
@@ -875,4 +879,54 @@ test('an unknown higher header version is skipped and recorded, never parsed as 
   const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
   assert.equal(units.length, 0);
   assert.ok(issues.some((i) => i.error.includes('version 99')));
+});
+
+test('a permission-denied session dir is an inventory error, never a deletion', () => {
+  const dir = makeTempDir('obelisk-eacces-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+  const before = dumpDb(db);
+
+  // Remove traverse permission from the child's session dir: the file exists
+  // but stat() fails with EACCES — existsSync would report "gone".
+  const childDir = join(sessionsDir, '--tmp-dsh-project--', 'child-session-1');
+  chmodSync(childDir, 0o000);
+  try {
+    const issues = [];
+    const units = provider.discover({
+      ...store.ctx(),
+      reportIncompleteInventory: (i) => issues.push(i),
+      indexedSessions: () => [{ sessionId: ROOT_ID, jsonlPath: unit.key }],
+    });
+    assert.ok(issues.length > 0, 'permission error reported as inventory issue');
+    assert.ok(!units.some((u) => (u.retractSessionIds ?? []).length > 0), 'no tombstone on a permission error');
+    assert.deepEqual(dumpDb(db), before, 'last-good snapshot preserved');
+  } finally {
+    chmodSync(childDir, 0o755);
+  }
+  db.close();
+});
+
+test('a watcher report of only the OLD path after a move reconciles provenance immediately', () => {
+  const dir = makeTempDir('obelisk-movehint-');
+  const sessionsDir = writeTree(dir);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+
+  renameSync(join(sessionsDir, '--tmp-dsh-project--'), join(sessionsDir, '--moved--'));
+  // The watcher reports only the old (now nonexistent) root path.
+  const units = provider.discover({ ...store.ctx(), changedPaths: [unit.key] });
+  assert.equal(units.length, 1, 'unroutable change falls back to reconciling the tree');
+  const newUnit = units[0];
+  persist(db, newUnit, provider.parse(newUnit, store.ctx().lastCursor(newUnit.key)));
+  const session = db.prepare('SELECT jsonl_path FROM sessions').get();
+  assert.ok(session.jsonl_path.includes('--moved--'), 'provenance updated immediately');
+  db.close();
 });

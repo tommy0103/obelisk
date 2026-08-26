@@ -23,12 +23,13 @@
 // session file plus every descendant subagent file, grouped at discovery by
 // project-scoped ancestry. The cursor is a checkpoint (`mtime:count` prefix
 // for persist's index_state columns, then opaque base64url JSON): per-member
-// { agentId, headerHash, inode, count, lastEntryHash } plus per-member
-// lastMessageUuid. Parse has two paths:
+// { agentId, headerHash, inode, count, prefixHash } plus per-member
+// lastMessageUuid (+ its own parent) and the steps with an emitted tool_use
+// anchor. Parse has two paths:
 //
 //   FAST PATH — every member satisfies strict preconditions (same member set,
-//   same identities, unchanged inodes, non-decreasing counts, stored
-//   last-entry hash still matches the frame/line at the stored position).
+//   same identities, unchanged inodes, non-decreasing counts, and the stored
+//   cumulative prefix hash still matches the current committed prefix).
 //   Only new frames/lines are decoded; parent chains resume from the
 //   checkpointed lastMessageUuid; records emit with countMode 'delta'.
 //
@@ -309,9 +310,20 @@ function outputTokens(usage: unknown): number | null {
 
 // ---- discovery: files → root session trees ----
 
+/** 'gone' only on ENOENT/ENOTDIR; anything else (EACCES, EIO, ...) is 'error'. */
+function probePath(path: string): 'present' | 'gone' | 'error' {
+  try {
+    statSync(path);
+    return 'present';
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'gone' : 'error';
+  }
+}
+
 function collectSessionFiles(sessionsDir: string, reportIssue: ((issue: { path: string; error: string }) => void) | undefined): SessionFile[] {
   const result: SessionFile[] = [];
-  if (!existsSync(sessionsDir)) return result;
+  if (probePath(sessionsDir) !== 'present') return result;
   let projects;
   try {
     projects = readdirSync(sessionsDir, { withFileTypes: true });
@@ -334,7 +346,13 @@ function collectSessionFiles(sessionsDir: string, reportIssue: ((issue: { path: 
       const sessionDir = join(projectDir, session.name);
       for (const suffix of SESSION_FILENAMES) {
         const path = join(sessionDir, `session${suffix}`);
-        if (existsSync(path)) {
+        const probe = probePath(path);
+        if (probe === 'error') {
+          // A permission/transient I/O error is NOT a deletion — record it so
+          // the inventory stays uncertified and no tombstone can fire.
+          reportIssue?.({ path, error: 'Session artifact is present but not stat-able' });
+        }
+        if (probe !== 'gone') {
           result.push({ path, projectDir: project.name, sessionDir });
           break;
         }
@@ -509,6 +527,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // last-good state) — never publish a partial tree.
   const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
 
+  // A changed path that routes to no current group (e.g. the watcher reported
+  // only the OLD path of a moved tree) means we cannot tell which trees were
+  // touched — reconcile all of them rather than leaving provenance stale.
+  const unroutableChange = changedFiles !== null && [...changedFiles].some((path) =>
+    ![...membersByRootKey.values()].some((group) =>
+      group.paths.includes(path)
+      || path.startsWith(join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '') + sep)));
+
   const units: IndexUnit[] = [];
   for (const [groupKey, group] of membersByRootKey.entries()) {
     if (divergentGroups.has(groupKey)) continue; // divergent copies: fail closed
@@ -546,7 +572,8 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     // the tree reparses and the stale rows retract.
     const projectDir = join(sessionsDir, fileByPath.get(group.paths[0]!)?.projectDir ?? '');
     const touched = changedFiles !== null && (
-      group.paths.some((path) => changedFiles.has(path))
+      unroutableChange
+      || group.paths.some((path) => changedFiles.has(path))
       || [...changedFiles].some((path) => path.startsWith(projectDir + sep))
     );
     if (changedFiles !== null && !touched) continue;
@@ -577,7 +604,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     if (liveSessionIds.has(indexed.sessionId)) continue; // moved or still indexed
     const jsonlPath = indexed.jsonlPath;
     if (fileByPath.has(jsonlPath)) continue; // still a member of a discovered tree
-    if (existsSync(jsonlPath)) continue;
+    if (probePath(jsonlPath) !== 'gone') continue; // present — or unreachable: keep last-good
     units.push({
       key: jsonlPath,
       sessionId: indexed.sessionId,
