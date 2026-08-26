@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { constants, zstdCompressSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -394,7 +395,7 @@ test('parse output assembles and survives a SQLite round-trip (whole tree)', () 
 });
 
 test('parses the real sanitized dsh artifacts end to end', () => {
-  const fixtureRoot = new URL('./fixtures/deepseek/sessions', import.meta.url).pathname;
+  const fixtureRoot = fileURLToPath(new URL('./fixtures/deepseek/sessions', import.meta.url));
   const provider = createDeepseekProvider({ rootDir: fixtureRoot });
   const units = provider.discover({ lastCursor: () => null });
   assert.equal(units.length, 1); // the real root+child pair is one tree
@@ -697,7 +698,7 @@ test('headerless artifacts are reported as incomplete inventory, not silently sk
 });
 
 test('fixtures stay free of user-identifying absolute paths', () => {
-  const fixtureRoot = new URL('./fixtures/deepseek/sessions', import.meta.url).pathname;
+  const fixtureRoot = fileURLToPath(new URL('./fixtures/deepseek/sessions', import.meta.url));
   for (const proj of readdirSync(fixtureRoot)) {
     for (const sid of readdirSync(join(fixtureRoot, proj))) {
       const buf = readFileSync(join(fixtureRoot, proj, sid, 'session.jsonl.zstd'));
@@ -881,7 +882,7 @@ test('an unknown higher header version is skipped and recorded, never parsed as 
   assert.ok(issues.some((i) => i.error.includes('version 99')));
 });
 
-test('a permission-denied session dir is an inventory error, never a deletion', () => {
+test('a permission-denied session dir is an inventory error, never a deletion', { skip: process.platform === 'win32' }, () => {
   const dir = makeTempDir('obelisk-eacces-');
   const sessionsDir = writeTree(dir);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
@@ -999,7 +1000,7 @@ test('a directory-level rename event triggers reconciliation (not dropped by the
   db.close();
 });
 
-test('a permission-denied root on FIRST index reports an inventory issue (no silent empty)', () => {
+test('a permission-denied root on FIRST index reports an inventory issue (no silent empty)', { skip: process.platform === 'win32' }, () => {
   const dir = makeTempDir('obelisk-rooteacces-');
   const sessionsDir = join(dir, 'sessions');
   mkdirSync(sessionsDir, { recursive: true });
@@ -1053,5 +1054,47 @@ test('changed paths under a symlinked root (realpath) still route to the tree', 
   const realChild = join(realpathSync(real), '--tmp-dsh-project--', 'child-session-1', 'session.jsonl.zstd');
   const units = provider.discover({ ...store.ctx(), changedPaths: [realChild] });
   assert.equal(units.length, 1, 'realpath event routed to the tree');
+  db.close();
+});
+
+test('deleting a child routes to its OWN tree even when a sibling tree shares the project dir', () => {
+  const dir = makeTempDir('obelisk-multitree-');
+  const sessionsDir = join(dir, 'sessions');
+  // Two trees in the SAME project dir (same cwd → same scope, different ids).
+  for (const sid of ['root-session-1', 'root-session-2']) {
+    const d = join(sessionsDir, '--tmp-dsh-project--', sid);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'session.jsonl'), [
+      JSON.stringify({ ...HEADER, id: sid }),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: `from ${sid}` }], source: { kind: 'user' }, role: 'user', id: `m-${sid}` } }),
+    ].join('\n') + '\n');
+  }
+  // Tree 1 has a child.
+  const childDir = join(sessionsDir, '--tmp-dsh-project--', 'child-of-1');
+  mkdirSync(childDir, { recursive: true });
+  const childPath = join(childDir, 'session.jsonl');
+  writeFileSync(childPath, [
+    JSON.stringify({ type: 'session', version: 0, id: 'child-of-1', createdAt: 1753005600200, cwd: '/tmp/dsh-project', parentSession: 'root-session-1', origin: 'subagent', delegationDepth: 1 }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601300, data: { content: [{ type: 'text', text: 'child of 1' }], source: { kind: 'user' }, role: 'user', id: 'cm-1' } }),
+  ].join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  for (const unit of provider.discover({ lastCursor: () => null })) {
+    store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+  }
+  assert.equal(dumpDb(db).sessions.length, 2);
+  assert.ok(dumpDb(db).messages.some((m) => m.text === 'child of 1'));
+
+  // Delete the child; the watcher reports only the deleted path.
+  rmSync(childPath);
+  const units = provider.discover({ ...store.ctx(), changedPaths: [childPath] });
+  // The deleted member is in tree 1's checkpoint: routes there precisely.
+  assert.ok(units.some((u) => u.sessionId === ROOT_ID), 'tree 1 re-emitted');
+  for (const u of units) persist(db, u, provider.parse(u, store.ctx().lastCursor(u.key)));
+  const dump = dumpDb(db);
+  assert.ok(!dump.messages.some((m) => m.text === 'child of 1'), 'stale sidechain rows retracted');
+  assert.ok(dump.messages.some((m) => m.text === 'from root-session-2'), 'sibling tree untouched');
   db.close();
 });

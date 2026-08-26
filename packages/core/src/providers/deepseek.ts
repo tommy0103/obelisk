@@ -57,7 +57,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { isAbsolute, join, normalize, sep } from 'node:path';
+import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 
 import { filePath, normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../vendor/dsh-zstd.ts';
@@ -550,40 +550,85 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // last-good state) — never publish a partial tree.
   const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
 
-  // A changed path we cannot route means we cannot tell which trees were
-  // touched — reconcile all of them rather than leaving provenance stale.
-  // Unroutable = a directory-level event (rename), a path matching no current
-  // group, or a path that IS an indexed session's recorded jsonl_path but no
-  // current tree's root (the old path of a move whose old project dir still
-  // hosts other trees — the project-prefix fallback alone would route it to
-  // the wrong, untouched tree).
-  // Routing compares canonical (realpath) forms on both sides: the watcher
-  // reports realpaths while members may live under a symlinked root.
+  // ---- changed-path routing table ----
+  // One canonicalization pass per changed path, one lookup per route
+  // decision. Sources of routing knowledge, merged into one table:
+  //   - current member files + their session dirs + project dirs;
+  //   - checkpointed member paths (a DELETED member still routes precisely);
+  //   - indexed sessions' jsonl_paths (the old path of a moved tree routes to
+  //     the tree by identity).
+  // A path that hits nothing — or any directory-level event — means we cannot
+  // tell which trees were touched: reconcile all of them. Multiple trees may
+  // share a project directory, so every map value is a SET of group indexes.
   const canon = (p: string): string => {
     try { return realpathSync(p); } catch { return p; }
   };
-  const groups = [...membersByRootKey.values()];
-  const currentRootPaths = new Set(
-    groups.map((group) => group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId)).filter((p) => p !== undefined),
-  );
-  const indexedPaths = new Set((ctx.indexedSessions?.() ?? []).map((session) => session.jsonlPath));
-  const canonicalMembers = new Map<string, number>(); // canon member path -> group index
-  const canonicalProjectDirs = new Map<string, number>();
-  groups.forEach((group, i) => {
-    for (const path of group.paths) canonicalMembers.set(canon(path), i);
-    const projectDir = fileByPath.get(group.paths[0]!)?.projectDir;
-    if (projectDir !== undefined) canonicalProjectDirs.set(canon(join(sessionsDir, projectDir)) + sep, i);
-  });
-  const routesToGroup = (path: string): boolean => {
-    const c = canon(path);
-    if (canonicalMembers.has(c)) return true;
-    for (const dirPrefix of canonicalProjectDirs.keys()) if (c.startsWith(dirPrefix)) return true;
-    return false;
-  };
-  const unroutableChange = changed !== null && (changed.hasDirEvent || [...changedFiles!].some((path) => {
-    if (indexedPaths.has(path) && !currentRootPaths.has(path)) return true;
-    return !routesToGroup(path);
-  }));
+  type Routing = Set<number> | 'all';
+  let routing: Routing | null = null;
+  if (changed !== null && changedFiles !== null) {
+    const groupList = [...membersByRootKey.entries()];
+    const fileToGroups = new Map<string, Set<number>>();
+    const dirToGroups = new Map<string, Set<number>>();
+    const addRoute = (map: Map<string, Set<number>>, key: string, i: number) => {
+      const set = map.get(key) ?? new Set<number>();
+      set.add(i);
+      map.set(key, set);
+    };
+    const groupBySessionId = new Map<string, number>();
+    groupList.forEach(([groupKey, group], i) => {
+      if (divergentGroups.has(groupKey)) return;
+      if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) return;
+      const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
+      if (rootPath === undefined) return;
+      groupBySessionId.set(dshDbId(group.scope, group.rootRawId), i);
+      for (const path of group.paths) {
+        addRoute(fileToGroups, canon(path), i);
+        addRoute(dirToGroups, canon(dirname(path)) + sep, i);       // session dir
+        addRoute(dirToGroups, canon(dirname(dirname(path))) + sep, i); // project dir
+      }
+      // Checkpointed member paths: a DELETED member is no longer on disk but
+      // still routes precisely to its tree.
+      const state = decodeCursorState(ctx.lastCursor(rootPath));
+      for (const memberPath of Object.keys(state?.members ?? {})) {
+        addRoute(fileToGroups, canon(memberPath), i);
+        addRoute(dirToGroups, canon(dirname(memberPath)) + sep, i);
+      }
+    });
+    // Indexed identities: the recorded jsonl_path of a session routes to its
+    // tree even when the tree moved (the old path is not a current member).
+    for (const indexed of ctx.indexedSessions?.() ?? []) {
+      const gi = groupBySessionId.get(indexed.sessionId);
+      if (gi !== undefined) addRoute(fileToGroups, canon(indexed.jsonlPath), gi);
+    }
+
+    const touched = new Set<number>();
+    let reconcileAll = changed.hasDirEvent;
+    for (const rawPath of changedFiles) {
+      const c = canon(rawPath);
+      const fileHit = fileToGroups.get(c);
+      if (fileHit !== undefined) {
+        for (const i of fileHit) touched.add(i);
+        continue;
+      }
+      // Fixed directory shape (project/session/file): at most two ancestor
+      // levels can hold a route.
+      let dir = dirname(c);
+      let routed = false;
+      for (let depth = 0; depth < 2; depth++) {
+        const hit = dirToGroups.get(canon(dir) + sep);
+        if (hit !== undefined) {
+          for (const i of hit) touched.add(i);
+          routed = true;
+          break;
+        }
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+      if (!routed) reconcileAll = true;
+    }
+    routing = reconcileAll ? 'all' : touched;
+  }
 
   const units: IndexUnit[] = [];
   for (const [groupIndex, [groupKey, group]] of [...membersByRootKey.entries()].entries()) {
@@ -617,17 +662,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       const state = decodeCursorState(cursor);
       if (state !== null && treeMatchesState(members, state)) continue;
     }
-    // A changed path that matches no current member (e.g. a DELETED child
-    // file) still belongs to this tree's project directory — route it here so
-    // the tree reparses and the stale rows retract.
-    const touched = changedFiles !== null && (
-      unroutableChange
-      || [...changedFiles].some((path) => routesToGroup(path) && (
-        canonicalMembers.get(canon(path)) === groupIndex
-        || canonicalProjectDirs.get([...canonicalProjectDirs.keys()].find((d) => canon(path).startsWith(d)) ?? '') === groupIndex
-      ))
-    );
-    if (changedFiles !== null && !touched) continue;
+    if (routing !== null && routing !== 'all' && !routing.has(groupIndex)) continue;
     units.push({
       key: rootPath,
       sessionId,
