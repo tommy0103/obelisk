@@ -59,10 +59,10 @@ parse**.
   sessions whose files have disappeared.
 
 **Changed-path routing.** Watcher events route through one lookup structure
-built per discovery: every changed path is canonicalized once (realpath,
-resolving through the longest existing ancestor so renamed-away paths still
-converge across symlink aliases), then matched exact member file → session
-dir → project dir — two maps keyed by path, whose values are SETs of trees
+built per discovery: bounded canonicalization (realpath, resolving through
+the longest existing ancestor so renamed-away paths still converge across
+symlink aliases) plus a bounded ancestor lookup (exact member file → session
+dir → project dir) — two maps keyed by path, whose values are SETs of trees
 (multiple trees may share a project directory — no key overwrite). Two extra knowledge sources keep the table complete: member
 paths recorded in each tree's cursor checkpoint (a deleted member still
 routes precisely to its tree) and indexed sessions' jsonl_paths (the old path
