@@ -53,7 +53,7 @@
 // codec (../vendor/dsh-chunk-rows.ts) remains available for raw
 // reconstruction but is not on the indexing path.
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, sep } from 'node:path';
@@ -409,10 +409,18 @@ function resolveRootRawId(rawId: string, header: DshHeader, headersByScopedId: M
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const sessionsDir = rootDir;
+  // Track every inventory problem: tombstones are destructive and may only
+  // fire when the inventory is fully certified (CONTRIBUTING: fail closed).
+  let inventoryProblem = false;
+  const reportIssue = (issue: { path: string; error: string }) => {
+    inventoryProblem = true;
+    ctx.reportIncompleteInventory?.(issue);
+  };
+  const innerCtx = { ...ctx, reportIncompleteInventory: reportIssue };
   if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
-    ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+    reportIssue({ path: sessionsDir, error: 'Source folder is unavailable' });
   }
-  const files = collectSessionFiles(sessionsDir, ctx.reportIncompleteInventory);
+  const files = collectSessionFiles(sessionsDir, reportIssue);
   const changedFiles = ctx.changedPaths === undefined
     ? null
     : changedSessionFiles(sessionsDir, ctx.changedPaths);
@@ -433,7 +441,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     // inventory issue (CONTRIBUTING: skip and record, fail closed).
     const header = readDshHeader(file.path);
     if (header === null || typeof header.id !== 'string' || header.id.length === 0) {
-      ctx.reportIncompleteInventory?.({ path: file.path, error: 'Session artifact has no readable header' });
+      reportIssue({ path: file.path, error: 'Session artifact has no readable header' });
       unreadable.push(file);
       fileByPath.set(file.path, file);
       continue;
@@ -441,7 +449,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     // Version gate (CONTRIBUTING: tolerate the unknown — skip and record,
     // never parse a higher format as v0).
     if (header.version !== undefined && header.version !== 0) {
-      ctx.reportIncompleteInventory?.({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
+      reportIssue({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
       unreadable.push(file);
       fileByPath.set(file.path, file);
       continue;
@@ -466,21 +474,33 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   }
   // Two files with the SAME scoped identity (e.g. a copied session file) are
   // one logical member: keeping both would upsert the same uuids twice and
-  // double-count aggregates. Keep the first sorted path; record the anomaly.
-  for (const group of membersByRootKey.values()) {
-    const seen = new Set<string>();
-    group.paths = group.paths.filter((path) => {
+  // double-count aggregates. Byte-identical copies dedupe to the first sorted
+  // path; DIVERGENT copies have no safe authority rule, so the whole tree
+  // fails closed (suppressed this round) and the anomaly is recorded.
+  const divergentGroups = new Set<string>();
+  for (const [groupKey, group] of membersByRootKey) {
+    const byIdentity = new Map<string, string[]>();
+    for (const path of group.paths) {
       const rawId = rawIdByPath.get(path)!;
       const header = headerByPath.get(path)!;
       const isSub = typeof header.parentSession === 'string' && header.parentSession.length > 0;
       const identity = `${isSub}\0${rawId}`;
-      if (seen.has(identity)) {
-        ctx.reportIncompleteInventory?.({ path, error: 'Duplicate session artifact (same scoped identity as another file)' });
-        return false;
+      byIdentity.set(identity, [...(byIdentity.get(identity) ?? []), path]);
+    }
+    const keptPaths: string[] = [];
+    for (const paths of byIdentity.values()) {
+      const sorted = [...paths].sort();
+      const canonical = sorted[0]!;
+      const canonicalBytes = readFileSync(canonical);
+      for (const dup of sorted.slice(1)) {
+        if (!readFileSync(dup).equals(canonicalBytes)) {
+          divergentGroups.add(groupKey);
+          reportIssue({ path: dup, error: 'Divergent session artifacts share one scoped identity' });
+        }
       }
-      seen.add(identity);
-      return true;
-    });
+      keptPaths.push(canonical);
+    }
+    group.paths = keptPaths;
   }
 
   // An unreadable-but-present file cannot prove which tree it belongs to in a
@@ -490,7 +510,8 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const suppressedProjectDirs = new Set(unreadable.map((file) => file.projectDir));
 
   const units: IndexUnit[] = [];
-  for (const group of membersByRootKey.values()) {
+  for (const [groupKey, group] of membersByRootKey.entries()) {
+    if (divergentGroups.has(groupKey)) continue; // divergent copies: fail closed
     if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) continue;
     const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
     // The root file is gone (deleted) while children survive: this tree cannot
@@ -543,8 +564,15 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   // fresh snapshot right after it was written. And tombstones are only safe
   // when the inventory is complete: an unreadable file or an offline source
   // root must never cascade into deleting last-good snapshots.
-  const inventoryComplete = existsSync(sessionsDir) && unreadable.length === 0;
-  const liveSessionIds = new Set(units.map((unit) => unit.sessionId));
+  // Identity liveness is computed from ALL groups with a root member —
+  // BEFORE the changed-path filter. A cross-directory move reported by the
+  // watcher as only the OLD path must not tombstone the moved session.
+  const inventoryComplete = existsSync(sessionsDir) && !inventoryProblem;
+  const liveSessionIds = new Set(
+    [...membersByRootKey.values()]
+      .filter((group) => group.paths.some((path) => rawIdByPath.get(path) === group.rootRawId))
+      .map((group) => dshDbId(group.scope, group.rootRawId)),
+  );
   for (const indexed of inventoryComplete ? (ctx.indexedSessions?.() ?? []) : []) {
     if (liveSessionIds.has(indexed.sessionId)) continue; // moved or still indexed
     const jsonlPath = indexed.jsonlPath;
@@ -575,7 +603,12 @@ interface MemberCheckpoint {
   prefixHash: string;
 }
 
+const CURSOR_STATE_VERSION = 1;
+
 interface TreeCursorState {
+  /** Shape version; an unrecognized/older checkpoint decodes as null and the
+   * parse falls back to a full snapshot (self-healing, no migration). */
+  v: number;
   /** The session id this checkpoint belongs to — identity changes retract it. */
   sessionId: string;
   members: Record<string, MemberCheckpoint>;
@@ -601,8 +634,17 @@ function decodeCursorState(cursor: Cursor): TreeCursorState | null {
   if (encoded === undefined) return null; // legacy or foreign cursor: no state
   try {
     const value: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-    if (!isRecord(value) || !isRecord(value.members) || typeof value.sessionId !== 'string') return null;
-    return value as unknown as TreeCursorState;
+    if (!isRecord(value) || value.v !== CURSOR_STATE_VERSION) return null;
+    if (typeof value.sessionId !== 'string' || !isRecord(value.members)) return null;
+    // Defensive defaults for the optional maps — never throw on a missing key.
+    return {
+      v: CURSOR_STATE_VERSION,
+      sessionId: value.sessionId,
+      members: value.members as TreeCursorState['members'],
+      lastMessageUuid: isRecord(value.lastMessageUuid) ? value.lastMessageUuid as Record<string, string> : {},
+      lastMessageParentUuid: isRecord(value.lastMessageParentUuid) ? value.lastMessageParentUuid as Record<string, string | null> : {},
+      anchorSteps: isRecord(value.anchorSteps) ? value.anchorSteps as Record<string, string[]> : {},
+    };
   } catch {
     return null;
   }
@@ -627,7 +669,35 @@ function sha256(text: string | Buffer): string {
 }
 
 function headerHashOf(header: DshHeader): string {
-  return sha256(JSON.stringify([header.id ?? null, header.createdAt ?? null, normalizeObservedCwd(header.cwd) ?? null, header.parentSession ?? null]));
+  return sha256(JSON.stringify([
+    header.id ?? null, header.createdAt ?? null, normalizeObservedCwd(header.cwd) ?? null,
+    header.parentSession ?? null, header.version ?? null,
+  ]));
+}
+
+/** Parse the header line out of an already-read artifact buffer (no second read). */
+function headerFromBuffer(path: string, buffer: Buffer): DshHeader | null {
+  try {
+    let firstLine: string | null;
+    if (path.endsWith('.jsonl.zstd')) {
+      const { frames } = scanZstdFrames(buffer);
+      if (frames.length === 0) return null;
+      const decoder = createZstdFrameDecoder();
+      try {
+        const first = decoder.decode(buffer, [frames[0]!]).next();
+        firstLine = first.done ? null : firstNonEmptyLine((first.value as Buffer).toString('utf8'));
+      } finally {
+        decoder.close();
+      }
+    } else {
+      firstLine = firstNonEmptyLine(buffer.toString('utf8'));
+    }
+    if (firstLine === null) return null;
+    const value: unknown = JSON.parse(firstLine);
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 /** sha256 over the committed prefix [0, count) of a snapshot. */
@@ -642,11 +712,22 @@ function prefixHashOf(snap: MemberSnapshot, count: number): string {
   return hash.digest('hex');
 }
 
-/** Load a member file once and compute its fresh checkpoint fields. */
+/** Load a member file once and compute its fresh checkpoint fields. The stat
+ * and the content are read under ONE file descriptor, so a replacement
+ * mid-snapshot cannot mix generations (TOCTOU). */
 function snapshotMember(path: string): MemberSnapshot | null {
   try {
-    const stat = statSync(path);
-    const header = readDshHeader(path);
+    // openSync+fstatSync+readFileSync(fd) pin a single file generation.
+    const fd = openSync(path, 'r');
+    let stat;
+    let buffer: Buffer;
+    try {
+      stat = fstatSync(fd);
+      buffer = readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    const header = headerFromBuffer(path, buffer);
     if (header === null) return null;
     if (path.endsWith('.jsonl.zstd')) {
       const buffer = readFileSync(path);
@@ -661,7 +742,7 @@ function snapshotMember(path: string): MemberSnapshot | null {
       snap.prefixHash = prefixHashOf(snap, snap.count);
       return snap;
     }
-    const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.trim().length > 0);
+    const lines = buffer.toString('utf8').split('\n').filter((line) => line.trim().length > 0);
     const snap: MemberSnapshot = {
       stat: { mtimeMs: stat.mtimeMs, size: stat.size, ctimeMs: stat.ctimeMs, ino: stat.ino },
       count: lines.length,
@@ -778,7 +859,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   };
   let maxMtime = 0;
   let totalCount = 0;
-  const nextState: TreeCursorState = { sessionId, members: {}, lastMessageUuid: {}, lastMessageParentUuid: {}, anchorSteps: {} };
+  const nextState: TreeCursorState = { v: CURSOR_STATE_VERSION, sessionId, members: {}, lastMessageUuid: {}, lastMessageParentUuid: {}, anchorSteps: {} };
 
   for (const member of meta.members) {
     const snap = snaps.get(member.path);

@@ -727,17 +727,35 @@ test('duplicate files with the same scoped identity are one member (no double co
       JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'one' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
     ].join('\n') + '\n');
   }
-  const issues = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const db = freshDb();
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
-  assert.equal(units.length, 1);
-  assert.ok(issues.some((i) => i.error.includes('Duplicate')));
+  const units = provider.discover({ lastCursor: () => null });
+  assert.equal(units.length, 1, 'identical copies dedupe to one member');
   persist(db, units[0], provider.parse(units[0], null));
   const dump = dumpDb(db);
   assert.equal(dump.messages.length, 1);
   assert.equal(dump.sessions[0].message_count, 1); // ADR-0007: count matches rows
   db.close();
+});
+
+test('divergent copies of one identity fail closed (no arbitrary winner overwrites last-good)', () => {
+  const dir = makeTempDir('obelisk-divergent-');
+  const sessionsDir = join(dir, 'sessions');
+  const write = (name, text) => {
+    const d = join(sessionsDir, '--tmp-dsh-project--', name);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'session.jsonl'), [
+      JSON.stringify(HEADER),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+    ].join('\n') + '\n');
+  };
+  write('root-session-1', 'FROM_A');
+  write('root-session-1-copy', 'FROM_B_DIFFERENT');
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  assert.equal(units.length, 0, 'divergent copies publish nothing');
+  assert.ok(issues.some((i) => i.error.includes('Divergent')));
 });
 
 test('a step straddling two runs does not create a parent cycle (text <-> tool_use)', () => {
@@ -746,10 +764,12 @@ test('a step straddling two runs does not create a parent cycle (text <-> tool_u
   const sessionDir = join(sessionsDir, '--tmp-dsh-project--', 'cycle-session');
   mkdirSync(sessionDir, { recursive: true });
   const path = join(sessionDir, 'session.jsonl');
+  // Window 1: user message + the durable tool/call (provisional anchor,
+  // parent = user message).
   const first = [
     { type: 'session', version: 0, id: 'cycle-session', createdAt: 1753005600000, cwd: '/tmp/dsh-project', delegationDepth: 0 },
     { type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'go' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } },
-    // assistant/message of the step lands in window 1 (canonical anchor)...
+    { type: 'tool/call', seq: 2, time: 1753005601100, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } },
   ];
   writeFileSync(path, first.map((e) => JSON.stringify(e)).join('\n') + '\n');
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
@@ -758,8 +778,15 @@ test('a step straddling two runs does not create a parent cycle (text <-> tool_u
   let unit = provider.discover({ lastCursor: () => null })[0];
   store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
 
-  // ...the durable tool/call lands in window 2.
-  const second = [{ type: 'tool/call', seq: 2, time: 1753005601100, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } }];
+  // Window 2: the step's assistant/message arrives (canonical anchor + text).
+  const second = [{ type: 'assistant/message', seq: 3, time: 1753005602000, data: {
+    turn: 1, step: 1,
+    message: { role: 'assistant', content: [
+      { type: 'text', text: 'done' },
+      { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' },
+    ], source: { kind: 'model', model: 'm' }, id: 'a-1' },
+    usage: { inputTokens: 9, outputTokens: 3 },
+  } }];
   writeFileSync(path, first.concat(second).map((e) => JSON.stringify(e)).join('\n') + '\n');
   unit = provider.discover(store.ctx())[0];
   store.set(unit.key, persist(db, unit, provider.parse(unit, store.ctx().lastCursor(unit.key))));
@@ -776,12 +803,15 @@ test('a step straddling two runs does not create a parent cycle (text <-> tool_u
       cur = byUuid.get(cur);
     }
   }
-  // And the chain matches the full-parse shape.
+  // And the chain matches the full-parse shape exactly.
   const dbFull = freshDb();
   const unitF = provider.discover({ lastCursor: () => null })[0];
   persist(dbFull, unitF, provider.parse(unitF, null));
   const chainOf = (dbX) => dbX.prepare('SELECT uuid, parent_uuid FROM messages ORDER BY uuid').all();
   assert.deepEqual(chainOf(db), chainOf(dbFull));
+  // The canonical row won: anchor carries the assistant's model/usage.
+  const anchor = db.prepare("SELECT model, input_tokens FROM messages WHERE content_type='tool_use'").get();
+  assert.equal(anchor.model, 'm');
   db.close();
   dbFull.close();
 });

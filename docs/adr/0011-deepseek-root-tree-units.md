@@ -39,8 +39,9 @@ parse**.
   frame scans) becomes explicit, inspectable state.
 - **Fast path** applies only when every member satisfies strict
   preconditions: identical member set and identities, unchanged inodes,
-  counts non-decreasing, and the stored last-entry hash still matches the
-  frame/line at the stored position (prefix continuity). Then only new
+  counts non-decreasing, and the stored cumulative prefix hash still
+  matches the current committed prefix (every frame/line, not just the
+  boundary entry). Then only new
   frames/lines are decoded, `lastMessageUuid` is restored from the
   checkpoint, and records emit with `countMode: 'delta'`. Anchor
   canonicality converges via the upstream checkpoint policy (a durable
