@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Nonce self-search: the CLI embeds a unique invocation nonce in its argv
-// (--search --nonce <token>, or the as-typed --query file path). Providers
+// (--search --nonce <token>, or the as-typed --query file path). For --query
+// the script content is a second candidate, because heredoc/Write tool-call
+// records carry the content verbatim even when the path hides behind a shell
+// variable. Providers
 // write the tool-call record before the tool finishes, so after the pre-query
 // index refresh the nonce is in the fresh index. The session with the newest
 // matching record is the invoking session; matches far apart in time are
@@ -177,6 +180,33 @@ test('resolver bounds the tool_calls scan to the recency window', () => {
   db.close();
 });
 
+test('resolver falls back to the script-content candidate when the path misses', () => {
+  // The documented mktemp flow hides the query path behind a shell variable;
+  // the transcript then carries the heredoc body verbatim, never the path.
+  const db = invokingDb();
+  const script = "const hits = search('content nonce needle', { limit: 3 });\nreturn hits.length;\n";
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-heredoc', 'msg-self-call', 'sid-self', 'Bash', JSON.stringify({
+      command: `cat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"`,
+    }));
+
+  assert.equal(resolveInvokingSessionId(db, ['/tmp/obq.hidden/query.mjs', script.trim()], { nowMs: FIXTURE_NOW_MS }), 'sid-self');
+  assert.equal(resolveInvokingSessionId(db, ['/tmp/obq.hidden/query.mjs'], { nowMs: FIXTURE_NOW_MS }), null);
+  db.close();
+});
+
+test('resolver matches a JSON-escaped multi-line content candidate in tool_calls', () => {
+  // Write-style tool input JSON-escapes newlines, so the stored input_json
+  // holds the escaped spelling; the resolver already matches both spellings.
+  const db = invokingDb();
+  const script = "const map = overview({ limit: 6 });\nreturn map.current_project;\n";
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-write', 'msg-self-call', 'sid-self', 'Write', JSON.stringify({ file_path: '/tmp/obq.write/query.mjs', content: script }));
+
+  assert.equal(resolveInvokingSessionId(db, ['/tmp/obq.absent/query.mjs', script.trim()], { nowMs: FIXTURE_NOW_MS }), 'sid-self');
+  db.close();
+});
+
 test('resolver tolerates a partially built index', () => {
   // A read-only query can face a DB with only index_state (writer lease held,
   // schema never published). The nonce cannot resolve: honest null, no throw.
@@ -257,6 +287,64 @@ test('cli --search --nonce marks the invoking session end to end', () => {
   const plainHits = JSON.parse(withoutNonce.stdout);
   assert.equal(plainHits.length, 1);
   assert.equal(plainHits[0].session.is_invoking, undefined);
+});
+
+test('cli --query marks the invoking session via script content when the path is hidden', () => {
+  // The documented mktemp flow: the path sits behind a shell variable, so only
+  // the heredoc body reaches the transcript. The content candidate must still
+  // identify the invoking session.
+  const home = tempHome('obelisk-invoking-content-');
+  const projectDir = join(home, '.claude', 'projects', '-tmp-content');
+  mkdirSync(projectDir, { recursive: true });
+  const script = [
+    "const hits = search('content nonce needle', { limit: 5 });",
+    'return hits.map(h => ({ id: h.session.id, invoking: h.session.is_invoking === true }));',
+  ].join('\n') + '\n';
+  const now = new Date().toISOString();
+  const lines = [
+    {
+      uuid: 'content-user', type: 'user', timestamp: now, cwd: '/tmp/content',
+      message: { role: 'user', content: 'find the content nonce needle evidence' },
+    },
+    {
+      uuid: 'content-call', type: 'assistant', timestamp: now, cwd: '/tmp/content',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_content', name: 'Bash', input: { command: `qfile=$(mktemp /tmp/obq.XXXXXX)\ncat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"` } }] },
+    },
+  ];
+  writeFileSync(join(projectDir, 'content-invoking-session.jsonl'), lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+
+  const queryFile = join(makeTempDir('obelisk-content-query-'), 'query.mjs');
+  writeFileSync(queryFile, script);
+  const result = runCli(['--query', queryFile], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const hits = JSON.parse(result.stdout);
+  assert.ok(hits.length > 0);
+  assert.ok(hits.every(h => h.id === 'content-invoking-session' && h.invoking === true));
+});
+
+test('cli --query does not treat short script content as a nonce candidate', () => {
+  // `return overview().current.session_id;` is under the distinctiveness
+  // floor: only the path remains, a hidden path resolves nothing, and the
+  // decoy transcript quoting the same script must NOT be marked as invoking.
+  const home = tempHome('obelisk-invoking-short-');
+  const projectDir = join(home, '.claude', 'projects', '-tmp-short');
+  mkdirSync(projectDir, { recursive: true });
+  const script = 'return overview().current.session_id;\n';
+  assert.ok(script.trim().length < 40, 'fixture stays under the content-nonce floor');
+  const now = new Date().toISOString();
+  const lines = [
+    {
+      uuid: 'short-call', type: 'assistant', timestamp: now, cwd: '/tmp/short',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_short', name: 'Bash', input: { command: `cat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"` } }] },
+    },
+  ];
+  writeFileSync(join(projectDir, 'short-decoy-session.jsonl'), lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+
+  const queryFile = join(makeTempDir('obelisk-short-query-'), 'query.mjs');
+  writeFileSync(queryFile, script);
+  const result = runCli(['--query', queryFile], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout), null);
 });
 
 test('wait helper skips the recovery build and poll on an immediate hit', () => {

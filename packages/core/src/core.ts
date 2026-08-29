@@ -31,7 +31,11 @@ export { buildIndex, DB_PATH };
 type SandboxApi = Record<string, unknown>;
 
 interface InvocationOptions {
-  invocationNonce?: string;
+  // One nonce, or candidates tried in order (first match wins). The CLI passes
+  // the as-typed --query path first and the script content second: transcripts
+  // record the content verbatim (Write input, heredoc command text) even when
+  // the path sits behind a shell variable and never reaches the transcript.
+  invocationNonce?: string | readonly string[];
 }
 
 interface InventoryIssue {
@@ -112,13 +116,16 @@ interface InvocationResolveOptions {
   collisionMs?: number;
 }
 
-// Resolve the session that invoked this query via a unique nonce embedded in
-// the CLI's argv (a uuidgen token for --search, the as-typed query file path
-// for --query). Every provider writes the tool-call record before the tool
+// Resolve the session that invoked this query via a unique nonce observed in
+// the transcript (the --nonce token for --search; for --query the as-typed
+// file path, falling back to the script content, which heredoc/Write tool-call
+// records carry verbatim even when the path hides behind a shell variable).
+// Every provider writes the tool-call record before the tool
 // finishes, so once the nonce reaches the index it identifies the invoking
 // session. Both legs are bounded to the last INVOCATION_RECENCY_MS (see
 // above), which keeps weeks-old fixed-path reuse out of the candidate set and
-// makes cross-leg timestamps comparable.
+// makes cross-leg timestamps comparable. Candidates are tried in order and the
+// first one with any match resolves.
 //
 // The invoking record is always written "now", so matches far apart in time
 // are unrelated history, not ambiguity: each session tracks its newest
@@ -132,10 +139,23 @@ interface InvocationResolveOptions {
 // resolveInvokingSessionIdWithWait below.
 export function resolveInvokingSessionId(
   db: SqliteDb,
-  nonce: string | null | undefined,
-  { nowMs = Date.now(), recencyMs = INVOCATION_RECENCY_MS, collisionMs = INVOCATION_COLLISION_MS }: InvocationResolveOptions = {},
+  nonce: string | readonly string[] | null | undefined,
+  opts: InvocationResolveOptions = {},
 ): string | null {
-  if (!nonce) return null;
+  const candidates = Array.isArray(nonce) ? nonce : [nonce];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const hit = resolveSingleInvocationNonce(db, candidate, opts);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function resolveSingleInvocationNonce(
+  db: SqliteDb,
+  nonce: string,
+  { nowMs = Date.now(), recencyMs = INVOCATION_RECENCY_MS, collisionMs = INVOCATION_COLLISION_MS }: InvocationResolveOptions,
+): string | null {
   // The query path is read-only and may face a partially built index (for
   // example only index_state exists while a writer lease is held). A missing
   // schema simply means the nonce cannot resolve: honest unknown.
@@ -241,7 +261,7 @@ function sleepSync(ms: number): void {
 // honest null. Queries without a nonce or with an immediate hit pay zero
 // added latency.
 export function resolveInvokingSessionIdWithWait(
-  nonce: string | null | undefined,
+  nonce: string | readonly string[] | null | undefined,
   providerRegistry: ProviderRegistry,
   {
     openRead = openReadDb,
@@ -251,13 +271,14 @@ export function resolveInvokingSessionIdWithWait(
     resolveOpts,
   }: InvocationWaitOptions = {},
 ): string | null {
-  if (!nonce) return null;
+  const candidates = (Array.isArray(nonce) ? nonce : [nonce]).filter((c): c is string => Boolean(c));
+  if (candidates.length === 0) return null;
   // Open a fresh read snapshot per attempt: another writer (the daemon or a
   // concurrent agent's build) may publish a newer index between ticks.
   const tryResolve = (): string | null => {
     const db = openRead();
     try {
-      return resolveInvokingSessionId(db, nonce, resolveOpts);
+      return resolveInvokingSessionId(db, candidates, resolveOpts);
     } finally {
       db.close();
     }

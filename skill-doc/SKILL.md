@@ -51,16 +51,18 @@ exits successfully and returns its query result.
 ## Quick Start
 
 Fast keyword search (pass a unique nonce so Obelisk can recognize your own
-session in results):
+session in results). Invent the nonce yourself and type it as a literal token:
+the transcript records the command as typed, so a shell substitution like
+`$(uuidgen)` never expands there and can never resolve:
 
 ```bash
-obelisk --search "keyword" --nonce "$(uuidgen 2>/dev/null || echo "$$.$RANDOM.$RANDOM")"
+obelisk --search "keyword" --nonce "obq-<unique-token-you-invent>"
 ```
 
 Custom query:
 
-1. Write a bounded JS query to a unique temp file — the as-typed file path is
-   your invocation nonce:
+1. Write a bounded JS query to a unique temp file (a Write tool call or a
+   heredoc both work):
 
    ```bash
    qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; })
@@ -76,6 +78,10 @@ Custom query:
    obelisk --query "$qfile"
    ```
 
+   Self-identification matches the file path when the transcript contains it,
+   and falls back to the script content — heredoc/Write tool-call records
+   carry it verbatim, so a path hidden behind `$qfile` still resolves.
+
 3. Parse JSON stdout and answer with concise evidence.
 
 The query file runs inside `(async () => { ... })()`. Use `return` to emit JSON.
@@ -85,10 +91,11 @@ Query scripts are read-only: `remember()` and `forget()` are not available, and
 ## Your Own Session In Results
 
 Obelisk refreshes the index before each query, so your own live session shows
-up in results. The invocation nonce (`--search --nonce`, or the unique
-`--query` file path) lets Obelisk mark it: session projections in `search()`
-hits and `sessions()` rows carry `is_invoking: true`, and
-`overview().current.session_id` holds the invoking session id when known. Treat
+up in results. The invocation nonce (a literal `--search --nonce` token, or the
+`--query` file path with script content as fallback) lets Obelisk mark it:
+session projections in `search()` hits and `sessions()` rows carry
+`is_invoking: true`, and `overview().current.session_id` holds the invoking
+session id when known. Treat
 a session flagged `is_invoking` as your own current context, NOT as independent
 historical evidence. Resolution is newest-wins over recent matches; only a
 near-simultaneous same-nonce collision (or no match at all) leaves nothing
