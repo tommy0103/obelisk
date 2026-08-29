@@ -82,10 +82,14 @@ async function main() {
       // content verbatim (Write input, heredoc command text) even when the
       // path sits behind a shell variable — the documented mktemp flow — and
       // never reaches the transcript. Short scripts are not distinctive enough
-      // to safely identify a session, so the path stands alone there.
+      // to safely identify a session, so the path stands alone there. Content
+      // is not unique by construction, so it resolves in strict mode: exactly
+      // one recent matching session that itself invoked the CLI, else null.
       const CONTENT_NONCE_MIN_CHARS = 40;
       const trimmed = script.trim();
-      const nonceCandidates = trimmed.length >= CONTENT_NONCE_MIN_CHARS ? [args[1], trimmed] : [args[1]];
+      const nonceCandidates = trimmed.length >= CONTENT_NONCE_MIN_CHARS
+        ? [args[1], { value: trimmed, strict: true }]
+        : [args[1]];
       emit(await executeQuery(script, { invocationNonce: nonceCandidates }));
     } catch (error) { fail(error); }
     return;

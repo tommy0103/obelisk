@@ -207,6 +207,65 @@ test('resolver matches a JSON-escaped multi-line content candidate in tool_calls
   db.close();
 });
 
+test('strict candidate resolves when the matching session invoked the CLI', () => {
+  // The heredoc body and the `obelisk --query` call land in the same command
+  // record, so the invoker always satisfies the invocation requirement.
+  const db = invokingDb();
+  const script = "const hits = search('strict needle', { limit: 3 });\nreturn hits.length;\n";
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-strict', 'msg-self-call', 'sid-self', 'Bash', JSON.stringify({
+      command: `cat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"`,
+    }));
+
+  assert.equal(
+    resolveInvokingSessionId(db, [{ value: script.trim(), strict: true }], { nowMs: FIXTURE_NOW_MS }),
+    'sid-self',
+  );
+  db.close();
+});
+
+test('strict candidate rejects a matching session that never invoked the CLI', () => {
+  // A stranger who merely wrote or quoted the same content has no CLI
+  // invocation record: honest null instead of mis-marking their session.
+  const db = invokingDb();
+  const script = "const hits = search('strict needle', { limit: 3 });\nreturn hits.length;\n";
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-quote', 'msg-history', 'sid-history', 'Write', JSON.stringify({ file_path: '/tmp/obq.quote/query.mjs', content: script }));
+  // msg-history sits at 2026-08-01, outside the window; give the quote a fresh message.
+  db.prepare('INSERT INTO messages (uuid, session_id, type, role, text, timestamp) VALUES (?,?,?,?,?,?)')
+    .run('msg-quote', 'sid-history', 'assistant', 'assistant', null, '2026-08-11T10:00:05Z');
+  db.prepare('UPDATE tool_calls SET message_uuid = ? WHERE id = ?').run('msg-quote', 'call-quote');
+
+  assert.equal(
+    resolveInvokingSessionId(db, [{ value: script.trim(), strict: true }], { nowMs: FIXTURE_NOW_MS }),
+    null,
+  );
+  db.close();
+});
+
+test('strict candidate rejects content matched by multiple sessions', () => {
+  // Shared boilerplate: two sessions hold the same script within the window.
+  // Newest-wins would guess; strict mode refuses.
+  const db = invokingDb();
+  const script = "const map = overview({ limit: 6 });\nreturn map.current_project;\n";
+  db.prepare('INSERT INTO messages (uuid, session_id, type, role, text, timestamp) VALUES (?,?,?,?,?,?)')
+    .run('msg-history-call', 'sid-history', 'assistant', 'assistant', null, '2026-08-11T09:59:00Z');
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-history', 'msg-history-call', 'sid-history', 'Bash', JSON.stringify({
+      command: `cat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"`,
+    }));
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-self-strict', 'msg-self-call', 'sid-self', 'Bash', JSON.stringify({
+      command: `cat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"`,
+    }));
+
+  assert.equal(
+    resolveInvokingSessionId(db, [{ value: script.trim(), strict: true }], { nowMs: FIXTURE_NOW_MS }),
+    null,
+  );
+  db.close();
+});
+
 test('resolver tolerates a partially built index', () => {
   // A read-only query can face a DB with only index_state (writer lease held,
   // schema never published). The nonce cannot resolve: honest null, no throw.

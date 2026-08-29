@@ -35,7 +35,11 @@ interface InvocationOptions {
   // the as-typed --query path first and the script content second: transcripts
   // record the content verbatim (Write input, heredoc command text) even when
   // the path sits behind a shell variable and never reaches the transcript.
-  invocationNonce?: string | readonly string[];
+  // A strict candidate (used for script content, which is not unique by
+  // construction — boilerplate queries recur across sessions) resolves only
+  // when exactly one recent session matches and that session itself holds a
+  // recent CLI invocation record; anything else is honest null.
+  invocationNonce?: string | readonly (string | { value: string; strict?: boolean })[];
 }
 
 interface InventoryIssue {
@@ -139,13 +143,14 @@ interface InvocationResolveOptions {
 // resolveInvokingSessionIdWithWait below.
 export function resolveInvokingSessionId(
   db: SqliteDb,
-  nonce: string | readonly string[] | null | undefined,
+  nonce: string | readonly (string | { value: string; strict?: boolean })[] | null | undefined,
   opts: InvocationResolveOptions = {},
 ): string | null {
-  const candidates = Array.isArray(nonce) ? nonce : [nonce];
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    const hit = resolveSingleInvocationNonce(db, candidate, opts);
+  const raw = Array.isArray(nonce) ? nonce : [nonce];
+  for (const entry of raw) {
+    const candidate = typeof entry === 'string' ? { value: entry } : entry;
+    if (!candidate?.value) continue;
+    const hit = resolveSingleInvocationNonce(db, candidate.value, opts, candidate.strict === true);
     if (hit) return hit;
   }
   return null;
@@ -155,6 +160,7 @@ function resolveSingleInvocationNonce(
   db: SqliteDb,
   nonce: string,
   { nowMs = Date.now(), recencyMs = INVOCATION_RECENCY_MS, collisionMs = INVOCATION_COLLISION_MS }: InvocationResolveOptions,
+  strict = false,
 ): string | null {
   // The query path is read-only and may face a partially built index (for
   // example only index_state exists while a writer lease is held). A missing
@@ -211,6 +217,18 @@ function resolveSingleInvocationNonce(
     }
   }
   if (newestBySession.size === 0) return null;
+  if (strict) {
+    // Content-derived candidates are not unique by construction (boilerplate
+    // queries recur across sessions), so newest-wins is not enough. Resolve
+    // only when exactly one recent session matches AND that session itself
+    // holds a recent CLI invocation record — the invoker's transcript always
+    // contains both the file write and the `obelisk --query` call, while a
+    // stranger who merely wrote or quoted the same content does not invoke.
+    // Zero or multiple eligible sessions are honest null, never a guess.
+    const invokers = recentCliInvokerSessions(db, cutoff, indexedTables);
+    const eligible = [...newestBySession.keys()].filter(id => invokers.has(id));
+    return eligible.length === 1 ? eligible[0] : null;
+  }
   const ranked = [...newestBySession.entries()]
     .map(([sessionId, timestamp]) => ({ sessionId, ms: Date.parse(timestamp) }))
     .sort((a, b) => b.ms - a.ms);
@@ -218,6 +236,38 @@ function resolveSingleInvocationNonce(
   if (ranked.some(r => Number.isNaN(r.ms))) return null;
   if (ranked.length > 1 && ranked[0].ms - ranked[1].ms <= collisionMs) return null;
   return ranked[0].sessionId;
+}
+
+// Sessions holding a recent record of an actual CLI invocation (`obelisk
+// --query ...` / `obelisk --search ...` in a tool-call command line or message
+// text). Bounded to the same recency window as the nonce legs.
+function recentCliInvokerSessions(
+  db: SqliteDb,
+  cutoff: string,
+  indexedTables: Set<string>,
+): Set<string> {
+  const invokers = new Set<string>();
+  const patterns = ['%obelisk --%', '%obelisk.js --%'];
+  if (indexedTables.has('tool_calls') && indexedTables.has('messages')) {
+    const rows = db.prepare(`
+      SELECT DISTINCT tc.session_id AS session_id
+      FROM messages m CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+      WHERE m.timestamp >= ? AND (tc.input_json LIKE ? OR tc.input_json LIKE ?)
+    `).all(cutoff, ...patterns);
+    for (const row of rows) {
+      if (typeof row.session_id === 'string') invokers.add(row.session_id);
+    }
+  }
+  if (indexedTables.has('messages')) {
+    const rows = db.prepare(`
+      SELECT DISTINCT session_id FROM messages
+      WHERE timestamp >= ? AND (text LIKE ? OR text LIKE ?)
+    `).all(cutoff, ...patterns);
+    for (const row of rows) {
+      if (typeof row.session_id === 'string') invokers.add(row.session_id);
+    }
+  }
+  return invokers;
 }
 
 // Poll bounds for the nonce freshness fallback. The poll runs only when the
@@ -261,7 +311,7 @@ function sleepSync(ms: number): void {
 // honest null. Queries without a nonce or with an immediate hit pay zero
 // added latency.
 export function resolveInvokingSessionIdWithWait(
-  nonce: string | readonly string[] | null | undefined,
+  nonce: string | readonly (string | { value: string; strict?: boolean })[] | null | undefined,
   providerRegistry: ProviderRegistry,
   {
     openRead = openReadDb,
@@ -271,7 +321,8 @@ export function resolveInvokingSessionIdWithWait(
     resolveOpts,
   }: InvocationWaitOptions = {},
 ): string | null {
-  const candidates = (Array.isArray(nonce) ? nonce : [nonce]).filter((c): c is string => Boolean(c));
+  const candidates = (Array.isArray(nonce) ? nonce : [nonce])
+    .filter(c => Boolean(typeof c === 'string' ? c : c?.value));
   if (candidates.length === 0) return null;
   // Open a fresh read snapshot per attempt: another writer (the daemon or a
   // concurrent agent's build) may publish a newer index between ticks.
