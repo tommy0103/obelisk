@@ -255,12 +255,15 @@ export function indexProviderPlan({
   db,
   plan,
   runTransaction,
+  onPersisted = () => {},
   onCommitted = () => {},
   onError,
 }: {
   db: SqliteDb;
   plan: ProviderIndexPlan;
   runTransaction: <T>(label: string, work: () => T) => T;
+  /** Runs after persist but inside the same transaction, before its commit. */
+  onPersisted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onCommitted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onError: (error: unknown, item: ProviderIndexItem) => 'skip' | 'stop';
 }): ProviderIndexResult {
@@ -269,9 +272,11 @@ export function indexProviderPlan({
   const failedItems: ProviderIndexItem[] = [];
   for (const item of plan.items) {
     try {
-      const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => (
-        persist(db, item.unit, item.provider.parse(item.unit, item.cursor))
-      ));
+      const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
+        const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
+        onPersisted(item, nextCursor);
+        return nextCursor;
+      });
       committed.push(item);
       onCommitted(item, cursor);
     } catch (error) {
@@ -300,16 +305,19 @@ export function indexProviderPlan({
 export function indexProviderPlanStrict({
   db,
   plan,
+  onPersisted = () => {},
   onCommitted = () => {},
 }: {
   db: SqliteDb;
   plan: ProviderIndexPlan;
+  onPersisted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onCommitted?: (item: ProviderIndexItem, cursor: Cursor) => void;
 }): ProviderIndexResult {
   return indexProviderPlan({
     db,
     plan,
     runTransaction: (_label, work) => work(),
+    onPersisted,
     onCommitted,
     onError: (error, item) => {
       throw new ProviderIndexFailure(error, item);

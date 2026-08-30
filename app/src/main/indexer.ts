@@ -7,6 +7,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import {
+  dropMessageFtsTriggers,
+  ensureFtsReady,
+  refreshSessionProjectPaths,
+} from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
 import {
@@ -27,9 +32,7 @@ import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapte
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
-import {
-  inferProjectPath,
-} from '../../../packages/core/src/parsing.ts';
+import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -147,31 +150,6 @@ function sessionIdFromChangedPath(projectsDir, changedPath) {
   return null;
 }
 
-function refreshSessionProjectPaths(db, sessionIds: ReadonlySet<string> | null = null) {
-  const sessionById = db.prepare('SELECT id, project FROM sessions WHERE id = ?');
-  const sessions = sessionIds === null
-    ? db.prepare('SELECT id, project FROM sessions').all()
-    : [...sessionIds]
-      .map(sessionId => sessionById.get(sessionId))
-      .filter(Boolean);
-  const cwdStmt = db.prepare(`
-    SELECT cwd FROM messages
-    WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
-  `);
-  const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
-  for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map(row => row.cwd);
-    const projectPath = inferProjectPath(session.project, cwds);
-    if (projectPath) update.run(projectPath, session.id);
-  }
-}
-
-function rebuildFts(db) {
-  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-  db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
-}
-
 // PASSIVE by default: it checkpoints what it can without blocking concurrent
 // readers/writers, so it is safe to run after every build. A blocking TRUNCATE
 // (which reclaims the -wal file but needs exclusive access and can contend with
@@ -180,27 +158,6 @@ function checkpointDb(db, mode = 'PASSIVE') {
   try {
     db.pragma(`wal_checkpoint(${mode})`);
   } catch {}
-}
-
-const MESSAGE_FTS_TRIGGERS = [
-  'messages_fts_ai',
-  'messages_fts_ad',
-  'messages_fts_au',
-];
-
-function dropMessageFtsTriggers(db) {
-  for (const trigger of MESSAGE_FTS_TRIGGERS) {
-    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-  }
-}
-
-function ensureFtsReady(db, { force = false } = {}) {
-  const marker = '__fts_triggers_ready__';
-  const ready = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(marker);
-  if (ready && !force) return false;
-  rebuildFts(db);
-  writeIndexMarker(db, marker);
-  return true;
 }
 
 function writeIndexMarker(db, key, value = Date.now()) {

@@ -8,6 +8,7 @@
     ".": "./dist/core.js",
     "./db": "./dist/db.js",
     "./indexer": "./dist/indexer.js",
+    "./index-finalize": "./dist/index-finalize.js",
     "./parsing": "./dist/parsing.js",
     "./persist": "./dist/persist.js",
     "./provider-indexing": "./dist/provider-indexing.js",

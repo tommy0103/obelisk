@@ -3,7 +3,8 @@
 
 // Passive-pull indexing orchestration for the Core package.
 import { existsSync } from 'node:fs';
-import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts } from './db.ts';
+import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
+import { ensureFtsReady, refreshSessionProjectPaths } from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
   createProviderIndexPlan,
@@ -22,7 +23,7 @@ import {
 } from './provider-settings.ts';
 import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { NodeSqliteDb, SqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 
 interface SkippedFile {
   provider: string;
@@ -56,22 +57,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-
-function refreshSessionProjectPaths(db: NodeSqliteDb): void {
-  const sessions = db.prepare('SELECT id, project FROM sessions').all();
-  const cwdStmt = db.prepare(`
-    SELECT cwd
-    FROM messages
-    WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
-  `);
-  const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
-  for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map((row: SqliteRow) => row.cwd);
-    const projectPath = inferProjectPath(session.project, cwds);
-    if (projectPath) update.run(projectPath, session.id);
-  }
-}
 
 // A workflow unit links to its parent Workflow tool call by matching the unique
 // run id in the tool_result text — but the run json can reach the index before
@@ -239,10 +224,9 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               db,
               plan: providerPlan,
             });
-            refreshSessionProjectPaths(db);
+            refreshSessionProjectPaths(db, null);
             healWorkflowParentLinks(db);
-            db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-            rebuildMemoryFts(db);
+            ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
           }, { label: 'force-rebuild' });
@@ -296,6 +280,12 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         db,
         plan: providerPlan,
         runTransaction: (label, work) => runRetryableWriteTransaction(txDb, work, { label }),
+        onPersisted: ({ unit }) => {
+          refreshSessionProjectPaths(db, new Set([
+            unit.sessionId,
+            ...(unit.retractSessionIds ?? []),
+          ]));
+        },
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
@@ -326,10 +316,11 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       // the build (a half-finalized index would be inconsistent).
       try {
         runRetryableWriteTransaction(txDb, () => {
-          refreshSessionProjectPaths(db);
+          // Per-unit paths commit atomically with their provider cursors above.
+          // An empty scope still repairs legacy rows with no project_path.
+          refreshSessionProjectPaths(db, new Set());
           healWorkflowParentLinks(db);
-          db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-          rebuildMemoryFts(db);
+          ensureFtsReady(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
           writeProviderIndexMarkers(db, providerPlan, providerResult);
         }, { label: 'finalize' });

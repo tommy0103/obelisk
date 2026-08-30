@@ -41,6 +41,10 @@ function counts(home) {
   return JSON.parse(r.stdout);
 }
 
+function ftsHits(db, query) {
+  return db.prepare('SELECT COUNT(*) AS count FROM messages_fts WHERE messages_fts MATCH ?').get(query).count;
+}
+
 test('incremental buildIndex resumes from cursor and accumulates message_count', () => {
   const home = makeTempDir('obelisk-incr-');
   const projDir = join(home, '.claude', 'projects', '-tmp-proj');
@@ -67,6 +71,41 @@ test('incremental buildIndex resumes from cursor and accumulates message_count',
   assert.equal(afterAppend.mc, 4, 'message_count accumulated to 4');
   assert.equal(afterAppend.n, 4, 'exactly four messages, no duplicates');
   assert.equal(afterAppend.lp, 4, 'cursor advanced to 4 lines');
+});
+
+test('ordinary incremental finalize keeps trigger-maintained FTS and scopes project paths', () => {
+  const home = makeTempDir('obelisk-incr-finalize-');
+  const projDir = join(home, '.claude', 'projects', '-tmp-proj');
+  mkdirSync(projDir, { recursive: true });
+  const affected = join(projDir, 'affected.jsonl');
+  const unaffected = join(projDir, 'unaffected.jsonl');
+  writeFileSync(affected, line('affected-u1', 'user', '2026-06-10T10:00:00Z') + '\n');
+  writeFileSync(unaffected, line('unaffected-u1', 'user', '2026-06-10T10:00:00Z') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  let db = new DatabaseSync(dbPath);
+  assert.ok(db.prepare("SELECT 1 FROM index_state WHERE jsonl_path='__fts_triggers_ready__'").get());
+  db.prepare('INSERT INTO messages_fts(rowid, uuid, session_id, text) VALUES (?,?,?,?)')
+    .run(999999, 'poison', 'affected', 'poisonword');
+  db.prepare("UPDATE sessions SET project_path='/stale/affected' WHERE id='affected'").run();
+  db.prepare("UPDATE sessions SET project_path='/stale/unaffected' WHERE id='unaffected'").run();
+  db.close();
+
+  appendFileSync(affected, line('freshneedle', 'user', '2026-06-10T10:01:00Z') + '\n');
+  const t = statSync(affected).mtimeMs / 1000 + 10;
+  utimesSync(affected, t, t);
+  clearBuildDebounce(home);
+
+  const result = runRuntime(['--search', 'freshneedle', '--nonce', 'freshneedle'], home);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  db = new DatabaseSync(dbPath);
+  assert.equal(ftsHits(db, 'freshneedle'), 1, 'message trigger indexed the appended row');
+  assert.equal(ftsHits(db, 'poisonword'), 1, 'poison survives because incremental finalize skipped wholesale rebuild');
+  assert.equal(db.prepare("SELECT project_path FROM sessions WHERE id='affected'").get().project_path, '/tmp/proj');
+  assert.equal(db.prepare("SELECT project_path FROM sessions WHERE id='unaffected'").get().project_path, '/stale/unaffected');
+  db.close();
 });
 
 test('force build purges sessions for deleted files and preserves memories', () => {
