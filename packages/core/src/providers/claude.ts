@@ -16,6 +16,7 @@ import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
 import {
   extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
   filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir, sourceInventoryIssue,
+  cursorSignatureDiffers,
 } from '../parsing.ts';
 
 import type {
@@ -28,28 +29,13 @@ import type {
   RawRecord,
 } from './types.ts';
 
-// Claude cursor encodes the file mtime and the number of lines already indexed:
-// "<mtimeMs>:<linesProcessed>". mtime lets discovery detect change; lines lets
-// parse resume without reprocessing.
+// Claude cursor starts with "<mtimeMs>:<linesProcessed>" (the full signature
+// format lives in cursorSignatureDiffers). mtime lets discovery detect change;
+// lines lets parse resume without reprocessing.
 function cursorToSkip(cursor: Cursor): number {
   if (!cursor) return 0;
   const n = Number(cursor.split(':')[1]);
   return Number.isFinite(n) ? n : 0;
-}
-
-// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
-// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
-// same-millisecond rewrites) lets a same-mtime tail completion or a
-// same-mtime replacement back into discovery. Legacy `${mtime}:${lines}`
-// cursors keep the mtime-only gate and upgrade on the next parse.
-function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
-  const stat = statSync(filePath);
-  const parts = cursor.split(':');
-  if (parts.length < 5) return Number(parts[0]) < stat.mtimeMs;
-  return Number(parts[0]) !== stat.mtimeMs
-    || Number(parts[2]) !== stat.size
-    || Number(parts[3]) !== stat.ctimeMs
-    || Number(parts[4]) !== stat.ino;
 }
 
 export const name = 'claude';

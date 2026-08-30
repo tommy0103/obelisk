@@ -23,7 +23,7 @@ import {
   codexEventText, codexMessagePayloadText, codexVisibleMessageKey,
   codexToolInput, codexToolOutput,
   extractMessageIsMeta, isSkillInstructions,
-  readCodexGuardianThreadInfo,
+  readCodexGuardianThreadInfo, cursorSignatureDiffers,
 } from '../parsing.ts';
 
 import type {
@@ -99,10 +99,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
       const cursor = ctx.lastCursor(file.path);
       // Skip unchanged files before paying for guardian detection: guardian
-      // status is content-derived, so a cursor-clean file's status cannot
-      // have changed. Pre-v3 databases may still hold guardian session rows;
-      // the v3 marker bump forces one full replay that retracts them.
-      if (!sessionIndexChanged && !fileChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs) {
+      // status is content-derived, so a file whose cursor signature still
+      // matches cannot have changed status. Pre-v3 databases may still hold
+      // guardian session rows; the v3 marker bump forces one full replay that
+      // retracts them.
+      if (!sessionIndexChanged && !fileChanged && cursor !== null && !cursorSignatureDiffers(cursor, file.path)) {
         return [];
       }
       const guardian = readCodexGuardianThreadInfo(file.path);
@@ -138,14 +139,14 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
 }
 
 export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
-  const mtime = statSync(unit.key).mtimeMs;
+  const stat = statSync(unit.key);
   const records: { lineNum: number; obj: any }[] = [];
   let lineNum = 0;
   readLines(unit.key, (line: string) => {
     lineNum++;
     try { records.push({ lineNum, obj: JSON.parse(line) }); } catch { /* skip malformed */ }
   });
-  const outCursor = `${mtime}:${lineNum}`;
+  const outCursor = `${stat.mtimeMs}:${lineNum}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
 
   const metaRecord = records.find(r => r.obj?.type === 'session_meta' && r.obj.payload?.id);
   if (!metaRecord) return outCursor;

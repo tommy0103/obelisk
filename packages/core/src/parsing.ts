@@ -137,6 +137,21 @@ function readLines(filePath: string, callback: (line: string, terminated: boolea
   }
 }
 
+// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
+// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
+// same-millisecond rewrites) lets a same-mtime tail completion or a
+// same-mtime replacement back into discovery. Legacy `${mtime}:${lines}`
+// cursors keep the mtime-only gate and upgrade on the next parse.
+function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
+  const stat = statSync(filePath);
+  const parts = cursor.split(':');
+  if (parts.length < 5) return Number(parts[0]) < stat.mtimeMs;
+  return Number(parts[0]) !== stat.mtimeMs
+    || Number(parts[2]) !== stat.size
+    || Number(parts[3]) !== stat.ctimeMs
+    || Number(parts[4]) !== stat.ino;
+}
+
 // ---- project-path + discovery helpers ----
 function legacyProjectPathFromSlug(project: string | null | undefined): string | null {
   if (!project) return null;
@@ -388,6 +403,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 export {
   CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
+  cursorSignatureDiffers,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
