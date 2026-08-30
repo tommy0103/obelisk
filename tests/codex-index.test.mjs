@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, writeFileSync, appendFileSync, utimesSync, statSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, utimesSync, statSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli } from './cli-test-helpers.mjs';
@@ -75,4 +75,84 @@ test('codex full build then incremental rebuild replaces the total count without
   assert.equal(c.mc, 3, 'message_count replaced with the new total');
   assert.equal(c.msgs, 3, 'exactly three messages, upserted (no duplicates)');
   assert.equal(c.hits, 1, 'the appended message is searchable');
+});
+
+// #104: a real same-mtime append must survive the full discover → parse →
+// persist path — the mtime is forced back after appending, so only the
+// size/ctime legs of the cursor signature can catch it.
+test('codex incremental rebuild detects a real append forced to the same mtime', () => {
+  const home = makeTempDir('obelisk-codex-samemtime-');
+  const dir = join(home, '.codex', 'sessions', '2026', '06', '15');
+  mkdirSync(dir, { recursive: true });
+  const jsonl = join(dir, `rollout-2026-06-15T10-00-00-${ID}.jsonl`);
+
+  writeFileSync(jsonl, [metaLine(), evt('user_message', 'codex hello', '2026-06-15T10:00:01Z'), evt('agent_message', 'codex reply', '2026-06-15T10:00:02Z')].join('\n') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+  assert.equal(codexCounts(home).msgs, 2);
+
+  const orig = statSync(jsonl).mtimeMs / 1000;
+  appendFileSync(jsonl, evt('user_message', 'same-mtime followup', '2026-06-15T10:01:00Z') + '\n');
+  utimesSync(jsonl, orig, orig); // force the mtime back — same-millisecond append
+  clearDebounce(home);
+
+  const c = codexCounts(home);
+  assert.equal(c.msgs, 3, 'the same-mtime append is re-parsed');
+  assert.equal(c.hits, 1, 'the appended message is searchable');
+});
+
+// #104: an in-place rewrite that preserves size AND mtime can only be caught
+// by ctime/ino. Node reports ctime as the status-change time on every
+// platform (birthtime is the creation time), so this runs everywhere.
+test('codex incremental rebuild detects a same-size rewrite forced to the same mtime', () => {
+  const home = makeTempDir('obelisk-codex-samemtime-rewrite-');
+  const dir = join(home, '.codex', 'sessions', '2026', '06', '15');
+  mkdirSync(dir, { recursive: true });
+  const jsonl = join(dir, `rollout-2026-06-15T10-00-00-${ID}.jsonl`);
+
+  // 'alpha' and 'omega' are equal length, keeping size identical.
+  writeFileSync(jsonl, [metaLine(), evt('user_message', 'codex alpha value', '2026-06-15T10:00:01Z'), evt('agent_message', 'codex reply', '2026-06-15T10:00:02Z')].join('\n') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+
+  const orig = statSync(jsonl).mtimeMs / 1000;
+  writeFileSync(jsonl, [metaLine(), evt('user_message', 'codex omega value', '2026-06-15T10:00:01Z'), evt('agent_message', 'codex reply', '2026-06-15T10:00:02Z')].join('\n') + '\n');
+  utimesSync(jsonl, orig, orig);
+  clearDebounce(home);
+
+  writeFileSync(join(home, 'q.mjs'), `return {
+    alpha: search('alpha', { source: 'codex', limit: 5 }).length,
+    omega: search('omega', { source: 'codex', limit: 5 }).length,
+  };`);
+  const r = runRuntime(['--query', join(home, 'q.mjs')], home);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  assert.deepEqual(JSON.parse(r.stdout), { alpha: 0, omega: 1 }, 'the rewritten content replaces the old text');
+});
+
+// #104: a real replacement swaps the file identity itself (write temp +
+// rename over). Size and mtime are forced equal, so only the ctime/ino legs
+// can catch it.
+test('codex incremental rebuild detects a rename replacement forced to the same mtime', () => {
+  const home = makeTempDir('obelisk-codex-samemtime-replace-');
+  const dir = join(home, '.codex', 'sessions', '2026', '06', '15');
+  mkdirSync(dir, { recursive: true });
+  const jsonl = join(dir, `rollout-2026-06-15T10-00-00-${ID}.jsonl`);
+
+  // 'alpha' and 'omega' are equal length, keeping size identical.
+  writeFileSync(jsonl, [metaLine(), evt('user_message', 'codex alpha value', '2026-06-15T10:00:01Z'), evt('agent_message', 'codex reply', '2026-06-15T10:00:02Z')].join('\n') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+
+  const orig = statSync(jsonl).mtimeMs / 1000;
+  const tmp = join(dir, 'replacement.tmp');
+  writeFileSync(tmp, [metaLine(), evt('user_message', 'codex omega value', '2026-06-15T10:00:01Z'), evt('agent_message', 'codex reply', '2026-06-15T10:00:02Z')].join('\n') + '\n');
+  utimesSync(tmp, orig, orig);
+  rmSync(jsonl); // Windows cannot rename over an existing path
+  renameSync(tmp, jsonl);
+  clearDebounce(home);
+
+  writeFileSync(join(home, 'q.mjs'), `return {
+    alpha: search('alpha', { source: 'codex', limit: 5 }).length,
+    omega: search('omega', { source: 'codex', limit: 5 }).length,
+  };`);
+  const r = runRuntime(['--query', join(home, 'q.mjs')], home);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  assert.deepEqual(JSON.parse(r.stdout), { alpha: 0, omega: 1 }, 'the replacement content replaces the old text');
 });

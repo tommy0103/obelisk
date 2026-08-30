@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, normalize } from 'node:path';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
@@ -63,7 +63,7 @@ test('app indexer records build success without claiming daemon ownership', () =
   assert.equal(db.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'hello'").get().uuid, 'msg-app-1');
   assert.equal(db.prepare("SELECT jsonl_path FROM index_state WHERE jsonl_path='__app_heartbeat__'").get(), undefined);
   assert.equal(db.prepare("SELECT jsonl_path FROM index_state WHERE jsonl_path='__app_last_successful_build__'").get().jsonl_path, '__app_last_successful_build__');
-  assert.equal(db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, '/tmp/obelisk-app');
+  assert.equal(db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, normalize('/tmp/obelisk-app'));
   db.prepare('UPDATE sessions SET project_path=? WHERE id=?').run('/tmp/stale-affected', sessionId);
   db.prepare('INSERT INTO sessions (id,project,project_path,source) VALUES (?,?,?,?)')
     .run('session-app-unaffected', '-tmp-unaffected', '/tmp/stale-unaffected', 'claude');
@@ -100,7 +100,7 @@ test('app indexer records build success without claiming daemon ownership', () =
   const db2 = new TestDatabase(dbPath);
   assert.equal(db2.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'companion'").get().uuid, 'msg-app-2');
   assert.equal(db2.prepare('SELECT message_count FROM sessions WHERE id=?').get(sessionId).message_count, 2);
-  assert.equal(db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, '/tmp/obelisk-app');
+  assert.equal(db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, normalize('/tmp/obelisk-app'));
   assert.equal(
     db2.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
     '/tmp/stale-unaffected',
@@ -117,7 +117,7 @@ test('app indexer records build success without claiming daemon ownership', () =
   const retryDb = new TestDatabase(dbPath);
   assert.equal(
     retryDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
-    '/tmp/unaffected',
+    normalize('/tmp/unaffected'),
   );
   retryDb.prepare('UPDATE sessions SET project_path=? WHERE id=?')
     .run('/tmp/stale-unaffected', 'session-app-unaffected');
@@ -127,7 +127,7 @@ test('app indexer records build success without claiming daemon ownership', () =
   const repairedDb = new TestDatabase(dbPath);
   assert.equal(
     repairedDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
-    '/tmp/unaffected',
+    normalize('/tmp/unaffected'),
   );
   repairedDb.close();
 });
@@ -465,7 +465,7 @@ test('app indexer loads Codex root sessions into the shared schema', () => {
   const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(`codex:${codexId}`);
   assert.equal(session.source, 'codex');
   assert.equal(session.project, '-tmp-obelisk-app');
-  assert.equal(session.project_path, '/tmp/obelisk-app');
+  assert.equal(session.project_path, normalize('/tmp/obelisk-app'));
   assert.equal(session.git_branch, 'feat/codex');
   assert.equal(session.version, '0.135.0-alpha.1');
   assert.equal(session.message_count, 3);
@@ -534,6 +534,68 @@ test('app indexer accepts Codex changed paths relative to the sessions directory
   assert.equal(
     db.prepare('SELECT text FROM messages WHERE session_id=?').get(`codex:${codexId}`).text,
     'sessions-relative codex change',
+  );
+  db.close();
+});
+
+// A changedPaths report must re-plan the file even when the cursor could not
+// prove it changed — this is the path watchers actually use. (Exact
+// matching-signature precedence is covered by the discovery unit tests; a
+// real rewrite always moves ctime, so this end-to-end case verifies the
+// database converges through the changedPaths path.)
+test('app indexer re-plans a Codex file reported via changedPaths and updates the database', () => {
+  const home = makeTempDir('obelisk-app-indexer-codex-changedpath-mtime-');
+  const claudeDir = join(home, '.claude');
+  const codexDir = join(home, '.codex');
+  const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
+  mkdirSync(join(claudeDir, 'projects'), { recursive: true });
+  mkdirSync(codexSessionDir, { recursive: true });
+
+  const codexId = '019ec6ee-cebd-7431-9c93-ceec89a98a60';
+  const filename = `rollout-2026-06-15T00-19-59-${codexId}.jsonl`;
+  const jsonlPath = join(codexSessionDir, filename);
+  const rollout = (message) => [
+    JSON.stringify({
+      timestamp: '2026-06-14T16:19:59.842Z',
+      type: 'session_meta',
+      payload: {
+        id: codexId,
+        timestamp: '2026-06-14T16:19:59.842Z',
+        cwd: '/tmp/obelisk-app',
+        cli_version: '0.135.0-alpha.1',
+        thread_source: 'user',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-14T16:20:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message, images: [], local_images: [], text_elements: [] },
+    }),
+    '',
+  ].join('\n');
+
+  // 'alpha' and 'omega' are equal length, and the rewrite is forced back to
+  // the original mtime, so the mtime+size legs alone could not catch it.
+  writeFileSync(jsonlPath, rollout('codex alpha value'));
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  buildIndex({ claudeDir, codexDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const orig = statSync(jsonlPath).mtimeMs / 1000;
+  writeFileSync(jsonlPath, rollout('codex omega value'));
+  utimesSync(jsonlPath, orig, orig);
+
+  buildIndex({
+    claudeDir,
+    codexDir,
+    dbPath,
+    DatabaseImpl: TestDatabase,
+    changedPaths: [join('2026', '06', '15', filename)],
+  });
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(
+    db.prepare('SELECT text FROM messages WHERE session_id=?').get(`codex:${codexId}`).text,
+    'codex omega value',
   );
   db.close();
 });

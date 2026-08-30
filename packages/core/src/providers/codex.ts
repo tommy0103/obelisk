@@ -57,6 +57,23 @@ function codexTranscriptDirs(rootDir: string): string[] {
   ];
 }
 
+// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
+// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
+// same-millisecond rewrites) lets a same-mtime tail completion or a
+// same-mtime replacement back into discovery. Unlike claude's legacy gate
+// (#102), two-part cursors here fail closed: codex never shipped a five-part
+// cursor before v3, so every legacy cursor can only prove "mtime not older",
+// never "unchanged" — it re-parses once and upgrades to the full signature.
+function codexCursorSignatureDiffers(cursor: string, filePath: string): boolean {
+  const stat = statSync(filePath);
+  const parts = cursor.split(':');
+  if (parts.length < 5) return true;
+  return Number(parts[0]) !== stat.mtimeMs
+    || Number(parts[2]) !== stat.size
+    || Number(parts[3]) !== stat.ctimeMs
+    || Number(parts[4]) !== stat.ino;
+}
+
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const [sessionsDir, archivedSessionsDir] = codexTranscriptDirs(rootDir);
   if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
@@ -99,10 +116,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
       const cursor = ctx.lastCursor(file.path);
       // Skip unchanged files before paying for guardian detection: guardian
-      // status is content-derived, so a cursor-clean file's status cannot
-      // have changed. Pre-v3 databases may still hold guardian session rows;
-      // the v3 marker bump forces one full replay that retracts them.
-      if (!sessionIndexChanged && !fileChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs) {
+      // status is content-derived, so a file whose cursor signature still
+      // matches cannot have changed status. Pre-v3 databases may still hold
+      // guardian session rows; the v3 marker bump forces one full replay that
+      // retracts them.
+      if (!sessionIndexChanged && !fileChanged && cursor !== null && !codexCursorSignatureDiffers(cursor, file.path)) {
         return [];
       }
       const guardian = readCodexGuardianThreadInfo(file.path);
@@ -138,14 +156,14 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
 }
 
 export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
-  const mtime = statSync(unit.key).mtimeMs;
+  const stat = statSync(unit.key);
   const records: { lineNum: number; obj: any }[] = [];
   let lineNum = 0;
   readLines(unit.key, (line: string) => {
     lineNum++;
     try { records.push({ lineNum, obj: JSON.parse(line) }); } catch { /* skip malformed */ }
   });
-  const outCursor = `${mtime}:${lineNum}`;
+  const outCursor = `${stat.mtimeMs}:${lineNum}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
 
   const metaRecord = records.find(r => r.obj?.type === 'session_meta' && r.obj.payload?.id);
   if (!metaRecord) return outCursor;

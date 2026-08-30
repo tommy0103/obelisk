@@ -25,7 +25,7 @@ jobs:
       - run: npm ci
       - run: npm run build:cli
       - name: Verify CLI package and runtime contract
-        run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs
+        run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs tests/codex-index.test.mjs
 
       - name: Verify DSH plugin package
         run: |
@@ -42,7 +42,7 @@ jobs:
       - name: Verify adaptive watcher package
         run: |
           npm run build --workspace @obelisk-apps/adaptive-watcher
-          node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/claude-parse.test.mjs tests/codex-discover.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs tests/app-main-settings.test.mjs tests/app-indexer-watcher-filter.test.mjs tests/deepseek-tree.test.mjs
+          node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/claude-parse.test.mjs tests/codex-parse.test.mjs tests/codex-discover.test.mjs tests/app-indexer.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs tests/app-main-settings.test.mjs tests/app-indexer-watcher-filter.test.mjs tests/deepseek-tree.test.mjs
 
       - name: Verify query sandbox read-only contract
         run: node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/query.test.mjs
