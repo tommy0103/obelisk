@@ -109,6 +109,33 @@ function healWorkflowParentLinks(db: SqliteDb): void {
 const BUILD_DEBOUNCE_MS = 30000;
 const APP_HEARTBEAT_FRESH_MS = 60000;
 
+// messages_fts is maintained row-by-row by its schema triggers: persist writes
+// messages with INSERT ... ON CONFLICT DO UPDATE (fires messages_fts_au) and
+// deletes them with plain DELETE (fires messages_fts_ad), so an incremental
+// build never leaves the index stale. The wholesale rebuild that used to run in
+// every finalize predates that guarantee, and its cost is independent of how
+// much changed — on a 1.8 GB index it is ~30 s of a ~50 s incremental build
+// (3× that under a trigram tokenizer). It is still needed exactly once, to heal
+// an index whose rows were written before trigger-only maintenance could be
+// trusted (e.g. by a version that wrote messages with INSERT OR REPLACE, whose
+// implicit deletes fire no DELETE trigger). This marker records that the heal
+// has happened; it is written in the same transaction as the rebuild, so an
+// interrupted build simply redoes it — the marker never runs ahead of the work.
+const MESSAGES_FTS_SYNC_MARKER = '__messages_fts_synced__';
+
+function markMessagesFtsSynced(db: SqliteDb): void {
+  db.prepare(
+    "INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)",
+  ).run(MESSAGES_FTS_SYNC_MARKER, Date.now());
+}
+
+function syncMessagesFtsOnce(db: SqliteDb): void {
+  const done = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(MESSAGES_FTS_SYNC_MARKER);
+  if (done) return;
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  markMessagesFtsSynced(db);
+}
+
 function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ignoreDaemonOwnership = false }: BuildCheckOptions = {}) {
   if (!ignoreDaemonOwnership) {
     const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
@@ -241,7 +268,11 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             });
             refreshSessionProjectPaths(db);
             healWorkflowParentLinks(db);
+            // A force snapshot keeps the wholesale rebuild as its last line of
+            // defence, and re-records the sync marker it just wiped with
+            // index_state so the next incremental build trusts the triggers.
             db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+            markMessagesFtsSynced(db);
             rebuildMemoryFts(db);
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
@@ -328,7 +359,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         runRetryableWriteTransaction(txDb, () => {
           refreshSessionProjectPaths(db);
           healWorkflowParentLinks(db);
-          db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+          syncMessagesFtsOnce(db);
           rebuildMemoryFts(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
           writeProviderIndexMarkers(db, providerPlan, providerResult);
