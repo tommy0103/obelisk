@@ -660,7 +660,7 @@ test('app indexer skips Codex guardian review threads', () => {
   db.close();
 });
 
-test('app indexer removes stale Codex guardian rows when the JSONL was already indexed', () => {
+test('app indexer retracts stale Codex guardian rows via the marker-driven replay', () => {
   const home = makeTempDir('obelisk-app-indexer-codex-guardian-stale-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -706,6 +706,10 @@ test('app indexer removes stale Codex guardian rows when the JSONL was already i
   db.prepare('INSERT INTO subagents (agent_id,session_id) VALUES (?,?)').run(guardianSessionId, guardianSessionId);
   db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path,mtime,lines_processed) VALUES (?,?,?)')
     .run(jsonlPath, statSync(jsonlPath).mtimeMs, 2);
+  // Simulate a pre-fix database: the old marker is present and the current
+  // one is absent, so the next build runs one marker-driven full replay.
+  db.prepare("DELETE FROM index_state WHERE jsonl_path LIKE '\\_\\_codex\\_canonical\\_transcript%' ESCAPE '\\'").run();
+  db.prepare("INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__codex_canonical_transcript_v2__', 0, 0)").run();
   db.close();
 
   buildIndex({ claudeDir, codexDir, dbPath, DatabaseImpl: TestDatabase });

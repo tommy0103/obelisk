@@ -38,7 +38,7 @@ import type {
 } from './types.ts';
 
 export const name = 'codex';
-const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v2__';
+const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v3__';
 const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
@@ -98,10 +98,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       const fileChanged = changedFiles.has(normalize(file.path));
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
       const cursor = ctx.lastCursor(file.path);
-      const guardian = readCodexGuardianThreadInfo(file.path);
-      if (!sessionIndexChanged && !fileChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs && guardian === null) {
+      // Skip unchanged files before paying for guardian detection: guardian
+      // status is content-derived, so a cursor-clean file's status cannot
+      // have changed. Pre-v3 databases may still hold guardian session rows;
+      // the v3 marker bump forces one full replay that retracts them.
+      if (!sessionIndexChanged && !fileChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs) {
         return [];
       }
+      const guardian = readCodexGuardianThreadInfo(file.path);
       let meta: any = null;
       readLines(file.path, (line: string) => {
         try {
