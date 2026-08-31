@@ -4,7 +4,11 @@
 // Passive-pull indexing orchestration for the Core package.
 import { existsSync } from 'node:fs';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
-import { ensureFtsReady, refreshSessionProjectPaths } from './index-finalize.ts';
+import {
+  backfillUnresolvedSessionProjectPathsOnce,
+  ensureFtsReady,
+  refreshSessionProjectPaths,
+} from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
   createProviderIndexPlan,
@@ -225,6 +229,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               plan: providerPlan,
             });
             refreshSessionProjectPaths(db, null);
+            backfillUnresolvedSessionProjectPathsOnce(db);
             healWorkflowParentLinks(db);
             ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -316,9 +321,9 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       // the build (a half-finalized index would be inconsistent).
       try {
         runRetryableWriteTransaction(txDb, () => {
-          // Per-unit paths commit atomically with their provider cursors above.
-          // An empty scope still repairs legacy rows with no project_path.
-          refreshSessionProjectPaths(db, new Set());
+          // Per-unit paths commit atomically with their provider cursors above;
+          // legacy unresolved rows use one explicit, convergent backfill.
+          backfillUnresolvedSessionProjectPathsOnce(db);
           healWorkflowParentLinks(db);
           ensureFtsReady(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());

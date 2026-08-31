@@ -10,6 +10,7 @@ import { inferProjectPath } from './parsing.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 const FTS_TRIGGERS_READY_MARKER = '__fts_triggers_ready__';
+const PROJECT_PATH_BACKFILL_MARKER = '__project_path_backfill_v1__';
 const MESSAGE_FTS_TRIGGERS = [
   'messages_fts_ai',
   'messages_fts_ad',
@@ -26,8 +27,11 @@ export function dropMessageFtsTriggers(db: SqliteDb): void {
 /**
  * Rebuild both external-content FTS indexes only when the index has not yet
  * recorded trigger readiness, or when a force snapshot explicitly requests a
- * complete repair. The marker is written by the caller's transaction after
- * both rebuilds succeed.
+ * complete repair. Trigger-only maintenance is safe because persist writes
+ * messages with INSERT ... ON CONFLICT DO UPDATE (fires messages_fts_au) and
+ * removes them with plain DELETE (fires messages_fts_ad); it never uses
+ * INSERT OR REPLACE for messages. The marker is written by the caller's
+ * transaction after both rebuilds succeed.
  */
 export function ensureFtsReady(db: SqliteDb, { force = false }: { force?: boolean } = {}): boolean {
   const ready = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
@@ -42,9 +46,7 @@ export function ensureFtsReady(db: SqliteDb, { force = false }: { force?: boolea
 }
 
 /**
- * Refresh project paths for every session (`null`) or for one affected set.
- * Scoped refreshes also repair unresolved rows, so legacy/null paths converge
- * without turning every ordinary incremental build into a corpus-wide scan.
+ * Refresh project paths for every session (`null`) or exactly one affected set.
  */
 export function refreshSessionProjectPaths(
   db: SqliteDb,
@@ -54,18 +56,10 @@ export function refreshSessionProjectPaths(
   if (sessionIds === null) {
     sessions = db.prepare('SELECT id, project FROM sessions').all();
   } else {
-    const byId = new Map<string, SqliteRow>();
     const sessionById = db.prepare('SELECT id, project FROM sessions WHERE id = ?');
-    for (const sessionId of sessionIds) {
-      const session = sessionById.get(sessionId);
-      if (session) byId.set(String(session.id), session);
-    }
-    for (const session of db.prepare(
-      "SELECT id, project FROM sessions WHERE project_path IS NULL OR project_path = ''",
-    ).all()) {
-      byId.set(String(session.id), session);
-    }
-    sessions = [...byId.values()];
+    sessions = [...sessionIds]
+      .map(sessionId => sessionById.get(sessionId))
+      .filter((session): session is SqliteRow => session !== undefined);
   }
 
   const cwdStmt = db.prepare(`
@@ -82,4 +76,19 @@ export function refreshSessionProjectPaths(
   }
 }
 
-export { FTS_TRIGGERS_READY_MARKER };
+/** Repair legacy unresolved project paths once; new/changed sessions use their unit transaction. */
+export function backfillUnresolvedSessionProjectPathsOnce(db: SqliteDb): boolean {
+  const done = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
+    .get(PROJECT_PATH_BACKFILL_MARKER);
+  if (done) return false;
+  const unresolved = new Set(db.prepare(
+    "SELECT id FROM sessions WHERE project_path IS NULL OR project_path = ''",
+  ).all().map((session: SqliteRow) => String(session.id)));
+  refreshSessionProjectPaths(db, unresolved);
+  db.prepare(
+    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
+  ).run(PROJECT_PATH_BACKFILL_MARKER, Date.now());
+  return true;
+}
+
+export { FTS_TRIGGERS_READY_MARKER, PROJECT_PATH_BACKFILL_MARKER };
