@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, normalize } from 'node:path';
 
 import {
   FTS_TRIGGERS_READY_MARKER,
@@ -75,7 +75,7 @@ test('scoped project-path refresh touches affected sessions only', () => {
   refreshSessionProjectPaths(db, new Set(['affected']));
 
   const projectPath = id => db.prepare('SELECT project_path FROM sessions WHERE id = ?').get(id).project_path;
-  assert.equal(projectPath('affected'), '/work/affected');
+  assert.equal(projectPath('affected'), normalize('/work/affected'));
   assert.equal(projectPath('unresolved'), null);
   assert.equal(projectPath('unaffected'), '/stale/unaffected');
   db.close();
@@ -87,7 +87,10 @@ test('legacy unresolved project paths are backfilled once, not on every finalize
   db.prepare("INSERT INTO sessions (id, project, project_path, source) VALUES ('permanent', NULL, NULL, 'claude')").run();
 
   assert.equal(backfillUnresolvedSessionProjectPathsOnce(db), true);
-  assert.equal(db.prepare("SELECT project_path FROM sessions WHERE id='repairable'").get().project_path, '/work/repairable');
+  assert.equal(
+    db.prepare("SELECT project_path FROM sessions WHERE id='repairable'").get().project_path,
+    normalize('/work/repairable'),
+  );
   assert.equal(db.prepare("SELECT project_path FROM sessions WHERE id='permanent'").get().project_path, null);
   assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?').get(PROJECT_PATH_BACKFILL_MARKER));
 
