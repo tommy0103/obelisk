@@ -42,7 +42,7 @@ jobs:
       - name: Verify adaptive watcher package
         run: |
           npm run build --workspace @obelisk-apps/adaptive-watcher
-          node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/claude-parse.test.mjs tests/codex-parse.test.mjs tests/codex-discover.test.mjs tests/app-indexer.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs tests/app-main-settings.test.mjs tests/app-indexer-watcher-filter.test.mjs tests/deepseek-tree.test.mjs tests/index-finalize.test.mjs
+          node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/claude-parse.test.mjs tests/codex-parse.test.mjs tests/codex-discover.test.mjs tests/kimi-parse.test.mjs tests/kimi-manifest.test.mjs tests/app-kimi-index.test.mjs tests/app-indexer.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs tests/app-main-settings.test.mjs tests/app-indexer-watcher-filter.test.mjs tests/deepseek-tree.test.mjs tests/index-finalize.test.mjs
 
       - name: Verify query sandbox read-only contract
         run: node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/query.test.mjs

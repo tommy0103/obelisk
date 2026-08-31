@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -283,5 +283,78 @@ test('Kimi canonical transcript marker replays unchanged sessions once', () => {
     { text: '/obelisk find prior decisions', is_meta: 0 },
   );
   assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(marker).c, 1);
+  db.close();
+});
+
+test('Kimi legacy cursors replay once into manifest-v1 without a canonical marker bump', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-legacy-replay-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const { sessionDir } = writeSession(kimiDir);
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  let db = new TestDatabase(dbPath);
+  const currentCursor = db.prepare(
+    'SELECT cursor FROM index_state WHERE jsonl_path = ?',
+  ).get(sessionDir).cursor;
+  const legacyCursor = `${currentCursor.split(':')[0]}:3`;
+  db.prepare('UPDATE index_state SET cursor = ?, mtime = ?, lines_processed = ? WHERE jsonl_path = ?')
+    .run(legacyCursor, Number(currentCursor.split(':')[0]), 3, sessionDir);
+  db.prepare("UPDATE messages SET text = 'stale legacy projection' WHERE source = 'kimi'").run();
+  db.close();
+
+  const migrated = buildIndex(options);
+  assert.deepEqual(migrated.affectedSessionIds, ['kimi:session-index-1']);
+  db = new TestDatabase(dbPath);
+  assert.equal(db.prepare("SELECT text FROM messages WHERE source = 'kimi'").get().text, 'kimi index needle');
+  assert.match(
+    db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(sessionDir).cursor,
+    /^\d+:0:kimi-manifest-v1:[A-Za-z0-9_-]{43}$/,
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path = '__kimi_canonical_transcript_v6__'").get().c,
+    1,
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path = '__kimi_canonical_transcript_v7__'").get().c,
+    0,
+  );
+  db.close();
+
+  assert.deepEqual(buildIndex(options).affectedSessionIds, []);
+});
+
+test('Kimi manifest replay retracts an indexed session whose last wire is removed', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-last-wire-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const { sessionDir, wirePath } = writeSession(kimiDir);
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  rmSync(wirePath);
+  const replay = buildIndex(options);
+  assert.deepEqual(replay.affectedSessionIds, ['kimi:session-index-1']);
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM sessions WHERE source = 'kimi'").get().c, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE source = 'kimi'").get().c, 0);
+  assert.match(
+    db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(sessionDir).cursor,
+    /^\d+:0:kimi-manifest-v1:[A-Za-z0-9_-]{43}$/,
+  );
   db.close();
 });

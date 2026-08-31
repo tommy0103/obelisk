@@ -5,12 +5,13 @@ import {
   existsSync,
   readdirSync,
   readFileSync,
-  statSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 
 import { filePath, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
+import { classifyKimiCursor, snapshotKimiSession } from './kimi-manifest.ts';
+import type { KimiSessionSnapshot } from './kimi-manifest.ts';
 import type {
   Cursor,
   DiscoverContext,
@@ -29,18 +30,9 @@ import type {
 
 type JsonRecord = Record<string, any>;
 
-interface KimiWireFile {
-  readonly agentId: string;
-  readonly main: boolean;
-  readonly path: string;
-}
-
-interface KimiSessionUnitMeta {
+interface KimiSessionUnitMeta extends KimiSessionSnapshot {
   readonly kind: 'session';
-  readonly sessionDir: string;
-  readonly statePath: string;
-  readonly wireFiles: readonly KimiWireFile[];
-  readonly currentCursor: Exclude<Cursor, null>;
+  readonly mode: 'replay' | 'tombstone';
 }
 
 interface LineRecord {
@@ -93,41 +85,6 @@ function readWire(path: string): LineRecord[] {
     }
   }
   return records;
-}
-
-function listWireFiles(sessionDir: string): KimiWireFile[] {
-  const agentsDir = join(sessionDir, 'agents');
-  const files: KimiWireFile[] = [];
-  if (existsSync(agentsDir)) {
-    for (const entry of readdirSync(agentsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const path = join(agentsDir, entry.name, 'wire.jsonl');
-      if (existsSync(path)) files.push({ agentId: entry.name, main: entry.name === 'main', path });
-    }
-  }
-  if (!files.some((file) => file.main)) {
-    const legacy = join(sessionDir, 'wire.jsonl');
-    if (existsSync(legacy)) files.push({ agentId: 'main', main: true, path: legacy });
-  }
-  return files.sort((a, b) => Number(b.main) - Number(a.main) || a.agentId.localeCompare(b.agentId));
-}
-
-function fileLineCount(path: string): number {
-  const raw = readFileSync(path, 'utf8');
-  if (raw.length === 0) return 0;
-  const newlines = raw.match(/\n/g)?.length ?? 0;
-  return newlines + (raw.endsWith('\n') ? 0 : 1);
-}
-
-function cursorFor(statePath: string, wires: readonly KimiWireFile[]): Exclude<Cursor, null> {
-  const paths = [statePath, ...wires.map((wire) => wire.path)].filter(existsSync);
-  let maxMtime = 0;
-  let totalLines = 0;
-  for (const path of paths) {
-    maxMtime = Math.max(maxMtime, statSync(path).mtimeMs);
-    totalLines += fileLineCount(path);
-  }
-  return `${maxMtime}:${totalLines}`;
 }
 
 function normalizeTime(value: unknown): string | null {
@@ -695,31 +652,64 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       const changedSessions = ctx.changedPaths === undefined
         ? null
         : changedSessionDirectories(rootDir, ctx.changedPaths);
+      const indexedSessionDirs = new Set((ctx.indexedSessions?.() ?? []).map(
+        ({ jsonlPath }) => sessionDirectoryFromWirePath(jsonlPath),
+      ));
       for (const sessionDir of sessionDirectories(rootDir, ctx.reportIncompleteInventory)) {
         if (changedSessions !== null && !changedSessions.has(sessionDir)) continue;
-        const statePath = join(sessionDir, 'state.json');
-        const wireFiles = listWireFiles(sessionDir);
-        if (wireFiles.length === 0) continue;
-        const currentCursor = cursorFor(statePath, wireFiles);
-        if (changedSessions === null && ctx.lastCursor(sessionDir) === currentCursor) continue;
+        let snapshot: KimiSessionSnapshot;
+        try {
+          snapshot = snapshotKimiSession(sessionDir);
+        } catch (error) {
+          ctx.reportIncompleteInventory?.(sourceInventoryIssue(sessionDir, error));
+          continue;
+        }
+        const { statePath, wireFiles, currentCursor } = snapshot;
+        const storedCursor = ctx.lastCursor(sessionDir);
+        if (
+          wireFiles.length === 0
+          && storedCursor === null
+          && !indexedSessionDirs.has(sessionDir)
+        ) continue;
+        if (
+          changedSessions === null
+          && classifyKimiCursor(storedCursor, currentCursor) === 'current'
+        ) continue;
         const state = readState(statePath);
         const cwd = typeof state.cwd === 'string' ? state.cwd : typeof state.workDir === 'string' ? state.workDir : null;
         units.push({
           key: sessionDir,
           sessionId: namespacedSessionId(basename(sessionDir)),
           project: projectSlugFromPath(cwd) ?? undefined,
-          meta: { kind: 'session', sessionDir, statePath, wireFiles, currentCursor } satisfies KimiSessionUnitMeta,
+          meta: {
+            kind: 'session',
+            mode: wireFiles.length === 0 ? 'tombstone' : 'replay',
+            ...snapshot,
+          } satisfies KimiSessionUnitMeta,
         });
       }
       return units;
     },
     *parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
       const meta = unit.meta as KimiSessionUnitMeta;
-      const before = cursorFor(meta.statePath, meta.wireFiles);
+      const before = snapshotKimiSession(meta.sessionDir);
+      if (before.currentCursor !== meta.currentCursor) {
+        throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
+      }
+      if (meta.mode === 'tombstone') {
+        yield { kind: 'delete-session', sessionId: unit.sessionId };
+        const afterTombstone = snapshotKimiSession(meta.sessionDir);
+        if (before.currentCursor !== afterTombstone.currentCursor) {
+          throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
+        }
+        return afterTombstone.currentCursor;
+      }
       const state = readState(meta.statePath);
       const projected = projectSession(meta, unit.sessionId, state);
-      const after = cursorFor(meta.statePath, meta.wireFiles);
-      if (before !== after) throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
+      const after = snapshotKimiSession(meta.sessionDir);
+      if (before.currentCursor !== after.currentCursor) {
+        throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
+      }
 
       yield { kind: 'delete-session', sessionId: unit.sessionId };
       // Kimi persists a titled session before the first prompt; keep it retracted until user evidence exists.
@@ -727,7 +717,7 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       const hasProjectedUserPrompt = projected.messages.some((message) => (
         message.agent_id === null && message.role === 'user' && !message.is_meta
       ));
-      if (state.title === 'New Session' && !hasLastPrompt && !hasProjectedUserPrompt) return after;
+      if (state.title === 'New Session' && !hasLastPrompt && !hasProjectedUserPrompt) return after.currentCursor;
       yield {
         kind: 'session',
         id: unit.sessionId,
@@ -752,7 +742,7 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       yield* projected.summaries;
       yield* projected.subagents;
       yield* projected.durations;
-      return after;
+      return after.currentCursor;
     },
     raw(input: RawLookup): RawRecord | null {
       const mainPath = typeof input.session?.jsonl_path === 'string' ? input.session.jsonl_path : null;
