@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 
 import type { Cursor } from './types.ts';
@@ -44,44 +44,103 @@ interface KimiManifestMember {
   readonly ctimeNs: string;
 }
 
+interface CapturedKimiSession extends KimiSessionSnapshot {
+  readonly members: readonly KimiManifestMember[];
+}
+
 function normalizedRelativePath(sessionDir: string, path: string): string {
   return relative(sessionDir, path).split(sep).join('/');
 }
 
-function listWireFiles(sessionDir: string): KimiWireFile[] {
-  const agentsDir = join(sessionDir, 'agents');
-  const files: KimiWireFile[] = [];
-  if (existsSync(agentsDir)) {
-    for (const entry of readdirSync(agentsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const path = join(agentsDir, entry.name, 'wire.jsonl');
-      if (existsSync(path)) files.push({ agentId: entry.name, main: entry.name === 'main', path });
-    }
-  }
-  if (!files.some((file) => file.main)) {
-    const legacy = join(sessionDir, 'wire.jsonl');
-    if (existsSync(legacy)) files.push({ agentId: 'main', main: true, path: legacy });
-  }
-  return files.sort((a, b) => Number(b.main) - Number(a.main) || a.agentId.localeCompare(b.agentId));
+function isMissing(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
-function manifestCursor(sessionDir: string, paths: readonly string[]): string {
-  let maxMtimeNs = 0n;
-  const members = paths.filter(existsSync).map((path): KimiManifestMember => {
-    const stat = statSync(path, { bigint: true });
-    if (stat.mtimeNs > maxMtimeNs) maxMtimeNs = stat.mtimeNs;
-    return {
-      relativePath: normalizedRelativePath(sessionDir, path),
-      dev: String(stat.dev),
-      ino: String(stat.ino),
-      size: String(stat.size),
-      mtimeNs: String(stat.mtimeNs),
-      ctimeNs: String(stat.ctimeNs),
-    };
-  }).sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+function optionalDirectoryEntries(path: string) {
+  try {
+    return readdirSync(path, { withFileTypes: true });
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw error;
+  }
+}
+
+function listedMember(sessionDir: string, path: string): KimiManifestMember {
+  // The caller observed this exact entry in a directory listing. Any stat
+  // failure, including ENOENT, means the snapshot raced a mutation rather than
+  // proving that the member was absent.
+  const stat = statSync(path, { bigint: true });
+  return {
+    relativePath: normalizedRelativePath(sessionDir, path),
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    size: String(stat.size),
+    mtimeNs: String(stat.mtimeNs),
+    ctimeNs: String(stat.ctimeNs),
+  };
+}
+
+function manifestCursor(members: readonly KimiManifestMember[]): string {
+  const maxMtimeNs = members.reduce((latest, member) => {
+    const mtimeNs = BigInt(member.mtimeNs);
+    return mtimeNs > latest ? mtimeNs : latest;
+  }, 0n);
   const digest = createHash('sha256').update(JSON.stringify(members)).digest('base64url');
   const maxMtimeMs = maxMtimeNs / 1_000_000n;
   return `${maxMtimeMs}:0:${KIMI_MANIFEST_CURSOR_FORMAT}:${digest}`;
+}
+
+function captureKimiSession(sessionDir: string): CapturedKimiSession {
+  const statePath = join(sessionDir, 'state.json');
+  const sessionEntries = optionalDirectoryEntries(sessionDir);
+  if (sessionEntries === null) {
+    const members: KimiManifestMember[] = [];
+    return {
+      sessionDir,
+      statePath,
+      wireFiles: [],
+      members,
+      currentCursor: manifestCursor(members),
+    };
+  }
+
+  const members: KimiManifestMember[] = [];
+  if (sessionEntries.some((entry) => entry.name === 'state.json')) {
+    members.push(listedMember(sessionDir, statePath));
+  }
+
+  const wireFiles: KimiWireFile[] = [];
+  const agentsEntry = sessionEntries.find((entry) => entry.name === 'agents' && entry.isDirectory());
+  if (agentsEntry !== undefined) {
+    const agentsDir = join(sessionDir, agentsEntry.name);
+    const agentEntries = readdirSync(agentsDir, { withFileTypes: true });
+    for (const agentEntry of agentEntries) {
+      if (!agentEntry.isDirectory()) continue;
+      const agentDir = join(agentsDir, agentEntry.name);
+      const entries = readdirSync(agentDir, { withFileTypes: true });
+      if (!entries.some((entry) => entry.name === 'wire.jsonl')) continue;
+      const path = join(agentDir, 'wire.jsonl');
+      members.push(listedMember(sessionDir, path));
+      wireFiles.push({ agentId: agentEntry.name, main: agentEntry.name === 'main', path });
+    }
+  }
+
+  if (!wireFiles.some((file) => file.main) && sessionEntries.some((entry) => entry.name === 'wire.jsonl')) {
+    const path = join(sessionDir, 'wire.jsonl');
+    members.push(listedMember(sessionDir, path));
+    wireFiles.push({ agentId: 'main', main: true, path });
+  }
+
+  members.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  wireFiles.sort((a, b) => Number(b.main) - Number(a.main) || a.agentId.localeCompare(b.agentId));
+  return {
+    sessionDir,
+    statePath,
+    wireFiles,
+    members,
+    currentCursor: manifestCursor(members),
+  };
 }
 
 /**
@@ -90,12 +149,15 @@ function manifestCursor(sessionDir: string, paths: readonly string[]): string {
  * digest encoding; changing any of those requires a new cursor-format tag.
  */
 export function snapshotKimiSession(sessionDir: string): KimiSessionSnapshot {
-  const statePath = join(sessionDir, 'state.json');
-  const wireFiles = listWireFiles(sessionDir);
+  const before = captureKimiSession(sessionDir);
+  const after = captureKimiSession(sessionDir);
+  if (before.currentCursor !== after.currentCursor) {
+    throw new Error(`Kimi session changed while snapshotting: ${sessionDir}`);
+  }
   return {
-    sessionDir,
-    statePath,
-    wireFiles,
-    currentCursor: manifestCursor(sessionDir, [statePath, ...wireFiles.map((wire) => wire.path)]),
+    sessionDir: after.sessionDir,
+    statePath: after.statePath,
+    wireFiles: after.wireFiles,
+    currentCursor: after.currentCursor,
   };
 }

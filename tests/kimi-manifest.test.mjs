@@ -8,13 +8,25 @@ import { join } from 'node:path';
 
 import { makeTempDir } from './temp-dirs.mjs';
 
+const REAL_STATE = fs.readFileSync(new URL('./fixtures/kimi/manifest-session/state.json', import.meta.url), 'utf8');
+const REAL_WIRE = fs.readFileSync(new URL('./fixtures/kimi/manifest-session/agents/main/wire.jsonl', import.meta.url), 'utf8');
+const REAL_METADATA_LINE = `${REAL_WIRE.split('\n')[0]}\n`;
+
 let forbidSessionBodyReads = false;
 let failingStatPath = null;
+let failingStatCode = 'ENOENT';
+let hiddenExistsPath = null;
+let addMemberDuringStatSessionDir = null;
+let addedMemberDuringStat = false;
 let mutateAfterReadPath = null;
 let mutatedAfterRead = false;
 const fsMock = mock.module('node:fs', {
   namedExports: {
     ...fs,
+    existsSync(path) {
+      if (hiddenExistsPath !== null && String(path) === hiddenExistsPath) return false;
+      return fs.existsSync(path);
+    },
     readFileSync(path, ...args) {
       if (forbidSessionBodyReads && (
         String(path).endsWith('state.json') || String(path).endsWith('wire.jsonl')
@@ -28,14 +40,24 @@ const fsMock = mock.module('node:fs', {
         && !mutatedAfterRead
       ) {
         mutatedAfterRead = true;
-        fs.appendFileSync(path, '{"type":"metadata","created_at":3}\n');
+        fs.appendFileSync(path, REAL_METADATA_LINE);
       }
       return result;
     },
     statSync(path, ...args) {
+      if (
+        addMemberDuringStatSessionDir !== null
+        && !addedMemberDuringStat
+        && String(path).endsWith(join('agents', 'main', 'wire.jsonl'))
+      ) {
+        addedMemberDuringStat = true;
+        const childDir = join(addMemberDuringStatSessionDir, 'agents', 'raced-child');
+        fs.mkdirSync(childDir, { recursive: true });
+        fs.writeFileSync(join(childDir, 'wire.jsonl'), REAL_METADATA_LINE);
+      }
       if (failingStatPath !== null && String(path) === failingStatPath) {
         const error = new Error(`simulated disappearance: ${path}`);
-        error.code = 'ENOENT';
+        error.code = failingStatCode;
         throw error;
       }
       return fs.statSync(path, ...args);
@@ -52,19 +74,8 @@ function writeSession(root) {
   const sessionDir = join(root, 'sessions', 'workspace-1', 'session-1');
   const mainDir = join(sessionDir, 'agents', 'main');
   fs.mkdirSync(mainDir, { recursive: true });
-  fs.writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({
-    title: 'Manifest fixture',
-    workDir: '/tmp/kimi-manifest',
-  }));
-  fs.writeFileSync(join(mainDir, 'wire.jsonl'), [
-    JSON.stringify({ type: 'metadata', protocol_version: '1.5', created_at: 1 }),
-    JSON.stringify({
-      type: 'context.append_message',
-      time: 2,
-      message: { role: 'user', content: 'hello', toolCalls: [], origin: { kind: 'user' } },
-    }),
-    '',
-  ].join('\n'));
+  fs.writeFileSync(join(sessionDir, 'state.json'), REAL_STATE);
+  fs.writeFileSync(join(mainDir, 'wire.jsonl'), REAL_WIRE);
   return sessionDir;
 }
 
@@ -112,7 +123,7 @@ test('Kimi parse rejects a member added after discovery', async () => {
 
   const childDir = join(sessionDir, 'agents', 'child-1');
   fs.mkdirSync(childDir, { recursive: true });
-  fs.writeFileSync(join(childDir, 'wire.jsonl'), '{"type":"metadata"}\n');
+  fs.writeFileSync(join(childDir, 'wire.jsonl'), REAL_METADATA_LINE);
 
   assert.throws(
     () => drain(provider.parse(unit, null)),
@@ -144,7 +155,7 @@ test('Kimi discovery ignores an empty session that was never indexed', async () 
   const root = makeTempDir('obelisk-kimi-manifest-new-empty-');
   const sessionDir = join(root, 'sessions', 'workspace-1', 'empty-session');
   fs.mkdirSync(sessionDir, { recursive: true });
-  fs.writeFileSync(join(sessionDir, 'state.json'), '{"title":"New Session"}\n');
+  fs.writeFileSync(join(sessionDir, 'state.json'), REAL_STATE);
   const { createKimiProvider } = await loadKimiProvider('new-empty');
 
   assert.deepEqual(createKimiProvider({ rootDir: root }).discover({
@@ -190,6 +201,75 @@ test('Kimi discovery reports a member that disappears during snapshotting', asyn
   assert.match(issues[0].error, /ENOENT|simulated disappearance/);
 });
 
+test('Kimi discovery never treats an inaccessible member as deleted', async () => {
+  const root = makeTempDir('obelisk-kimi-manifest-permission-');
+  const sessionDir = writeSession(root);
+  const wirePath = join(sessionDir, 'agents', 'main', 'wire.jsonl');
+  const { createKimiProvider } = await loadKimiProvider('permission');
+  const provider = createKimiProvider({ rootDir: root });
+  const initial = provider.discover({ lastCursor: () => null })[0];
+  const issues = [];
+  hiddenExistsPath = wirePath;
+  failingStatPath = wirePath;
+  failingStatCode = 'EACCES';
+  try {
+    assert.deepEqual(provider.discover({
+      lastCursor: () => initial.meta.currentCursor,
+      reportIncompleteInventory: issue => issues.push(issue),
+    }), []);
+  } finally {
+    hiddenExistsPath = null;
+    failingStatPath = null;
+    failingStatCode = 'ENOENT';
+  }
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].path, sessionDir);
+  assert.match(issues[0].error, /EACCES|simulated disappearance/);
+});
+
+test('Kimi discovery rejects a member added while its snapshot is being captured', async () => {
+  const root = makeTempDir('obelisk-kimi-manifest-member-race-');
+  const sessionDir = writeSession(root);
+  const { createKimiProvider } = await loadKimiProvider('member-race');
+  const provider = createKimiProvider({ rootDir: root });
+  const initial = provider.discover({ lastCursor: () => null })[0];
+  const issues = [];
+  addMemberDuringStatSessionDir = sessionDir;
+  addedMemberDuringStat = false;
+  try {
+    assert.deepEqual(provider.discover({
+      lastCursor: () => initial.meta.currentCursor,
+      reportIncompleteInventory: issue => issues.push(issue),
+    }), []);
+  } finally {
+    addMemberDuringStatSessionDir = null;
+    addedMemberDuringStat = false;
+  }
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].path, sessionDir);
+  assert.match(issues[0].error, /changed while snapshotting/);
+});
+
+test('Kimi discovery emits a tombstone when an indexed session directory is deleted', async () => {
+  const root = makeTempDir('obelisk-kimi-manifest-session-delete-');
+  const sessionDir = writeSession(root);
+  const mainWire = join(sessionDir, 'agents', 'main', 'wire.jsonl');
+  const { createKimiProvider } = await loadKimiProvider('session-delete');
+  const provider = createKimiProvider({ rootDir: root });
+  const initial = provider.discover({ lastCursor: () => null })[0];
+  fs.rmSync(sessionDir, { recursive: true });
+
+  const [tombstone] = provider.discover({
+    lastCursor: key => key === sessionDir ? initial.meta.currentCursor : null,
+    indexedSessions: () => [{ sessionId: 'kimi:session-1', jsonlPath: mainWire }],
+  });
+  assert.equal(tombstone.key, sessionDir);
+  assert.equal(tombstone.meta.mode, 'tombstone');
+  assert.deepEqual(drain(provider.parse(tombstone, initial.meta.currentCursor)).values, [
+    { kind: 'delete-session', sessionId: 'kimi:session-1' },
+  ]);
+});
+
 test('Kimi discovery detects an append even when mtime is restored', async () => {
   const root = makeTempDir('obelisk-kimi-manifest-same-mtime-append-');
   const sessionDir = writeSession(root);
@@ -199,7 +279,7 @@ test('Kimi discovery detects an append even when mtime is restored', async () =>
   const initial = provider.discover({ lastCursor: () => null })[0];
   const before = fs.statSync(wirePath);
 
-  fs.appendFileSync(wirePath, '{"type":"metadata","created_at":3}\n');
+  fs.appendFileSync(wirePath, REAL_METADATA_LINE);
   fs.utimesSync(wirePath, before.atime, before.mtime);
 
   assert.deepEqual(provider.discover({
@@ -207,9 +287,7 @@ test('Kimi discovery detects an append even when mtime is restored', async () =>
   }).map(unit => unit.key), [sessionDir]);
 });
 
-test('Kimi discovery detects a same-size rewrite with restored mtime', {
-  skip: process.platform === 'win32' && 'Windows ctime is creation time',
-}, async () => {
+test('Kimi discovery detects a same-size rewrite with restored mtime', async () => {
   const root = makeTempDir('obelisk-kimi-manifest-same-size-rewrite-');
   const sessionDir = writeSession(root);
   const wirePath = join(sessionDir, 'agents', 'main', 'wire.jsonl');
@@ -218,7 +296,7 @@ test('Kimi discovery detects a same-size rewrite with restored mtime', {
   const initial = provider.discover({ lastCursor: () => null })[0];
   const before = fs.statSync(wirePath);
   const original = fs.readFileSync(wirePath, 'utf8');
-  const rewritten = original.replace('hello', 'hullo');
+  const rewritten = original.replace('"runtimeId":"local"', '"runtimeId":"focal"');
   assert.equal(Buffer.byteLength(rewritten), Buffer.byteLength(original));
 
   fs.writeFileSync(wirePath, rewritten);
@@ -234,7 +312,7 @@ test('Kimi discovery detects removal of one member from a multi-wire session', a
   const sessionDir = writeSession(root);
   const childDir = join(sessionDir, 'agents', 'child-1');
   fs.mkdirSync(childDir, { recursive: true });
-  fs.writeFileSync(join(childDir, 'wire.jsonl'), '{"type":"metadata"}\n');
+  fs.writeFileSync(join(childDir, 'wire.jsonl'), REAL_METADATA_LINE);
   const { createKimiProvider } = await loadKimiProvider('member-removal');
   const provider = createKimiProvider({ rootDir: root });
   const initial = provider.discover({ lastCursor: () => null })[0];

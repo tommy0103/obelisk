@@ -646,22 +646,44 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
     discover(ctx: DiscoverContext): IndexUnit[] {
       const units: IndexUnit[] = [];
       const sessionsDir = join(rootDir, 'sessions');
-      if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
-        ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+      const indexedSessions = ctx.indexedSessions?.() ?? [];
+      let inventoryComplete = true;
+      const reportIssue = (issue: InventoryIssue): void => {
+        inventoryComplete = false;
+        ctx.reportIncompleteInventory?.(issue);
+      };
+      if (!existsSync(sessionsDir) && indexedSessions.length > 0) {
+        reportIssue({ path: sessionsDir, error: 'Source folder is unavailable' });
       }
       const changedSessions = ctx.changedPaths === undefined
         ? null
         : changedSessionDirectories(rootDir, ctx.changedPaths);
-      const indexedSessionDirs = new Set((ctx.indexedSessions?.() ?? []).map(
+      const indexedSessionDirs = new Set(indexedSessions.map(
         ({ jsonlPath }) => sessionDirectoryFromWirePath(jsonlPath),
       ));
-      for (const sessionDir of sessionDirectories(rootDir, ctx.reportIncompleteInventory)) {
-        if (changedSessions !== null && !changedSessions.has(sessionDir)) continue;
+      const discoveredSessionDirs = sessionDirectories(rootDir, reportIssue);
+      const candidateSessionDirs = new Set(
+        changedSessions === null
+          ? discoveredSessionDirs
+          : discoveredSessionDirs.filter((sessionDir) => changedSessions.has(sessionDir)),
+      );
+      if (changedSessions === null && inventoryComplete) {
+        for (const indexedSessionDir of indexedSessionDirs) {
+          const inside = relative(sessionsDir, indexedSessionDir);
+          if (inside && !inside.startsWith('..') && !isAbsolute(inside)) {
+            candidateSessionDirs.add(indexedSessionDir);
+          }
+        }
+      } else if (changedSessions !== null) {
+        for (const changedSessionDir of changedSessions) candidateSessionDirs.add(changedSessionDir);
+      }
+
+      for (const sessionDir of [...candidateSessionDirs].sort()) {
         let snapshot: KimiSessionSnapshot;
         try {
           snapshot = snapshotKimiSession(sessionDir);
         } catch (error) {
-          ctx.reportIncompleteInventory?.(sourceInventoryIssue(sessionDir, error));
+          reportIssue(sourceInventoryIssue(sessionDir, error));
           continue;
         }
         const { statePath, wireFiles, currentCursor } = snapshot;
