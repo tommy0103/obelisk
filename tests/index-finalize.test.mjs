@@ -97,6 +97,33 @@ test('legacy unresolved project paths are backfilled once, not on every finalize
   insertSession(db, 'later', null);
   assert.equal(backfillUnresolvedSessionProjectPathsOnce(db), false);
   assert.equal(db.prepare("SELECT project_path FROM sessions WHERE id='later'").get().project_path, null);
+  refreshSessionProjectPaths(db, new Set(['later']));
+  assert.equal(
+    db.prepare("SELECT project_path FROM sessions WHERE id='later'").get().project_path,
+    normalize('/work/later'),
+    'the backfill marker never blocks the affected-unit repair path',
+  );
+  db.close();
+});
+
+test('legacy project-path backfill retries cleanly after transaction rollback', () => {
+  const db = freshDb();
+  insertSession(db, 'rollback', null);
+
+  db.exec('BEGIN');
+  assert.equal(backfillUnresolvedSessionProjectPathsOnce(db), true);
+  db.exec('ROLLBACK');
+  assert.equal(db.prepare("SELECT project_path FROM sessions WHERE id='rollback'").get().project_path, null);
+  assert.equal(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?').get(PROJECT_PATH_BACKFILL_MARKER), undefined);
+
+  db.exec('BEGIN');
+  assert.equal(backfillUnresolvedSessionProjectPathsOnce(db), true);
+  db.exec('COMMIT');
+  assert.equal(
+    db.prepare("SELECT project_path FROM sessions WHERE id='rollback'").get().project_path,
+    normalize('/work/rollback'),
+  );
+  assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?').get(PROJECT_PATH_BACKFILL_MARKER));
   db.close();
 });
 
