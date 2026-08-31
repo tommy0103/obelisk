@@ -33,6 +33,12 @@ type JsonRecord = Record<string, any>;
 interface KimiSessionUnitMeta extends KimiSessionSnapshot {
   readonly kind: 'session';
   readonly mode: 'replay' | 'tombstone';
+  readonly identityWitnesses?: readonly KimiIdentityWitness[];
+}
+
+interface KimiIdentityWitness {
+  readonly sessionId: string;
+  readonly snapshots: readonly KimiSessionSnapshot[];
 }
 
 interface LineRecord {
@@ -571,7 +577,7 @@ function sessionDirectories(
   return result.sort();
 }
 
-function changedSessionDirectories(rootDir: string, changedPaths: readonly string[]): Set<string> {
+function changedSessionDirectories(rootDir: string, changedPaths: readonly string[]): Set<string> | null {
   const sessionsDir = join(rootDir, 'sessions');
   const result = new Set<string>();
   for (const changedPath of changedPaths) {
@@ -579,8 +585,10 @@ function changedSessionDirectories(rootDir: string, changedPaths: readonly strin
       ? normalize(changedPath)
       : normalize(join(sessionsDir, changedPath));
     const inside = relative(sessionsDir, absolute);
-    if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
+    if (!inside) return null;
+    if (inside.startsWith('..') || isAbsolute(inside)) continue;
     const [workspaceId, sessionId] = inside.split(sep);
+    if (workspaceId && !sessionId) return null;
     if (workspaceId && sessionId) result.add(join(sessionsDir, workspaceId, sessionId));
   }
   return result;
@@ -591,6 +599,38 @@ function sessionDirectoryFromWirePath(wirePath: string): string {
   return basename(parent) === 'main' && basename(dirname(parent)) === 'agents'
     ? dirname(dirname(parent))
     : parent;
+}
+
+function verifyKimiIdentityWitnesses(
+  rootDir: string,
+  witnesses: readonly KimiIdentityWitness[] | undefined,
+): void {
+  if (witnesses === undefined || witnesses.length === 0) return;
+  const sessionsDir = join(rootDir, 'sessions');
+  if (!existsSync(sessionsDir)) {
+    throw new Error(`Kimi session identity changed while indexing: ${sessionsDir}`);
+  }
+  const currentSessionDirs = sessionDirectories(rootDir, (issue) => {
+    throw new Error(`Kimi session identity changed while indexing: ${issue.path}: ${issue.error}`);
+  });
+  for (const witness of witnesses) {
+    const expectedDirs = witness.snapshots.map(({ sessionDir }) => sessionDir).sort();
+    const currentDirs = currentSessionDirs.filter((sessionDir) => (
+      namespacedSessionId(basename(sessionDir)) === witness.sessionId
+    ));
+    if (
+      currentDirs.length !== expectedDirs.length
+      || currentDirs.some((sessionDir, index) => sessionDir !== expectedDirs[index])
+    ) {
+      throw new Error(`Kimi session identity changed while indexing: ${witness.sessionId}`);
+    }
+    for (const expected of witness.snapshots) {
+      const current = snapshotKimiSession(expected.sessionDir);
+      if (current.currentCursor !== expected.currentCursor) {
+        throw new Error(`Kimi session identity changed while indexing: ${witness.sessionId}`);
+      }
+    }
+  }
 }
 
 function rawFromWire(path: string, messageUuid: string): RawRecord | null {
@@ -658,72 +698,252 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       const changedSessions = ctx.changedPaths === undefined
         ? null
         : changedSessionDirectories(rootDir, ctx.changedPaths);
-      const indexedSessionDirs = new Set(indexedSessions.map(
-        ({ jsonlPath }) => sessionDirectoryFromWirePath(jsonlPath),
+      const indexedSessionDirById = new Map(indexedSessions.map(
+        ({ sessionId, jsonlPath }) => [sessionId, sessionDirectoryFromWirePath(jsonlPath)],
       ));
+      const indexedSessionByDir = new Map(indexedSessions.map((indexed) => (
+        [sessionDirectoryFromWirePath(indexed.jsonlPath), indexed]
+      )));
       const discoveredSessionDirs = sessionDirectories(rootDir, reportIssue);
-      const candidateSessionDirs = new Set(
+      const discoveredBySessionId = new Map<string, string[]>();
+      for (const sessionDir of discoveredSessionDirs) {
+        const sessionId = namespacedSessionId(basename(sessionDir));
+        discoveredBySessionId.set(sessionId, [
+          ...(discoveredBySessionId.get(sessionId) ?? []),
+          sessionDir,
+        ]);
+      }
+      const candidateSessionDirs = new Set<string>(
         changedSessions === null
           ? discoveredSessionDirs
           : discoveredSessionDirs.filter((sessionDir) => changedSessions.has(sessionDir)),
       );
-      if (changedSessions === null && inventoryComplete) {
-        for (const indexedSessionDir of indexedSessionDirs) {
-          const inside = relative(sessionsDir, indexedSessionDir);
-          if (inside && !inside.startsWith('..') && !isAbsolute(inside)) {
-            candidateSessionDirs.add(indexedSessionDir);
-          }
+      for (const sessionDirs of discoveredBySessionId.values()) {
+        if (sessionDirs.length < 2) continue;
+        for (const sessionDir of sessionDirs) candidateSessionDirs.add(sessionDir);
+      }
+      for (const indexed of indexedSessions) {
+        const indexedSessionDir = sessionDirectoryFromWirePath(indexed.jsonlPath);
+        const inside = relative(sessionsDir, indexedSessionDir);
+        if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
+        const shouldReconcile = changedSessions === null || changedSessions.has(indexedSessionDir);
+        if (!shouldReconcile) continue;
+        const movedSessionDirs = discoveredBySessionId.get(indexed.sessionId) ?? [];
+        if (movedSessionDirs.length === 1 && movedSessionDirs[0] !== indexedSessionDir) {
+          candidateSessionDirs.add(movedSessionDirs[0]!);
         }
-      } else if (changedSessions !== null) {
-        for (const changedSessionDir of changedSessions) candidateSessionDirs.add(changedSessionDir);
       }
 
-      for (const sessionDir of [...candidateSessionDirs].sort()) {
-        let snapshot: KimiSessionSnapshot;
+      const snapshots = new Map<string, KimiSessionSnapshot>();
+      for (const sessionDir of discoveredSessionDirs) {
         try {
-          snapshot = snapshotKimiSession(sessionDir);
+          snapshots.set(sessionDir, snapshotKimiSession(sessionDir));
         } catch (error) {
           reportIssue(sourceInventoryIssue(sessionDir, error));
-          continue;
         }
-        const { statePath, wireFiles, currentCursor } = snapshot;
+      }
+
+      const liveSessionDirsById = new Map<string, string[]>();
+      for (const [sessionDir, snapshot] of snapshots) {
+        if (snapshot.wireFiles.length === 0) continue;
+        const sessionId = namespacedSessionId(basename(sessionDir));
+        liveSessionDirsById.set(sessionId, [
+          ...(liveSessionDirsById.get(sessionId) ?? []),
+          sessionDir,
+        ]);
+      }
+      const ambiguousSessionIds = new Set<string>();
+      for (const [sessionId, sessionDirs] of liveSessionDirsById) {
+        if (sessionDirs.length < 2) continue;
+        ambiguousSessionIds.add(sessionId);
+        reportIssue({
+          path: sessionsDir,
+          error: `Multiple live Kimi session directories share identity ${sessionId}`,
+        });
+      }
+
+      const liveSessionIds = new Set(liveSessionDirsById.keys());
+      const touchedSessionIds = new Set<string>();
+      const replayCandidates: Array<{
+        sessionDir: string;
+        sessionId: string;
+        snapshot: KimiSessionSnapshot;
+        sourceLocal: boolean;
+        retractSessionIds: readonly string[];
+      }> = [];
+      const plannedRetractions = new Set<string>();
+      for (const sessionDir of [...candidateSessionDirs].sort()) {
+        const snapshot = snapshots.get(sessionDir);
+        if (snapshot === undefined) continue;
+        const sessionId = namespacedSessionId(basename(sessionDir));
+        touchedSessionIds.add(sessionId);
+        const { wireFiles, currentCursor } = snapshot;
+        if (wireFiles.length === 0) continue;
+        if (ambiguousSessionIds.has(sessionId)) continue;
         const storedCursor = ctx.lastCursor(sessionDir);
-        if (
-          wireFiles.length === 0
-          && storedCursor === null
-          && !indexedSessionDirs.has(sessionDir)
-        ) continue;
+        const indexedSessionDir = indexedSessionDirById.get(sessionId);
+        const indexedAtDir = indexedSessionByDir.get(sessionDir);
+        const ownsIndexedProvenance = indexedSessionDir === sessionDir;
+        const cursorCanProveProvenance = ownsIndexedProvenance
+          || (indexedSessionDir === undefined && indexedAtDir === undefined);
+        const sourceLocal = cursorCanProveProvenance;
+        const retractSessionIds = indexedAtDir !== undefined
+          && indexedAtDir.sessionId !== sessionId
+          && !liveSessionIds.has(indexedAtDir.sessionId)
+          ? [indexedAtDir.sessionId]
+          : [];
         if (
           changedSessions === null
+          && cursorCanProveProvenance
           && classifyKimiCursor(storedCursor, currentCursor) === 'current'
         ) continue;
-        const state = readState(statePath);
+        for (const retractedSessionId of retractSessionIds) plannedRetractions.add(retractedSessionId);
+        replayCandidates.push({
+          sessionDir,
+          sessionId,
+          snapshot,
+          sourceLocal,
+          retractSessionIds,
+        });
+      }
+
+      const pendingTombstones: Array<{
+        indexed: (typeof indexedSessions)[number];
+        sessionDir: string;
+        snapshot: KimiSessionSnapshot;
+      }> = [];
+      for (const indexed of indexedSessions) {
+        if (
+          ambiguousSessionIds.has(indexed.sessionId)
+          || liveSessionIds.has(indexed.sessionId)
+          || plannedRetractions.has(indexed.sessionId)
+        ) continue;
+        const indexedSessionDir = sessionDirectoryFromWirePath(indexed.jsonlPath);
+        const shouldReconcile = changedSessions === null
+          || changedSessions.has(indexedSessionDir)
+          || touchedSessionIds.has(indexed.sessionId);
+        if (!shouldReconcile || !inventoryComplete) continue;
+        let snapshot = snapshots.get(indexedSessionDir);
+        if (snapshot === undefined) {
+          try {
+            snapshot = snapshotKimiSession(indexedSessionDir);
+          } catch (error) {
+            reportIssue(sourceInventoryIssue(indexedSessionDir, error));
+            continue;
+          }
+        }
+        if (snapshot.wireFiles.length > 0) {
+          reportIssue({
+            path: indexedSessionDir,
+            error: 'Kimi session appeared after the identity census',
+          });
+          continue;
+        }
+        pendingTombstones.push({ indexed, sessionDir: indexedSessionDir, snapshot });
+      }
+
+      const verifiedSessionDirs = sessionDirectories(rootDir, reportIssue);
+      if (inventoryComplete && !existsSync(sessionsDir) && indexedSessions.length > 0) {
+        reportIssue({ path: sessionsDir, error: 'Source folder became unavailable during discovery' });
+      }
+      if (
+        verifiedSessionDirs.length !== discoveredSessionDirs.length
+        || verifiedSessionDirs.some((sessionDir, index) => sessionDir !== discoveredSessionDirs[index])
+      ) {
+        reportIssue({ path: sessionsDir, error: 'Kimi session inventory changed during discovery' });
+      }
+
+      const destructiveSessionIds = new Set([
+        ...plannedRetractions,
+        ...pendingTombstones.map(({ indexed }) => indexed.sessionId),
+        ...replayCandidates.filter(({ sourceLocal }) => !sourceLocal).map(({ sessionId }) => sessionId),
+      ]);
+      for (const sessionId of destructiveSessionIds) {
+        for (const sessionDir of discoveredBySessionId.get(sessionId) ?? []) {
+          const before = snapshots.get(sessionDir);
+          let after: KimiSessionSnapshot;
+          try {
+            after = snapshotKimiSession(sessionDir);
+          } catch (error) {
+            reportIssue(sourceInventoryIssue(sessionDir, error));
+            continue;
+          }
+          if (before === undefined || before.currentCursor !== after.currentCursor) {
+            reportIssue({
+              path: sessionDir,
+              error: 'Kimi session identity changed during discovery',
+            });
+          }
+        }
+      }
+
+      const identityWitnessesFor = (sessionIds: readonly string[]): KimiIdentityWitness[] => (
+        [...new Set(sessionIds)].map((sessionId) => ({
+          sessionId,
+          snapshots: (discoveredBySessionId.get(sessionId) ?? []).flatMap((sessionDir) => {
+            const snapshot = snapshots.get(sessionDir);
+            return snapshot === undefined ? [] : [snapshot];
+          }),
+        }))
+      );
+
+      for (const {
+        sessionDir,
+        sessionId,
+        snapshot,
+        sourceLocal,
+        retractSessionIds,
+      } of replayCandidates) {
+        if (!inventoryComplete && !sourceLocal) continue;
+        const state = readState(snapshot.statePath);
         const cwd = typeof state.cwd === 'string' ? state.cwd : typeof state.workDir === 'string' ? state.workDir : null;
+        const identityWitnesses = sourceLocal && retractSessionIds.length === 0
+          ? []
+          : identityWitnessesFor([sessionId, ...retractSessionIds]);
         units.push({
           key: sessionDir,
-          sessionId: namespacedSessionId(basename(sessionDir)),
+          sessionId,
+          ...(retractSessionIds.length === 0 ? {} : { retractSessionIds }),
           project: projectSlugFromPath(cwd) ?? undefined,
           meta: {
             kind: 'session',
-            mode: wireFiles.length === 0 ? 'tombstone' : 'replay',
+            mode: 'replay',
+            ...(identityWitnesses.length === 0 ? {} : { identityWitnesses }),
             ...snapshot,
           } satisfies KimiSessionUnitMeta,
         });
+      }
+      if (inventoryComplete) {
+        for (const { indexed, sessionDir, snapshot } of pendingTombstones) {
+          const identityWitnesses = identityWitnessesFor([indexed.sessionId]);
+          units.push({
+            key: sessionDir,
+            sessionId: indexed.sessionId,
+            retractSessionIds: [indexed.sessionId],
+            meta: {
+              kind: 'session',
+              mode: 'tombstone',
+              identityWitnesses,
+              ...snapshot,
+            } satisfies KimiSessionUnitMeta,
+          });
+        }
       }
       return units;
     },
     *parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
       const meta = unit.meta as KimiSessionUnitMeta;
+      verifyKimiIdentityWitnesses(rootDir, meta.identityWitnesses);
       const before = snapshotKimiSession(meta.sessionDir);
       if (before.currentCursor !== meta.currentCursor) {
         throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
       }
       if (meta.mode === 'tombstone') {
-        yield { kind: 'delete-session', sessionId: unit.sessionId };
         const afterTombstone = snapshotKimiSession(meta.sessionDir);
         if (before.currentCursor !== afterTombstone.currentCursor) {
           throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
         }
+        verifyKimiIdentityWitnesses(rootDir, meta.identityWitnesses);
         return afterTombstone.currentCursor;
       }
       const state = readState(meta.statePath);
@@ -732,6 +952,7 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
       if (before.currentCursor !== after.currentCursor) {
         throw new Error(`Kimi session changed while indexing: ${meta.sessionDir}`);
       }
+      verifyKimiIdentityWitnesses(rootDir, meta.identityWitnesses);
 
       yield { kind: 'delete-session', sessionId: unit.sessionId };
       // Kimi persists a titled session before the first prompt; keep it retracted until user evidence exists.

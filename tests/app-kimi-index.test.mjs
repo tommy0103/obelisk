@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -398,5 +398,170 @@ test('Kimi manifest replay retracts an indexed session directory that is deleted
   const db = new TestDatabase(dbPath);
   assert.equal(db.prepare("SELECT COUNT(*) AS c FROM sessions WHERE source = 'kimi'").get().c, 0);
   assert.equal(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE source = 'kimi'").get().c, 0);
+  db.close();
+});
+
+test('Kimi reconciliation preserves a session moved across workspaces', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-session-move-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const { sessionDir } = writeManifestSession(kimiDir);
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  const movedSessionDir = join(kimiDir, 'sessions', 'a-workspace', 'session-manifest-1');
+  mkdirSync(join(kimiDir, 'sessions', 'a-workspace'), { recursive: true });
+  renameSync(sessionDir, movedSessionDir);
+  const replay = buildIndex(options);
+  assert.deepEqual(replay.affectedSessionIds, ['kimi:session-manifest-1']);
+
+  const db = new TestDatabase(dbPath);
+  assert.deepEqual(
+    { ...db.prepare("SELECT id,jsonl_path FROM sessions WHERE source='kimi'").get() },
+    {
+      id: 'kimi:session-manifest-1',
+      jsonl_path: join(movedSessionDir, 'agents', 'main', 'wire.jsonl'),
+    },
+  );
+  db.close();
+});
+
+test('Kimi reconciliation follows a moved identity from an old-path-only change', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-old-path-move-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const { sessionDir } = writeManifestSession(kimiDir);
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  const movedSessionDir = join(kimiDir, 'sessions', 'a-workspace', 'session-manifest-1');
+  mkdirSync(join(kimiDir, 'sessions', 'a-workspace'), { recursive: true });
+  renameSync(sessionDir, movedSessionDir);
+  const replay = buildIndex({ ...options, changedPaths: [sessionDir] });
+  assert.deepEqual(replay.affectedSessionIds, ['kimi:session-manifest-1']);
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(
+    db.prepare("SELECT jsonl_path FROM sessions WHERE source='kimi'").get().jsonl_path,
+    join(movedSessionDir, 'agents', 'main', 'wire.jsonl'),
+  );
+  db.close();
+});
+
+test('Kimi reconciliation refreshes provenance after a round-trip workspace move', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-round-trip-move-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const { sessionDir } = writeManifestSession(kimiDir);
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  const movedSessionDir = join(kimiDir, 'sessions', 'workspace-2', 'session-manifest-1');
+  mkdirSync(join(kimiDir, 'sessions', 'workspace-2'), { recursive: true });
+  renameSync(sessionDir, movedSessionDir);
+  buildIndex(options);
+  renameSync(movedSessionDir, sessionDir);
+  const replay = buildIndex(options);
+  assert.deepEqual(replay.affectedSessionIds, ['kimi:session-manifest-1']);
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(
+    db.prepare("SELECT jsonl_path FROM sessions WHERE source='kimi'").get().jsonl_path,
+    join(sessionDir, 'agents', 'main', 'wire.jsonl'),
+  );
+  db.close();
+});
+
+test('Kimi changed-path reconciliation preserves sessions when inventory is incomplete', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-incomplete-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const { sessionDir } = writeManifestSession(kimiDir);
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  rmSync(join(kimiDir, 'sessions'), { recursive: true });
+  const incomplete = buildIndex({ ...options, changedPaths: [sessionDir] });
+  assert.equal(incomplete.complete, false);
+  assert.deepEqual(incomplete.incompleteProviders, ['kimi']);
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM sessions WHERE source='kimi'").get().c, 1);
+  db.close();
+});
+
+test('Kimi reconciliation retracts sessions after a workspace-level deletion event', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-workspace-delete-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  writeManifestSession(kimiDir);
+  const workspaceDir = join(kimiDir, 'sessions', 'workspace-1');
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  rmSync(workspaceDir, { recursive: true });
+  const replay = buildIndex({ ...options, changedPaths: [workspaceDir] });
+  assert.deepEqual(replay.affectedSessionIds, ['kimi:session-manifest-1']);
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM sessions WHERE source='kimi'").get().c, 0);
+  db.close();
+});
+
+test('Kimi reconciliation follows identities after a workspace-level rename event', () => {
+  const home = makeTempDir('obelisk-kimi-manifest-workspace-rename-index-');
+  const kimiDir = join(home, '.kimi-code');
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  writeManifestSession(kimiDir);
+  const oldWorkspaceDir = join(kimiDir, 'sessions', 'workspace-1');
+  const newWorkspaceDir = join(kimiDir, 'sessions', 'workspace-2');
+  const options = {
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    providerRoots: { kimi: kimiDir },
+    dbPath,
+    DatabaseImpl: TestDatabase,
+  };
+
+  buildIndex(options);
+  renameSync(oldWorkspaceDir, newWorkspaceDir);
+  const replay = buildIndex({ ...options, changedPaths: [oldWorkspaceDir] });
+  assert.deepEqual(replay.affectedSessionIds, ['kimi:session-manifest-1']);
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(
+    db.prepare("SELECT jsonl_path FROM sessions WHERE source='kimi'").get().jsonl_path,
+    join(newWorkspaceDir, 'session-manifest-1', 'agents', 'main', 'wire.jsonl'),
+  );
   db.close();
 });

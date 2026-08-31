@@ -100,6 +100,23 @@ last wire, is a changed/tombstone unit rather than an unchanged session to skip.
 An enumeration/stat race is reported as incomplete or unstable inventory and is
 retried; it must not publish a cursor for a snapshot the adapter did not prove.
 
+Kimi deletion reconciliation is identity-based, not path-ordered. The
+namespaced native session id remains stable when Kimi moves a session directory
+between workspaces, so discovery first builds a provider-wide identity census
+and then routes work to the current directory. A missing old path never produces
+a tombstone while the same identity is live elsewhere; the current directory is
+replayed instead, updating canonical provenance atomically. Duplicate live
+directories for one identity make the census ambiguous and fail closed.
+
+`changedPaths` is an invalidation/routing hint, not evidence that a missing path
+was intentionally deleted. Discovery-known retractions are emitted through
+`IndexUnit.retractSessionIds` only after the complete identity census proves the
+identity absent. If the sessions root, a workspace, or a required member cannot
+be inventoried, Kimi may still replay source-local readable units, but it must
+withhold tombstones and moved-provenance replacement until a later complete
+census. This preserves the last-good canonical snapshot across unmounts,
+permission failures, and observation races.
+
 Cursor-format versions and canonical-transcript markers have different
 lifecycles. A legacy or unknown Kimi cursor never proves that a unit is
 unchanged, but it also does not throw: it fails closed to replay and is replaced
