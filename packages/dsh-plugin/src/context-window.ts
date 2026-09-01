@@ -35,7 +35,10 @@ export function apply(ctx: Context): void {
       },
     },
     output,
-    async execute() {
+    async execute(args) {
+      if (typeof args.handoff !== 'string' || args.handoff.trim() === '') {
+        throw new TypeError('new_context handoff must be a non-empty prose string')
+      }
       return 'A fresh context will start after this sampling step.'
     },
   }))

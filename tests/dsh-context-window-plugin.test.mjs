@@ -130,3 +130,44 @@ test('applies a successful new_context handoff at the next pre-step', async () =
   assert.ok(replacement)
   assert.equal(replacement.surfaceOp.op, 'replace')
 })
+
+test('does not rollover a failed new_context call', async () => {
+  const adapter = new ScriptedAdapter([
+    toolCallResponse('new-context-empty', 'new_context', { handoff: '   ' }),
+    textResponse('recovered from the tool error'),
+  ])
+  const ctx = await harness(adapter)
+  const agent = ctx.agentLoop.create(SessionId('failed-rollover'), { provider: 'mock', model: 'mock' })
+  const idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'keep this context' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  assert.equal(adapter.requests.length, 2)
+  assert.match(JSON.stringify(adapter.requests[1].messages), /keep this context/)
+  assert.equal(agent.session.snapshotEvents().some(event =>
+    event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff'), false)
+})
+
+test('does not reapply a committed rollover on a later turn', async () => {
+  const adapter = new ScriptedAdapter([
+    toolCallResponse('new-context-once', 'new_context', { handoff: 'Continue once.' }),
+    textResponse('first fresh response'),
+    textResponse('later response'),
+  ])
+  const ctx = await harness(adapter)
+  const agent = ctx.agentLoop.create(SessionId('one-rollover'), { provider: 'mock', model: 'mock' })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'start' }], source: { kind: 'user' } }))
+  await idle
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'later turn' }], source: { kind: 'user' } }))
+  await idle
+
+  const replacements = agent.session.snapshotEvents().filter(event =>
+    event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff')
+  assert.equal(replacements.length, 1)
+})

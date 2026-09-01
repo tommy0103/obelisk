@@ -56,8 +56,7 @@ export async function handlePreStep(
   next: () => Promise<PreStepDecision>,
 ): Promise<PreStepDecision> {
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
-  if (state?.pending !== undefined
-    && !state.appliedRootCallIds.includes(state.pending.rootCallId)) {
+  if (state?.pending !== undefined) {
     await applyExplicitRollover(ctx, agent, state.pending)
   }
   return next()

@@ -17,7 +17,6 @@ export type PendingRollover = z.infer<typeof candidateSchema>
 const stateSchema = z.object({
   calls: z.record(z.string(), candidateSchema),
   pending: candidateSchema.optional(),
-  appliedRootCallIds: z.array(z.string()),
 }).strict()
 
 export type ContextWindowState = z.infer<typeof stateSchema>
@@ -44,7 +43,7 @@ export const contextWindowProjectionDefinition = {
   key: 'obeliskContextWindow',
   stateVersion: 1,
   stateSchema,
-  init: (): ContextWindowState => ({ calls: {}, appliedRootCallIds: [] }),
+  init: (): ContextWindowState => ({ calls: {} }),
   apply: (state, event): ContextWindowState => {
     if (event.type === 'tool/call' && event.data.name === 'new_context') {
       const handoff = handoffFrom(event.data.arguments)
@@ -78,7 +77,6 @@ export const contextWindowProjectionDefinition = {
       delete calls[rootCallId]
       return {
         calls,
-        appliedRootCallIds: [...state.appliedRootCallIds, rootCallId],
       }
     }
     return state
