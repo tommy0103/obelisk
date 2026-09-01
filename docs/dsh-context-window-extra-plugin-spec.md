@@ -1,6 +1,6 @@
 # Obelisk DSH Context Window Extra Plugin 规格说明
 
-**状态：** 待评审草案
+**状态：** 已实现，待评审
 
 **日期：** 2026-09-02
 
@@ -576,7 +576,6 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 1. PTC calls 是否只使用 prompt discipline，还是 extra plugin 应在成功 `new_context` dispatch 后拒绝所有后续 nested tool calls？
 2. 缺少 Obelisk skill contribution 时，extra plugin 是否应在 load 阶段失败？还是只要 CLI 和 model guidance 可用即可？
 3. 当前 DSH persistence checkpoint policy 是否足以证明上述 crash cases，还是实现前需要增加一个 focused persistence fixture？
-4. hard-limit forced rollover 的 anchor 应统一选择最后一个 assistant message，还是优先选择最后一个 assistant `tool_use` message？
 
 ## 18. 验收标准
 
