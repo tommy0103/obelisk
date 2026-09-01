@@ -3,11 +3,14 @@
 
 import { mock, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { pathToFileURL } from 'node:url'
 
 import { Context } from '@deepseek-ai/cordis'
+import Include from '@deepseek-ai/cordis-plugin-include'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import CodeRuntime from '@deepseek-ai/dsh-code-runtime'
@@ -173,6 +176,58 @@ test('loads the built context-window package subpath', async () => {
   const built = await import(`../packages/dsh-plugin/dist/context-window.js?test=${Date.now()}`)
   assert.equal(built.name, '@obelisk/dsh-obelisk-plugin/context-window')
   assert.equal(typeof built.apply, 'function')
+})
+
+test('loads the built extra plugin through a real Cordis YAML composition', async () => {
+  const root = makeTempDir('obelisk-context-loader-')
+  const configPath = resolve(root, 'cordis.yml')
+  writeFileSync(configPath, [
+    "- name: '@deepseek-ai/dsh-llm'",
+    "- name: '@deepseek-ai/dsh-session'",
+    "- name: '@deepseek-ai/dsh-session-projection'",
+    "- name: '@deepseek-ai/dsh-token-meter'",
+    "- name: '@deepseek-ai/dsh-system-prompt'",
+    "- name: '@deepseek-ai/dsh-tools'",
+    "- name: '@obelisk/dsh-obelisk-plugin/context-window'",
+    '  config:',
+    '    reminderThresholdTokens: 100',
+    '    fallbackReserveTokens: 200',
+    '    outputReserveTokens: 100',
+    '',
+  ].join('\n'))
+  const built = await import(`../packages/dsh-plugin/dist/context-window.js?loader=${Date.now()}`)
+  const ctx = new Context()
+  ctx.baseUrl = `${pathToFileURL(root).href}/`
+  await ctx.plugin(Loader)
+  ctx.loader.builtins.include = Include
+  const modules = new Map([
+    ['@deepseek-ai/dsh-llm', LlmRuntime],
+    ['@deepseek-ai/dsh-session', SessionStore],
+    ['@deepseek-ai/dsh-session-projection', SessionProjectionRegistry],
+    ['@deepseek-ai/dsh-token-meter', TokenMeter],
+    ['@deepseek-ai/dsh-system-prompt', SystemPrompt],
+    ['@deepseek-ai/dsh-tools', ToolRuntime],
+    ['@obelisk/dsh-obelisk-plugin/context-window', built],
+  ])
+  ctx.loader.internal = {
+    version: 'v2',
+    async import(specifier) {
+      if (!modules.has(specifier)) throw new Error(`unexpected Loader import: ${specifier}`)
+      return modules.get(specifier)
+    },
+  }
+  await ctx.loader.create({
+    name: 'cordis:include',
+    config: { path: pathToFileURL(configPath).href },
+  })
+  await ctx.loader.await()
+
+  const unloaded = [...ctx.loader.entries()]
+    .filter(entry => entry.fiber === undefined && !entry.disabled)
+    .map(entry => entry.options.name)
+  assert.deepEqual(unloaded, [])
+  assert.ok(ctx.tools.get('new_context'))
+  await ctx.fiber.dispose()
 })
 
 test('rejects a competing automatic compaction policy', () => {
