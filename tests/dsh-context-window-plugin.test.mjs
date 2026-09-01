@@ -34,11 +34,11 @@ import { persist } from '../packages/core/src/persist.ts'
 import { createQueryApi } from '../packages/core/src/query.ts'
 import { makeTempDir } from './temp-dirs.mjs'
 
-const ContextWindowPlugin = await import('../packages/dsh-plugin/src/context-window.ts')
-const { decideContextWindowBudget } = await import('../packages/dsh-plugin/src/context-window-budget.ts')
-const { contextWindowProjectionDefinition } = await import('../packages/dsh-plugin/src/context-window-state.ts')
-const { recoveryAnchors } = await import('../packages/dsh-plugin/src/context-window-identity.ts')
-const identity = await import('../packages/dsh-plugin/src/deepseek-identity.ts')
+const ContextWindowPlugin = await import('../packages/dsh-plugin/dist/context-window.js')
+const { decideContextWindowBudget } = await import('../packages/dsh-plugin/dist/context-window-budget.js')
+const { contextWindowProjectionDefinition } = await import('../packages/dsh-plugin/dist/context-window-state.js')
+const { recoveryAnchors } = await import('../packages/dsh-plugin/dist/context-window-identity.js')
+const identity = await import('../packages/dsh-plugin/dist/deepseek-identity.js')
 const coreIdentity = await import('../packages/core/src/providers/deepseek-identity.ts')
 const {
   canonicalDeepseekMemberAssistantMessageUuid,

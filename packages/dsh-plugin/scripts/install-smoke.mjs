@@ -33,6 +33,10 @@ try {
   if (manifest.dependencies?.['@obelisk/core'] !== undefined) {
     throw new Error('distributable DSH plugin must not depend on private @obelisk/core')
   }
+  const identityAdapter = readFileSync(join(pluginRoot, 'dist', 'context-window-identity.js'), 'utf8')
+  if (identityAdapter.includes('@obelisk/core')) {
+    throw new Error('packed context-window identity must resolve to the vendored shared implementation')
+  }
 
   const npmProject = join(root, 'npm-project')
   const pnpmProject = join(root, 'pnpm-project')

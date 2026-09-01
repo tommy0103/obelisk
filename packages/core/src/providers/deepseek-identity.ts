@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { createHash } from 'node:crypto'
-
-import { normalizeObservedCwd } from '../parsing.ts'
+import { isAbsolute, normalize } from 'node:path'
 
 export type DeepseekAssistantMessageKind = 'reasoning' | 'text' | 'tool_use'
+
+function normalizeObservedCwd(cwd: unknown): string | null {
+  if (typeof cwd !== 'string' || !cwd.trim() || !isAbsolute(cwd)) return null
+  return normalize(cwd)
+}
 
 /** Return the deterministic project discriminator used by every DeepSeek identity. */
 export function deepseekProjectScope(cwd: unknown): string {
