@@ -61,6 +61,11 @@ import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 
 import { filePath, normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../vendor/dsh-zstd.ts';
+import {
+  canonicalDeepseekAssistantMessageUuid,
+  canonicalDeepseekTreeSessionId,
+  deepseekProjectScope,
+} from './deepseek-identity.ts';
 
 import type {
   Cursor,
@@ -108,17 +113,16 @@ interface LogRecord {
  * two projects reusing the same raw session id cannot overwrite each other.
  */
 function projectScope(cwd: unknown): string {
-  const normalized = normalizeObservedCwd(cwd) ?? (typeof cwd === 'string' ? cwd : '');
-  return createHash('sha256').update('deepseek-cwd-v1\0').update(normalized).digest('hex');
+  return deepseekProjectScope(cwd);
 }
 
 /** Database identity for one raw session id inside one project scope. */
 function dshDbId(scope: string, rawId: string): string {
-  return `deepseek:${encodeURIComponent(rawId)}:${scope}`;
+  return canonicalDeepseekTreeSessionId(rawId, scope);
 }
 
 function assistantMessageUuid(dbId: string, turn: unknown, step: unknown, kind: 'reasoning' | 'text' | 'tool_use'): string {
-  return `${dbId}:t${turn}:s${step}:${kind}`;
+  return canonicalDeepseekAssistantMessageUuid(dbId, turn, step, kind);
 }
 
 function toolUseUuid(dbId: string, turn: unknown, step: unknown): string {
