@@ -4,7 +4,7 @@ Optional Obelisk skill provider for DeepSeek Harness (DSH). The plugin owns and
 bundles its [DSH-facing `obelisk` skill](https://github.com/tommy0103/obelisk/blob/main/packages/dsh-plugin/skill/SKILL.md),
 then contributes it to DSH's standard skill registry.
 
-The integration intentionally adds no dedicated model tool, system-prompt
+The default integration intentionally adds no dedicated model tool, system-prompt
 section, frontend tool card, or DSH source change. Once the model loads the
 skill through DSH's existing `skill` tool, it follows the same
 `obelisk --query ...` Bash workflow used in every other supported agent
@@ -44,8 +44,40 @@ dsh --profile web --dump-config
 dsh --profile web
 ```
 
-The row is opt-in; without it, DSH behaves exactly as before. The plugin has no
-configuration or settings page.
+The default row is opt-in; without it, DSH behaves exactly as before. The root
+plugin has no configuration or settings page.
+
+## Optional context-window rollover
+
+The package also exports a separate context-window plugin. It is not part of
+`obelisk.cordis.yml` and is never mounted by the normal installation above.
+Add another profile row only for an agent composition that should receive
+prose handoffs, pressure reminders, and safe active-context rollover:
+
+```yaml
+- insert:
+    - id: obelisk-context-window
+      name: '@obelisk/dsh-obelisk-plugin/context-window'
+```
+
+That composition must disable `compaction-basic.auto`; manual `/compact` may
+remain available. The extra plugin derives its default reminder, fallback, and
+output reserves from the effective model `maxTokens`. A profile can override
+any reserve explicitly:
+
+```yaml
+- insert:
+    - id: obelisk-context-window
+      name: '@obelisk/dsh-obelisk-plugin/context-window'
+      config:
+        reminderThresholdTokens: 8192
+        fallbackReserveTokens: 8192
+        outputReserveTokens: 8192
+```
+
+The extra plugin never changes Obelisk's schema. After rollover it retains a
+prose handoff plus the canonical Obelisk `session_id` and `message_uuid` needed
+to recover older evidence through the bundled skill.
 
 ## Uninstall
 
@@ -105,4 +137,5 @@ npm ci
 npm run typecheck --workspace @obelisk/dsh-obelisk-plugin
 npm run build --workspace @obelisk/dsh-obelisk-plugin
 node --experimental-test-module-mocks --test tests/dsh-plugin.test.mjs
+node --experimental-test-module-mocks --test tests/dsh-context-window-plugin.test.mjs
 ```

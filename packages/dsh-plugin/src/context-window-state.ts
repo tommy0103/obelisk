@@ -16,6 +16,7 @@ const candidateSchema = z.object({
 export type PendingRollover = z.infer<typeof candidateSchema>
 
 const stateSchema = z.object({
+  generation: z.number().int().nonnegative(),
   calls: z.record(z.string(), candidateSchema),
   rootCalls: z.record(z.string(), z.object({
     turn: z.number().int().nonnegative(),
@@ -24,6 +25,8 @@ const stateSchema = z.object({
   ptcCalls: z.record(z.string(), candidateSchema),
   ptcSettled: z.record(z.string(), candidateSchema),
   pending: candidateSchema.optional(),
+  reminderClaimed: z.boolean(),
+  fallbackClaimed: z.boolean(),
 }).strict()
 
 export type ContextWindowState = z.infer<typeof stateSchema>
@@ -55,9 +58,17 @@ function resultFailed(event: SessionEvent<'tool/result'>): boolean {
 /** Fold existing native tool facts and committed handoff sources into rollover state. */
 export const contextWindowProjectionDefinition = {
   key: 'obeliskContextWindow',
-  stateVersion: 1,
+  stateVersion: 2,
   stateSchema,
-  init: (): ContextWindowState => ({ calls: {}, rootCalls: {}, ptcCalls: {}, ptcSettled: {} }),
+  init: (): ContextWindowState => ({
+    generation: 0,
+    calls: {},
+    rootCalls: {},
+    ptcCalls: {},
+    ptcSettled: {},
+    reminderClaimed: false,
+    fallbackClaimed: false,
+  }),
   apply: (state, event): ContextWindowState => {
     if (event.type === 'tool/call') {
       const rootCalls = {
@@ -126,16 +137,26 @@ export const contextWindowProjectionDefinition = {
         ? { ...state, calls, rootCalls, ptcSettled }
         : { ...state, calls, rootCalls, ptcSettled, pending: accepted }
     }
+    if (event.type === 'user/message' && event.data.source.kind === 'obelisk-context-pressure') {
+      return event.data.source.phase === 'reminder'
+        ? { ...state, reminderClaimed: true }
+        : { ...state, fallbackClaimed: true }
+    }
     if (event.type === 'user/message'
       && event.data.source.kind === 'obelisk-context-handoff') {
-      const rootCallId = event.data.source.rootCallId
+      const rootCallId = event.data.source.trigger.kind === 'model'
+        ? event.data.source.trigger.rootCallId
+        : undefined
       const calls = { ...state.calls }
-      delete calls[rootCallId]
+      if (rootCallId !== undefined) delete calls[rootCallId]
       return {
+        generation: state.generation + 1,
         calls,
         rootCalls: {},
         ptcCalls: {},
         ptcSettled: {},
+        reminderClaimed: false,
+        fallbackClaimed: false,
       }
     }
     return state

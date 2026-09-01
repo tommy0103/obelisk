@@ -30,7 +30,7 @@ jobs:
       - name: Verify DSH plugin package
         run: |
           npm run build --workspace @obelisk/dsh-obelisk-plugin
-          node --experimental-test-module-mocks --test tests/dsh-plugin.test.mjs
+          node --experimental-test-module-mocks --test tests/dsh-plugin.test.mjs tests/dsh-context-window-plugin.test.mjs
 
       - name: Verify Electron main schema asset
         env:

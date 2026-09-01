@@ -94,6 +94,15 @@ historical evidence. Resolution is newest-wins over recent matches; only a
 near-simultaneous same-nonce collision (or no match at all) leaves nothing
 marked and `current.session_id` null — identity is honestly unknown.
 
+## Context-Window Handoffs
+
+When the current context begins with an Obelisk rollover handoff, read that
+handoff before searching. Treat its `session_id` as the default scope for
+recovering this task: pass it as `sessionId` to `search()` or other helpers.
+When you need evidence around the end of the previous context, call
+`context()` with the supplied `message_uuid`. Expand to global or cross-session
+search only when the task actually needs evidence outside that session.
+
 ## Default First Pass
 
 Start with helpers, not raw SQL. For the first Obelisk query in a task, normally

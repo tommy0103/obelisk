@@ -193,6 +193,47 @@ test('discovers one unit per root session tree and skips an unchanged tree', () 
   assert.deepEqual(again, []);
 });
 
+test('seeded child indexes only events after its inherited prefix', () => {
+  const dir = makeTempDir('obelisk-seeded-child-');
+  const sessionsDir = join(dir, 'sessions');
+  const projectDir = join(sessionsDir, '--tmp-dsh-project--');
+  const rootDir = join(projectDir, 'seed-root');
+  const childDir = join(projectDir, 'seed-child');
+  mkdirSync(rootDir, { recursive: true });
+  mkdirSync(childDir, { recursive: true });
+  const rootHeader = {
+    type: 'session', version: 0, id: 'seed-root', createdAt: 1753005600000,
+    cwd: '/tmp/dsh-project', delegationDepth: 0,
+  };
+  const inherited = [
+    { type: 'request/header', seq: 0, time: 1753005600100, data: { header: { config: { provider: 'mock', model: 'mock' } }, reason: 'initial' } },
+    { type: 'user/message', seq: 1, time: 1753005600200, data: { content: [{ type: 'text', text: 'parent inherited request' }], source: { kind: 'user' }, role: 'user', id: 'parent-message' } },
+  ];
+  const childHeader = {
+    type: 'session', version: 0, id: 'seed-child', createdAt: 1753005600300,
+    cwd: '/tmp/dsh-project', parentSession: 'seed-root', isSeeded: true,
+    seedLength: inherited.length, origin: 'subagent', delegationDepth: 1,
+  };
+  const childOwn = [
+    { type: 'session/end-seed', seq: 2, time: 1753005600300, data: {} },
+    { type: 'user/message', seq: 3, time: 1753005600400, data: { content: [{ type: 'text', text: 'child-owned request' }], source: { kind: 'user' }, role: 'user', id: 'child-message' } },
+    { type: 'assistant/message', seq: 4, time: 1753005600500, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'child-owned response' }], source: { kind: 'model', provider: 'mock', model: 'mock' }, id: 'child-response' } } },
+  ];
+  writeFileSync(join(rootDir, 'session.jsonl'), [rootHeader, ...inherited].map(value => JSON.stringify(value)).join('\n') + '\n');
+  writeFileSync(join(childDir, 'session.jsonl'), [childHeader, ...inherited, ...childOwn].map(value => JSON.stringify(value)).join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  assert.ok(unit);
+  const values = drain(provider.parse(unit, null)).values;
+  const childMessages = values.filter(value => value.kind === 'message' && value.agent_id !== null);
+  assert.deepEqual(childMessages.map(message => message.text).filter(Boolean), [
+    'child-owned request',
+    'child-owned response',
+  ]);
+  assert.equal(childMessages.some(message => message.text === 'parent inherited request'), false);
+});
+
 test('projects a whole tree into canonical records with correct linkage', () => {
   const dir = makeTempDir('obelisk-tree-proj-');
   const provider = createDeepseekProvider({ rootDir: writeTree(dir) });

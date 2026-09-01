@@ -79,7 +79,7 @@ import type {
 } from './types.ts';
 
 export const name = 'deepseek';
-const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v2__';
+const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v3__';
 
 const SESSION_FILENAMES = ['.jsonl.zstd', '.jsonl'];
 const SUBAGENT_RESULT_RE = /started\s+subagent\s+(\S+)/;
@@ -92,6 +92,7 @@ interface DshHeader {
   parentSession?: unknown;
   origin?: unknown;
   delegationDepth?: unknown;
+  seedLength?: unknown;
 }
 
 interface SessionFile {
@@ -804,7 +805,7 @@ function sha256(text: string | Buffer): string {
 function headerHashOf(header: DshHeader): string {
   return sha256(JSON.stringify([
     header.id ?? null, header.createdAt ?? null, normalizeObservedCwd(header.cwd) ?? null,
-    header.parentSession ?? null, header.version ?? null,
+    header.parentSession ?? null, header.version ?? null, header.seedLength ?? null,
   ]));
 }
 
@@ -1001,7 +1002,14 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     const isSubagent = member.isSubagent;
     const cwd = typeof header.cwd === 'string' ? header.cwd : null;
     const fromCount = fast ? prior!.members[member.path]!.count : 0;
-    const records = readLogRecords(memberText(snap, fromCount));
+    const inheritedEventCount = isSubagent
+      && typeof header.seedLength === 'number'
+      && Number.isSafeInteger(header.seedLength)
+      && header.seedLength >= 0
+      ? header.seedLength
+      : 0;
+    const records = readLogRecords(memberText(snap, fromCount))
+      .filter(record => record.seq >= inheritedEventCount);
 
     // Steps whose assistant/message is inside this window emit their own
     // canonical tool_use anchor; a durable tool/call for such a step must not

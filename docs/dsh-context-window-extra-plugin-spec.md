@@ -341,10 +341,11 @@ listener 先决定本次是否存在 rollover trigger：
 4. 确认当前 session 中尚不存在引用同一 root call 的 handoff replacement。
 5. 读取 `session.surface.nodes`；所有节点均为 `SessionSeq`。
 6. 使用 recovery anchors 和原样 prose 构造 handoff message。
-7. 追加一个 `user/message`，以 `surfaceOp: { op: 'replace', start, end }` 替换完整 active surface。
-8. 在 `sourceEventSeqs: SessionSeq[]` 中包含所有被 shadow 的 surface nodes。
-9. flush session；flush 成功前不得 dispatch 下一次 model request。
-10. 调用 `next()`，并保留 downstream `PreStepDecision` 的全部字段。
+7. 使用 token meter 对同一组 surface nodes 的 fixed-heuristic token price 求和，并先追加 DSH 现有的 `compaction/prune` shadow-price 记录。该记录只负责让 token projection 正确扣除被替换内容，不表示 rollover intent 或 commit。
+8. 紧接着追加一个 `user/message`，以 `surfaceOp: { op: 'replace', start, end }` 替换完整 active surface。
+9. 在 `sourceEventSeqs: SessionSeq[]` 中包含所有被 shadow 的 surface nodes。
+10. flush session；flush 成功前不得 dispatch 下一次 model request。
+11. 调用 `next()`，并保留 downstream `PreStepDecision` 的全部字段。
 
 对 `hard-limit` trigger，listener 执行同一个私有 surface-replacement 操作，但使用 host 生成的降级 handoff：
 
@@ -377,6 +378,8 @@ DSH 的 `MessageSourceMap` 支持 declaration merging。该 source 既是 handof
 
 本设计只有一个私有 surface-replacement implementation，不增加公共 rollover commit interface，也不增加 opening/closing transaction events。
 
+`compaction/prune` 必须与 replacement 相邻。实现需要在追加它之前完成 message、surface range、token measurement 和 identity 的全部可失败校验，沿用 DSH compaction 已有的 shadow-price plan/commit 约束；不得留下会被后续无关 replacement 消费的悬空计价记录。
+
 DSH 当前在 `agent/pre-step` 之前已经完成 system prompt assembly。因此 rollover listener 不维护 window-specific dynamic system prompt。稳定 guidance 在 rollover 前后不变；新的 recovery identifiers 通过 replacement message 进入新 context。
 
 ## 11. Active History 与 Durable History
@@ -403,6 +406,8 @@ interface ContextWindowBudgetPolicy {
   outputReserveTokens: number
 }
 ```
+
+第一版的配置归属为 context-window extra plugin row。三个字段都允许显式覆盖；未覆盖时，分别使用当前 request 的 effective `maxTokens`，因此 reserve 随 adapter/model 的实际输出上限变化，而不是复制 Codex 的固定数值。若 adapter 和 agent 都没有提供 effective `maxTokens`，并且 plugin row 也没有显式提供 `outputReserveTokens`，pressure policy 必须给出可操作的配置错误，不能静默失效。
 
 host 使用 DSH 的有效 token measurement 和当前模型 context capacity 计算剩余预算。模型不得自报 token usage。
 
@@ -568,12 +573,10 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 
 ## 17. 待确认问题
 
-1. DeepSeek model-specific reminder threshold 和 reserve size 应由哪一层配置拥有？
-2. 第一批支持的 DeepSeek models 分别采用什么 reminder、fallback reserve 和 output reserve 数值？
-3. PTC calls 是否只使用 prompt discipline，还是 extra plugin 应在成功 `new_context` dispatch 后拒绝所有后续 nested tool calls？
-4. 缺少 Obelisk skill contribution 时，extra plugin 是否应在 load 阶段失败？还是只要 CLI 和 model guidance 可用即可？
-5. 当前 DSH persistence checkpoint policy 是否足以证明上述 crash cases，还是实现前需要增加一个 focused persistence fixture？
-6. hard-limit forced rollover 的 anchor 应统一选择最后一个 assistant message，还是优先选择最后一个 assistant `tool_use` message？
+1. PTC calls 是否只使用 prompt discipline，还是 extra plugin 应在成功 `new_context` dispatch 后拒绝所有后续 nested tool calls？
+2. 缺少 Obelisk skill contribution 时，extra plugin 是否应在 load 阶段失败？还是只要 CLI 和 model guidance 可用即可？
+3. 当前 DSH persistence checkpoint policy 是否足以证明上述 crash cases，还是实现前需要增加一个 focused persistence fixture？
+4. hard-limit forced rollover 的 anchor 应统一选择最后一个 assistant message，还是优先选择最后一个 assistant `tool_use` message？
 
 ## 18. 验收标准
 
