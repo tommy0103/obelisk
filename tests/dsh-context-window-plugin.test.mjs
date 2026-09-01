@@ -17,7 +17,13 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 
-const identity = await import('../packages/core/src/providers/deepseek-identity.ts')
+const identityModule = await import('../packages/core/src/providers/deepseek-identity.ts')
+const identity = {
+  canonicalDeepseekAssistantMessageUuid: identityModule.canonicalDeepseekAssistantMessageUuid,
+  canonicalDeepseekMemberAssistantMessageUuid: identityModule.canonicalDeepseekMemberAssistantMessageUuid,
+  canonicalDeepseekTreeSessionId: identityModule.canonicalDeepseekTreeSessionId,
+  deepseekProjectScope: identityModule.deepseekProjectScope,
+}
 mock.module('@obelisk/core/providers/deepseek-identity', { exports: identity })
 
 const ContextWindowPlugin = await import('../packages/dsh-plugin/src/context-window.ts')
