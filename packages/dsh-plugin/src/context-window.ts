@@ -6,7 +6,6 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
 import type { EpochHeader } from '@deepseek-ai/dsh-session'
 import {
-  renderContextSnapshot,
   renderPrompt,
   type PromptAssembly,
 } from '@deepseek-ai/dsh-system-prompt'
@@ -22,6 +21,7 @@ import { recoverySessionId } from './context-window-identity.ts'
 import { CONTEXT_WINDOW_GUIDANCE } from './context-window-prompt.ts'
 import {
   applyForcedRollover,
+  ensureRolloverFlushed,
   handlePreStep,
   queueForcedRolloverStep,
 } from './context-window-rollover.ts'
@@ -235,10 +235,6 @@ async function assemblyBudgetPlan(
   assembly: PromptAssembly,
   signal?: AbortSignal,
 ): Promise<AssemblyBudgetPlan> {
-  const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
-  if (state?.pending !== undefined) {
-    return { decide: () => ({ kind: 'rollover', reason: 'model' }) }
-  }
   const previous = agent.session.requestHeader()?.config
   const provider = assembly.variables.provider ?? agent.options.provider ?? previous?.provider
   const model = assembly.variables.model ?? agent.options.model ?? previous?.model
@@ -333,35 +329,61 @@ export function apply(ctx: Context, config: unknown = {}): void {
     }
     return 'The context-window fallback reserve only permits new_context.'
   })
-  ctx.on('agent/pre-step', ({ agent, messages, signal }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
     assertCompatibleCompaction(ctx)
+    await ensureRolloverFlushed(ctx, agent, signal)
     const captured = assemblies.get(agent)
-    const runtimeContext = captured === undefined ? '' : renderContextSnapshot(captured.assembly)
-    const pendingMessages = runtimeContext === ''
-      ? messages
-      : [...messages, createUserMessage({
-          content: [{ type: 'text', text: runtimeContext }],
-          source: { kind: 'user' },
-        })]
-    const decision = captured === undefined
-      ? budgetDecision(ctx, agent, config, pendingMessageTokens(ctx, pendingMessages))
-      : captured.budgetPlan.decide(pendingMessageTokens(
-          ctx,
-          pendingMessages,
-          captured.budgetPlan.requestHeader,
-        ))
-    if (captured !== undefined) {
+    const decide = (additionalTokens = 0): ContextWindowBudgetDecision | undefined => (
+      captured === undefined
+        ? budgetDecision(ctx, agent, config, additionalTokens)
+        : captured.budgetPlan.decide(additionalTokens)
+    )
+    let decision = decide()
+    const applySchemas = (): void => {
+      if (captured === undefined) return
       captured.decision = decision
       captured.assembly.tools = decision?.kind === 'fallback'
         ? fallbackAssembly(ctx, { ...captured.assembly, tools: captured.fullTools }, agent).tools
         : [...captured.fullTools]
     }
+    const knownRollover = decision?.kind === 'rollover'
+    if (knownRollover) applySchemas()
+    let resolved = knownRollover
+      ? await handlePreStep(ctx, agent, signal, decision, next)
+      : await next()
+    if (resolved.kind === 'reject') return resolved
+
+    const pendingTokens = pendingMessageTokens(
+      ctx,
+      resolved.messages,
+      captured?.budgetPlan.requestHeader,
+    )
+    decision = decide(pendingTokens)
+    if (decision?.kind === 'rollover' && !knownRollover) {
+      applySchemas()
+      resolved = await handlePreStep(
+        ctx,
+        agent,
+        signal,
+        decision,
+        () => Promise.resolve(resolved),
+      )
+      decision = decide(pendingTokens)
+    }
+    if (decision?.kind === 'rollover' && decision.reason === 'hard-limit') {
+      for (const message of messages) agent.inject(message)
+      throw new Error(
+        'context-window: pending input exceeds the fresh context capacity; '
+        + 'the input was preserved for retry with a larger model or smaller request',
+      )
+    }
+    applySchemas()
     return handlePreStep(
       ctx,
       agent,
       signal,
       decision,
-      next,
+      () => Promise.resolve(resolved),
     )
   }, { prepend: true })
   ctx.on('agent/request-error', async ({ agent, signal }, next) => {

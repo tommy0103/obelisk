@@ -426,8 +426,8 @@ test('prices retained images with the model selected for this assembly', async (
 
 test('includes newly claimed input in the pre-step pressure decision', async () => {
   const adapter = new ScriptedAdapter([
-    textResponse('response before oversized input', { inputTokens: 20, outputTokens: 1 }),
-    textResponse('continued with oversized input on the fresh surface'),
+    textResponse(`response before rollover ${'y'.repeat(400)}`, { inputTokens: 20, outputTokens: 1 }),
+    textResponse('continued with pending input on the fresh surface'),
   ], { contextWindow: 1_000, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, {
     reminderThresholdTokens: 100,
@@ -437,22 +437,97 @@ test('includes newly claimed input in the pre-step pressure decision', async () 
   const agent = ctx.agentLoop.create(SessionId('pending-input-session'), { provider: 'mock', model: 'mock' })
   let idle = waitForIdle(ctx, agent)
   agent.followup(createUserMessage({
-    content: [{ type: 'text', text: 'old surface sentinel' }],
+    content: [{ type: 'text', text: `old surface sentinel ${'x'.repeat(1_600)}` }],
     source: { kind: 'user' },
   }))
   await idle
 
   idle = waitForIdle(ctx, agent)
   agent.followup(createUserMessage({
-    content: [{ type: 'text', text: `oversized next input ${'x'.repeat(4_000)}` }],
+    content: [{ type: 'text', text: `fit after rollover ${'z'.repeat(600)}` }],
     source: { kind: 'user' },
   }))
   await idle
 
   const request = JSON.stringify(adapter.requests[1].messages)
   assert.match(request, /No prose handoff was produced/)
-  assert.match(request, /oversized next input/)
+  assert.match(request, /fit after rollover/)
   assert.doesNotMatch(request, /old surface sentinel/)
+})
+
+test('preserves pending input instead of dispatching when it cannot fit a fresh context', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse('response before impossible input', { inputTokens: 20, outputTokens: 1 }),
+  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('impossible-input-session'), { provider: 'mock', model: 'mock' })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'establish prior assistant' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  const impossible = createUserMessage({
+    content: [{ type: 'text', text: `cannot fit fresh context ${'x'.repeat(4_000)}` }],
+    source: { kind: 'user' },
+  })
+  idle = waitForIdle(ctx, agent)
+  agent.followup(impossible)
+  await idle
+
+  assert.equal(adapter.requests.length, 1)
+  assert.equal(agent.inbox.nextStep.length, 1)
+  assert.equal(agent.inbox.nextStep[0].id, impossible.id)
+})
+
+test('measures the final messages produced by downstream pre-step listeners', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse(`response before downstream context ${'y'.repeat(400)}`, { inputTokens: 20, outputTokens: 1 }),
+    textResponse('continued with downstream context on the fresh surface'),
+  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('downstream-input-session'), { provider: 'mock', model: 'mock' })
+  let addDownstreamContext = false
+  agent.ctx.on('agent/pre-step', async (_payload, next) => {
+    const decision = await next()
+    if (!addDownstreamContext || decision.kind === 'reject') return decision
+    return {
+      ...decision,
+      messages: [...decision.messages, createUserMessage({
+        content: [{ type: 'text', text: `downstream runtime context ${'z'.repeat(600)}` }],
+        source: { kind: 'plugin', plugin: 'test', form: 'instructions' },
+      })],
+    }
+  })
+
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: `old downstream surface ${'x'.repeat(1_600)}` }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  addDownstreamContext = true
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'continue with downstream context' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  const request = JSON.stringify(adapter.requests[1].messages)
+  assert.match(request, /No prose handoff was produced/)
+  assert.match(request, /downstream runtime context/)
+  assert.doesNotMatch(request, /old downstream surface/)
 })
 
 test('replaces pending image structure cost with route pricing', async () => {

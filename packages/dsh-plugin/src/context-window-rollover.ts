@@ -24,6 +24,18 @@ export type ContextRolloverTrigger =
 
 const unflushedRollovers = new WeakSet<Session>()
 
+/** Retry a previously failed rollover flush before any later request work runs. */
+export async function ensureRolloverFlushed(
+  ctx: Context,
+  agent: Agent,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted()
+  if (!unflushedRollovers.has(agent.session)) return
+  await ctx.sessions.flush(agent.session)
+  unflushedRollovers.delete(agent.session)
+}
+
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'obelisk-context-pressure': {
@@ -180,11 +192,7 @@ export async function handlePreStep(
   budget: ContextWindowBudgetDecision | undefined,
   next: () => Promise<PreStepDecision>,
 ): Promise<PreStepDecision> {
-  signal.throwIfAborted()
-  if (unflushedRollovers.has(agent.session)) {
-    await ctx.sessions.flush(agent.session)
-    unflushedRollovers.delete(agent.session)
-  }
+  await ensureRolloverFlushed(ctx, agent, signal)
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
   if (state?.pending !== undefined) {
     await applyExplicitRollover(ctx, agent, state.pending, signal)
