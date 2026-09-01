@@ -24,7 +24,10 @@ const identity = {
   canonicalDeepseekTreeSessionId: identityModule.canonicalDeepseekTreeSessionId,
   deepseekProjectScope: identityModule.deepseekProjectScope,
 }
-mock.module('@obelisk/core/providers/deepseek-identity', { exports: identity })
+const identityMockOptions = Number(process.versions.node.split('.')[0]) >= 24
+  ? { exports: identity }
+  : { namedExports: identity }
+mock.module('@obelisk/core/providers/deepseek-identity', identityMockOptions)
 
 const ContextWindowPlugin = await import('../packages/dsh-plugin/src/context-window.ts')
 const { decideContextWindowBudget } = await import('../packages/dsh-plugin/src/context-window-budget.ts')
