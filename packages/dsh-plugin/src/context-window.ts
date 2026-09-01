@@ -51,6 +51,8 @@ type RequestImage = Parameters<
   NonNullable<ReturnType<Context['llm']['imageRequestPricing']>>['priceImages']
 >[0][number]
 
+const unflushedPreStepRecovery = new WeakSet<Agent['session']>()
+
 const output = {
   schema: { type: 'string' as const },
   render: (_args: unknown, value: string) => [{ type: 'text' as const, text: value }],
@@ -404,10 +406,17 @@ export function apply(ctx: Context, config: unknown = {}): void {
         agent.session.append('user/message', message, { surfaceOp: 'append' })
         appended = true
       }
-      if (appended) await ctx.sessions.flush(agent.session)
+      if (!appended) return
+      unflushedPreStepRecovery.add(agent.session)
+      await ctx.sessions.flush(agent.session)
+      unflushedPreStepRecovery.delete(agent.session)
     }
 
     try {
+      if (unflushedPreStepRecovery.has(agent.session)) {
+        await ctx.sessions.flush(agent.session)
+        unflushedPreStepRecovery.delete(agent.session)
+      }
       await ensureRolloverFlushed(ctx, agent, signal)
       const claimedTokens = pendingMessageTokens(
         ctx,

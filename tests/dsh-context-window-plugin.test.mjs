@@ -510,6 +510,39 @@ test('preserves downstream messages when a late rollover cannot proceed', async 
   assert.ok(durableIds.has(downstream.id))
 })
 
+test('retries a failed recovery-message flush before later pre-step work', async () => {
+  const adapter = new ScriptedAdapter([], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('recovery-flush-retry'), { provider: 'mock', model: 'mock' })
+  let flushAttempts = 0
+  ctx.on('session/flush', session => {
+    if (session !== agent.session) return
+    flushAttempts += 1
+    if (flushAttempts === 1) throw new Error('simulated recovery persistence failure')
+  })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: `cannot fit or flush ${'x'.repeat(4_000)}` }],
+    source: { kind: 'user' },
+  }))
+  await idle
+  assert.equal(adapter.requests.length, 0)
+  assert.equal(flushAttempts, 1)
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'retry after persistence recovery' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+  assert.equal(flushAttempts, 3)
+  assert.equal(adapter.requests.length, 0)
+})
+
 test('measures the final messages produced by downstream pre-step listeners', async () => {
   const adapter = new ScriptedAdapter([
     textResponse(`response before downstream context ${'r'.repeat(7_600)}`, { inputTokens: 1, outputTokens: 1 }),
