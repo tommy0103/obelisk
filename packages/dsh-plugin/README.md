@@ -30,7 +30,7 @@ install dependencies, build the plugin, and add the local checkout to the
 `web` profile:
 
 ```bash
-npm ci && npm run build --workspace @obelisk/dsh-obelisk-plugin && dsh plugin --profile web add --workspace-root "$PWD/packages/dsh-plugin"
+npm ci && npm run build:core && npm run build --workspace @obelisk/dsh-obelisk-plugin && dsh plugin --profile web add --workspace-root "$PWD/packages/dsh-plugin"
 ```
 
 Replace `web` with another profile name if needed. The package declares its
@@ -134,6 +134,7 @@ a second tool identity merely to obtain branding.
 
 ```bash
 npm ci
+npm run build:core
 npm run typecheck --workspace @obelisk/dsh-obelisk-plugin
 npm run build --workspace @obelisk/dsh-obelisk-plugin
 node --experimental-test-module-mocks --test tests/dsh-plugin.test.mjs

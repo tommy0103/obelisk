@@ -9,7 +9,7 @@
     "packages/*"
   ],
   "scripts": {
-    "pretest": "npm run build:cli && npm run build --workspace @obelisk/dsh-obelisk-plugin",
+    "pretest": "npm run build:core && npm run build:cli && npm run build --workspace @obelisk/dsh-obelisk-plugin",
     "test": "node --experimental-test-module-mocks --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json",
     "lint": "eslint .",
