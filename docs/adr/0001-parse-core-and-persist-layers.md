@@ -61,6 +61,30 @@ binding-agnostic and does not need a per-binding implementation.
   (CLI) and `better-sqlite3` (app) run the same code — there is no
   per-binding persist layer.
 
+**Amendment (2026-09-01): idempotent exact-value persistence.** Snapshot
+providers may correctly replay a complete canonical session after a small
+source change. The shared persist layer must not turn an identical replay into
+physical database churn. `messages`, `tool_calls`, and `tool_results` therefore
+use primary-key UPSERTs whose update branch runs only when at least one
+authoritative persisted value differs, using NULL-safe comparison. Message
+comparison deliberately excludes `turn_duration_ms`, which is owned by the
+separate `message-turn-duration` record; that targeted update is itself skipped
+when the stored duration already matches. A skipped message update also skips
+the schema's `AFTER UPDATE` FTS maintenance, while a real message change retains
+the existing atomic content-row and FTS update behavior. Tool rowids remain
+stable across both identical and changed replay, preserving insertion order for
+consumers such as workflow-parent healing.
+
+This is a table-specific rule, not permission to mechanically replace every
+write in `persist()`. Sessions derive merge values and counts from prior state;
+subagents and workflow agents merge multiple contributors with `COALESCE`;
+summaries and workflows retain whole-row replacement semantics; and
+`index_state` must continue publishing provider progress. Any later no-op
+optimization for those records must compare their computed post-merge state and
+preserve their individual contracts. No provider cursor or canonical transcript
+marker changes for this amendment because the projected canonical values do not
+change.
+
 **Two indexing modes** share all of the above and differ only in trigger:
 **daemon mode** (the app, and potentially a future CLI daemon, watches and keeps
 the index fresh) and **passive pull mode** (a CLI command indexes on invocation

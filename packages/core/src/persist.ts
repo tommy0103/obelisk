@@ -10,10 +10,11 @@
 // only place that knows the schema. Adapters stay pure.
 //
 // Write semantics are the canonical ones reconciled from the drift: messages
-// upsert via ON CONFLICT; sessions merge with any existing row (started_at MIN,
-// ended_at MAX, message_count reset-or-accumulate, fill-if-null for the rest);
-// turn-duration is a targeted UPDATE; delete-session cascades. The generator's
-// return value is the new cursor, persisted verbatim into index_state.
+// and tool rows upsert only when canonical values differ; sessions merge with
+// any existing row (started_at MIN, ended_at MAX, message_count
+// reset-or-accumulate, fill-if-null for the rest); turn-duration is a targeted
+// conditional UPDATE; delete-session cascades. The generator's return value is
+// the new cursor, persisted verbatim into index_state.
 
 import type { Cursor, TranscriptRecord, IndexUnit } from './providers/types.ts';
 import type { SqliteDb } from './sqlite-types.ts';
@@ -33,9 +34,54 @@ function statements(db: SqliteDb) {
         visibility=excluded.visibility, model=excluded.model,
         is_sidechain=excluded.is_sidechain, agent_id=excluded.agent_id,
         input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
-        cwd=excluded.cwd, skill=excluded.skill, source=excluded.source`),
-    tc: db.prepare('INSERT OR REPLACE INTO tool_calls (id,message_uuid,session_id,name,presentation,input_json,file_path) VALUES (?,?,?,?,?,?,?)'),
-    tr: db.prepare('INSERT OR REPLACE INTO tool_results (tool_use_id,message_uuid,session_id,content,file_path,is_error) VALUES (?,?,?,?,?,?)'),
+        cwd=excluded.cwd, skill=excluded.skill, source=excluded.source
+      WHERE messages.session_id IS NOT excluded.session_id
+        OR messages.type IS NOT excluded.type
+        OR messages.parent_uuid IS NOT excluded.parent_uuid
+        OR messages.timestamp IS NOT excluded.timestamp
+        OR messages.role IS NOT excluded.role
+        OR messages.text IS NOT excluded.text
+        OR messages.content_type IS NOT excluded.content_type
+        OR messages.is_meta IS NOT excluded.is_meta
+        OR messages.visibility IS NOT excluded.visibility
+        OR messages.model IS NOT excluded.model
+        OR messages.is_sidechain IS NOT excluded.is_sidechain
+        OR messages.agent_id IS NOT excluded.agent_id
+        OR messages.input_tokens IS NOT excluded.input_tokens
+        OR messages.output_tokens IS NOT excluded.output_tokens
+        OR messages.cwd IS NOT excluded.cwd
+        OR messages.skill IS NOT excluded.skill
+        OR messages.source IS NOT excluded.source`),
+    tc: db.prepare(`
+      INSERT INTO tool_calls (id,message_uuid,session_id,name,presentation,input_json,file_path)
+      VALUES (?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET
+        message_uuid=excluded.message_uuid,
+        session_id=excluded.session_id,
+        name=excluded.name,
+        presentation=excluded.presentation,
+        input_json=excluded.input_json,
+        file_path=excluded.file_path
+      WHERE tool_calls.message_uuid IS NOT excluded.message_uuid
+        OR tool_calls.session_id IS NOT excluded.session_id
+        OR tool_calls.name IS NOT excluded.name
+        OR tool_calls.presentation IS NOT excluded.presentation
+        OR tool_calls.input_json IS NOT excluded.input_json
+        OR tool_calls.file_path IS NOT excluded.file_path`),
+    tr: db.prepare(`
+      INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,file_path,is_error)
+      VALUES (?,?,?,?,?,?)
+      ON CONFLICT(tool_use_id) DO UPDATE SET
+        message_uuid=excluded.message_uuid,
+        session_id=excluded.session_id,
+        content=excluded.content,
+        file_path=excluded.file_path,
+        is_error=excluded.is_error
+      WHERE tool_results.message_uuid IS NOT excluded.message_uuid
+        OR tool_results.session_id IS NOT excluded.session_id
+        OR tool_results.content IS NOT excluded.content
+        OR tool_results.file_path IS NOT excluded.file_path
+        OR tool_results.is_error IS NOT excluded.is_error`),
     sum: db.prepare('INSERT OR REPLACE INTO summaries (id,session_id,timestamp,source,content,visibility,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?)'),
     ses: db.prepare('INSERT OR REPLACE INTO sessions (id,title,project,project_path,started_at,ended_at,git_branch,version,message_count,jsonl_path,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)'),
     sub: db.prepare(`
@@ -67,7 +113,7 @@ function statements(db: SqliteDb) {
         duration_ms=COALESCE(excluded.duration_ms, workflow_agents.duration_ms),
         tokens=COALESCE(excluded.tokens, workflow_agents.tokens),
         tool_calls=COALESCE(excluded.tool_calls, workflow_agents.tool_calls)`),
-    turn: db.prepare('UPDATE messages SET turn_duration_ms=? WHERE uuid=?'),
+    turn: db.prepare('UPDATE messages SET turn_duration_ms=? WHERE uuid=? AND turn_duration_ms IS NOT ?'),
     idx: db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,?,?,?)'),
     getSession: db.prepare('SELECT * FROM sessions WHERE id=?'),
   };
@@ -124,7 +170,7 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
         st.wa.run(r.agent_id, r.run_id, r.session_id, r.agent_type ?? null, r.description ?? null, r.phase ?? null, r.label ?? null, r.model ?? null, r.state ?? null, r.duration_ms ?? null, r.tokens ?? null, r.tool_calls ?? null);
         break;
       case 'message-turn-duration':
-        st.turn.run(r.turn_duration_ms, r.uuid);
+        st.turn.run(r.turn_duration_ms, r.uuid, r.turn_duration_ms);
         break;
       case 'session': {
         const prev = st.getSession.get(r.id);
