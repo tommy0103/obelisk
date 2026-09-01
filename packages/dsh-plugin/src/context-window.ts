@@ -393,12 +393,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
       }
       return settled
     }
-    const preserveClaimedInput = async (): Promise<void> => {
+    let messagesToPreserve: readonly UserMessage[] = messages
+    const preservePendingMessages = async (): Promise<void> => {
       const recordedIds = new Set(agent.session.snapshotEvents()
         .filter(event => event.type === 'user/message')
         .map(event => event.data.id))
       let appended = false
-      for (const message of messages) {
+      for (const message of messagesToPreserve) {
         if (recordedIds.has(message.id)) continue
         agent.session.append('user/message', message, { surfaceOp: 'append' })
         appended = true
@@ -420,8 +421,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
         ? await handlePreStep(ctx, agent, signal, decision, next)
         : await next()
       if (resolved.kind === 'reject') return resolved
+      messagesToPreserve = resolved.messages
       if (knownRollover && captured !== undefined) {
         resolved = { ...resolved, messages: restoreRuntimeContext(captured.assembly, resolved.messages) }
+        messagesToPreserve = resolved.messages
       }
 
       decision = settlePolicy(resolved.messages)
@@ -435,8 +438,10 @@ export function apply(ctx: Context, config: unknown = {}): void {
           () => Promise.resolve(resolved),
         )
         if (resolved.kind === 'reject') return resolved
+        messagesToPreserve = resolved.messages
         if (captured !== undefined) {
           resolved = { ...resolved, messages: restoreRuntimeContext(captured.assembly, resolved.messages) }
+          messagesToPreserve = resolved.messages
         }
         decision = settlePolicy(resolved.messages)
       }
@@ -455,7 +460,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         () => Promise.resolve(resolved),
       )
     } catch (error) {
-      await preserveClaimedInput()
+      await preservePendingMessages()
       throw error
     }
   }, { prepend: true })

@@ -476,6 +476,40 @@ test('preserves pending input instead of dispatching when it cannot fit a fresh 
     event.type === 'user/message' && event.data.id === impossible.id))
 })
 
+test('preserves downstream messages when a late rollover cannot proceed', async () => {
+  const adapter = new ScriptedAdapter([], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const downstream = createUserMessage({
+    content: [{ type: 'text', text: `one-shot downstream context ${'x'.repeat(4_000)}` }],
+    source: { kind: 'plugin', plugin: 'test', form: 'instructions' },
+  })
+  const agent = ctx.agentLoop.create(SessionId('late-rollover-preservation'), { provider: 'mock', model: 'mock' })
+  agent.ctx.on('agent/pre-step', async (_payload, next) => {
+    const decision = await next()
+    return decision.kind === 'reject'
+      ? decision
+      : { ...decision, messages: [...decision.messages, downstream] }
+  })
+  const user = createUserMessage({
+    content: [{ type: 'text', text: 'keep this claimed input too' }],
+    source: { kind: 'user' },
+  })
+  const idle = waitForIdle(ctx, agent)
+  agent.followup(user)
+  await idle
+
+  assert.equal(adapter.requests.length, 0)
+  const durableIds = new Set(agent.session.snapshotEvents()
+    .filter(event => event.type === 'user/message')
+    .map(event => event.data.id))
+  assert.ok(durableIds.has(user.id))
+  assert.ok(durableIds.has(downstream.id))
+})
+
 test('measures the final messages produced by downstream pre-step listeners', async () => {
   const adapter = new ScriptedAdapter([
     textResponse(`response before downstream context ${'r'.repeat(7_600)}`, { inputTokens: 1, outputTokens: 1 }),
