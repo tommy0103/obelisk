@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-tools/types'
 import { z } from 'zod'
 
@@ -16,6 +17,12 @@ export type PendingRollover = z.infer<typeof candidateSchema>
 
 const stateSchema = z.object({
   calls: z.record(z.string(), candidateSchema),
+  rootCalls: z.record(z.string(), z.object({
+    turn: z.number().int().nonnegative(),
+    step: z.number().int().positive(),
+  }).strict()),
+  ptcCalls: z.record(z.string(), candidateSchema),
+  ptcSettled: z.record(z.string(), candidateSchema),
   pending: candidateSchema.optional(),
 }).strict()
 
@@ -29,13 +36,20 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
 
 function handoffFrom(raw: string): string | undefined {
   try {
-    const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null) return undefined
-    const handoff = Reflect.get(parsed, 'handoff')
-    return typeof handoff === 'string' && handoff.trim() !== '' ? handoff : undefined
+    return handoffFromValue(JSON.parse(raw))
   } catch {
     return undefined
   }
+}
+
+function handoffFromValue(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const handoff = Reflect.get(value, 'handoff')
+  return typeof handoff === 'string' && handoff.trim() !== '' ? handoff : undefined
+}
+
+function resultFailed(event: SessionEvent<'tool/result'>): boolean {
+  return event.data.message.content.some(block => block.isError === true)
 }
 
 /** Fold existing native tool facts and committed handoff sources into rollover state. */
@@ -43,13 +57,19 @@ export const contextWindowProjectionDefinition = {
   key: 'obeliskContextWindow',
   stateVersion: 1,
   stateSchema,
-  init: (): ContextWindowState => ({ calls: {} }),
+  init: (): ContextWindowState => ({ calls: {}, rootCalls: {}, ptcCalls: {}, ptcSettled: {} }),
   apply: (state, event): ContextWindowState => {
-    if (event.type === 'tool/call' && event.data.name === 'new_context') {
+    if (event.type === 'tool/call') {
+      const rootCalls = {
+        ...state.rootCalls,
+        [event.data.callId]: { turn: event.data.turn, step: event.data.step },
+      }
+      if (event.data.name !== 'new_context') return { ...state, rootCalls }
       const handoff = handoffFrom(event.data.arguments)
-      if (handoff === undefined) return state
+      if (handoff === undefined) return { ...state, rootCalls }
       return {
         ...state,
+        rootCalls,
         calls: {
           ...state.calls,
           [event.data.callId]: {
@@ -61,14 +81,50 @@ export const contextWindowProjectionDefinition = {
         },
       }
     }
+    if (event.type === 'tool/code-dispatch-start' && event.data.name === 'new_context') {
+      const handoff = handoffFromValue(event.data.arguments)
+      const position = state.rootCalls[event.data.rootCallId]
+      if (handoff === undefined || position === undefined) return state
+      return {
+        ...state,
+        ptcCalls: {
+          ...state.ptcCalls,
+          [event.data.subCallId]: {
+            rootCallId: event.data.rootCallId,
+            handoff,
+            turn: position.turn,
+            step: position.step,
+          },
+        },
+      }
+    }
+    if (event.type === 'tool/code-dispatch' && event.data.name === 'new_context') {
+      const candidate = state.ptcCalls[event.data.subCallId]
+      if (candidate === undefined) return state
+      const ptcCalls = { ...state.ptcCalls }
+      delete ptcCalls[event.data.subCallId]
+      return event.data.isError
+        ? { ...state, ptcCalls }
+        : {
+            ...state,
+            ptcCalls,
+            ptcSettled: { ...state.ptcSettled, [event.data.rootCallId]: candidate },
+          }
+    }
     if (event.type === 'tool/result') {
       const callId = event.data.message.source.callId
       const candidate = state.calls[callId]
-      if (candidate === undefined) return state
-      const failed = event.data.message.content.some(block => block.isError === true)
+      const ptcCandidate = state.ptcSettled[callId]
       const calls = { ...state.calls }
       delete calls[callId]
-      return failed ? { ...state, calls } : { ...state, calls, pending: candidate }
+      const rootCalls = { ...state.rootCalls }
+      delete rootCalls[callId]
+      const ptcSettled = { ...state.ptcSettled }
+      delete ptcSettled[callId]
+      const accepted = candidate ?? ptcCandidate
+      return accepted === undefined || resultFailed(event)
+        ? { ...state, calls, rootCalls, ptcSettled }
+        : { ...state, calls, rootCalls, ptcSettled, pending: accepted }
     }
     if (event.type === 'user/message'
       && event.data.source.kind === 'obelisk-context-handoff') {
@@ -77,6 +133,9 @@ export const contextWindowProjectionDefinition = {
       delete calls[rootCallId]
       return {
         calls,
+        rootCalls: {},
+        ptcCalls: {},
+        ptcSettled: {},
       }
     }
     return state

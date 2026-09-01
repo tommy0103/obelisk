@@ -16,6 +16,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 
 import * as ContextWindowPlugin from '../packages/dsh-plugin/src/context-window.ts'
+import { contextWindowProjectionDefinition } from '../packages/dsh-plugin/src/context-window-state.ts'
 import {
   canonicalDeepseekMemberAssistantMessageUuid,
   canonicalDeepseekTreeSessionId,
@@ -95,6 +96,43 @@ test('exports context-window as an opt-in package subpath without mounting it in
   assert.equal(manifest.exports['./context-window'], './dist/context-window.js')
   const bundle = readFileSync(resolve(pluginRoot, 'obelisk.cordis.yml'), 'utf8')
   assert.doesNotMatch(bundle, /context-window/)
+})
+
+test('derives a pending PTC rollover only after nested and enclosing calls succeed', () => {
+  const apply = contextWindowProjectionDefinition.apply
+  let state = contextWindowProjectionDefinition.init({})
+  state = apply(state, {
+    type: 'tool/call', seq: 1, time: 1, surfaceOp: undefined,
+    data: { turn: 2, step: 4, callId: 'run-1', name: 'run_code', arguments: '{}' },
+  })
+  state = apply(state, {
+    type: 'tool/code-dispatch-start', seq: 2, time: 2,
+    data: {
+      rootCallId: 'run-1', parentCallId: 'run-1', subCallId: 'run-1:code:0',
+      name: 'new_context', arguments: { handoff: 'PTC handoff' },
+    },
+  })
+  state = apply(state, {
+    type: 'tool/code-dispatch', seq: 3, time: 3,
+    data: {
+      rootCallId: 'run-1', parentCallId: 'run-1', subCallId: 'run-1:code:0',
+      name: 'new_context', arguments: { handoff: 'PTC handoff' }, isError: false, content: [],
+    },
+  })
+  assert.equal(state.pending, undefined)
+  state = apply(state, {
+    type: 'tool/result', seq: 4, time: 4, surfaceOp: 'append', sourceEventSeqs: [1],
+    data: {
+      turn: 2, step: 4,
+      message: {
+        id: 'result-1', role: 'user', source: { kind: 'tool', callId: 'run-1' },
+        content: [{ type: 'tool-result', toolCallId: 'run-1', content: [], isError: false }],
+      },
+    },
+  })
+  assert.deepEqual(state.pending, {
+    rootCallId: 'run-1', handoff: 'PTC handoff', turn: 2, step: 4,
+  })
 })
 
 test('applies a successful new_context handoff at the next pre-step', async () => {
