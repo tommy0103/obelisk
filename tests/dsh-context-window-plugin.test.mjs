@@ -16,6 +16,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 
 import * as ContextWindowPlugin from '../packages/dsh-plugin/src/context-window.ts'
+import { decideContextWindowBudget } from '../packages/dsh-plugin/src/context-window-budget.ts'
 import { contextWindowProjectionDefinition } from '../packages/dsh-plugin/src/context-window-state.ts'
 import {
   canonicalDeepseekMemberAssistantMessageUuid,
@@ -96,6 +97,31 @@ test('exports context-window as an opt-in package subpath without mounting it in
   assert.equal(manifest.exports['./context-window'], './dist/context-window.js')
   const bundle = readFileSync(resolve(pluginRoot, 'obelisk.cordis.yml'), 'utf8')
   assert.doesNotMatch(bundle, /context-window/)
+})
+
+test('resolves reminder, fallback reserve, and forced rollover from host pressure', () => {
+  const policy = {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  }
+  const decide = (totalTokens, claims = {}) => decideContextWindowBudget({
+    contextWindow: 1_000,
+    totalTokens,
+    explicitRolloverPending: false,
+    reminderClaimed: false,
+    fallbackClaimed: false,
+    policy,
+    ...claims,
+  })
+
+  assert.equal(decide(599).kind, 'continue')
+  assert.equal(decide(600).kind, 'remind')
+  assert.equal(decide(600, { reminderClaimed: true }).kind, 'continue')
+  assert.equal(decide(700).kind, 'fallback')
+  assert.deepEqual(decide(701, { fallbackClaimed: true }), { kind: 'rollover', reason: 'hard-limit' })
+  assert.deepEqual(decide(900), { kind: 'rollover', reason: 'hard-limit' })
+  assert.deepEqual(decide(100, { explicitRolloverPending: true }), { kind: 'rollover', reason: 'model' })
 })
 
 test('derives a pending PTC rollover only after nested and enclosing calls succeed', () => {
