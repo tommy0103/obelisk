@@ -150,31 +150,54 @@ function collectImages(message: Message): RequestImage[] {
   return images
 }
 
+function withoutImages(content: Message['content']): Message['content'] {
+  const stripped: Message['content'][number][] = []
+  for (const block of content) {
+    if (block.type === 'image') continue
+    stripped.push(block.type === 'tool-result'
+      ? { ...block, content: withoutImages(block.content) }
+      : block)
+  }
+  return stripped
+}
+
+function estimateTextBlock(ctx: Context, text: string): number {
+  const source = { kind: 'user' as const }
+  const withText = createUserMessage({ content: [{ type: 'text', text }], source })
+  const withoutText = createUserMessage({ content: [], source })
+  return ctx.tokenMeter.estimateMessage(withText) - ctx.tokenMeter.estimateMessage(withoutText)
+}
+
 function pendingMessageTokens(
   ctx: Context,
   messages: readonly Message[],
   requestHeader?: EpochHeader,
 ): number {
-  let total = messages.reduce((sum, message) => sum + ctx.tokenMeter.estimateMessage(message), 0)
-  if (requestHeader === undefined) return total
+  if (requestHeader === undefined) {
+    return messages.reduce((sum, message) => sum + ctx.tokenMeter.estimateMessage(message), 0)
+  }
   const pricing = ctx.llm.imageRequestPricing(
     requestHeader.config.provider,
     requestHeader.config.model,
   )
-  if (pricing === undefined) return total
-  const images = messages.flatMap(collectImages)
+  if (pricing === undefined) {
+    return messages.reduce((sum, message) => sum + ctx.tokenMeter.estimateMessage(message), 0)
+  }
+  let total = 0
+  const images: RequestImage[] = []
+  for (const message of messages) {
+    const messageImages = collectImages(message)
+    images.push(...messageImages)
+    total += messageImages.length === 0
+      ? ctx.tokenMeter.estimateMessage(message)
+      : ctx.tokenMeter.estimateMessage({ ...message, content: withoutImages(message.content) })
+  }
   const prices = pricing.priceImages(images)
   if (prices.length !== images.length) {
     throw new Error(`context-window: route image pricing returned ${prices.length} prices for ${images.length} images`)
   }
   for (const price of prices) {
-    total += price.visualTokens
-    if (price.text !== '') {
-      total += ctx.tokenMeter.estimateMessage(createUserMessage({
-        content: [{ type: 'text', text: price.text }],
-        source: { kind: 'user' },
-      }))
-    }
+    total += price.visualTokens + estimateTextBlock(ctx, price.text)
   }
   return total
 }

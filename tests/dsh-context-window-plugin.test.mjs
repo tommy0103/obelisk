@@ -455,6 +455,51 @@ test('includes newly claimed input in the pre-step pressure decision', async () 
   assert.doesNotMatch(request, /old surface sentinel/)
 })
 
+test('replaces pending image structure cost with route pricing', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse('response before cheap image', { inputTokens: 20, outputTokens: 1 }),
+    textResponse('continued without an unnecessary rollover'),
+  ], {
+    models: {
+      cheap: { contextWindow: 1_000, defaultMaxTokens: 100, imageTokens: 1 },
+    },
+  })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('pending-image-pricing'), { provider: 'mock', model: 'cheap' })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'keep the existing surface' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{
+      type: 'image',
+      attachment: {
+        attachmentId: 'cheap-pending-image',
+        mediaType: 'image/png',
+        bytes: 4,
+        width: 1,
+        height: 1,
+        name: `structurally-expensive-${'x'.repeat(3_000)}`,
+      },
+    }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  const request = JSON.stringify(adapter.requests[1].messages)
+  assert.match(request, /keep the existing surface/)
+  assert.match(request, /cheap-pending-image/)
+  assert.doesNotMatch(request, /No prose handoff was produced/)
+})
+
 test('limits fallback inference to new_context and rolls over on success', async () => {
   const policy = {
     reminderThresholdTokens: 100,
