@@ -5,7 +5,7 @@ import {
   canonicalDeepseekMemberAssistantMessageUuid,
   canonicalDeepseekTreeSessionId,
   deepseekProjectScope,
-} from '@obelisk/core/providers/deepseek-identity'
+} from './deepseek-identity.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'

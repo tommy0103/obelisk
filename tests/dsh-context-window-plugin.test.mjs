@@ -1,7 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { mock, test } from 'node:test'
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -34,22 +34,12 @@ import { persist } from '../packages/core/src/persist.ts'
 import { createQueryApi } from '../packages/core/src/query.ts'
 import { makeTempDir } from './temp-dirs.mjs'
 
-const identityModule = await import('../packages/core/src/providers/deepseek-identity.ts')
-const identity = {
-  canonicalDeepseekAssistantMessageUuid: identityModule.canonicalDeepseekAssistantMessageUuid,
-  canonicalDeepseekMemberAssistantMessageUuid: identityModule.canonicalDeepseekMemberAssistantMessageUuid,
-  canonicalDeepseekTreeSessionId: identityModule.canonicalDeepseekTreeSessionId,
-  deepseekProjectScope: identityModule.deepseekProjectScope,
-}
-const identityMockOptions = Number(process.versions.node.split('.')[0]) >= 24
-  ? { exports: identity }
-  : { namedExports: identity }
-mock.module('@obelisk/core/providers/deepseek-identity', identityMockOptions)
-
 const ContextWindowPlugin = await import('../packages/dsh-plugin/src/context-window.ts')
 const { decideContextWindowBudget } = await import('../packages/dsh-plugin/src/context-window-budget.ts')
 const { contextWindowProjectionDefinition } = await import('../packages/dsh-plugin/src/context-window-state.ts')
 const { recoveryAnchors } = await import('../packages/dsh-plugin/src/context-window-identity.ts')
+const identity = await import('../packages/dsh-plugin/src/deepseek-identity.ts')
+const coreIdentity = await import('../packages/core/src/providers/deepseek-identity.ts')
 const {
   canonicalDeepseekMemberAssistantMessageUuid,
   canonicalDeepseekTreeSessionId,
@@ -101,6 +91,14 @@ class ScriptedAdapter extends LlmAdapter {
       context: { contextWindow: selected?.contextWindow ?? this.contextWindow },
       defaultMaxTokens: selected?.defaultMaxTokens ?? this.defaultMaxTokens,
     })
+  }
+
+  imageRequestPricing(_provider, model) {
+    const visualTokens = this.models?.[model]?.imageTokens
+    if (visualTokens === undefined) return undefined
+    return {
+      priceImages: images => images.map(() => ({ visualTokens, text: '' })),
+    }
   }
 
   async * stream(options) {
@@ -165,11 +163,23 @@ function waitForIdle(ctx, agent) {
 test('exports context-window as an opt-in package subpath without mounting it in the default bundle', () => {
   const manifest = JSON.parse(readFileSync(resolve(pluginRoot, 'package.json'), 'utf8'))
   assert.equal(manifest.exports['./context-window'], './dist/context-window.js')
+  assert.equal(manifest.dependencies?.['@obelisk/core'], undefined)
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-skill'], '0.1.2-alpha.4')
   const bundle = readFileSync(resolve(pluginRoot, 'obelisk.cordis.yml'), 'utf8')
   assert.doesNotMatch(bundle, /context-window/)
   const skill = readFileSync(resolve(pluginRoot, 'skill', 'SKILL.md'), 'utf8')
   assert.match(skill, /Treat its `session_id` as the default scope/)
   assert.match(skill, /call\s+`context\(\)` with the supplied `message_uuid`/)
+})
+
+test('keeps packaged recovery identities compatible with the Obelisk provider', () => {
+  const cwd = resolve('project', 'with spaces')
+  const scope = identity.deepseekProjectScope(cwd)
+  assert.equal(scope, coreIdentity.deepseekProjectScope(cwd))
+  assert.equal(
+    identity.canonicalDeepseekMemberAssistantMessageUuid('member/id', scope, 2, 3, 'tool_use'),
+    coreIdentity.canonicalDeepseekMemberAssistantMessageUuid('member/id', scope, 2, 3, 'tool_use'),
+  )
 })
 
 test('loads the built context-window package subpath', async () => {
@@ -335,7 +345,10 @@ test('uses the model selected for this assembly instead of the previous request 
   }))
 
   let idle = waitForIdle(ctx, agent)
-  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'large model context' }], source: { kind: 'user' } }))
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: `large model context ${'x'.repeat(4_000)}` }],
+    source: { kind: 'user' },
+  }))
   await idle
 
   selectedModel = 'small'
@@ -347,6 +360,68 @@ test('uses the model selected for this assembly instead of the previous request 
   const secondMessages = JSON.stringify(adapter.requests[1].messages)
   assert.match(secondMessages, /No prose handoff was produced/)
   assert.doesNotMatch(secondMessages, /large model context/)
+})
+
+test('prices retained images with the model selected for this assembly', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse('old-route response', { inputTokens: 20, outputTokens: 1 }),
+    textResponse('continued after route-priced rollover'),
+  ], {
+    models: {
+      cheap: { contextWindow: 1_000, defaultMaxTokens: 100, imageTokens: 1 },
+      expensive: { contextWindow: 1_000, defaultMaxTokens: 100, imageTokens: 900 },
+    },
+  })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('route-pricing-session'), { provider: 'mock', model: 'cheap' })
+  let selectedModel = 'cheap'
+  agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const assembly = await next()
+    return {
+      ...assembly,
+      variables: { ...assembly.variables, provider: 'mock', model: selectedModel },
+    }
+  })
+  agent.ctx.on('agent/request', async (_payload, next) => ({
+    ...await next(),
+    provider: 'mock',
+    model: selectedModel,
+  }))
+
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [
+      { type: 'text', text: 'retain this image only in the old context' },
+      {
+        type: 'image',
+        attachment: {
+          attachmentId: 'route-pricing-image',
+          mediaType: 'image/png',
+          bytes: 4,
+          width: 1,
+          height: 1,
+        },
+      },
+    ],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  selectedModel = 'expensive'
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'continue after switching image pricing' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  assert.equal(adapter.requests[1].model, 'expensive')
+  assert.match(JSON.stringify(adapter.requests[1].messages), /No prose handoff was produced/)
+  assert.doesNotMatch(JSON.stringify(adapter.requests[1].messages), /route-pricing-image/)
 })
 
 test('limits fallback inference to new_context and rolls over on success', async () => {

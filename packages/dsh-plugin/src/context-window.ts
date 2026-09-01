@@ -3,7 +3,8 @@
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+import type { EpochHeader } from '@deepseek-ai/dsh-session'
+import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-compaction'
 
@@ -107,17 +108,43 @@ function decideForCapacity(
   agent: Agent,
   config: Config,
   contextWindow: number,
+  requestHeader: EpochHeader,
   maxTokens?: number,
 ): ContextWindowBudgetDecision {
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
   return decideContextWindowBudget({
     contextWindow,
-    totalTokens: ctx.tokenMeter.measure(agent.session).totalTokens,
+    totalTokens: ctx.tokenMeter.measure(agent.session, requestHeader).totalTokens,
     explicitRolloverPending: state?.pending !== undefined,
     reminderClaimed: state?.reminderClaimed ?? false,
     fallbackClaimed: state?.fallbackClaimed ?? false,
     policy: effectivePolicy(agent, config, maxTokens),
   })
+}
+
+function assemblyRequestHeader(
+  agent: Agent,
+  assembly: PromptAssembly,
+  provider: string,
+  model: string,
+  defaultMaxTokens?: number,
+): EpochHeader {
+  const previous = agent.session.requestHeader()
+  const config = { ...previous?.config, provider, model }
+  if (previous?.adapterDefaults?.reasoningEffort === true) delete config.reasoningEffort
+  if (previous?.adapterDefaults?.maxTokens === true) delete config.maxTokens
+  if (agent.options.reasoningEffort !== undefined) config.reasoningEffort = agent.options.reasoningEffort
+  const maxTokens = agent.options.maxTokens ?? defaultMaxTokens
+  if (maxTokens !== undefined) config.maxTokens = maxTokens
+  const system = renderPrompt(assembly)
+  return {
+    config,
+    ...(agent.options.maxTokens === undefined && defaultMaxTokens !== undefined
+      ? { adapterDefaults: { maxTokens: true as const } }
+      : {}),
+    ...(system === '' ? {} : { system }),
+    ...(assembly.tools.length === 0 ? {} : { tools: assembly.tools }),
+  }
 }
 
 /** Resolve the route captured by this exact prompt assembly before applying pressure policy. */
@@ -137,6 +164,7 @@ async function assemblyBudgetDecision(
     return budgetDecision(ctx, agent, config)
   }
   const selected = await ctx.llm.resolveModelInfo(provider, model, signal)
+  const maxTokens = agent.options.maxTokens ?? selected.defaultMaxTokens
   return selected.context?.contextWindow === undefined
     ? budgetDecision(ctx, agent, config)
     : decideForCapacity(
@@ -144,7 +172,8 @@ async function assemblyBudgetDecision(
         agent,
         config,
         selected.context.contextWindow,
-        agent.options.maxTokens ?? selected.defaultMaxTokens,
+        assemblyRequestHeader(agent, assembly, provider, model, selected.defaultMaxTokens),
+        maxTokens,
       )
 }
 

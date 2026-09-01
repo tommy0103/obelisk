@@ -23,6 +23,9 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - name: Verify complete repository suite
+        if: runner.os == 'Linux'
+        run: npm test
       - run: npm run build:cli
       - name: Verify CLI package and runtime contract
         run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs tests/codex-index.test.mjs
@@ -32,6 +35,7 @@ jobs:
           npm run build:core
           npm run build --workspace @obelisk/dsh-obelisk-plugin
           npm pack --workspace @obelisk/dsh-obelisk-plugin --dry-run --json
+          npm run smoke:install --workspace @obelisk/dsh-obelisk-plugin
           node --experimental-test-module-mocks --test tests/dsh-plugin.test.mjs tests/dsh-context-window-plugin.test.mjs
 
       - name: Verify Electron main schema asset
