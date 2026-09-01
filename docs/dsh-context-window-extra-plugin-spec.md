@@ -116,7 +116,7 @@ packages/dsh-plugin/
 
 删除该 row 后，`new_context`、handoff guidance、reminder 和 rollover listener 一并撤销；根插件注册的 Obelisk skill 不受影响。
 
-启用 extra plugin 的 agent composition 同时必须关闭该 agent 的 `compaction-basic.auto`。context-window plugin 自己拥有 reminder、fallback reserve 和 hard-limit rollover；两个 automatic pressure policies 不能竞争同一段 history。手动 `/compact` 可以继续挂载。
+启用 extra plugin 的 agent composition 同时必须关闭该 agent 的 `compaction-basic.auto`。context-window plugin 自己拥有 reminder、fallback reserve 和 hard-limit rollover；两个 automatic pressure policies 不能竞争同一段 history。extra plugin 在 load 和每次真实 prompt assembly/pre-step 前检查已挂载 compaction service；检测到 `config.auto === true` 时 fail fast，不允许两套 policy 同时改写 surface。手动 `/compact` 可以继续挂载。
 
 ### Alpha.4 peer metadata
 
@@ -238,6 +238,8 @@ canonicalDeepseekMemberAssistantMessageUuid(
 该重构必须保证现有所有 DeepSeek fixture 的 indexed IDs 完全不变。
 
 alpha.4 继续在物理 header 中保存 `parentSession`，因此 lineage 输入仍然存在。root resolution 必须同时覆盖 live parent chain 和当前 parent 未进入 live `SessionStore` 的 resumed-child 场景；后者通过 DSH persistence metadata 解析，不能依赖 Obelisk index 已经刷新。
+
+持久化 lineage 的查找键必须是 `(project scope, native session id)`，不能只按 native id 建 Map。官方 JSONL backend 当前会拒绝跨 project 的重复 session id，但 extra plugin 不应把这一具体 backend 限制误当成 `SessionPersistence` 抽象的 identity contract。
 
 当前 Obelisk adapter 对 seeded fork child 尚未过滤物理 header 的 `seedLength` inherited prefix，会重复索引 child sidechain 中的父历史。这不是 alpha.4 新回归，但会降低 subagent handoff recovery 的准确性。在宣称 context-window extra plugin 支持 fork-based subagents 前，必须修正该 adapter 缺口并加入 alpha.4 seeded-child fixture。top-level 与无 inherited prefix 的 continuable child 不受该缺口影响。
 
@@ -409,6 +411,8 @@ interface ContextWindowBudgetPolicy {
 
 第一版的配置归属为 context-window extra plugin row。三个字段都允许显式覆盖；未覆盖时，分别使用当前 request 的 effective `maxTokens`，因此 reserve 随 adapter/model 的实际输出上限变化，而不是复制 Codex 的固定数值。若 adapter 和 agent 都没有提供 effective `maxTokens`，并且 plugin row 也没有显式提供 `outputReserveTokens`，pressure policy 必须给出可操作的配置错误，不能静默失效。
 
+预算必须针对本次 prompt assembly 已捕获的 provider/model 计算。extra plugin 在 `system-prompt/assemble` downstream 完成后读取该 assembly 的 route variables，并通过 LLM exact-model metadata seam 解析新 route 的 `contextWindow` 与 default `maxTokens`；`agent/pre-step` 消费同一份 captured decision。模型切换时不得退回上一条 durable `request/header` / `request/context` 的容量。
+
 host 使用 DSH 的有效 token measurement 和当前模型 context capacity 计算剩余预算。模型不得自报 token usage。
 
 当前 `TokenMeasurement.logRevision` 是 `SessionLogOffset`，每个 `TokenSurfaceNode.seq` 是 `SessionSeq`。budget module 应直接消费这些 branded values，不引入自己的裸 `number` revision/position 类型。
@@ -452,7 +456,11 @@ fallback prompt 要求模型：
 3. 调用一次 `new_context`；
 4. 不调用其他工具。
 
-fallback sampling 的工具 surface 只保留 `new_context`。由于 DSH 在 `agent/pre-step` 之前 assemble system prompt 和 tool schemas，extra plugin 必须在 `system-prompt/assemble` waterfall 中根据 token measurement 与 host-only projection state 识别 fallback phase，并过滤本次 assembly 的 tools。plugin 同时注册 execution guard，拒绝 fallback phase 中的其他 tool calls；不能只依赖 schema filtering 或 prompt discipline。
+fallback sampling 的可执行 capability 只保留 `new_context`。由于 DSH 在 `agent/pre-step` 之前 assemble system prompt 和 tool schemas，extra plugin 必须在 `system-prompt/assemble` waterfall 中根据 token measurement 与 host-only projection state 识别 fallback phase：native mode 的 wire schemas 过滤为 `new_context`；PTC mode 只保留 `run_code` transport，并由 execution guard 拒绝除 nested `new_context` 之外的所有 capability。不能只依赖 prompt discipline。
+
+PTC assembly 保留完整 SDK declarations，但这些额外 bindings 在 fallback generation 中不可执行。原因是 DSH 的 terminal `agent/request-error` retry 会复用同一份已渲染 system string；保留 declarations 才能在 host forced rollover 后恢复同一 user turn 的正常 PTC capability。初次 fallback request 期间，monotonic execution guard 是实际的权限边界。
+
+若 fallback model request 在 downstream retry policy 用尽后仍失败，extra plugin 在 `agent/request-error` 应用 forced rollover、恢复该 captured assembly 的正常 tool schemas，并返回一次 retry。retry 使用已经缩小的 recovery surface，且仍属于原 user turn；不得等待不会触发的 `agent/turn-stopping`。
 
 fallback claim 必须通过 plugin-owned durable context source 记录。每段 active context 只能 claim 一次，resume 后不能重新获得一份 reserve。
 
@@ -473,6 +481,7 @@ forced rollover 使用 `handoff_status: missing` 的内部 provenance，并在�
 - surface replacement 校验失败时，旧 active history 继续保持 authoritative；不得报告 rollover 已应用。
 - durability flush 失败时，下一次 model request 不得 dispatch。
 - replacement append 后、flush 前发生 hard crash 时，由 DSH persistence semantics 决定恢复结果：replacement 已持久化则证明完成；否则成功 tool pair 或 durable hard-limit state 仍可在下一 eligible step 重试。
+- 若 durable prefix 恰好停在 `compaction/prune` 之后、replacement 之前，DSH open-turn crash repair 追加的 closing event 会使只对“紧邻下一事件”有效的 shadow-price claim 失效；resume 后成功 tool pair 重新驱动一组相邻的 prune + replacement。真实 alpha.4 JSONL persistence fixture 必须覆盖该前缀并证明收敛。
 - Obelisk index lag 不阻止 rollover。确定性 identity 允许 handoff 在 incremental index catch up 前引用未来会出现的 canonical UUID。
 
 ## 14. Tool Scheduling、PTC 与 Compaction
@@ -484,6 +493,8 @@ forced rollover 使用 `handoff_status: missing` 的内部 provenance，并在�
 PTC mode 下，`new_context` 是 SDK nested call。prompt 必须要求它成为 program 的最后一个 operation。plugin 可以在成功 result 后拒绝新的 nested tool calls，但无法撤销之前已经执行的 calls。严格 direct-model-only exposure 或整个 tool batch 的预先拒绝需要修改 DSH tools，不属于本 extra plugin 的范围。
 
 context-window pressure policy 与 `compaction-basic.auto` 不得同时控制同一个 agent。启用 extra plugin 的 composition 必须关闭该 agent 的 automatic compaction，让 reminder、fallback reserve 和 forced rollover 成为唯一 pressure policy。手动 `/compact` 可以保留；它是用户显式选择的独立操作。
+
+README 仍说明正确 composition，但文档不是互斥机制。运行时检查必须拒绝已经启用的 `compaction-basic.auto`，并在 compaction service 晚于 extra plugin 挂载时于第一条真实 request 前再次验证。
 
 explicit rollover 与 hard-limit forced rollover 都在 prepended `agent/pre-step` listener 中先完成 replacement。之后继续委托时，后续 listener 只会看到已经缩小的 active surface。
 
@@ -505,6 +516,7 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - package 根导出仍然只注册 Obelisk skill。
 - 现有 `obelisk.cordis.yml` 输出保持不变。
 - `./context-window` export 可以独立 build、pack 和 load。
+- CI 对 distributable 执行 `npm pack --dry-run`，并直接加载 built subpath。
 - 不挂载 extra row 的真实 Loader composition 不暴露 `new_context` 或 rollover guidance。
 - 挂载 extra row 后，同时保留现有 Obelisk skill 和 extra behavior。
 - package peer ranges 明确接受已验证的 alpha.4 peers；npm 与 pnpm 安装 smoke 均通过。
@@ -516,6 +528,7 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - host-only session projection 从完整 replay、incremental append 和 projection-cache restore 得到相同状态。
 - hot-path `agent/pre-step` 不调用无界 `snapshotEvents()`；已知 event 通过 `eventAt(SessionSeq)` 精确读取。
 - physical JSONL header fixture 仍使用 version-0 `seedLength` encoding，Obelisk DeepSeek provider 可以继续 discovery/index。
+- seeded-child fixture 由 alpha.4 `SessionStore.fork()` 与真实 JSONL persistence 生成，并验证 direct parse 与 SQLite round-trip 一致。
 - `agent/pre-step`、tool result ordering、surface replacement 和 `ctx.sessions.flush()` 的现有行为分别有 real-composition coverage。
 
 ### 16.3 Prompt 与工具
@@ -533,6 +546,7 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - Obelisk 完成索引后，handoff 中的 `session_id` 存在，`context(message_uuid)` 可以解析预期的 previous-context message。
 - top-level handoff 的 `session_id` 指向自身 Obelisk session；child handoff 的 `session_id` 指向 Obelisk root-tree session，`message_uuid` 指向 child member message。
 - resumed child 在 parent 不 live 时仍能通过 persistence metadata 解析 root lineage。
+- persistence metadata 中存在跨 scope 同名 native id 时，lineage 只选择当前 project scope 的 parent。
 - fork-based child 支持启用前，seeded-child fixture 证明 adapter 不重复索引 `seedLength` inherited prefix。
 
 ### 16.5 Rollover
@@ -544,13 +558,16 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - 静态 initial context、system prompt 和 tool schemas 仍然存在。
 - explicit rollover 不生成 summary。
 - 启用 context-window pressure policy 的 composition 关闭 `compaction-basic.auto`，但仍可保留手动 `/compact`。
+- `compaction-basic.auto` 已启用或稍后挂载时，extra plugin 在首个 request 前 fail fast。
 
 ### 16.6 Reminder、Fallback 与 Forced Rollover
 
 - 达到 model-specific reminder threshold 时自动注入一次 durable reminder。
 - 同一 active context 不重复 claim reminder。
+- 本次 assembly 切换到更小 context model 时，预算使用新 model capacity，而不是上一请求的 durable capacity。
 - normal budget 耗尽且没有成功 `new_context` 时，自动进入一次 fallback reserve inference。
-- fallback sampling 的工具 schema 只保留 `new_context`，execution guard 拒绝其他 calls。
+- native fallback sampling 的工具 schema 只保留 `new_context`；PTC 只暴露 `run_code` transport，execution guard 拒绝除 nested `new_context` 外的其他 calls。
+- fallback request 的 terminal transport failure 在 forced rollover 后以正常 capability 于同一 user turn retry。
 - 成功 `new_context` 优先于 fallback 和 forced rollover。
 - fallback reserve 耗尽后强制 rollover，并生成带 `handoff_status: missing` provenance 的降级 handoff。
 - resume 不重复发放已经 claim 的 reminder 或 fallback reserve。
@@ -562,6 +579,7 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - 成功 tool pair 尚未产生 replacement 时，resume 后在下一个 eligible step 应用 rollover。
 - 只有 tool call、没有成功 result 时不 rollover。
 - flush failure 阻止下一次 model request。
+- durable prefix 停在 prune 与 replacement 之间时，真实 JSONL persistence resume 收敛为一个 committed replacement。
 - Obelisk index lag 不影响 rollover；后续 refresh 可以解析预计算的 message UUID。
 
 ### 16.8 Product-level composition
@@ -570,12 +588,12 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - recorded session 包含成功 tool pair、surface replacement、prose handoff 和 recovery anchors。
 - 单独的 recorded sessions 覆盖 reminder、fallback success 和 forced rollover。
 - 使用 handoff `session_id` 的端到端 Obelisk query 只返回目标 session 的证据。
+- handoff `message_uuid` 在真实持久化 session 被 Obelisk 索引后可由 `context()` 直接解析。
 
 ## 17. 待确认问题
 
 1. PTC calls 是否只使用 prompt discipline，还是 extra plugin 应在成功 `new_context` dispatch 后拒绝所有后续 nested tool calls？
 2. 缺少 Obelisk skill contribution 时，extra plugin 是否应在 load 阶段失败？还是只要 CLI 和 model guidance 可用即可？
-3. 当前 DSH persistence checkpoint policy 是否足以证明上述 crash cases，还是实现前需要增加一个 focused persistence fixture？
 
 ## 18. 验收标准
 

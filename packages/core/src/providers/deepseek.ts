@@ -117,11 +117,6 @@ function projectScope(cwd: unknown): string {
   return deepseekProjectScope(cwd);
 }
 
-/** Database identity for one raw session id inside one project scope. */
-function dshDbId(scope: string, rawId: string): string {
-  return canonicalDeepseekTreeSessionId(rawId, scope);
-}
-
 function assistantMessageUuid(dbId: string, turn: unknown, step: unknown, kind: 'reasoning' | 'text' | 'tool_use'): string {
   return canonicalDeepseekAssistantMessageUuid(dbId, turn, step, kind);
 }
@@ -601,7 +596,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       if (suppressedProjectDirs.has(fileByPath.get(group.paths[0]!)?.projectDir ?? '')) return;
       const rootPath = group.paths.find((path) => rawIdByPath.get(path) === group.rootRawId);
       if (rootPath === undefined) return;
-      groupBySessionId.set(dshDbId(group.scope, group.rootRawId), i);
+      groupBySessionId.set(canonicalDeepseekTreeSessionId(group.rootRawId, group.scope), i);
       for (const path of group.paths) {
         addRoute(fileToGroups, canon(path), i);
         addRoute(dirToGroups, canon(dirname(path)) + sep, i);       // session dir
@@ -660,7 +655,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     // emit a valid session row, and promoting a child would publish a phantom
     // snapshot. Skip the live unit; the tombstone path retracts the identity.
     if (rootPath === undefined) continue;
-    const sessionId = dshDbId(group.scope, group.rootRawId);
+    const sessionId = canonicalDeepseekTreeSessionId(group.rootRawId, group.scope);
     const members: TreeMember[] = group.paths
       .sort((a, b) => (a === rootPath ? -1 : b === rootPath ? 1 : a.localeCompare(b)))
       .map((path) => {
@@ -670,8 +665,8 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         return {
           path,
           rawId,
-          dbId: dshDbId(group.scope, rawId),
-          agentId: isSubagent ? dshDbId(group.scope, rawId) : null,
+          dbId: canonicalDeepseekTreeSessionId(rawId, group.scope),
+          agentId: isSubagent ? canonicalDeepseekTreeSessionId(rawId, group.scope) : null,
           isSubagent,
           header,
         };
@@ -705,7 +700,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const liveSessionIds = new Set(
     [...membersByRootKey.values()]
       .filter((group) => group.paths.some((path) => rawIdByPath.get(path) === group.rootRawId))
-      .map((group) => dshDbId(group.scope, group.rootRawId)),
+      .map((group) => canonicalDeepseekTreeSessionId(group.rootRawId, group.scope)),
   );
   for (const indexed of inventoryComplete ? (ctx.indexedSessions?.() ?? []) : []) {
     if (liveSessionIds.has(indexed.sessionId)) continue; // moved or still indexed
@@ -1201,7 +1196,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           // survives any parse window (the spawn tool/call may be in an earlier frame).
           const match = SUBAGENT_RESULT_RE.exec(content);
           if (match !== null && match[1]) {
-            subagentPart(dshDbId(meta.scope, match[1])).parent_tool_use_id = toolId;
+            subagentPart(canonicalDeepseekTreeSessionId(match[1], meta.scope)).parent_tool_use_id = toolId;
           }
           break;
         }

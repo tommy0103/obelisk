@@ -60,7 +60,8 @@ prose handoffs, pressure reminders, and safe active-context rollover:
       name: '@obelisk/dsh-obelisk-plugin/context-window'
 ```
 
-That composition must disable `compaction-basic.auto`; manual `/compact` may
+That composition must disable `compaction-basic.auto`; the extra plugin fails
+fast if it detects the competing automatic policy. Manual `/compact` may
 remain available. The extra plugin derives its default reminder, fallback, and
 output reserves from the effective model `maxTokens`. A profile can override
 any reserve explicitly:

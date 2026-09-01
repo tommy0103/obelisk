@@ -38,8 +38,11 @@ async function rootNativeSessionId(
       if (persistence === undefined) {
         throw new Error('context-window: persisted parent lineage requires sessionPersistence')
       }
-      persisted ??= new Map((await persistence.list(signal)).map(candidate => [candidate.id, candidate]))
-      const stored = persisted.get(parentId)
+      persisted ??= new Map((await persistence.list(signal)).map(candidate => [
+        `${deepseekProjectScope(candidate.cwd)}\0${candidate.id}`,
+        candidate,
+      ]))
+      const stored = persisted.get(`${scope}\0${parentId}`)
       if (stored === undefined) {
         throw new Error(`context-window: parent session ${JSON.stringify(parentId)} is unavailable`)
       }

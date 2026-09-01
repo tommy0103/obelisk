@@ -17,8 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { constants, zstdCompressSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
+import { Context } from '@deepseek-ai/cordis';
+import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm';
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
+import { JsonlSessionPersistence } from '@deepseek-ai/dsh-session-persistence-jsonl';
+
 import { createDeepseekProvider } from '../packages/core/src/providers/deepseek.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 import { makeTempDir } from './temp-dirs.mjs';
@@ -193,45 +199,85 @@ test('discovers one unit per root session tree and skips an unchanged tree', () 
   assert.deepEqual(again, []);
 });
 
-test('seeded child indexes only events after its inherited prefix', () => {
+test('seeded child indexes only events after its inherited prefix', async () => {
   const dir = makeTempDir('obelisk-seeded-child-');
   const sessionsDir = join(dir, 'sessions');
-  const projectDir = join(sessionsDir, '--tmp-dsh-project--');
-  const rootDir = join(projectDir, 'seed-root');
-  const childDir = join(projectDir, 'seed-child');
-  mkdirSync(rootDir, { recursive: true });
-  mkdirSync(childDir, { recursive: true });
-  const rootHeader = {
-    type: 'session', version: 0, id: 'seed-root', createdAt: 1753005600000,
-    cwd: '/tmp/dsh-project', delegationDepth: 0,
-  };
-  const inherited = [
-    { type: 'request/header', seq: 0, time: 1753005600100, data: { header: { config: { provider: 'mock', model: 'mock' } }, reason: 'initial' } },
-    { type: 'user/message', seq: 1, time: 1753005600200, data: { content: [{ type: 'text', text: 'parent inherited request' }], source: { kind: 'user' }, role: 'user', id: 'parent-message' } },
-  ];
-  const childHeader = {
-    type: 'session', version: 0, id: 'seed-child', createdAt: 1753005600300,
-    cwd: '/tmp/dsh-project', parentSession: 'seed-root', isSeeded: true,
-    seedLength: inherited.length, origin: 'subagent', delegationDepth: 1,
-  };
-  const childOwn = [
-    { type: 'session/end-seed', seq: 2, time: 1753005600300, data: {} },
-    { type: 'user/message', seq: 3, time: 1753005600400, data: { content: [{ type: 'text', text: 'child-owned request' }], source: { kind: 'user' }, role: 'user', id: 'child-message' } },
-    { type: 'assistant/message', seq: 4, time: 1753005600500, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'child-owned response' }], source: { kind: 'model', provider: 'mock', model: 'mock' }, id: 'child-response' } } },
-  ];
-  writeFileSync(join(rootDir, 'session.jsonl'), [rootHeader, ...inherited].map(value => JSON.stringify(value)).join('\n') + '\n');
-  writeFileSync(join(childDir, 'session.jsonl'), [childHeader, ...inherited, ...childOwn].map(value => JSON.stringify(value)).join('\n') + '\n');
+  const cwd = join(dir, 'project');
+  const ctx = new Context();
+  await ctx.plugin(SessionStore);
+  await ctx.plugin(JsonlSessionPersistence, {
+    root: sessionsDir,
+    compression: 'none',
+    packChunks: false,
+    writeBatchMaxDelayMs: 1,
+  });
+  const rootSession = ctx.sessions.create(SessionId('seed-root'), { meta: { cwd } });
+  rootSession.append('turn/start', { turn: 1 });
+  rootSession.append('step/start', { turn: 1, step: 1 });
+  rootSession.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'parent inherited request' }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' });
+  rootSession.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: createAssistantMessage({
+      content: [{ type: 'text', text: 'parent response' }],
+      source: { provider: 'mock', model: 'mock' },
+    }),
+  }, { surfaceOp: 'append' });
+  rootSession.append('step/end', { turn: 1, step: 1 });
+  const rootEnd = rootSession.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  await ctx.sessions.flush(rootSession);
+
+  const child = ctx.sessions.fork(rootSession, rootEnd.seq, SessionId('seed-child'));
+  child.append('turn/start', { turn: 2 });
+  child.append('step/start', { turn: 2, step: 1 });
+  child.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'child-owned request' }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' });
+  child.append('assistant/message', {
+    turn: 2,
+    step: 1,
+    message: createAssistantMessage({
+      content: [{ type: 'text', text: 'child-owned response' }],
+      source: { provider: 'mock', model: 'mock' },
+    }),
+  }, { surfaceOp: 'append' });
+  child.append('step/end', { turn: 2, step: 1 });
+  child.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+  await ctx.sessions.flush(child);
 
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const unit = provider.discover({ lastCursor: () => null })[0];
   assert.ok(unit);
   const values = drain(provider.parse(unit, null)).values;
   const childMessages = values.filter(value => value.kind === 'message' && value.agent_id !== null);
-  assert.deepEqual(childMessages.map(message => message.text).filter(Boolean), [
+  assert.deepEqual(childMessages.map(message => message.text).filter(Boolean).sort(), [
     'child-owned request',
     'child-owned response',
-  ]);
+  ].sort());
   assert.equal(childMessages.some(message => message.text === 'parent inherited request'), false);
+  const direct = assembleSessionDetail(values);
+  const db = freshDb();
+  persist(db, unit, provider.parse(unit, null));
+  const roundTripped = assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions').get(),
+    messages: db.prepare('SELECT * FROM messages ORDER BY timestamp, uuid').all(),
+    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+    toolResults: db.prepare('SELECT * FROM tool_results').all(),
+    subagents: db.prepare('SELECT * FROM subagents').all(),
+  });
+  assert.deepEqual(roundTripped, direct);
+  const api = createQueryApi(db);
+  const scoped = api.search('child owned', { sessionId: unit.sessionId, limit: 10 });
+  assert.ok(scoped.length > 0);
+  assert.ok(scoped.every(hit => hit.session.id === unit.sessionId));
+  const childAnchor = childMessages.find(message => message.text === 'child-owned response');
+  assert.ok(childAnchor);
+  assert.equal(api.context(childAnchor.uuid).message.uuid, childAnchor.uuid);
+  db.close();
 });
 
 test('projects a whole tree into canonical records with correct linkage', () => {

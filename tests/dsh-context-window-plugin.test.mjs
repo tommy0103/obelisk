@@ -5,17 +5,31 @@ import { mock, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import CodeRuntime from '@deepseek-ai/dsh-code-runtime'
-import LlmRuntime, { createUserMessage, LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, {
+  createAssistantMessage,
+  createToolResultMessage,
+  createUserMessage,
+  LlmAdapter,
+  ToolCallId,
+} from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import * as SessionCheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
+import { JsonlSessionPersistence } from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
+
+import { createDeepseekProvider } from '../packages/core/src/providers/deepseek.ts'
+import { persist } from '../packages/core/src/persist.ts'
+import { createQueryApi } from '../packages/core/src/query.ts'
+import { makeTempDir } from './temp-dirs.mjs'
 
 const identityModule = await import('../packages/core/src/providers/deepseek-identity.ts')
 const identity = {
@@ -40,6 +54,7 @@ const {
 } = identity
 
 const pluginRoot = resolve(import.meta.dirname, '..', 'packages', 'dsh-plugin')
+const coreSchema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8')
 
 function textResponse(text, usage = { inputTokens: 10, outputTokens: text.length }) {
   return [
@@ -66,20 +81,22 @@ function toolCallResponse(id, name, args) {
 class ScriptedAdapter extends LlmAdapter {
   requests = []
 
-  constructor(script, { contextWindow = 100_000, defaultMaxTokens = 4_096 } = {}) {
+  constructor(script, { contextWindow = 100_000, defaultMaxTokens = 4_096, models } = {}) {
     super()
     this.script = [...script]
     this.contextWindow = contextWindow
     this.defaultMaxTokens = defaultMaxTokens
+    this.models = models
   }
 
   resolveModel(provider, model) {
+    const selected = this.models?.[model]
     return Promise.resolve({
       provider,
       id: model,
       name: model,
-      context: { contextWindow: this.contextWindow },
-      defaultMaxTokens: this.defaultMaxTokens,
+      context: { contextWindow: selected?.contextWindow ?? this.contextWindow },
+      defaultMaxTokens: selected?.defaultMaxTokens ?? this.defaultMaxTokens,
     })
   }
 
@@ -87,6 +104,7 @@ class ScriptedAdapter extends LlmAdapter {
     this.requests.push(options)
     const chunks = this.script.shift()
     if (chunks === undefined) throw new Error('script exhausted')
+    if (chunks instanceof Error) throw chunks
     yield* chunks
   }
 }
@@ -100,6 +118,13 @@ class HandoffCodeRuntime extends CodeRuntime {
     const newContext = tools?.functions.new_context
     if (newContext === undefined) {
       return { logs: [], error: { kind: 'exception', message: 'new_context binding missing' } }
+    }
+    if (request.program.includes('attempt-other')) {
+      try {
+        await tools?.functions.other_tool?.({})
+      } catch {
+        // The fallback guard must reject this; continue to the required handoff.
+      }
     }
     return {
       logs: [],
@@ -142,6 +167,32 @@ test('exports context-window as an opt-in package subpath without mounting it in
   const skill = readFileSync(resolve(pluginRoot, 'skill', 'SKILL.md'), 'utf8')
   assert.match(skill, /Treat its `session_id` as the default scope/)
   assert.match(skill, /call\s+`context\(\)` with the supplied `message_uuid`/)
+})
+
+test('loads the built context-window package subpath', async () => {
+  const built = await import(`../packages/dsh-plugin/dist/context-window.js?test=${Date.now()}`)
+  assert.equal(built.name, '@obelisk/dsh-obelisk-plugin/context-window')
+  assert.equal(typeof built.apply, 'function')
+})
+
+test('rejects a competing automatic compaction policy', () => {
+  assert.throws(() => ContextWindowPlugin.assertCompatibleCompaction({
+    get: service => service === 'compaction' ? { config: { auto: true } } : undefined,
+  }), /compaction-basic\.auto is enabled/)
+  assert.doesNotThrow(() => ContextWindowPlugin.assertCompatibleCompaction({
+    get: service => service === 'compaction' ? { config: { auto: false } } : undefined,
+  }))
+})
+
+test('blocks the first request when automatic compaction is mounted later', async () => {
+  const adapter = new ScriptedAdapter([])
+  const ctx = await harness(adapter)
+  ctx.provide('compaction', { config: { auto: true } })
+  const agent = ctx.agentLoop.create(SessionId('compaction-conflict'), { provider: 'mock', model: 'mock' })
+  const idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'must not dispatch' }], source: { kind: 'user' } }))
+  await idle
+  assert.equal(adapter.requests.length, 0)
 })
 
 test('resolves reminder, fallback reserve, and forced rollover from host pressure', () => {
@@ -197,6 +248,52 @@ test('injects one durable reminder near the normal budget', async () => {
   assert.equal(reminders.length, 1)
 })
 
+test('uses the model selected for this assembly instead of the previous request capacity', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse('large-model response', { inputTokens: 1_500, outputTokens: 1 }),
+    textResponse('continued on the small model'),
+  ], {
+    models: {
+      large: { contextWindow: 10_000, defaultMaxTokens: 100 },
+      small: { contextWindow: 1_000, defaultMaxTokens: 100 },
+    },
+  })
+  const policy = {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  }
+  const ctx = await harness(adapter, policy)
+  const agent = ctx.agentLoop.create(SessionId('model-switch-session'), { provider: 'mock', model: 'large' })
+  let selectedModel = 'large'
+  agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const assembly = await next()
+    return {
+      ...assembly,
+      variables: { ...assembly.variables, provider: 'mock', model: selectedModel },
+    }
+  })
+  agent.ctx.on('agent/request', async (_payload, next) => ({
+    ...await next(),
+    provider: 'mock',
+    model: selectedModel,
+  }))
+
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'large model context' }], source: { kind: 'user' } }))
+  await idle
+
+  selectedModel = 'small'
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'continue after switching' }], source: { kind: 'user' } }))
+  await idle
+
+  assert.equal(adapter.requests[1].model, 'small')
+  const secondMessages = JSON.stringify(adapter.requests[1].messages)
+  assert.match(secondMessages, /No prose handoff was produced/)
+  assert.doesNotMatch(secondMessages, /large model context/)
+})
+
 test('limits fallback inference to new_context and rolls over on success', async () => {
   const policy = {
     reminderThresholdTokens: 100,
@@ -225,7 +322,7 @@ test('limits fallback inference to new_context and rolls over on success', async
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff').length, 1)
 })
 
-test('PTC fallback exposes only new_context through run_code and completes rollover', async () => {
+test('PTC fallback guard permits only new_context through run_code and completes rollover', async () => {
   const policy = {
     reminderThresholdTokens: 100,
     fallbackReserveTokens: 200,
@@ -234,12 +331,13 @@ test('PTC fallback exposes only new_context through run_code and completes rollo
   const adapter = new ScriptedAdapter([
     textResponse('first response', { inputTokens: 9_750, outputTokens: 1 }),
     toolCallResponse('fallback-program', 'run_code', {
-      code: 'return await tools.new_context({ handoff: "PTC fallback handoff." })',
+      code: '/* attempt-other */ return await tools.new_context({ handoff: "PTC fallback handoff." })',
       description: 'Prepare context handoff',
     }),
     textResponse('continued after PTC rollover'),
   ], { contextWindow: 10_000, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, policy, { mode: 'ptc' })
+  let otherRan = false
   ctx.tools.register(defineTool({
     name: 'other_tool',
     description: 'Must be hidden during fallback.',
@@ -249,6 +347,7 @@ test('PTC fallback exposes only new_context through run_code and completes rollo
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute() {
+      otherRan = true
       return 'other'
     },
   }))
@@ -264,7 +363,7 @@ test('PTC fallback exposes only new_context through run_code and completes rollo
   assert.deepEqual(adapter.requests[1].tools.map(tool => tool.name), ['run_code'])
   assert.match(JSON.stringify(adapter.requests[1].messages), /normal task budget is exhausted/)
   assert.match(adapter.requests[1].system, /new_context/)
-  assert.doesNotMatch(adapter.requests[1].system, /other_tool/)
+  assert.equal(otherRan, false)
   assert.match(JSON.stringify(adapter.requests[2].messages), /PTC fallback handoff/)
   const replacement = agent.session.snapshotEvents().find(event =>
     event.type === 'user/message'
@@ -305,6 +404,33 @@ test('forces a recoverable rollover in the same user turn when fallback produces
     && event.data.source.trigger.kind === 'hard-limit')
   assert.ok(replacement)
   assert.equal(replacement.data.source.handoffStatus, 'missing')
+})
+
+test('fallback request failure forces rollover and retries within the same user turn', async () => {
+  const policy = {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  }
+  const adapter = new ScriptedAdapter([
+    textResponse('first response', { inputTokens: 730, outputTokens: 1 }),
+    new Error('simulated fallback transport failure'),
+    textResponse('continued after failed fallback request'),
+  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, policy)
+  const agent = ctx.agentLoop.create(SessionId('fallback-request-error'), { provider: 'mock', model: 'mock' })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'start' }], source: { kind: 'user' } }))
+  await idle
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'continue' }], source: { kind: 'user' } }))
+  await idle
+
+  assert.equal(adapter.requests.length, 3)
+  assert.match(JSON.stringify(adapter.requests[2].messages), /No prose handoff was produced/)
+  const secondTurnStarts = agent.session.snapshotEvents().filter(event => event.type === 'turn/start')
+  assert.equal(secondTurnStarts.length, 2)
 })
 
 test('execution guard rejects non-handoff tools after fallback is claimed', async () => {
@@ -399,6 +525,37 @@ test('resolves a resumed child root from persistence metadata when the parent is
   ))
 })
 
+test('resolves persisted parent lineage by project scope when native ids collide', async () => {
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  const cwd = '/tmp/dsh-context-window-scoped-child'
+  const otherCwd = '/tmp/dsh-context-window-other-project'
+  const parentId = SessionId('shared-parent-id')
+  const child = ctx.sessions.create(SessionId('scoped-child'), {
+    meta: {
+      cwd,
+      parentSession: parentId,
+      isSeeded: false,
+      origin: 'subagent',
+    },
+  })
+  const persistence = {
+    async list() {
+      return [
+        { version: 0, id: parentId, createdAt: 1, cwd, isSeeded: false },
+        { version: 0, id: parentId, createdAt: 2, cwd: otherCwd, isSeeded: false },
+      ]
+    },
+  }
+  const identityContext = {
+    sessions: { get: () => undefined },
+    get: service => service === 'sessionPersistence' ? persistence : undefined,
+  }
+
+  const anchors = await recoveryAnchors(identityContext, child, 6, 7)
+  assert.equal(anchors.sessionId, canonicalDeepseekTreeSessionId(parentId, deepseekProjectScope(cwd)))
+})
+
 test('derives a pending PTC rollover only after nested and enclosing calls succeed', () => {
   const apply = contextWindowProjectionDefinition.apply
   let state = contextWindowProjectionDefinition.init({})
@@ -468,6 +625,28 @@ test('applies a successful new_context handoff at the next pre-step', async () =
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff')
   assert.ok(replacement)
   assert.equal(replacement.surfaceOp.op, 'replace')
+  const replayed = agent.session.snapshotEvents().reduce(
+    (state, event) => contextWindowProjectionDefinition.apply(state, event),
+    contextWindowProjectionDefinition.init({}),
+  )
+  assert.deepEqual(
+    replayed,
+    ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow'),
+  )
+  const checkpoint = ctx.sessionProjections.checkpoint(agent.session)
+  const floor = ctx.sessionProjections.restoreFloor(checkpoint)
+  assert.notEqual(floor, undefined)
+  const restored = ctx.sessionProjections.restore(
+    checkpoint,
+    agent.session.snapshotEvents(floor),
+    floor,
+    agent.session.header,
+    agent.session.inheritedEventCount,
+  )
+  assert.deepEqual(
+    restored.checkpoint.obeliskContextWindow.val,
+    ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow'),
+  )
 })
 
 test('does not rollover a failed new_context call', async () => {
@@ -509,6 +688,133 @@ test('does not reapply a committed rollover on a later turn', async () => {
   const replacements = agent.session.snapshotEvents().filter(event =>
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff')
   assert.equal(replacements.length, 1)
+})
+
+test('a persisted crash after prune but before replacement converges on resume', async () => {
+  const root = makeTempDir('obelisk-context-rollover-crash-')
+  const cwd = resolve(root, 'project')
+  const sessionId = SessionId('rollover-crash-session')
+  const callId = ToolCallId('rollover-crash-call')
+
+  const first = new Context()
+  await first.plugin(SessionStore)
+  await first.plugin(SessionProjectionRegistry)
+  await first.plugin(TokenMeter)
+  await first.plugin(JsonlSessionPersistence, {
+    root,
+    compression: 'none',
+    packChunks: false,
+    writeBatchMaxDelayMs: 1,
+  })
+  const session = first.sessions.create(sessionId, { meta: { cwd } })
+  session.append('turn/start', { turn: 1 })
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'work before crash' }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: createAssistantMessage({
+      content: [{
+        type: 'tool-call',
+        id: callId,
+        name: 'new_context',
+        arguments: JSON.stringify({ handoff: 'Resume the work after the crash.' }),
+      }],
+      source: { provider: 'mock', model: 'mock' },
+    }),
+    usage: { inputTokens: 20, outputTokens: 5 },
+  }, { surfaceOp: 'append' })
+  const call = session.append('tool/call', {
+    turn: 1,
+    step: 1,
+    callId,
+    name: 'new_context',
+    arguments: JSON.stringify({ handoff: 'Resume the work after the crash.' }),
+  })
+  session.append('tool/result', {
+    turn: 1,
+    step: 1,
+    message: createToolResultMessage({
+      callId,
+      content: [{ type: 'text', text: 'accepted' }],
+      isError: false,
+    }),
+  }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+  session.append('step/end', { turn: 1, step: 1 })
+  const measured = first.tokenMeter.measure(session)
+  const nodes = session.surface.nodes
+  session.append('compaction/prune', {
+    shadowedRange: { start: nodes[0], end: nodes.at(-1) },
+    shadowedSeqs: [...nodes],
+    shadowedTokenCount: measured.nodes.reduce((total, node) => total + node.heuristicTokens, 0),
+  })
+  await first.sessions.flush(session)
+
+  const adapter = new ScriptedAdapter([textResponse('continued after crash recovery')])
+  const second = new Context()
+  await second.plugin(LlmRuntime)
+  await second.plugin(SessionStore)
+  await second.plugin(SessionProjectionRegistry)
+  await second.plugin(TokenMeter)
+  await second.plugin(SystemPrompt, { persona: 'test' })
+  await second.plugin(ToolRuntime)
+  await second.plugin(JsonlSessionPersistence, {
+    root,
+    compression: 'none',
+    packChunks: false,
+    writeBatchMaxDelayMs: 1,
+  })
+  await second.plugin(SessionCheckpointPolicy)
+  await second.plugin(AgentRegistry)
+  await second.plugin(AgentLoop, { agents: [] })
+  await second.plugin(ContextWindowPlugin)
+  second.llm.registerAdapter(['mock'], adapter)
+  const handle = await second.agents.resume({
+    resumeSessionId: sessionId,
+    agentOptions: { provider: 'mock', model: 'mock' },
+  })
+  const agent = handle.agent
+  const idle = waitForIdle(second, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'continue the interrupted task' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  assert.equal(adapter.requests.length, 1)
+  const request = JSON.stringify(adapter.requests[0].messages)
+  assert.match(request, /Resume the work after the crash/)
+  assert.doesNotMatch(request, /work before crash/)
+  const replacements = agent.session.snapshotEvents().filter(event =>
+    event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff')
+  assert.equal(replacements.length, 1)
+  const replacementSource = replacements[0].data.source
+  await handle.dispose()
+
+  const provider = createDeepseekProvider({ rootDir: root })
+  const unit = provider.discover({ lastCursor: () => null })[0]
+  assert.ok(unit)
+  const db = new DatabaseSync(':memory:')
+  db.exec(coreSchema)
+  persist(db, unit, provider.parse(unit, null))
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE id=?').get(
+    replacementSource.sessionId,
+  ).count, 1)
+  const api = createQueryApi(db)
+  assert.equal(
+    api.context(replacementSource.previousContextMessageUuid).message.uuid,
+    replacementSource.previousContextMessageUuid,
+  )
+  const scoped = api.search('work before crash', {
+    sessionId: replacementSource.sessionId,
+    limit: 10,
+  })
+  assert.ok(scoped.length > 0)
+  assert.ok(scoped.every(hit => hit.session.id === replacementSource.sessionId))
+  db.close()
 })
 
 test('flush failure prevents dispatching the fresh-context request', async () => {

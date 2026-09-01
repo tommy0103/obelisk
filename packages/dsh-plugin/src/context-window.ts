@@ -4,13 +4,8 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
-import {
-  defineTool,
-  renderToolsSdk,
-  renderToolsSdkPy,
-} from '@deepseek-ai/dsh-tools'
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-code-runtime'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type {} from '@deepseek-ai/dsh-compaction'
 
 import {
   decideContextWindowBudget,
@@ -19,11 +14,15 @@ import {
 } from './context-window-budget.ts'
 import { recoverySessionId } from './context-window-identity.ts'
 import { CONTEXT_WINDOW_GUIDANCE } from './context-window-prompt.ts'
-import { handlePreStep, queueForcedRolloverStep } from './context-window-rollover.ts'
+import {
+  applyForcedRollover,
+  handlePreStep,
+  queueForcedRolloverStep,
+} from './context-window-rollover.ts'
 import { contextWindowProjectionDefinition } from './context-window-state.ts'
 
 export const name = '@obelisk/dsh-obelisk-plugin/context-window'
-export const inject = ['tools', 'systemPrompt', 'sessions', 'sessionProjections', 'tokenMeter']
+export const inject = ['llm', 'tools', 'systemPrompt', 'sessions', 'sessionProjections', 'tokenMeter']
 
 export interface Config {
   /** Defaults to the effective model maxTokens for the current request. */
@@ -57,8 +56,22 @@ function validateConfig(config: unknown): asserts config is Config {
   optionalPositiveTokens('outputReserveTokens', Reflect.get(config, 'outputReserveTokens'))
 }
 
-function effectivePolicy(agent: Agent, config: Config): ContextWindowBudgetPolicy {
-  const maxTokens = agent.session.requestHeader()?.config.maxTokens ?? agent.options.maxTokens
+/** Reject the one known competing automatic surface-pressure owner. */
+export function assertCompatibleCompaction(ctx: Context): void {
+  const compaction = ctx.get('compaction') as { config?: { auto?: unknown } } | undefined
+  if (compaction?.config?.auto === true) {
+    throw new Error('context-window cannot run while compaction-basic.auto is enabled; set auto: false')
+  }
+}
+
+function effectivePolicy(
+  agent: Agent,
+  config: Config,
+  selectedMaxTokens?: number,
+): ContextWindowBudgetPolicy {
+  const maxTokens = selectedMaxTokens
+    ?? agent.session.requestHeader()?.config.maxTokens
+    ?? agent.options.maxTokens
   const outputReserveTokens = config.outputReserveTokens ?? maxTokens
   if (outputReserveTokens === undefined) {
     throw new Error('context-window: set outputReserveTokens when the effective model has no maxTokens')
@@ -89,13 +102,50 @@ export function budgetDecision(
   })
 }
 
-function sdkSchema(definition: ToolDefinition) {
-  return {
-    name: definition.name,
-    description: definition.description,
-    parameters: definition.parameters,
-    output: definition.output.schema,
+function decideForCapacity(
+  ctx: Context,
+  agent: Agent,
+  config: Config,
+  contextWindow: number,
+  maxTokens?: number,
+): ContextWindowBudgetDecision {
+  const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
+  return decideContextWindowBudget({
+    contextWindow,
+    totalTokens: ctx.tokenMeter.measure(agent.session).totalTokens,
+    explicitRolloverPending: state?.pending !== undefined,
+    reminderClaimed: state?.reminderClaimed ?? false,
+    fallbackClaimed: state?.fallbackClaimed ?? false,
+    policy: effectivePolicy(agent, config, maxTokens),
+  })
+}
+
+/** Resolve the route captured by this exact prompt assembly before applying pressure policy. */
+async function assemblyBudgetDecision(
+  ctx: Context,
+  agent: Agent,
+  config: Config,
+  assembly: PromptAssembly,
+  signal?: AbortSignal,
+): Promise<ContextWindowBudgetDecision | undefined> {
+  const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
+  if (state?.pending !== undefined) return { kind: 'rollover', reason: 'model' }
+  const previous = agent.session.requestHeader()?.config
+  const provider = assembly.variables.provider ?? agent.options.provider ?? previous?.provider
+  const model = assembly.variables.model ?? agent.options.model ?? previous?.model
+  if (provider === undefined || provider.length === 0 || model === undefined || model.length === 0) {
+    return budgetDecision(ctx, agent, config)
   }
+  const selected = await ctx.llm.resolveModelInfo(provider, model, signal)
+  return selected.context?.contextWindow === undefined
+    ? budgetDecision(ctx, agent, config)
+    : decideForCapacity(
+        ctx,
+        agent,
+        config,
+        selected.context.contextWindow,
+        agent.options.maxTokens ?? selected.defaultMaxTokens,
+      )
 }
 
 /** Restrict one fallback request to the new_context capability and PTC transport. */
@@ -103,25 +153,18 @@ export function fallbackAssembly(ctx: Context, assembly: PromptAssembly, agent: 
   const definition = ctx.tools.get('new_context', agent)
   if (definition === undefined) throw new Error('context-window: new_context is unavailable during fallback')
   const tools = assembly.tools.filter(tool => tool.name === 'new_context' || tool.name === 'run_code')
-  const hasPtc = tools.some(tool => tool.name === 'run_code')
-  if (!hasPtc) return { ...assembly, tools }
-  const runtime = ctx.get('codeRuntime')
-  if (runtime === undefined) throw new Error('context-window: PTC fallback requires a code runtime')
-  const text = runtime.language === 'python'
-    ? renderToolsSdkPy([sdkSchema(definition)])
-    : renderToolsSdk([sdkSchema(definition)])
-  return {
-    ...assembly,
-    tools,
-    sections: assembly.sections.map(section => (
-      section.name === 'tools:sdk' ? { ...section, text } : section
-    )),
-  }
+  return { ...assembly, tools }
 }
 
 /** Register the opt-in prose handoff, pressure policy, and safe-boundary rollover path. */
 export function apply(ctx: Context, config: unknown = {}): void {
   validateConfig(config)
+  assertCompatibleCompaction(ctx)
+  const assemblies = new WeakMap<Agent, {
+    assembly: PromptAssembly
+    decision: ContextWindowBudgetDecision | undefined
+    fullTools: PromptAssembly['tools']
+  }>()
   ctx.sessionProjections.register(contextWindowProjectionDefinition)
   ctx.systemPrompt.section({
     name: 'obelisk:context-window',
@@ -149,11 +192,16 @@ export function apply(ctx: Context, config: unknown = {}): void {
     },
   }))
   ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+    assertCompatibleCompaction(ctx)
     const resolved = await next()
     const agent = context.agent
-    return agent !== undefined && budgetDecision(ctx, agent, config)?.kind === 'fallback'
+    if (agent === undefined) return resolved
+    const decision = await assemblyBudgetDecision(ctx, agent, config, resolved, context.signal)
+    const selected = decision?.kind === 'fallback'
       ? fallbackAssembly(ctx, resolved, agent)
       : resolved
+    assemblies.set(agent, { assembly: selected, decision, fullTools: resolved.tools })
+    return selected
   }, { prepend: true })
   ctx.tools.guard(exec => {
     const agent = exec.agent
@@ -165,9 +213,26 @@ export function apply(ctx: Context, config: unknown = {}): void {
     }
     return 'The context-window fallback reserve only permits new_context.'
   })
-  ctx.on('agent/pre-step', ({ agent, signal }, next) => (
-    handlePreStep(ctx, agent, signal, budgetDecision(ctx, agent, config), next)
-  ), { prepend: true })
+  ctx.on('agent/pre-step', ({ agent, signal }, next) => {
+    assertCompatibleCompaction(ctx)
+    return handlePreStep(
+      ctx,
+      agent,
+      signal,
+      assemblies.get(agent)?.decision ?? budgetDecision(ctx, agent, config),
+      next,
+    )
+  }, { prepend: true })
+  ctx.on('agent/request-error', async ({ agent, signal }, next) => {
+    const downstream = await next()
+    if (downstream?.kind === 'retry' || signal.aborted) return downstream
+    const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
+    const captured = assemblies.get(agent)
+    if (state?.fallbackClaimed !== true || captured?.decision?.kind !== 'fallback') return downstream
+    await applyForcedRollover(ctx, agent, signal)
+    captured.assembly.tools = [...captured.fullTools]
+    return { kind: 'retry' }
+  })
   ctx.on('agent/turn-stopping', ({ agent }) => {
     const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
     const decision = budgetDecision(ctx, agent, config)
