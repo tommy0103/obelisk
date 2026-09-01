@@ -23,6 +23,10 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - name: Install app test dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: npm --prefix app ci
       - name: Verify complete repository suite
         if: runner.os == 'Linux'
         run: npm test
@@ -39,11 +43,7 @@ jobs:
           node --experimental-test-module-mocks --test tests/dsh-plugin.test.mjs tests/dsh-context-window-plugin.test.mjs
 
       - name: Verify Electron main schema asset
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-        run: |
-          npm --prefix app ci
-          node --test app/tests/electron-vite-schema-asset.mjs
+        run: node --test app/tests/electron-vite-schema-asset.mjs
 
       - name: Verify shared persistence idempotency
         run: node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/persist-idempotency.test.mjs tests/persist.test.mjs tests/indexer-upsert-drift.test.mjs
