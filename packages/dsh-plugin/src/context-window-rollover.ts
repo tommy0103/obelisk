@@ -22,6 +22,8 @@ export type ContextRolloverTrigger =
   | { kind: 'model'; rootCallId: string }
   | { kind: 'hard-limit' }
 
+const unflushedRollovers = new WeakSet<Session>()
+
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'obelisk-context-pressure': {
@@ -117,7 +119,9 @@ async function applyRollover(
     surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes.at(-1)! },
     sourceEventSeqs: [...nodes],
   })
+  unflushedRollovers.add(session)
   await ctx.sessions.flush(session)
+  unflushedRollovers.delete(session)
 }
 
 /** Replace the complete active surface with the model-authored prose handoff. */
@@ -177,6 +181,10 @@ export async function handlePreStep(
   next: () => Promise<PreStepDecision>,
 ): Promise<PreStepDecision> {
   signal.throwIfAborted()
+  if (unflushedRollovers.has(agent.session)) {
+    await ctx.sessions.flush(agent.session)
+    unflushedRollovers.delete(agent.session)
+  }
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
   if (state?.pending !== undefined) {
     await applyExplicitRollover(ctx, agent, state.pending, signal)

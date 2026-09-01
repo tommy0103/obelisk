@@ -424,6 +424,37 @@ test('prices retained images with the model selected for this assembly', async (
   assert.doesNotMatch(JSON.stringify(adapter.requests[1].messages), /route-pricing-image/)
 })
 
+test('includes newly claimed input in the pre-step pressure decision', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse('response before oversized input', { inputTokens: 20, outputTokens: 1 }),
+    textResponse('continued with oversized input on the fresh surface'),
+  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('pending-input-session'), { provider: 'mock', model: 'mock' })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'old surface sentinel' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: `oversized next input ${'x'.repeat(4_000)}` }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  const request = JSON.stringify(adapter.requests[1].messages)
+  assert.match(request, /No prose handoff was produced/)
+  assert.match(request, /oversized next input/)
+  assert.doesNotMatch(request, /old surface sentinel/)
+})
+
 test('limits fallback inference to new_context and rolls over on success', async () => {
   const policy = {
     reminderThresholdTokens: 100,
@@ -678,7 +709,7 @@ test('resolves persisted parent lineage by project scope when native ids collide
     },
   }
   const identityContext = {
-    sessions: { get: () => undefined },
+    sessions: { get: () => ({ header: { cwd: otherCwd } }) },
     get: service => service === 'sessionPersistence' ? persistence : undefined,
   }
 
@@ -947,21 +978,33 @@ test('a persisted crash after prune but before replacement converges on resume',
   db.close()
 })
 
-test('flush failure prevents dispatching the fresh-context request', async () => {
+test('flush failure blocks dispatch until the rollover flush succeeds', async () => {
   const adapter = new ScriptedAdapter([
     toolCallResponse('flush-failure', 'new_context', { handoff: 'Persist before continuing.' }),
-    textResponse('must not dispatch'),
+    textResponse('continued after persistence recovered'),
   ])
   const ctx = await harness(adapter)
   const agent = ctx.agentLoop.create(SessionId('flush-failure-session'), { provider: 'mock', model: 'mock' })
+  let flushAttempts = 0
   ctx.on('session/flush', session => {
-    if (session === agent.session) throw new Error('simulated persistence failure')
+    if (session !== agent.session) return
+    flushAttempts += 1
+    if (flushAttempts === 1) throw new Error('simulated persistence failure')
   })
-  const idle = waitForIdle(ctx, agent)
+  let idle = waitForIdle(ctx, agent)
   agent.followup(createUserMessage({ content: [{ type: 'text', text: 'start' }], source: { kind: 'user' } }))
   await idle
 
   assert.equal(adapter.requests.length, 1)
+  assert.equal(flushAttempts, 1)
   assert.equal(agent.session.snapshotEvents().filter(event =>
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff').length, 1)
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'retry after persistence recovers' }], source: { kind: 'user' } }))
+  await idle
+
+  assert.equal(flushAttempts, 2)
+  assert.equal(adapter.requests.length, 2)
+  assert.match(JSON.stringify(adapter.requests[1].messages), /retry after persistence recovers/)
 })

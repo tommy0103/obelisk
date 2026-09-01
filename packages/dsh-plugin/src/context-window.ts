@@ -3,8 +3,13 @@
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
+import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
 import type { EpochHeader } from '@deepseek-ai/dsh-session'
-import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+import {
+  renderContextSnapshot,
+  renderPrompt,
+  type PromptAssembly,
+} from '@deepseek-ai/dsh-system-prompt'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-compaction'
 
@@ -33,6 +38,15 @@ export interface Config {
   /** Defaults to the effective model maxTokens for the current request. */
   outputReserveTokens?: number
 }
+
+interface AssemblyBudgetPlan {
+  readonly requestHeader?: EpochHeader
+  decide(additionalTokens?: number): ContextWindowBudgetDecision | undefined
+}
+
+type RequestImage = Parameters<
+  NonNullable<ReturnType<Context['llm']['imageRequestPricing']>>['priceImages']
+>[0][number]
 
 const output = {
   schema: { type: 'string' as const },
@@ -89,13 +103,14 @@ export function budgetDecision(
   ctx: Context,
   agent: Agent,
   config: Config,
+  additionalTokens = 0,
 ): ContextWindowBudgetDecision | undefined {
   const pressure = ctx.sessionProjections.stateOf(agent.session, 'contextPressure')
   if (pressure?.contextWindow === undefined) return undefined
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
   return decideContextWindowBudget({
     contextWindow: pressure.contextWindow,
-    totalTokens: ctx.tokenMeter.measure(agent.session).totalTokens,
+    totalTokens: ctx.tokenMeter.measure(agent.session).totalTokens + additionalTokens,
     explicitRolloverPending: state?.pending !== undefined,
     reminderClaimed: state?.reminderClaimed ?? false,
     fallbackClaimed: state?.fallbackClaimed ?? false,
@@ -110,16 +125,58 @@ function decideForCapacity(
   contextWindow: number,
   requestHeader: EpochHeader,
   maxTokens?: number,
+  additionalTokens = 0,
 ): ContextWindowBudgetDecision {
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
   return decideContextWindowBudget({
     contextWindow,
-    totalTokens: ctx.tokenMeter.measure(agent.session, requestHeader).totalTokens,
+    totalTokens: ctx.tokenMeter.measure(agent.session, requestHeader).totalTokens + additionalTokens,
     explicitRolloverPending: state?.pending !== undefined,
     reminderClaimed: state?.reminderClaimed ?? false,
     fallbackClaimed: state?.fallbackClaimed ?? false,
     policy: effectivePolicy(agent, config, maxTokens),
   })
+}
+
+function collectImages(message: Message): RequestImage[] {
+  const images: RequestImage[] = []
+  const visit = (content: Message['content']): void => {
+    for (const block of content) {
+      if (block.type === 'image') images.push(block.attachment)
+      if (block.type === 'tool-result') visit(block.content)
+    }
+  }
+  visit(message.content)
+  return images
+}
+
+function pendingMessageTokens(
+  ctx: Context,
+  messages: readonly Message[],
+  requestHeader?: EpochHeader,
+): number {
+  let total = messages.reduce((sum, message) => sum + ctx.tokenMeter.estimateMessage(message), 0)
+  if (requestHeader === undefined) return total
+  const pricing = ctx.llm.imageRequestPricing(
+    requestHeader.config.provider,
+    requestHeader.config.model,
+  )
+  if (pricing === undefined) return total
+  const images = messages.flatMap(collectImages)
+  const prices = pricing.priceImages(images)
+  if (prices.length !== images.length) {
+    throw new Error(`context-window: route image pricing returned ${prices.length} prices for ${images.length} images`)
+  }
+  for (const price of prices) {
+    total += price.visualTokens
+    if (price.text !== '') {
+      total += ctx.tokenMeter.estimateMessage(createUserMessage({
+        content: [{ type: 'text', text: price.text }],
+        source: { kind: 'user' },
+      }))
+    }
+  }
+  return total
 }
 
 function assemblyRequestHeader(
@@ -148,33 +205,42 @@ function assemblyRequestHeader(
 }
 
 /** Resolve the route captured by this exact prompt assembly before applying pressure policy. */
-async function assemblyBudgetDecision(
+async function assemblyBudgetPlan(
   ctx: Context,
   agent: Agent,
   config: Config,
   assembly: PromptAssembly,
   signal?: AbortSignal,
-): Promise<ContextWindowBudgetDecision | undefined> {
+): Promise<AssemblyBudgetPlan> {
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
-  if (state?.pending !== undefined) return { kind: 'rollover', reason: 'model' }
+  if (state?.pending !== undefined) {
+    return { decide: () => ({ kind: 'rollover', reason: 'model' }) }
+  }
   const previous = agent.session.requestHeader()?.config
   const provider = assembly.variables.provider ?? agent.options.provider ?? previous?.provider
   const model = assembly.variables.model ?? agent.options.model ?? previous?.model
   if (provider === undefined || provider.length === 0 || model === undefined || model.length === 0) {
-    return budgetDecision(ctx, agent, config)
+    return { decide: additionalTokens => budgetDecision(ctx, agent, config, additionalTokens) }
   }
   const selected = await ctx.llm.resolveModelInfo(provider, model, signal)
+  const contextWindow = selected.context?.contextWindow
+  if (contextWindow === undefined) {
+    return { decide: additionalTokens => budgetDecision(ctx, agent, config, additionalTokens) }
+  }
   const maxTokens = agent.options.maxTokens ?? selected.defaultMaxTokens
-  return selected.context?.contextWindow === undefined
-    ? budgetDecision(ctx, agent, config)
-    : decideForCapacity(
+  const requestHeader = assemblyRequestHeader(agent, assembly, provider, model, selected.defaultMaxTokens)
+  return {
+    requestHeader,
+    decide: additionalTokens => decideForCapacity(
         ctx,
         agent,
         config,
-        selected.context.contextWindow,
-        assemblyRequestHeader(agent, assembly, provider, model, selected.defaultMaxTokens),
+        contextWindow,
+        requestHeader,
         maxTokens,
-      )
+        additionalTokens,
+      ),
+  }
 }
 
 /** Restrict one fallback request to the new_context capability and PTC transport. */
@@ -192,6 +258,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
   const assemblies = new WeakMap<Agent, {
     assembly: PromptAssembly
     decision: ContextWindowBudgetDecision | undefined
+    budgetPlan: AssemblyBudgetPlan
     fullTools: PromptAssembly['tools']
   }>()
   ctx.sessionProjections.register(contextWindowProjectionDefinition)
@@ -225,11 +292,12 @@ export function apply(ctx: Context, config: unknown = {}): void {
     const resolved = await next()
     const agent = context.agent
     if (agent === undefined) return resolved
-    const decision = await assemblyBudgetDecision(ctx, agent, config, resolved, context.signal)
+    const budgetPlan = await assemblyBudgetPlan(ctx, agent, config, resolved, context.signal)
+    const decision = budgetPlan.decide()
     const selected = decision?.kind === 'fallback'
       ? fallbackAssembly(ctx, resolved, agent)
       : resolved
-    assemblies.set(agent, { assembly: selected, decision, fullTools: resolved.tools })
+    assemblies.set(agent, { assembly: selected, decision, budgetPlan, fullTools: resolved.tools })
     return selected
   }, { prepend: true })
   ctx.tools.guard(exec => {
@@ -242,13 +310,34 @@ export function apply(ctx: Context, config: unknown = {}): void {
     }
     return 'The context-window fallback reserve only permits new_context.'
   })
-  ctx.on('agent/pre-step', ({ agent, signal }, next) => {
+  ctx.on('agent/pre-step', ({ agent, messages, signal }, next) => {
     assertCompatibleCompaction(ctx)
+    const captured = assemblies.get(agent)
+    const runtimeContext = captured === undefined ? '' : renderContextSnapshot(captured.assembly)
+    const pendingMessages = runtimeContext === ''
+      ? messages
+      : [...messages, createUserMessage({
+          content: [{ type: 'text', text: runtimeContext }],
+          source: { kind: 'user' },
+        })]
+    const decision = captured === undefined
+      ? budgetDecision(ctx, agent, config, pendingMessageTokens(ctx, pendingMessages))
+      : captured.budgetPlan.decide(pendingMessageTokens(
+          ctx,
+          pendingMessages,
+          captured.budgetPlan.requestHeader,
+        ))
+    if (captured !== undefined) {
+      captured.decision = decision
+      captured.assembly.tools = decision?.kind === 'fallback'
+        ? fallbackAssembly(ctx, { ...captured.assembly, tools: captured.fullTools }, agent).tools
+        : [...captured.fullTools]
+    }
     return handlePreStep(
       ctx,
       agent,
       signal,
-      assemblies.get(agent)?.decision ?? budgetDecision(ctx, agent, config),
+      decision,
       next,
     )
   }, { prepend: true })

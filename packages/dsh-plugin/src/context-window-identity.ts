@@ -31,7 +31,7 @@ async function rootNativeSessionId(
     if (seen.has(parentId)) throw new Error('context-window: cyclic DSH parentSession lineage')
     seen.add(parentId)
     const live = ctx.sessions.get(parentId)
-    if (live !== undefined) {
+    if (live !== undefined && deepseekProjectScope(live.header.cwd) === scope) {
       header = live.header
     } else {
       const persistence = ctx.get('sessionPersistence')
