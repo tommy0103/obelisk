@@ -287,14 +287,14 @@ test('resolves reminder, fallback reserve, and forced rollover from host pressur
 
 test('injects one durable reminder near the normal budget', async () => {
   const policy = {
-    reminderThresholdTokens: 100,
+    reminderThresholdTokens: 800,
     fallbackReserveTokens: 200,
     outputReserveTokens: 100,
   }
   const adapter = new ScriptedAdapter([
-    textResponse('first response', { inputTokens: 620, outputTokens: 1 }),
+    textResponse('first response', { inputTokens: 1_000, outputTokens: 1 }),
     textResponse('continued after reminder'),
-  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  ], { contextWindow: 2_000, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, policy)
   const agent = ctx.agentLoop.create(SessionId('reminder-session'), { provider: 'mock', model: 'mock' })
   let idle = waitForIdle(ctx, agent)
@@ -426,9 +426,9 @@ test('prices retained images with the model selected for this assembly', async (
 
 test('includes newly claimed input in the pre-step pressure decision', async () => {
   const adapter = new ScriptedAdapter([
-    textResponse(`response before rollover ${'y'.repeat(400)}`, { inputTokens: 20, outputTokens: 1 }),
+    textResponse(`response before rollover ${'r'.repeat(8_000)}`, { inputTokens: 1, outputTokens: 1 }),
     textResponse('continued with pending input on the fresh surface'),
-  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  ], { contextWindow: 2_500, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, {
     reminderThresholdTokens: 100,
     fallbackReserveTokens: 200,
@@ -437,14 +437,14 @@ test('includes newly claimed input in the pre-step pressure decision', async () 
   const agent = ctx.agentLoop.create(SessionId('pending-input-session'), { provider: 'mock', model: 'mock' })
   let idle = waitForIdle(ctx, agent)
   agent.followup(createUserMessage({
-    content: [{ type: 'text', text: `old surface sentinel ${'x'.repeat(1_600)}` }],
+    content: [{ type: 'text', text: 'old surface sentinel' }],
     source: { kind: 'user' },
   }))
   await idle
 
   idle = waitForIdle(ctx, agent)
   agent.followup(createUserMessage({
-    content: [{ type: 'text', text: `fit after rollover ${'z'.repeat(600)}` }],
+    content: [{ type: 'text', text: 'fit after rollover' }],
     source: { kind: 'user' },
   }))
   await idle
@@ -456,40 +456,31 @@ test('includes newly claimed input in the pre-step pressure decision', async () 
 })
 
 test('preserves pending input instead of dispatching when it cannot fit a fresh context', async () => {
-  const adapter = new ScriptedAdapter([
-    textResponse('response before impossible input', { inputTokens: 20, outputTokens: 1 }),
-  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const adapter = new ScriptedAdapter([], { contextWindow: 1_000, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, {
     reminderThresholdTokens: 100,
     fallbackReserveTokens: 200,
     outputReserveTokens: 100,
   })
   const agent = ctx.agentLoop.create(SessionId('impossible-input-session'), { provider: 'mock', model: 'mock' })
-  let idle = waitForIdle(ctx, agent)
-  agent.followup(createUserMessage({
-    content: [{ type: 'text', text: 'establish prior assistant' }],
-    source: { kind: 'user' },
-  }))
-  await idle
-
   const impossible = createUserMessage({
     content: [{ type: 'text', text: `cannot fit fresh context ${'x'.repeat(4_000)}` }],
     source: { kind: 'user' },
   })
-  idle = waitForIdle(ctx, agent)
+  const idle = waitForIdle(ctx, agent)
   agent.followup(impossible)
   await idle
 
-  assert.equal(adapter.requests.length, 1)
-  assert.equal(agent.inbox.nextStep.length, 1)
-  assert.equal(agent.inbox.nextStep[0].id, impossible.id)
+  assert.equal(adapter.requests.length, 0)
+  assert.ok(agent.session.snapshotEvents().some(event =>
+    event.type === 'user/message' && event.data.id === impossible.id))
 })
 
 test('measures the final messages produced by downstream pre-step listeners', async () => {
   const adapter = new ScriptedAdapter([
-    textResponse(`response before downstream context ${'y'.repeat(400)}`, { inputTokens: 20, outputTokens: 1 }),
+    textResponse(`response before downstream context ${'r'.repeat(7_600)}`, { inputTokens: 1, outputTokens: 1 }),
     textResponse('continued with downstream context on the fresh surface'),
-  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  ], { contextWindow: 2_500, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, {
     reminderThresholdTokens: 100,
     fallbackReserveTokens: 200,
@@ -503,7 +494,7 @@ test('measures the final messages produced by downstream pre-step listeners', as
     return {
       ...decision,
       messages: [...decision.messages, createUserMessage({
-        content: [{ type: 'text', text: `downstream runtime context ${'z'.repeat(600)}` }],
+        content: [{ type: 'text', text: `downstream runtime context ${'z'.repeat(1_000)}` }],
         source: { kind: 'plugin', plugin: 'test', form: 'instructions' },
       })],
     }
@@ -511,7 +502,7 @@ test('measures the final messages produced by downstream pre-step listeners', as
 
   let idle = waitForIdle(ctx, agent)
   agent.followup(createUserMessage({
-    content: [{ type: 'text', text: `old downstream surface ${'x'.repeat(1_600)}` }],
+    content: [{ type: 'text', text: 'old downstream surface' }],
     source: { kind: 'user' },
   }))
   await idle
@@ -573,6 +564,36 @@ test('replaces pending image structure cost with route pricing', async () => {
   assert.match(request, /keep the existing surface/)
   assert.match(request, /cheap-pending-image/)
   assert.doesNotMatch(request, /No prose handoff was produced/)
+})
+
+test('remeasures a policy message before allowing fallback inference', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse(`large prior response ${'r'.repeat(2_800)}`, { inputTokens: 20, outputTokens: 720 }),
+    textResponse('continued after policy-safe rollover'),
+  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  const ctx = await harness(adapter, {
+    reminderThresholdTokens: 100,
+    fallbackReserveTokens: 200,
+    outputReserveTokens: 100,
+  })
+  const agent = ctx.agentLoop.create(SessionId('policy-message-fit'), { provider: 'mock', model: 'mock' })
+  let idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'establish pressure near the fallback boundary' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'continue safely' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  const request = JSON.stringify(adapter.requests[1].messages)
+  assert.match(request, /No prose handoff was produced/)
+  assert.doesNotMatch(request, /fallback reserve is active/)
 })
 
 test('limits fallback inference to new_context and rolls over on success', async () => {
@@ -657,14 +678,14 @@ test('PTC fallback guard permits only new_context through run_code and completes
 test('forces a recoverable rollover in the same user turn when fallback produces no handoff', async () => {
   const policy = {
     reminderThresholdTokens: 100,
-    fallbackReserveTokens: 200,
+    fallbackReserveTokens: 500,
     outputReserveTokens: 100,
   }
   const adapter = new ScriptedAdapter([
-    textResponse('first response', { inputTokens: 730, outputTokens: 1 }),
-    textResponse('incorrect final instead of handoff', { inputTokens: 760, outputTokens: 1 }),
+    textResponse('first response', { inputTokens: 2_450, outputTokens: 1 }),
+    textResponse(`incorrect final instead of handoff ${'q'.repeat(9_000)}`, { inputTokens: 1, outputTokens: 1 }),
     textResponse('continued after forced rollover'),
-  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  ], { contextWindow: 3_000, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, policy)
   const agent = ctx.agentLoop.create(SessionId('forced-session'), { provider: 'mock', model: 'mock' })
   let idle = waitForIdle(ctx, agent)
@@ -675,6 +696,7 @@ test('forces a recoverable rollover in the same user turn when fallback produces
   agent.followup(createUserMessage({ content: [{ type: 'text', text: 'continue' }], source: { kind: 'user' } }))
   await idle
 
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /normal task budget is exhausted/)
   assert.equal(adapter.requests.length, 3)
   const third = JSON.stringify(adapter.requests[2].messages)
   assert.match(third, /No prose handoff was produced/)
@@ -928,6 +950,29 @@ test('applies a successful new_context handoff at the next pre-step', async () =
     restored.checkpoint.obeliskContextWindow.val,
     ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow'),
   )
+})
+
+test('restores unchanged runtime context after replacing the old surface', async () => {
+  const adapter = new ScriptedAdapter([
+    toolCallResponse('runtime-context-rollover', 'new_context', { handoff: 'Continue with runtime context.' }),
+    textResponse('continued with restored runtime context'),
+  ])
+  const ctx = await harness(adapter)
+  ctx.systemPrompt.context({
+    name: 'test:stable-runtime-context',
+    order: 10,
+    text: 'Stable runtime context must survive rollover.',
+  })
+  const agent = ctx.agentLoop.create(SessionId('runtime-context-rollover'), { provider: 'mock', model: 'mock' })
+  const idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'start with runtime context' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  assert.match(JSON.stringify(adapter.requests[0].messages), /Stable runtime context must survive rollover/)
+  assert.match(JSON.stringify(adapter.requests[1].messages), /Stable runtime context must survive rollover/)
 })
 
 test('does not rollover a failed new_context call', async () => {

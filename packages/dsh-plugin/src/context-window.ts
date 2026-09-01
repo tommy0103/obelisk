@@ -3,9 +3,11 @@
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type Message, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { EpochHeader } from '@deepseek-ai/dsh-session'
 import {
+  joinContextSections,
+  renderContextSections,
   renderPrompt,
   type PromptAssembly,
 } from '@deepseek-ai/dsh-system-prompt'
@@ -21,6 +23,7 @@ import { recoverySessionId } from './context-window-identity.ts'
 import { CONTEXT_WINDOW_GUIDANCE } from './context-window-prompt.ts'
 import {
   applyForcedRollover,
+  contextPressureMessage,
   ensureRolloverFlushed,
   handlePreStep,
   queueForcedRolloverStep,
@@ -202,6 +205,31 @@ function pendingMessageTokens(
   return total
 }
 
+const RUNTIME_CONTEXT_PLUGIN = '@deepseek-ai/dsh-system-prompt'
+
+function restoreRuntimeContext(
+  assembly: PromptAssembly,
+  messages: readonly UserMessage[],
+): UserMessage[] {
+  if (messages.some(message =>
+    message.source.kind === 'plugin'
+    && message.source.plugin === RUNTIME_CONTEXT_PLUGIN)) {
+    return [...messages]
+  }
+  const sections = renderContextSections(assembly)
+  const text = joinContextSections(sections)
+  if (text === '') return [...messages]
+  return [...messages, createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: RUNTIME_CONTEXT_PLUGIN,
+      form: 'snapshot',
+      sections,
+    },
+  })]
+}
+
 function assemblyRequestHeader(
   agent: Agent,
   assembly: PromptAssembly,
@@ -331,14 +359,13 @@ export function apply(ctx: Context, config: unknown = {}): void {
   })
   ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
     assertCompatibleCompaction(ctx)
-    await ensureRolloverFlushed(ctx, agent, signal)
     const captured = assemblies.get(agent)
     const decide = (additionalTokens = 0): ContextWindowBudgetDecision | undefined => (
       captured === undefined
         ? budgetDecision(ctx, agent, config, additionalTokens)
         : captured.budgetPlan.decide(additionalTokens)
     )
-    let decision = decide()
+    let decision: ContextWindowBudgetDecision | undefined
     const applySchemas = (): void => {
       if (captured === undefined) return
       captured.decision = decision
@@ -346,45 +373,91 @@ export function apply(ctx: Context, config: unknown = {}): void {
         ? fallbackAssembly(ctx, { ...captured.assembly, tools: captured.fullTools }, agent).tools
         : [...captured.fullTools]
     }
-    const knownRollover = decision?.kind === 'rollover'
-    if (knownRollover) applySchemas()
-    let resolved = knownRollover
-      ? await handlePreStep(ctx, agent, signal, decision, next)
-      : await next()
-    if (resolved.kind === 'reject') return resolved
+    const settlePolicy = (pending: readonly UserMessage[]): ContextWindowBudgetDecision | undefined => {
+      const measure = (candidate: readonly UserMessage[]): number => pendingMessageTokens(
+        ctx,
+        candidate,
+        captured?.budgetPlan.requestHeader,
+      )
+      let settled = decide(measure(pending))
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (settled?.kind !== 'remind' && settled?.kind !== 'fallback') return settled
+        const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
+        const pressure = contextPressureMessage(
+          settled.kind === 'remind' ? 'reminder' : 'fallback',
+          state?.generation ?? 0,
+        )
+        const withPressure = decide(measure([...pending, pressure]))
+        if (withPressure?.kind === settled.kind) return settled
+        settled = withPressure
+      }
+      return settled
+    }
+    const preserveClaimedInput = async (): Promise<void> => {
+      const recordedIds = new Set(agent.session.snapshotEvents()
+        .filter(event => event.type === 'user/message')
+        .map(event => event.data.id))
+      let appended = false
+      for (const message of messages) {
+        if (recordedIds.has(message.id)) continue
+        agent.session.append('user/message', message, { surfaceOp: 'append' })
+        appended = true
+      }
+      if (appended) await ctx.sessions.flush(agent.session)
+    }
 
-    const pendingTokens = pendingMessageTokens(
-      ctx,
-      resolved.messages,
-      captured?.budgetPlan.requestHeader,
-    )
-    decision = decide(pendingTokens)
-    if (decision?.kind === 'rollover' && !knownRollover) {
+    try {
+      await ensureRolloverFlushed(ctx, agent, signal)
+      const claimedTokens = pendingMessageTokens(
+        ctx,
+        messages,
+        captured?.budgetPlan.requestHeader,
+      )
+      decision = decide(claimedTokens)
+      const knownRollover = decision?.kind === 'rollover'
       applySchemas()
-      resolved = await handlePreStep(
+      let resolved = knownRollover
+        ? await handlePreStep(ctx, agent, signal, decision, next)
+        : await next()
+      if (resolved.kind === 'reject') return resolved
+      if (knownRollover && captured !== undefined) {
+        resolved = { ...resolved, messages: restoreRuntimeContext(captured.assembly, resolved.messages) }
+      }
+
+      decision = settlePolicy(resolved.messages)
+      if (decision?.kind === 'rollover' && !knownRollover) {
+        applySchemas()
+        resolved = await handlePreStep(
+          ctx,
+          agent,
+          signal,
+          decision,
+          () => Promise.resolve(resolved),
+        )
+        if (resolved.kind === 'reject') return resolved
+        if (captured !== undefined) {
+          resolved = { ...resolved, messages: restoreRuntimeContext(captured.assembly, resolved.messages) }
+        }
+        decision = settlePolicy(resolved.messages)
+      }
+      if (decision?.kind === 'rollover' && decision.reason === 'hard-limit') {
+        throw new Error(
+          'context-window: pending input exceeds the fresh context capacity; '
+          + 'the input was preserved for retry with a larger model or smaller request',
+        )
+      }
+      applySchemas()
+      return handlePreStep(
         ctx,
         agent,
         signal,
         decision,
         () => Promise.resolve(resolved),
       )
-      decision = decide(pendingTokens)
+    } catch (error) {
+      await preserveClaimedInput()
+      throw error
     }
-    if (decision?.kind === 'rollover' && decision.reason === 'hard-limit') {
-      for (const message of messages) agent.inject(message)
-      throw new Error(
-        'context-window: pending input exceeds the fresh context capacity; '
-        + 'the input was preserved for retry with a larger model or smaller request',
-      )
-    }
-    applySchemas()
-    return handlePreStep(
-      ctx,
-      agent,
-      signal,
-      decision,
-      () => Promise.resolve(resolved),
-    )
   }, { prepend: true })
   ctx.on('agent/request-error', async ({ agent, signal }, next) => {
     const downstream = await next()

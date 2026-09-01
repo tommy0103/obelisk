@@ -496,7 +496,9 @@ context-window pressure policy 与 `compaction-basic.auto` 不得同时控制同
 
 README 仍说明正确 composition，但文档不是互斥机制。运行时检查必须拒绝已经启用的 `compaction-basic.auto`，并在 compaction service 晚于 extra plugin 挂载时于第一条真实 request 前再次验证。
 
-explicit rollover 与 hard-limit forced rollover 都在 prepended `agent/pre-step` listener 中先完成 replacement。之后继续委托时，后续 listener 只会看到已经缩小的 active surface。
+explicit rollover，以及能由 durable surface 与本次已 claim user messages 判定的 hard-limit forced rollover，都会在 prepended `agent/pre-step` listener 中先完成 replacement；这些路径的后续 listener 只会看到已经缩小的 active surface。
+
+DSH waterfall 不会在 downstream `agent/pre-step` listener 返回前暴露它追加的最终 messages。若 pressure 只由 downstream 新增内容触发，extra plugin 必须在 `await next()` 后以最终 messages 做安全检查，并在 model request dispatch 前完成 replacement 与 fresh-surface 复检；已经执行的 downstream listener 会观察到 replacement 前的 surface。第一版接受这个受 DSH extension-point 顺序限定的例外，不通过重复调用 `next()` 制造 listener 副作用。claimed user input 不属于该例外：它在 prepended listener 入口已经可见，必须在 downstream 之前参与决策。
 
 ## 15. Obelisk Skill 调整
 
@@ -555,7 +557,7 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - 旧 user、assistant 和 tool-result content 不进入下一次 model request。
 - 下一次 request 包含原样 prose handoff 和两个 recovery anchors。
 - rollover 后同一个 user turn 继续 inference。
-- 静态 initial context、system prompt 和 tool schemas 仍然存在。
+- 静态 initial context、未变化的 runtime context、system prompt 和 tool schemas 仍然存在。
 - explicit rollover 不生成 summary。
 - 启用 context-window pressure policy 的 composition 关闭 `compaction-basic.auto`，但仍可保留手动 `/compact`。
 - `compaction-basic.auto` 已启用或稍后挂载时，extra plugin 在首个 request 前 fail fast。
@@ -566,11 +568,13 @@ skill 不教授 window listing、UUID range 或第二套 query protocol。
 - 同一 active context 不重复 claim reminder。
 - 本次 assembly 切换到更小 context model 时，预算使用新 model capacity，而不是上一请求的 durable capacity。
 - normal budget 耗尽且没有成功 `new_context` 时，自动进入一次 fallback reserve inference。
+- final fit check 包含本次实际 downstream messages 以及将要追加的 reminder/fallback pressure message。
 - native fallback sampling 的工具 schema 只保留 `new_context`；PTC 只暴露 `run_code` transport，execution guard 拒绝除 nested `new_context` 外的其他 calls。
 - fallback request 的 terminal transport failure 在 forced rollover 后以正常 capability 于同一 user turn retry。
 - 成功 `new_context` 优先于 fallback 和 forced rollover。
 - fallback reserve 耗尽后强制 rollover，并生成带 `handoff_status: missing` provenance 的降级 handoff。
 - resume 不重复发放已经 claim 的 reminder 或 fallback reserve。
+- forced rollover 或 identity/flush 失败时，本次已 claim user input 必须先进入 durable session surface，不能因 pre-step error 丢失。
 
 ### 16.7 Durability 与恢复
 

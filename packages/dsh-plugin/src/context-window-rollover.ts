@@ -76,7 +76,7 @@ function assistantKind(session: Session): {
   throw new Error('context-window: forced rollover requires a previous assistant message')
 }
 
-function pressureMessage(phase: 'reminder' | 'fallback', generation: number) {
+export function contextPressureMessage(phase: 'reminder' | 'fallback', generation: number) {
   return createUserMessage({
     content: [{
       type: 'text',
@@ -204,7 +204,7 @@ export async function handlePreStep(
   if (decision.kind === 'reject') return decision
   return {
     ...decision,
-    messages: [...decision.messages, pressureMessage(
+    messages: [...decision.messages, contextPressureMessage(
       budget.kind === 'remind' ? 'reminder' : 'fallback',
       state?.generation ?? 0,
     )],
