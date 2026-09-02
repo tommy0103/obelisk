@@ -476,8 +476,15 @@ test('preserves pending input instead of dispatching when it cannot fit a fresh 
     event.type === 'user/message' && event.data.id === impossible.id))
 })
 
-test('preserves downstream messages when a late rollover cannot proceed', async () => {
-  const adapter = new ScriptedAdapter([], { contextWindow: 1_000, defaultMaxTokens: 100 })
+test('replays downstream middleware without persisting duplicate output', async () => {
+  const adapter = new ScriptedAdapter([
+    textResponse('continued once on the larger model'),
+  ], {
+    models: {
+      small: { contextWindow: 1_000, defaultMaxTokens: 100 },
+      large: { contextWindow: 10_000, defaultMaxTokens: 100 },
+    },
+  })
   const ctx = await harness(adapter, {
     reminderThresholdTokens: 100,
     fallbackReserveTokens: 200,
@@ -487,7 +494,20 @@ test('preserves downstream messages when a late rollover cannot proceed', async 
     content: [{ type: 'text', text: `one-shot downstream context ${'x'.repeat(4_000)}` }],
     source: { kind: 'plugin', plugin: 'test', form: 'instructions' },
   })
-  const agent = ctx.agentLoop.create(SessionId('late-rollover-preservation'), { provider: 'mock', model: 'mock' })
+  const agent = ctx.agentLoop.create(SessionId('late-rollover-retry'), { provider: 'mock', model: 'small' })
+  let selectedModel = 'small'
+  agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const assembly = await next()
+    return {
+      ...assembly,
+      variables: { ...assembly.variables, provider: 'mock', model: selectedModel },
+    }
+  })
+  agent.ctx.on('agent/request', async (_payload, next) => ({
+    ...await next(),
+    provider: 'mock',
+    model: selectedModel,
+  }))
   agent.ctx.on('agent/pre-step', async (_payload, next) => {
     const decision = await next()
     return decision.kind === 'reject'
@@ -498,7 +518,7 @@ test('preserves downstream messages when a late rollover cannot proceed', async 
     content: [{ type: 'text', text: 'keep this claimed input too' }],
     source: { kind: 'user' },
   })
-  const idle = waitForIdle(ctx, agent)
+  let idle = waitForIdle(ctx, agent)
   agent.followup(user)
   await idle
 
@@ -507,7 +527,19 @@ test('preserves downstream messages when a late rollover cannot proceed', async 
     .filter(event => event.type === 'user/message')
     .map(event => event.data.id))
   assert.ok(durableIds.has(user.id))
-  assert.ok(durableIds.has(downstream.id))
+  assert.equal(durableIds.has(downstream.id), false)
+
+  selectedModel = 'large'
+  idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'retry on the larger model' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  assert.equal(adapter.requests.length, 1)
+  const request = JSON.stringify(adapter.requests[0].messages)
+  assert.equal(request.match(/one-shot downstream context/g)?.length, 1)
 })
 
 test('retries a failed recovery-message flush before later pre-step work', async () => {

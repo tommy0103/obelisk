@@ -22,18 +22,25 @@ export type ContextRolloverTrigger =
   | { kind: 'model'; rootCallId: string }
   | { kind: 'hard-limit' }
 
-const unflushedRollovers = new WeakSet<Session>()
+const unflushedContextWindowState = new WeakSet<Session>()
+
+/** Flush one context-window mutation and latch failures until a later pre-step retry. */
+export async function flushContextWindowState(ctx: Context, session: Session): Promise<void> {
+  unflushedContextWindowState.add(session)
+  await ctx.sessions.flush(session)
+  unflushedContextWindowState.delete(session)
+}
 
 /** Retry a previously failed rollover flush before any later request work runs. */
-export async function ensureRolloverFlushed(
+export async function ensureContextWindowFlushed(
   ctx: Context,
   agent: Agent,
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted()
-  if (!unflushedRollovers.has(agent.session)) return
+  if (!unflushedContextWindowState.has(agent.session)) return
   await ctx.sessions.flush(agent.session)
-  unflushedRollovers.delete(agent.session)
+  unflushedContextWindowState.delete(agent.session)
 }
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -131,9 +138,7 @@ async function applyRollover(
     surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes.at(-1)! },
     sourceEventSeqs: [...nodes],
   })
-  unflushedRollovers.add(session)
-  await ctx.sessions.flush(session)
-  unflushedRollovers.delete(session)
+  await flushContextWindowState(ctx, session)
 }
 
 /** Replace the complete active surface with the model-authored prose handoff. */
@@ -192,7 +197,7 @@ export async function handlePreStep(
   budget: ContextWindowBudgetDecision | undefined,
   next: () => Promise<PreStepDecision>,
 ): Promise<PreStepDecision> {
-  await ensureRolloverFlushed(ctx, agent, signal)
+  await ensureContextWindowFlushed(ctx, agent, signal)
   const state = ctx.sessionProjections.stateOf(agent.session, 'obeliskContextWindow')
   if (state?.pending !== undefined) {
     await applyExplicitRollover(ctx, agent, state.pending, signal)

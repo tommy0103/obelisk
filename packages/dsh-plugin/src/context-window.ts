@@ -24,7 +24,8 @@ import { CONTEXT_WINDOW_GUIDANCE } from './context-window-prompt.ts'
 import {
   applyForcedRollover,
   contextPressureMessage,
-  ensureRolloverFlushed,
+  ensureContextWindowFlushed,
+  flushContextWindowState,
   handlePreStep,
   queueForcedRolloverStep,
 } from './context-window-rollover.ts'
@@ -50,8 +51,6 @@ interface AssemblyBudgetPlan {
 type RequestImage = Parameters<
   NonNullable<ReturnType<Context['llm']['imageRequestPricing']>>['priceImages']
 >[0][number]
-
-const unflushedPreStepRecovery = new WeakSet<Agent['session']>()
 
 const output = {
   schema: { type: 'string' as const },
@@ -395,29 +394,23 @@ export function apply(ctx: Context, config: unknown = {}): void {
       }
       return settled
     }
-    let messagesToPreserve: readonly UserMessage[] = messages
-    const preservePendingMessages = async (): Promise<void> => {
-      const recordedIds = new Set(agent.session.snapshotEvents()
-        .filter(event => event.type === 'user/message')
-        .map(event => event.data.id))
+    const preserveClaimedInput = async (): Promise<void> => {
+      const recordedIds = new Set(agent.session.surface.nodes.flatMap(seq => {
+        const event = agent.session.eventAt(seq)
+        return event?.type === 'user/message' ? [event.data.id] : []
+      }))
       let appended = false
-      for (const message of messagesToPreserve) {
+      for (const message of messages) {
         if (recordedIds.has(message.id)) continue
         agent.session.append('user/message', message, { surfaceOp: 'append' })
         appended = true
       }
       if (!appended) return
-      unflushedPreStepRecovery.add(agent.session)
-      await ctx.sessions.flush(agent.session)
-      unflushedPreStepRecovery.delete(agent.session)
+      await flushContextWindowState(ctx, agent.session)
     }
 
     try {
-      if (unflushedPreStepRecovery.has(agent.session)) {
-        await ctx.sessions.flush(agent.session)
-        unflushedPreStepRecovery.delete(agent.session)
-      }
-      await ensureRolloverFlushed(ctx, agent, signal)
+      await ensureContextWindowFlushed(ctx, agent, signal)
       const claimedTokens = pendingMessageTokens(
         ctx,
         messages,
@@ -430,10 +423,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
         ? await handlePreStep(ctx, agent, signal, decision, next)
         : await next()
       if (resolved.kind === 'reject') return resolved
-      messagesToPreserve = resolved.messages
       if (knownRollover && captured !== undefined) {
         resolved = { ...resolved, messages: restoreRuntimeContext(captured.assembly, resolved.messages) }
-        messagesToPreserve = resolved.messages
       }
 
       decision = settlePolicy(resolved.messages)
@@ -447,10 +438,8 @@ export function apply(ctx: Context, config: unknown = {}): void {
           () => Promise.resolve(resolved),
         )
         if (resolved.kind === 'reject') return resolved
-        messagesToPreserve = resolved.messages
         if (captured !== undefined) {
           resolved = { ...resolved, messages: restoreRuntimeContext(captured.assembly, resolved.messages) }
-          messagesToPreserve = resolved.messages
         }
         decision = settlePolicy(resolved.messages)
       }
@@ -469,7 +458,7 @@ export function apply(ctx: Context, config: unknown = {}): void {
         () => Promise.resolve(resolved),
       )
     } catch (error) {
-      await preservePendingMessages()
+      await preserveClaimedInput()
       throw error
     }
   }, { prepend: true })
