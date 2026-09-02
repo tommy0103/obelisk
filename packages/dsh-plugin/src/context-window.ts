@@ -30,6 +30,7 @@ import {
   queueForcedRolloverStep,
 } from './context-window-rollover.ts'
 import { contextWindowProjectionDefinition } from './context-window-state.ts'
+import { RELATED_FILE_ROLES, validateRelatedFiles } from './context-window-related-files.ts'
 
 export const name = '@obelisk/dsh-obelisk-plugin/context-window'
 export const inject = ['llm', 'tools', 'systemPrompt', 'sessions', 'sessionProjections', 'tokenMeter']
@@ -324,12 +325,39 @@ export function apply(ctx: Context, config: unknown = {}): void {
         required: true,
         description: 'Concise prose covering goal, decisions, progress, learnings, next steps, unresolved requests, and important actions.',
       },
+      related_files: {
+        type: 'array',
+        description: 'Workspace-relative files needed after rollover, with why each matters and its evidence role.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            path: {
+              type: 'string',
+              required: true,
+              description: 'Normalized workspace-relative path.',
+            },
+            reason: {
+              type: 'string',
+              required: true,
+              description: 'Why the next context may need this file.',
+            },
+            role: {
+              type: 'string',
+              required: true,
+              enum: RELATED_FILE_ROLES,
+              description: 'How this file relates to the continuing task.',
+            },
+          },
+        },
+      },
     },
     output,
     async execute(args, exec) {
       if (typeof args.handoff !== 'string' || args.handoff.trim() === '') {
         throw new TypeError('new_context handoff must be a non-empty prose string')
       }
+      validateRelatedFiles(args.related_files)
       if (exec.agent === undefined) throw new Error('new_context requires an agent-owned execution')
       await recoverySessionId(ctx, exec.agent.session, exec.signal)
       return 'A fresh context will start after this sampling step.'

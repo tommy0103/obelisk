@@ -6,9 +6,12 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-tools/types'
 import { z } from 'zod'
 
+import { relatedFileSchema } from './context-window-related-files.ts'
+
 const candidateSchema = z.object({
   rootCallId: z.string(),
   handoff: z.string(),
+  relatedFiles: z.array(relatedFileSchema),
   turn: z.number().int().nonnegative(),
   step: z.number().int().positive(),
 }).strict()
@@ -37,7 +40,12 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
   }
 }
 
-function handoffFrom(raw: string): string | undefined {
+interface HandoffArguments {
+  handoff: string
+  relatedFiles: z.infer<typeof relatedFileSchema>[]
+}
+
+function handoffFrom(raw: string): HandoffArguments | undefined {
   try {
     return handoffFromValue(JSON.parse(raw))
   } catch {
@@ -45,10 +53,13 @@ function handoffFrom(raw: string): string | undefined {
   }
 }
 
-function handoffFromValue(value: unknown): string | undefined {
+function handoffFromValue(value: unknown): HandoffArguments | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const handoff = Reflect.get(value, 'handoff')
-  return typeof handoff === 'string' && handoff.trim() !== '' ? handoff : undefined
+  if (typeof handoff !== 'string' || handoff.trim() === '') return undefined
+  const relatedFiles = z.array(relatedFileSchema).safeParse(Reflect.get(value, 'related_files'))
+  if (!relatedFiles.success && Reflect.get(value, 'related_files') !== undefined) return undefined
+  return { handoff, relatedFiles: relatedFiles.success ? relatedFiles.data : [] }
 }
 
 function resultFailed(event: SessionEvent<'tool/result'>): boolean {
@@ -58,7 +69,7 @@ function resultFailed(event: SessionEvent<'tool/result'>): boolean {
 /** Fold existing native tool facts and committed handoff sources into rollover state. */
 export const contextWindowProjectionDefinition = {
   key: 'obeliskContextWindow',
-  stateVersion: 2,
+  stateVersion: 3,
   stateSchema,
   init: (): ContextWindowState => ({
     generation: 0,
@@ -85,7 +96,7 @@ export const contextWindowProjectionDefinition = {
           ...state.calls,
           [event.data.callId]: {
             rootCallId: event.data.callId,
-            handoff,
+            ...handoff,
             turn: event.data.turn,
             step: event.data.step,
           },
@@ -102,7 +113,7 @@ export const contextWindowProjectionDefinition = {
           ...state.ptcCalls,
           [event.data.subCallId]: {
             rootCallId: event.data.rootCallId,
-            handoff,
+            ...handoff,
             turn: position.turn,
             step: position.step,
           },

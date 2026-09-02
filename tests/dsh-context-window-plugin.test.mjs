@@ -962,6 +962,11 @@ test('resolves persisted parent lineage by project scope when native ids collide
 })
 
 test('derives a pending PTC rollover only after nested and enclosing calls succeed', () => {
+  const relatedFiles = [{
+    path: 'HANDOFF.md',
+    reason: 'Durable continuation notes.',
+    role: 'handoff',
+  }]
   const apply = contextWindowProjectionDefinition.apply
   let state = contextWindowProjectionDefinition.init({})
   state = apply(state, {
@@ -972,14 +977,14 @@ test('derives a pending PTC rollover only after nested and enclosing calls succe
     type: 'tool/code-dispatch-start', seq: 2, time: 2,
     data: {
       rootCallId: 'run-1', parentCallId: 'run-1', subCallId: 'run-1:code:0',
-      name: 'new_context', arguments: { handoff: 'PTC handoff' },
+      name: 'new_context', arguments: { handoff: 'PTC handoff', related_files: relatedFiles },
     },
   })
   state = apply(state, {
     type: 'tool/code-dispatch', seq: 3, time: 3,
     data: {
       rootCallId: 'run-1', parentCallId: 'run-1', subCallId: 'run-1:code:0',
-      name: 'new_context', arguments: { handoff: 'PTC handoff' }, isError: false, content: [],
+      name: 'new_context', arguments: { handoff: 'PTC handoff', related_files: relatedFiles }, isError: false, content: [],
     },
   })
   assert.equal(state.pending, undefined)
@@ -994,14 +999,26 @@ test('derives a pending PTC rollover only after nested and enclosing calls succe
     },
   })
   assert.deepEqual(state.pending, {
-    rootCallId: 'run-1', handoff: 'PTC handoff', turn: 2, step: 4,
+    rootCallId: 'run-1', handoff: 'PTC handoff', relatedFiles, turn: 2, step: 4,
   })
 })
 
 test('applies a successful new_context handoff at the next pre-step', async () => {
   const handoff = 'Goal: finish the parser. Progress: tests added. Next: implement the remaining cases.'
+  const relatedFiles = [
+    {
+      path: 'docs/adr/0011-deepseek-root-tree-units.md',
+      reason: 'Authoritative provider requirements.',
+      role: 'spec',
+    },
+    {
+      path: 'packages/core/src/vendor/dsh-zstd.ts',
+      reason: 'Required implementation target.',
+      role: 'implementation',
+    },
+  ]
   const adapter = new ScriptedAdapter([
-    toolCallResponse('new-context-1', 'new_context', { handoff }),
+    toolCallResponse('new-context-1', 'new_context', { handoff, related_files: relatedFiles }),
     textResponse('continued in fresh context'),
   ])
   const ctx = await harness(adapter)
@@ -1031,6 +1048,10 @@ test('applies a successful new_context handoff at the next pre-step', async () =
   assert.match(secondText, /do not search global history or other sessions/)
   assert.match(secondText, /Treat unsectioned or `LOCKED DESIGN` claims as `AGENT INFERENCES`/)
   assert.match(secondText, /direct user, spec, or source evidence/)
+  assert.match(secondText, /<related_files>/)
+  assert.match(secondText, /docs\/adr\/0011-deepseek-root-tree-units\.md/)
+  assert.match(secondText, /packages\/core\/src\/vendor\/dsh-zstd\.ts/)
+  assert.match(secondText, /Authoritative provider requirements/)
 
   const scope = deepseekProjectScope(undefined)
   const sessionId = canonicalDeepseekTreeSessionId('rollover-session', scope)
@@ -1044,6 +1065,7 @@ test('applies a successful new_context handoff at the next pre-step', async () =
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff')
   assert.ok(replacement)
   assert.equal(replacement.surfaceOp.op, 'replace')
+  assert.deepEqual(replacement.data.source.relatedFiles, relatedFiles)
   const replayed = agent.session.snapshotEvents().reduce(
     (state, event) => contextWindowProjectionDefinition.apply(state, event),
     contextWindowProjectionDefinition.init({}),
@@ -1107,6 +1129,34 @@ test('does not rollover a failed new_context call', async () => {
 
   assert.equal(adapter.requests.length, 2)
   assert.match(JSON.stringify(adapter.requests[1].messages), /keep this context/)
+  assert.equal(agent.session.snapshotEvents().some(event =>
+    event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff'), false)
+})
+
+test('rejects related files outside the workspace without rolling over', async () => {
+  const adapter = new ScriptedAdapter([
+    toolCallResponse('new-context-escaping-file', 'new_context', {
+      handoff: 'Do not replace this context.',
+      related_files: [{
+        path: '../outside.md',
+        reason: 'This must not escape the workspace.',
+        role: 'spec',
+      }],
+    }),
+    textResponse('recovered from the related file error'),
+  ])
+  const ctx = await harness(adapter)
+  const agent = ctx.agentLoop.create(SessionId('failed-related-files'), { provider: 'mock', model: 'mock' })
+  const idle = waitForIdle(ctx, agent)
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'keep this workspace context' }],
+    source: { kind: 'user' },
+  }))
+  await idle
+
+  assert.equal(adapter.requests.length, 2)
+  assert.match(JSON.stringify(adapter.requests[1].messages), /keep this workspace context/)
+  assert.match(JSON.stringify(adapter.requests[1].messages), /path must stay within the workspace/)
   assert.equal(agent.session.snapshotEvents().some(event =>
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff'), false)
 })

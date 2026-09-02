@@ -1,6 +1,8 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import type { RelatedFile } from './context-window-related-files.ts'
+
 const CONTEXT_WINDOW_EVIDENCE_STATUS = [
   'Use handoff sections `SPEC-CONFIRMED REQUIREMENTS` (goal, progress, next steps; cite user, spec, or source), `AGENT INFERENCES` (never `LOCKED DESIGN` or confirmed by repetition), `UNRESOLVED CONFLICTS`, and `UNVERIFIED ACCEPTANCE CRITERIA`.',
 ].join(' ')
@@ -38,7 +40,12 @@ const CONTEXT_WINDOW_RECOVERY = [
 ].join(' ')
 
 /** Render the only model-visible message retained across an explicit rollover. */
-export function renderContextHandoff(sessionId: string, messageUuid: string, handoff: string): string {
+export function renderContextHandoff(
+  sessionId: string,
+  messageUuid: string,
+  handoff: string,
+  relatedFiles: readonly RelatedFile[] = [],
+): string {
   return [
     'Previous context is available in Obelisk.',
     `session_id: ${sessionId}`,
@@ -47,6 +54,9 @@ export function renderContextHandoff(sessionId: string, messageUuid: string, han
     '<handoff>',
     handoff,
     '</handoff>',
+    ...relatedFiles.length === 0
+      ? []
+      : ['', '<related_files>', JSON.stringify(relatedFiles, null, 2), '</related_files>'],
     '',
     CONTEXT_WINDOW_RECOVERY,
   ].join('\n')

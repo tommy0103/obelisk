@@ -17,6 +17,7 @@ import {
   renderMissingContextHandoff,
 } from './context-window-prompt.ts'
 import type { PendingRollover } from './context-window-state.ts'
+import type { RelatedFile } from './context-window-related-files.ts'
 
 export type ContextRolloverTrigger =
   | { kind: 'model'; rootCallId: string }
@@ -56,6 +57,7 @@ declare module '@deepseek-ai/dsh-llm' {
       handoffStatus: 'present' | 'missing'
       sessionId: string
       previousContextMessageUuid: string
+      relatedFiles?: readonly RelatedFile[]
     }
   }
 }
@@ -120,6 +122,7 @@ async function applyRollover(
     handoffStatus: 'present' | 'missing'
     sessionId: string
     previousContextMessageUuid: string
+    relatedFiles?: readonly RelatedFile[]
   },
   text: string,
   signal?: AbortSignal,
@@ -162,7 +165,13 @@ export async function applyExplicitRollover(
     handoffStatus: 'present',
     sessionId: anchors.sessionId,
     previousContextMessageUuid: anchors.messageUuid,
-  }, renderContextHandoff(anchors.sessionId, anchors.messageUuid, pending.handoff), signal)
+    relatedFiles: pending.relatedFiles,
+  }, renderContextHandoff(
+    anchors.sessionId,
+    anchors.messageUuid,
+    pending.handoff,
+    pending.relatedFiles,
+  ), signal)
 }
 
 /** Replace the complete active surface with a host-authored recovery instruction. */
