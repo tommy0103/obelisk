@@ -5,8 +5,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { zstdCompressSync } from 'node:zlib';
 
 import {
   DEFAULT_EVAL_POLICY,
@@ -16,7 +17,19 @@ import {
   summarizeSession,
   validatePolicy,
 } from '../scripts/context-window-ab-eval-lib.mjs';
-import { recoverRunSlot, resolveDshBin } from '../scripts/context-window-ab-eval.mjs';
+import {
+  parseArgs,
+  recoverRunSlot,
+  resolveDshBin,
+  sessionMetrics,
+  taskPrompt,
+} from '../scripts/context-window-ab-eval.mjs';
+
+test('agent runs wait for natural completion unless an explicit timeout is configured', () => {
+  const output = join(tmpdir(), 'context-window-timeout-plan');
+  assert.equal(parseArgs(['--output', output]).timeoutMinutes, undefined);
+  assert.equal(parseArgs(['--output', output, '--timeout-minutes', '90']).timeoutMinutes, 90);
+});
 
 test('A/B arms share a 200K normal-budget boundary while selecting one pressure policy', () => {
   const compact = buildArmPatch({ arm: 'compact', sessionsRoot: '/tmp/compact' });
@@ -32,6 +45,13 @@ test('A/B arms share a 200K normal-budget boundary while selecting one pressure 
   assert.match(rollover, /obelisk-context-window/u);
   assert.match(rollover, /fallbackReserveTokens: 24000/u);
   assert.match(rollover, /outputReserveTokens: 16000/u);
+});
+
+test('eval history recovery is scoped to the current rollover session', () => {
+  const prompt = taskPrompt();
+  assert.match(prompt, /After a rollover, use Obelisk only with the handoff session_id and message_uuid/u);
+  assert.match(prompt, /Do not search global history or other sessions/u);
+  assert.doesNotMatch(prompt, /recover prior reasoning and decisions/u);
 });
 
 test('policy validation refuses comparisons with unequal normal budgets', () => {
@@ -89,6 +109,38 @@ test('session metrics distinguish compaction, model rollover, forced rollover, a
   assert.equal(summary.repeatedBashCalls, 1);
 });
 
+test('shared DSH session storage reports only the current eval workspace', () => {
+  const root = mkdtempSync(join(tmpdir(), 'obelisk-shared-dsh-sessions-'));
+  const currentWorkspace = '/eval/current-workspace';
+  const otherWorkspace = '/eval/other-workspace';
+  const writeSession = (name, cwd, outputTokens, compressed = false) => {
+    const directory = join(root, 'project', name);
+    mkdirSync(directory, { recursive: true });
+    const contents = [
+      JSON.stringify({ type: 'session', id: name, cwd }),
+      JSON.stringify({ type: 'request/context', data: { contextWindow: 200_000 } }),
+      JSON.stringify({ type: 'assistant/message', data: { usage: { inputTokens: 10, outputTokens } } }),
+      JSON.stringify({ type: 'turn/end', data: { reason: { kind: 'completed' } } }),
+    ].join('\n');
+    writeFileSync(
+      join(directory, compressed ? 'session.jsonl.zstd' : 'session.jsonl'),
+      compressed
+        ? Buffer.concat(contents.split('\n').map(line => zstdCompressSync(Buffer.from(`${line}\n`))))
+        : contents,
+    );
+  };
+  try {
+    writeSession('current', currentWorkspace, 20, true);
+    writeSession('other', otherWorkspace, 900);
+    const metrics = sessionMetrics(root, currentWorkspace);
+    assert.equal(metrics.files.length, 1);
+    assert.match(metrics.files[0], /current\/session\.jsonl\.zstd$/u);
+    assert.equal(metrics.usage.outputTokens, 20);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('200K runs using at least 450K and crossing two boundaries qualify without a cache-read ceiling', () => {
   const qualified = { policyBoundaries: 2, totalProviderTokens: 500_000, observedContextWindows: [200_000] };
   assert.deepEqual(qualifyRun(qualified), {
@@ -119,7 +171,16 @@ test('CLI dry-run materializes an auditable plan without invoking a model', () =
     assert.equal(plan.mode, 'dry-run');
     assert.deepEqual(plan.arms, ['compact', 'rollover']);
     assert.equal(plan.policy.contextWindow, 200_000);
+    assert.equal(plan.timeoutMinutes, null);
     assert.equal(plan.fairness.oracleTestsInjectedAfterAgentStops, true);
+    assert.equal(plan.fairness.currentDshSessionIndexable, true);
+    assert.equal(plan.fairness.globalObeliskHistoryUnavailable, true);
+    assert.equal(plan.fairness.agentRunsWaitForNaturalCompletion, true);
+    const rolloverPatch = readFileSync(join(output, 'rollover.patch.yml'), 'utf8');
+    assert.match(
+      rolloverPatch,
+      new RegExp(`root: ${JSON.stringify(join(homedir(), '.dsh', 'sessions'))}`),
+    );
     const resumed = spawnSync(process.execPath, [
       'scripts/context-window-ab-eval.mjs',
       '--output', output,

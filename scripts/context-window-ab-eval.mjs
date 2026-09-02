@@ -6,15 +6,18 @@ import { spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 
 import {
   CONTEXT_WINDOW_TASK,
@@ -27,6 +30,8 @@ import {
 
 const SOURCE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_DSH_ROOT = join(homedir(), 'Code', 'deepseek-harness');
+const DEFAULT_DSH_HOME = join(homedir(), '.dsh');
+const DEFAULT_DSH_SESSIONS_ROOT = join(DEFAULT_DSH_HOME, 'sessions');
 const MAX_BUFFER = 128 * 1024 * 1024;
 
 const HELP = `Usage:
@@ -40,13 +45,14 @@ Options:
   --provider-capacity <tokens> Required with --execute; operator-confirmed real route capacity.
   --model <id>              Default: deepseek-v4-flash.
   --dsh-root <path>         Default: ~/Code/deepseek-harness.
-  --timeout-minutes <n>     Per agent run. Default: 90.
+  --timeout-minutes <n>     Optional per-agent safety cap. Omit to wait for natural completion.
   --keep-workspaces         Retain exported candidate trees after validation.
   --help                    Show this text.
 
-The real run requires DEEPSEEK_API_KEY. Each run gets an isolated DSH_HOME and
-a git-free export of the base commit. Oracle tests are injected only after the
-agent stops. Output paths must not already exist.
+The real run uses the selected DSH profile's configured credentials. Sessions
+are written under ~/.dsh/sessions so Obelisk can recover the active run by
+session_id. Each run gets a git-free export of the base commit. Oracle tests are
+injected only after the agent stops. Output paths must not already exist.
 `;
 
 function positiveInteger(name, raw) {
@@ -63,7 +69,7 @@ export function parseArgs(argv) {
     contextWindow: DEFAULT_EVAL_POLICY.contextWindow,
     model: 'deepseek-v4-flash',
     dshRoot: DEFAULT_DSH_ROOT,
-    timeoutMinutes: 90,
+    timeoutMinutes: undefined,
     keepWorkspaces: false,
     providerCapacity: undefined,
   };
@@ -238,13 +244,14 @@ function dshInvocation(dshRoot, args, options) {
   return checkedSpawn(process.execPath, [bin, ...args], options);
 }
 
-function taskPrompt() {
+export function taskPrompt() {
   return [
     'Implement the DeepSeek Harness root-tree provider described by TASK_SPEC.md completely in this repository.',
     'Work autonomously until the implementation and its tests pass; do not stop after planning.',
     'The task is finished only when the package builds, relevant tests pass, and the documented install surface is usable.',
     'Do not inspect filesystem paths outside the current workspace for a finished implementation or oracle tests.',
-    'You may use the installed Obelisk skill to recover prior reasoning and decisions when useful.',
+    'After a rollover, use Obelisk only with the handoff session_id and message_uuid to recover this run.',
+    'Do not search global history or other sessions.',
   ].join(' ');
 }
 
@@ -258,10 +265,31 @@ function findFiles(root, suffix, found = []) {
   return found;
 }
 
-function sessionMetrics(sessionsRoot) {
-  const files = findFiles(sessionsRoot, '.jsonl');
-  const events = files.flatMap(path => parseSessionJsonl(readFileSync(path, 'utf8')));
-  return { files, ...summarizeSession(events) };
+function readSessionEvents(path) {
+  if (!path.endsWith('.zstd')) return parseSessionJsonl(readFileSync(path, 'utf8'));
+  const source = readFileSync(path);
+  const { frames } = scanZstdFrames(source);
+  const decoder = createZstdFrameDecoder();
+  try {
+    const chunks = [];
+    for (const chunk of decoder.decode(source, frames)) chunks.push(Buffer.from(chunk));
+    return parseSessionJsonl(Buffer.concat(chunks).toString('utf8'));
+  } finally {
+    decoder.close();
+  }
+}
+
+export function sessionMetrics(sessionsRoot, workspace) {
+  const files = [
+    ...findFiles(sessionsRoot, '.jsonl'),
+    ...findFiles(sessionsRoot, '.jsonl.zstd'),
+  ];
+  const sessions = files
+    .map(path => ({ path, events: readSessionEvents(path) }))
+    .filter(({ events }) => events[0]?.type === 'session' && events[0].cwd === workspace);
+  const selectedFiles = sessions.map(session => session.path);
+  const events = sessions.flatMap(session => session.events);
+  return { files: selectedFiles, ...summarizeSession(events) };
 }
 
 function captureCandidate(workspace, runDir) {
@@ -300,10 +328,9 @@ function validateCandidate(workspace, runDir, timeout) {
 function prepareRun(runDir, arm, options, policy) {
   mkdirSync(runDir);
   const workspace = exportTaskWorkspace(runDir);
-  const dshHome = join(runDir, 'dsh-home');
-  const sessionsRoot = join(runDir, 'sessions');
-  mkdirSync(dshHome);
-  mkdirSync(sessionsRoot);
+  const dshHome = DEFAULT_DSH_HOME;
+  const sessionsRoot = DEFAULT_DSH_SESSIONS_ROOT;
+  mkdirSync(sessionsRoot, { recursive: true });
   const patchPath = join(runDir, 'arm.patch.yml');
   writeFileSync(patchPath, buildArmPatch({
     arm,
@@ -367,16 +394,18 @@ function executeRun(runDir, arm, index, options, policy) {
   writeCommandLog(join(runDir, 'install.log'), install);
   requireSuccess('install eval plugin', install);
 
+  const agentHome = mkdtempSync(join(tmpdir(), 'obelisk-context-window-agent-home-'));
   const agent = dshInvocation(options.dshRoot, [
     '--profile', 'headless', '--patch', patchPath, taskPrompt(),
   ], {
     cwd: workspace,
-    env,
-    timeout: options.timeoutMinutes * 60_000,
+    env: { ...env, HOME: agentHome },
+    timeout: options.timeoutMinutes === undefined ? undefined : options.timeoutMinutes * 60_000,
   });
+  rmSync(agentHome, { recursive: true, force: true });
   writeCommandLog(join(runDir, 'agent.log'), agent);
   captureCandidate(workspace, runDir);
-  const metrics = sessionMetrics(sessionsRoot);
+  const metrics = sessionMetrics(sessionsRoot, workspace);
   injectOracleTests(workspace);
   const validation = validateCandidate(workspace, runDir, 15 * 60_000);
   const qualification = qualifyRun(metrics, policy.contextWindow);
@@ -410,11 +439,15 @@ function materializePlan(output, options, policy, arms) {
     model: options.model,
     dshRoot: options.dshRoot,
     providerCapacity: options.providerCapacity ?? null,
+    timeoutMinutes: options.timeoutMinutes ?? null,
     policy,
     fairness: {
       sameBaseCommit: true,
       sameModelAndBudget: true,
       obeliskSkillAvailableToBothArms: true,
+      currentDshSessionIndexable: true,
+      globalObeliskHistoryUnavailable: true,
+      agentRunsWaitForNaturalCompletion: options.timeoutMinutes === undefined,
       gitHistoryRemovedFromWorkspace: true,
       oracleTestsInjectedAfterAgentStops: true,
     },
@@ -429,6 +462,7 @@ function materializePlan(output, options, policy, arms) {
       model: value.model,
       dshRoot: value.dshRoot,
       providerCapacity: value.providerCapacity,
+      timeoutMinutes: value.timeoutMinutes,
       policy: value.policy,
     });
     if (JSON.stringify(comparable(existing)) !== JSON.stringify(comparable(plan))) {
@@ -438,7 +472,7 @@ function materializePlan(output, options, policy, arms) {
   for (const arm of arms) {
     atomicWrite(join(output, `${arm}.patch.yml`), buildArmPatch({
       arm,
-      sessionsRoot: `/eval-output/${arm}/sessions`,
+      sessionsRoot: DEFAULT_DSH_SESSIONS_ROOT,
       model: options.model,
       policy,
     }));
@@ -454,9 +488,6 @@ export function main(argv = process.argv.slice(2)) {
     return;
   }
   if (!existsSync(options.dshRoot)) throw new Error(`deepseek-harness not found: ${options.dshRoot}`);
-  if (options.execute && !process.env.DEEPSEEK_API_KEY) {
-    throw new Error('--execute requires DEEPSEEK_API_KEY');
-  }
   if (options.execute && options.providerCapacity === undefined) {
     throw new Error('--execute requires --provider-capacity from the selected route provider documentation');
   }

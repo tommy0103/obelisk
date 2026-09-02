@@ -1,10 +1,15 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+const CONTEXT_WINDOW_EVIDENCE_STATUS = [
+  'Use handoff sections `SPEC-CONFIRMED REQUIREMENTS` (goal, progress, next steps; cite user, spec, or source), `AGENT INFERENCES` (never `LOCKED DESIGN` or confirmed by repetition), `UNRESOLVED CONFLICTS`, and `UNVERIFIED ACCEPTANCE CRITERIA`.',
+].join(' ')
+
 /** Stable model guidance for prose handoff and scoped Obelisk recovery. */
 export const CONTEXT_WINDOW_GUIDANCE = [
   'Before context pressure becomes critical, call `new_context` with a concise prose handoff.',
   'Cover the current goal, decisions and rationale, completed and in-progress work, learnings, concrete next steps, every unresolved user request, and important actions or tool results.',
+  CONTEXT_WINDOW_EVIDENCE_STATUS,
   'Do not copy the transcript: older evidence remains available through Obelisk.',
   'After rollover, use the supplied `session_id` as the default Obelisk search scope and pass the supplied `message_uuid` to `context(uuid)` when you need to expand from the previous context boundary.',
 ].join(' ')
@@ -13,12 +18,22 @@ export const CONTEXT_WINDOW_REMINDER = [
   'The active context is approaching its normal task budget.',
   'Prepare a concise prose handoff and call `new_context` soon.',
   'Cover the current goal, decisions and rationale, completed and in-progress work, learnings, concrete next steps, every unresolved user request, and important actions or tool results.',
+  CONTEXT_WINDOW_EVIDENCE_STATUS,
 ].join(' ')
 
 export const CONTEXT_WINDOW_FALLBACK = [
   'The normal task budget is exhausted. Stop ordinary task execution and do not give a final answer.',
   'Use this reserved step only to prepare a concise prose handoff covering the current goal, decisions and rationale, completed and in-progress work, learnings, concrete next steps, every unresolved user request, and important actions or tool results.',
+  CONTEXT_WINDOW_EVIDENCE_STATUS,
   'Then call `new_context` exactly once. Do not call any other tool, and make `new_context` the final operation in a PTC program.',
+].join(' ')
+
+const CONTEXT_WINDOW_RECOVERY = [
+  'Treat this handoff as a checkpoint, not an exhaustive history.',
+  'If a required detail is missing, uncertain, or based on an earlier decision, load the `obelisk` skill before re-deriving it.',
+  'Scope searches to `session_id`; use `context(message_uuid)` to expand from the previous-window boundary.',
+  'Do not use global history search for this task.',
+  'Treat unsectioned or `LOCKED DESIGN` claims as `AGENT INFERENCES` until this session supplies direct user, spec, or source evidence; preserve conflicts and unverified criteria.',
 ].join(' ')
 
 /** Render the only model-visible message retained across an explicit rollover. */
@@ -31,6 +46,8 @@ export function renderContextHandoff(sessionId: string, messageUuid: string, han
     '<handoff>',
     handoff,
     '</handoff>',
+    '',
+    CONTEXT_WINDOW_RECOVERY,
   ].join('\n')
 }
 
@@ -42,5 +59,7 @@ export function renderMissingContextHandoff(sessionId: string, messageUuid: stri
     '',
     `session_id: ${sessionId}`,
     `message_uuid: ${messageUuid}`,
+    '',
+    CONTEXT_WINDOW_RECOVERY,
   ].join('\n')
 }

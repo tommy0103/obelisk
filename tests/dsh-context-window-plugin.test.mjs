@@ -698,11 +698,12 @@ test('remeasures a policy message before allowing fallback inference', async () 
 test('limits fallback inference to new_context and rolls over on success', async () => {
   const policy = {
     reminderThresholdTokens: 100,
-    fallbackReserveTokens: 200,
+    fallbackReserveTokens: 500,
     outputReserveTokens: 100,
   }
   const adapter = new ScriptedAdapter([
-    textResponse('first response', { inputTokens: 9_750, outputTokens: 1 }),
+    // Enter fallback at the normal-budget boundary with room for the full handoff contract.
+    textResponse('first response', { inputTokens: 9_400, outputTokens: 1 }),
     toolCallResponse('fallback-handoff', 'new_context', { handoff: 'Continue the pressured task.' }),
     textResponse('continued after fallback rollover'),
   ], { contextWindow: 10_000, defaultMaxTokens: 100 })
@@ -726,11 +727,12 @@ test('limits fallback inference to new_context and rolls over on success', async
 test('PTC fallback guard permits only new_context through run_code and completes rollover', async () => {
   const policy = {
     reminderThresholdTokens: 100,
-    fallbackReserveTokens: 200,
+    fallbackReserveTokens: 500,
     outputReserveTokens: 100,
   }
   const adapter = new ScriptedAdapter([
-    textResponse('first response', { inputTokens: 9_750, outputTokens: 1 }),
+    // Enter fallback at the normal-budget boundary with room for the full handoff contract.
+    textResponse('first response', { inputTokens: 9_400, outputTokens: 1 }),
     toolCallResponse('fallback-program', 'run_code', {
       code: '/* attempt-other */ return await tools.new_context({ handoff: "PTC fallback handoff." })',
       description: 'Prepare context handoff',
@@ -811,14 +813,15 @@ test('forces a recoverable rollover in the same user turn when fallback produces
 test('fallback request failure forces rollover and retries within the same user turn', async () => {
   const policy = {
     reminderThresholdTokens: 100,
-    fallbackReserveTokens: 200,
+    fallbackReserveTokens: 1_200,
     outputReserveTokens: 100,
   }
   const adapter = new ScriptedAdapter([
+    // Leave enough reserve to dispatch the complete fallback handoff contract before transport fails.
     textResponse('first response', { inputTokens: 730, outputTokens: 1 }),
     new Error('simulated fallback transport failure'),
     textResponse('continued after failed fallback request'),
-  ], { contextWindow: 1_000, defaultMaxTokens: 100 })
+  ], { contextWindow: 2_000, defaultMaxTokens: 100 })
   const ctx = await harness(adapter, policy)
   const agent = ctx.agentLoop.create(SessionId('fallback-request-error'), { provider: 'mock', model: 'mock' })
   let idle = waitForIdle(ctx, agent)
@@ -1011,9 +1014,23 @@ test('applies a successful new_context handoff at the next pre-step', async () =
   await idle
 
   assert.equal(adapter.requests.length, 2)
+  const firstRequest = JSON.stringify(adapter.requests[0])
+  assert.match(firstRequest, /SPEC-CONFIRMED REQUIREMENTS/)
+  assert.match(firstRequest, /AGENT INFERENCES/)
+  assert.match(firstRequest, /UNRESOLVED CONFLICTS/)
+  assert.match(firstRequest, /UNVERIFIED ACCEPTANCE CRITERIA/)
+  assert.match(firstRequest, /never `LOCKED DESIGN`/)
+  assert.match(firstRequest, /confirmed by repetition/)
   const secondText = JSON.stringify(adapter.requests[1].messages)
   assert.doesNotMatch(secondText, /old context request/)
   assert.match(secondText, /Goal: finish the parser/)
+  assert.match(secondText, /Treat this handoff as a checkpoint, not an exhaustive history/)
+  assert.match(secondText, /load the `obelisk` skill before re-deriving it/)
+  assert.match(secondText, /Scope searches to `session_id`/)
+  assert.match(secondText, /use `context\(message_uuid\)` to expand from the previous-window boundary/)
+  assert.match(secondText, /Do not use global history search for this task/)
+  assert.match(secondText, /Treat unsectioned or `LOCKED DESIGN` claims as `AGENT INFERENCES`/)
+  assert.match(secondText, /direct user, spec, or source evidence/)
 
   const scope = deepseekProjectScope(undefined)
   const sessionId = canonicalDeepseekTreeSessionId('rollover-session', scope)

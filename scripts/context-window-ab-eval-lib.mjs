@@ -92,7 +92,7 @@ export function buildArmPatch({
     '- id: session-persistence-jsonl',
     '  config:',
     `    root: ${yamlString(sessionsRoot)}`,
-    '    compression: none',
+    '    compression: zstd',
     '',
     '- id: compaction-basic',
     '  config:',
