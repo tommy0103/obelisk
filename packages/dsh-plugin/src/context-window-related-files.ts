@@ -4,6 +4,9 @@
 import { posix, win32 } from 'node:path'
 import { z } from 'zod'
 
+// File references stay structured instead of living only in prose so the host
+// can validate workspace containment, persist roles exactly, and render them
+// without parsing model-authored handoff text.
 export const RELATED_FILE_ROLES = [
   'spec',
   'decision',
