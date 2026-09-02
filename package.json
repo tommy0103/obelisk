@@ -16,6 +16,7 @@
     "build:core": "npm run build --workspace @obelisk/core",
     "build:cli": "npm run build --workspace @obelisk-apps/cli",
     "build:skill": "node packaging/build-skill.mjs",
+    "eval:context-window": "node scripts/context-window-ab-eval.mjs",
     "publish:skill": "npm run build:skill && packaging/publish-skill.sh"
   },
   "devDependencies": {
