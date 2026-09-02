@@ -102,6 +102,37 @@ test('claude parse() resumes from a cursor, skipping already-indexed lines', () 
   // Only the (empty-chunk) session record, with message_count 0.
   assert.deepEqual(values.filter(r => r.kind !== 'session'), []);
   assert.equal(values.find(r => r.kind === 'session').message_count, 0);
+  assert.equal(values.find(r => r.kind === 'session').title, 'My Session');
+});
+
+test('claude parse() prefers the latest custom title over AI and history titles', () => {
+  const dir = makeTempDir('obelisk-claude-custom-title-');
+  const path = join(dir, 'sid-title.jsonl');
+  const lines = [
+    { type: 'ai-title', aiTitle: 'Initial AI title', sessionId: 'sid-title' },
+    { type: 'custom-title', customTitle: 'Earlier app title', sessionId: 'sid-title' },
+    { type: 'ai-title', aiTitle: 'Later AI title', sessionId: 'sid-title' },
+    { type: 'custom-title', customTitle: 'Current app title', sessionId: 'sid-title' },
+    { type: 'custom-title', customTitle: 'Current app title', sessionId: 'sid-title' },
+    {
+      uuid: 'u-title', type: 'user', timestamp: '2026-06-10T10:00:00Z',
+      message: { role: 'user', content: 'title precedence' },
+    },
+  ];
+  writeFileSync(path, `${lines.map(line => JSON.stringify(line)).join('\n')}\n`);
+
+  const unit = {
+    key: path,
+    sessionId: 'sid-title',
+    project: 'quiet-zero',
+    meta: { historyTitle: 'History title' },
+  };
+  const full = drain(parse(unit, null));
+  assert.equal(full.values.find(record => record.kind === 'session').title, 'Current app title');
+
+  const incremental = drain(parse(unit, full.ret));
+  assert.equal(incremental.values.find(record => record.kind === 'session').title, 'Current app title');
+  assert.equal(incremental.values.find(record => record.kind === 'session').message_count, 0);
 });
 
 test('claude provider emits workflow artifacts with an explicit canonical tool edge', () => {
