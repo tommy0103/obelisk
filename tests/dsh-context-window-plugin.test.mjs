@@ -1026,9 +1026,9 @@ test('applies a successful new_context handoff at the next pre-step', async () =
   assert.match(secondText, /Goal: finish the parser/)
   assert.match(secondText, /Treat this handoff as a checkpoint, not an exhaustive history/)
   assert.match(secondText, /load the `obelisk` skill before re-deriving it/)
-  assert.match(secondText, /Scope searches to `session_id`/)
-  assert.match(secondText, /use `context\(message_uuid\)` to expand from the previous-window boundary/)
-  assert.match(secondText, /Do not use global history search for this task/)
+  assert.match(secondText, /Scope Obelisk recovery to the supplied `session_id`/)
+  assert.match(secondText, /use `context\(message_uuid\)` at the previous-window boundary/)
+  assert.match(secondText, /do not search global history or other sessions/)
   assert.match(secondText, /Treat unsectioned or `LOCKED DESIGN` claims as `AGENT INFERENCES`/)
   assert.match(secondText, /direct user, spec, or source evidence/)
 

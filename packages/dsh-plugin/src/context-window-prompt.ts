@@ -5,13 +5,15 @@ const CONTEXT_WINDOW_EVIDENCE_STATUS = [
   'Use handoff sections `SPEC-CONFIRMED REQUIREMENTS` (goal, progress, next steps; cite user, spec, or source), `AGENT INFERENCES` (never `LOCKED DESIGN` or confirmed by repetition), `UNRESOLVED CONFLICTS`, and `UNVERIFIED ACCEPTANCE CRITERIA`.',
 ].join(' ')
 
+export const CONTEXT_WINDOW_OBELISK_SCOPE = 'Scope Obelisk recovery to the supplied `session_id` and use `context(message_uuid)` at the previous-window boundary; do not search global history or other sessions.'
+
 /** Stable model guidance for prose handoff and scoped Obelisk recovery. */
 export const CONTEXT_WINDOW_GUIDANCE = [
   'Before context pressure becomes critical, call `new_context` with a concise prose handoff.',
   'Cover the current goal, decisions and rationale, completed and in-progress work, learnings, concrete next steps, every unresolved user request, and important actions or tool results.',
   CONTEXT_WINDOW_EVIDENCE_STATUS,
   'Do not copy the transcript: older evidence remains available through Obelisk.',
-  'After rollover, use the supplied `session_id` as the default Obelisk search scope and pass the supplied `message_uuid` to `context(uuid)` when you need to expand from the previous context boundary.',
+  `After rollover: ${CONTEXT_WINDOW_OBELISK_SCOPE}`,
 ].join(' ')
 
 export const CONTEXT_WINDOW_REMINDER = [
@@ -31,8 +33,7 @@ export const CONTEXT_WINDOW_FALLBACK = [
 const CONTEXT_WINDOW_RECOVERY = [
   'Treat this handoff as a checkpoint, not an exhaustive history.',
   'If a required detail is missing, uncertain, or based on an earlier decision, load the `obelisk` skill before re-deriving it.',
-  'Scope searches to `session_id`; use `context(message_uuid)` to expand from the previous-window boundary.',
-  'Do not use global history search for this task.',
+  CONTEXT_WINDOW_OBELISK_SCOPE,
   'Treat unsectioned or `LOCKED DESIGN` claims as `AGENT INFERENCES` until this session supplies direct user, spec, or source evidence; preserve conflicts and unverified criteria.',
 ].join(' ')
 

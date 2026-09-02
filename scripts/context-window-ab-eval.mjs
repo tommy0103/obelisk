@@ -18,6 +18,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
+import { CONTEXT_WINDOW_OBELISK_SCOPE } from '../packages/dsh-plugin/src/context-window-prompt.ts';
 
 import {
   CONTEXT_WINDOW_TASK,
@@ -250,8 +251,8 @@ export function taskPrompt() {
     'Work autonomously until the implementation and its tests pass; do not stop after planning.',
     'The task is finished only when the package builds, relevant tests pass, and the documented install surface is usable.',
     'Do not inspect filesystem paths outside the current workspace for a finished implementation or oracle tests.',
-    'After a rollover, use Obelisk only with the handoff session_id and message_uuid to recover this run.',
-    'Do not search global history or other sessions.',
+    'After a rollover:',
+    CONTEXT_WINDOW_OBELISK_SCOPE,
   ].join(' ');
 }
 
@@ -446,7 +447,8 @@ function materializePlan(output, options, policy, arms) {
       sameModelAndBudget: true,
       obeliskSkillAvailableToBothArms: true,
       currentDshSessionIndexable: true,
-      globalObeliskHistoryUnavailable: true,
+      preexistingObeliskIndexUnavailable: true,
+      deepseekHistoryScope: 'prompt-enforced-session-id',
       agentRunsWaitForNaturalCompletion: options.timeoutMinutes === undefined,
       gitHistoryRemovedFromWorkspace: true,
       oracleTestsInjectedAfterAgentStops: true,

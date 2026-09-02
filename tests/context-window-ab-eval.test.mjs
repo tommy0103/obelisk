@@ -49,8 +49,8 @@ test('A/B arms share a 200K normal-budget boundary while selecting one pressure 
 
 test('eval history recovery is scoped to the current rollover session', () => {
   const prompt = taskPrompt();
-  assert.match(prompt, /After a rollover, use Obelisk only with the handoff session_id and message_uuid/u);
-  assert.match(prompt, /Do not search global history or other sessions/u);
+  assert.match(prompt, /Scope Obelisk recovery to the supplied `session_id`/u);
+  assert.match(prompt, /do not search global history or other sessions/u);
   assert.doesNotMatch(prompt, /recover prior reasoning and decisions/u);
 });
 
@@ -174,7 +174,9 @@ test('CLI dry-run materializes an auditable plan without invoking a model', () =
     assert.equal(plan.timeoutMinutes, null);
     assert.equal(plan.fairness.oracleTestsInjectedAfterAgentStops, true);
     assert.equal(plan.fairness.currentDshSessionIndexable, true);
-    assert.equal(plan.fairness.globalObeliskHistoryUnavailable, true);
+    assert.equal(plan.fairness.preexistingObeliskIndexUnavailable, true);
+    assert.equal(plan.fairness.deepseekHistoryScope, 'prompt-enforced-session-id');
+    assert.equal(plan.fairness.globalObeliskHistoryUnavailable, undefined);
     assert.equal(plan.fairness.agentRunsWaitForNaturalCompletion, true);
     const rolloverPatch = readFileSync(join(output, 'rollover.patch.yml'), 'utf8');
     assert.match(
