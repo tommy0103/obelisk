@@ -230,14 +230,13 @@ export function summarizeSession(events) {
 
 export function qualifyRun(metrics, minimumContextWindow = DEFAULT_EVAL_POLICY.contextWindow) {
   const crossedAtLeastTwoBoundaries = metrics.policyBoundaries >= 2;
-  const withinTargetTokenRange = metrics.totalProviderTokens >= 450_000
-    && metrics.totalProviderTokens <= 600_000;
+  const reachedMinimumProviderUsage = metrics.totalProviderTokens >= 450_000;
   const observedRequiredContext = metrics.observedContextWindows.length > 0
     && metrics.observedContextWindows.every(value => value >= minimumContextWindow);
   return {
     crossedAtLeastTwoBoundaries,
-    withinTargetTokenRange,
+    reachedMinimumProviderUsage,
     observedRequiredContext,
-    eligible: crossedAtLeastTwoBoundaries && withinTargetTokenRange && observedRequiredContext,
+    eligible: crossedAtLeastTwoBoundaries && reachedMinimumProviderUsage && observedRequiredContext,
   };
 }

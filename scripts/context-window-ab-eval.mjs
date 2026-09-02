@@ -331,6 +331,13 @@ function executeRun(runDir, arm, index, options, policy) {
   });
   writeCommandLog(join(runDir, 'dependency-install.log'), dependencies);
   requireSuccess('install isolated base dependencies', dependencies);
+  const appDependencies = checkedSpawn('npm', ['ci', '--prefix', 'app'], {
+    cwd: workspace,
+    env,
+    timeout: 15 * 60_000,
+  });
+  writeCommandLog(join(runDir, 'app-dependency-install.log'), appDependencies);
+  requireSuccess('install isolated app dependencies', appDependencies);
   const runtimeBuild = checkedSpawn('npm', [
     'run', 'build:core',
   ], { cwd: SOURCE_ROOT, env, timeout: 5 * 60_000 });

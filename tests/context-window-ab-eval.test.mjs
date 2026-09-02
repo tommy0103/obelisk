@@ -89,16 +89,17 @@ test('session metrics distinguish compaction, model rollover, forced rollover, a
   assert.equal(summary.repeatedBashCalls, 1);
 });
 
-test('only 200K runs using 450K–600K and crossing two boundaries qualify for comparison', () => {
+test('200K runs using at least 450K and crossing two boundaries qualify without a cache-read ceiling', () => {
   const qualified = { policyBoundaries: 2, totalProviderTokens: 500_000, observedContextWindows: [200_000] };
   assert.deepEqual(qualifyRun(qualified), {
     crossedAtLeastTwoBoundaries: true,
-    withinTargetTokenRange: true,
+    reachedMinimumProviderUsage: true,
     observedRequiredContext: true,
     eligible: true,
   });
   assert.equal(qualifyRun({ ...qualified, policyBoundaries: 1 }).eligible, false);
   assert.equal(qualifyRun({ ...qualified, totalProviderTokens: 200_000 }).eligible, false);
+  assert.equal(qualifyRun({ ...qualified, totalProviderTokens: 150_000_000 }).eligible, true);
   assert.equal(qualifyRun({ ...qualified, observedContextWindows: [128_000] }).eligible, false);
 });
 
