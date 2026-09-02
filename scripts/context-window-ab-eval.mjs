@@ -225,10 +225,17 @@ function exportTaskWorkspace(runDir) {
   return workspace;
 }
 
+export function resolveDshBin(dshRoot) {
+  const bin = join(dshRoot, 'apps', 'cli', 'lib', 'bin.js');
+  if (!existsSync(bin)) {
+    throw new Error(`built DSH CLI not found at ${bin}; run 'pnpm build:lib:host' in deepseek-harness`);
+  }
+  return bin;
+}
+
 function dshInvocation(dshRoot, args, options) {
-  const loader = join(dshRoot, 'node_modules', 'tsx', 'dist', 'loader.mjs');
-  const bin = join(dshRoot, 'apps', 'cli', 'src', 'bin.ts');
-  return checkedSpawn(process.execPath, ['--import', loader, bin, ...args], options);
+  const bin = resolveDshBin(dshRoot);
+  return checkedSpawn(process.execPath, [bin, ...args], options);
 }
 
 function taskPrompt() {

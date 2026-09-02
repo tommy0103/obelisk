@@ -16,7 +16,7 @@ import {
   summarizeSession,
   validatePolicy,
 } from '../scripts/context-window-ab-eval-lib.mjs';
-import { recoverRunSlot } from '../scripts/context-window-ab-eval.mjs';
+import { recoverRunSlot, resolveDshBin } from '../scripts/context-window-ab-eval.mjs';
 
 test('A/B arms share a 200K normal-budget boundary while selecting one pressure policy', () => {
   const compact = buildArmPatch({ arm: 'compact', sessionsRoot: '/tmp/compact' });
@@ -154,5 +154,19 @@ test('an interrupted run directory is cleared while an atomic result is reused',
     assert.equal(existsSync(run), true);
   } finally {
     rmSync(output, { recursive: true, force: true });
+  }
+});
+
+test('real execution uses the built DSH CLI instead of candidate-scoped tsx resolution', () => {
+  const root = mkdtempSync(join(tmpdir(), 'obelisk-dsh-bin-'));
+  const built = join(root, 'apps', 'cli', 'lib', 'bin.js');
+  try {
+    mkdirSync(join(root, 'apps', 'cli', 'lib'), { recursive: true });
+    mkdirSync(join(root, 'apps', 'cli', 'src'), { recursive: true });
+    writeFileSync(built, '');
+    writeFileSync(join(root, 'apps', 'cli', 'src', 'bin.ts'), '');
+    assert.equal(resolveDshBin(root), built);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
