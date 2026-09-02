@@ -1016,6 +1016,11 @@ test('applies a successful new_context handoff at the next pre-step', async () =
       reason: 'Required implementation target.',
       role: 'implementation',
     },
+    {
+      path: 'docs/adr/0011-deepseek-root-tree-units.md',
+      reason: 'Also records the accepted architecture decision.',
+      role: 'decision',
+    },
   ]
   const adapter = new ScriptedAdapter([
     toolCallResponse('new-context-1', 'new_context', { handoff, related_files: relatedFiles }),
@@ -1143,6 +1148,14 @@ test('rejects related files outside the workspace without rolling over', async (
         role: 'spec',
       }],
     }),
+    toolCallResponse('new-context-drive-relative-file', 'new_context', {
+      handoff: 'Still do not replace this context.',
+      related_files: [{
+        path: 'C:outside.md',
+        reason: 'A drive-relative path must not escape the workspace.',
+        role: 'spec',
+      }],
+    }),
     textResponse('recovered from the related file error'),
   ])
   const ctx = await harness(adapter)
@@ -1154,9 +1167,9 @@ test('rejects related files outside the workspace without rolling over', async (
   }))
   await idle
 
-  assert.equal(adapter.requests.length, 2)
-  assert.match(JSON.stringify(adapter.requests[1].messages), /keep this workspace context/)
-  assert.match(JSON.stringify(adapter.requests[1].messages), /path must stay within the workspace/)
+  assert.equal(adapter.requests.length, 3)
+  assert.match(JSON.stringify(adapter.requests[2].messages), /keep this workspace context/)
+  assert.match(JSON.stringify(adapter.requests[2].messages), /path must stay within the workspace/)
   assert.equal(agent.session.snapshotEvents().some(event =>
     event.type === 'user/message' && event.data.source.kind === 'obelisk-context-handoff'), false)
 })

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { isAbsolute, posix, win32 } from 'node:path'
+import { posix, win32 } from 'node:path'
 import { z } from 'zod'
 
 export const RELATED_FILE_ROLES = [
@@ -13,39 +13,52 @@ export const RELATED_FILE_ROLES = [
   'other',
 ] as const
 
+const relatedFilePathSchema = z.string().superRefine((path, context) => {
+  if (path === '' || path !== path.trim()) {
+    context.addIssue({
+      code: 'custom',
+      message: 'new_context related_files path must be a non-empty trimmed string',
+    })
+    return
+  }
+  if ([...path].some(character => character.charCodeAt(0) <= 0x1F)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'new_context related_files path must not contain control characters',
+    })
+    return
+  }
+  const portable = path.replaceAll('\\', '/')
+  const normalized = posix.normalize(portable)
+  if (posix.isAbsolute(portable) || win32.parse(path).root !== ''
+    || normalized === '.' || normalized === '..' || normalized.startsWith('../')) {
+    context.addIssue({
+      code: 'custom',
+      message: 'new_context related_files path must stay within the workspace',
+    })
+    return
+  }
+  if (normalized !== portable) {
+    context.addIssue({
+      code: 'custom',
+      message: 'new_context related_files path must be normalized',
+    })
+  }
+})
+
 export const relatedFileSchema = z.object({
-  path: z.string(),
-  reason: z.string(),
+  path: relatedFilePathSchema,
+  reason: z.string().refine(reason => reason.trim() !== '', {
+    message: 'new_context related_files reason must be non-empty',
+  }),
   role: z.enum(RELATED_FILE_ROLES),
 }).strict()
 
 export type RelatedFile = z.infer<typeof relatedFileSchema>
 
 /** Reject ambiguous or workspace-escaping references before rollover commits them. */
-export function validateRelatedFiles(files: readonly RelatedFile[] | undefined): void {
-  const seen = new Set<string>()
-  for (const file of files ?? []) {
-    if (file.path === '' || file.path !== file.path.trim()) {
-      throw new TypeError('new_context related_files path must be a non-empty trimmed string')
-    }
-    if ([...file.path].some(character => character.charCodeAt(0) <= 0x1F)) {
-      throw new TypeError('new_context related_files path must not contain control characters')
-    }
-    const portable = file.path.replaceAll('\\', '/')
-    const normalized = posix.normalize(portable)
-    if (isAbsolute(file.path) || win32.isAbsolute(file.path)
-      || normalized === '.' || normalized === '..' || normalized.startsWith('../')) {
-      throw new TypeError('new_context related_files path must stay within the workspace')
-    }
-    if (normalized !== portable) {
-      throw new TypeError('new_context related_files path must be normalized')
-    }
-    if (file.reason.trim() === '') {
-      throw new TypeError('new_context related_files reason must be non-empty')
-    }
-    if (seen.has(normalized)) {
-      throw new TypeError(`new_context related_files contains duplicate path ${JSON.stringify(normalized)}`)
-    }
-    seen.add(normalized)
-  }
+export function validateRelatedFiles(files: unknown): asserts files is readonly RelatedFile[] | undefined {
+  const result = z.array(relatedFileSchema).optional().safeParse(files)
+  if (result.success) return
+  throw new TypeError(result.error.issues[0]?.message ?? 'new_context related_files are invalid')
 }
