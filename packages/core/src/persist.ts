@@ -10,14 +10,102 @@
 // only place that knows the schema. Adapters stay pure.
 //
 // Write semantics are the canonical ones reconciled from the drift: messages
-// and tool rows upsert only when canonical values differ; sessions merge with
-// any existing row (started_at MIN, ended_at MAX, message_count
+// and tool rows are prefetched in bounded batches so only new or changed values
+// execute an upsert; sessions merge with any existing row (started_at MIN,
+// ended_at MAX, message_count
 // reset-or-accumulate, fill-if-null for the rest); turn-duration is a targeted
 // conditional UPDATE; delete-session cascades. The generator's return value is
 // the new cursor, persisted verbatim into index_state.
 
-import type { Cursor, TranscriptRecord, IndexUnit } from './providers/types.ts';
-import type { SqliteDb } from './sqlite-types.ts';
+import type {
+  Cursor,
+  IndexUnit,
+  MessageRecord,
+  ToolCallRecord,
+  ToolResultRecord,
+  TranscriptRecord,
+} from './providers/types.ts';
+import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
+
+const REPLAY_FILTER_THRESHOLD = 250;
+const SQLITE_SAFE_KEY_COUNT = 900;
+
+const MESSAGE_FIELDS = [
+  'session_id', 'type', 'parent_uuid', 'timestamp', 'role', 'text',
+  'content_type', 'is_meta', 'visibility', 'model', 'is_sidechain',
+  'agent_id', 'input_tokens', 'output_tokens', 'cwd', 'skill', 'source',
+] as const satisfies readonly (keyof MessageRecord)[];
+const TOOL_CALL_FIELDS = [
+  'message_uuid', 'session_id', 'name', 'presentation', 'input_json', 'file_path',
+] as const satisfies readonly (keyof ToolCallRecord)[];
+const TOOL_RESULT_FIELDS = [
+  'message_uuid', 'session_id', 'content', 'file_path', 'is_error',
+] as const satisfies readonly (keyof ToolResultRecord)[];
+
+interface ReplayState {
+  messages: Map<string, SqliteRow>;
+  toolCalls: Map<string, SqliteRow>;
+  toolResults: Map<string, SqliteRow>;
+}
+
+function sameFields<T extends object>(row: SqliteRow, record: T, fields: readonly (keyof T)[]): boolean {
+  return fields.every(field => row[String(field)] === record[field]);
+}
+
+function uniqueKeys(records: readonly TranscriptRecord[], kinds: readonly TranscriptRecord['kind'][]): string[] {
+  const accepted = new Set(kinds);
+  const keys = new Set<string>();
+  for (const record of records) {
+    if (!accepted.has(record.kind)) continue;
+    if (record.kind === 'message' || record.kind === 'message-turn-duration') keys.add(record.uuid);
+    else if (record.kind === 'tool_call') keys.add(record.id);
+    else if (record.kind === 'tool_result') keys.add(record.tool_use_id);
+  }
+  return [...keys];
+}
+
+function loadRows(
+  db: SqliteDb,
+  table: 'messages' | 'tool_calls' | 'tool_results',
+  keyColumn: 'uuid' | 'id' | 'tool_use_id',
+  columns: string,
+  keys: readonly string[],
+): Map<string, SqliteRow> {
+  if (keys.length === 0) return new Map();
+  // Identifiers are closed unions supplied by this module. Transcript keys
+  // remain bound values and never enter the SQL text.
+  const result = new Map<string, SqliteRow>();
+  for (let offset = 0; offset < keys.length; offset += SQLITE_SAFE_KEY_COUNT) {
+    const chunk = keys.slice(offset, offset + SQLITE_SAFE_KEY_COUNT);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE ${keyColumn} IN (${placeholders})`).all(...chunk);
+    for (const row of rows) result.set(String(row[keyColumn]), row);
+  }
+  return result;
+}
+
+function loadReplayState(db: SqliteDb, records: readonly TranscriptRecord[]): ReplayState {
+  const messageKeys = uniqueKeys(records, ['message', 'message-turn-duration']);
+  const toolCallKeys = uniqueKeys(records, ['tool_call']);
+  const toolResultKeys = uniqueKeys(records, ['tool_result']);
+  return {
+    messages: loadRows(
+      db,
+      'messages',
+      'uuid',
+      `uuid,${MESSAGE_FIELDS.join(',')},turn_duration_ms`,
+      messageKeys,
+    ),
+    toolCalls: loadRows(db, 'tool_calls', 'id', `id,${TOOL_CALL_FIELDS.join(',')}`, toolCallKeys),
+    toolResults: loadRows(
+      db,
+      'tool_results',
+      'tool_use_id',
+      `tool_use_id,${TOOL_RESULT_FIELDS.join(',')}`,
+      toolResultKeys,
+    ),
+  };
+}
 
 const minStr = (a: string | null, b: string | null) => (a == null ? b : b == null ? a : a < b ? a : b);
 const maxStr = (a: string | null, b: string | null) => (a == null ? b : b == null ? a : a > b ? a : b);
@@ -137,17 +225,29 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
   const st = statements(db);
   for (const sessionId of unit.retractSessionIds ?? []) deleteSession(db, sessionId);
 
-  const write = (r: TranscriptRecord) => {
+  const write = (r: TranscriptRecord, replay: ReplayState | null) => {
     switch (r.kind) {
-      case 'message':
+      case 'message': {
+        const previous = replay?.messages.get(r.uuid);
+        if (replay != null && previous != null && sameFields(previous, r, MESSAGE_FIELDS)) break;
         st.msg.run(r.uuid, r.session_id, r.type, r.parent_uuid, r.timestamp, r.role, r.text, r.content_type, r.is_meta, r.visibility, r.model, r.is_sidechain, r.agent_id, r.input_tokens, r.output_tokens, r.cwd, r.skill, r.source);
+        replay?.messages.set(r.uuid, { ...r, turn_duration_ms: previous?.turn_duration_ms ?? null });
         break;
-      case 'tool_call':
+      }
+      case 'tool_call': {
+        const previous = replay?.toolCalls.get(r.id);
+        if (replay != null && previous != null && sameFields(previous, r, TOOL_CALL_FIELDS)) break;
         st.tc.run(r.id, r.message_uuid, r.session_id, r.name, r.presentation, r.input_json, r.file_path);
+        replay?.toolCalls.set(r.id, r);
         break;
-      case 'tool_result':
+      }
+      case 'tool_result': {
+        const previous = replay?.toolResults.get(r.tool_use_id);
+        if (replay != null && previous != null && sameFields(previous, r, TOOL_RESULT_FIELDS)) break;
         st.tr.run(r.tool_use_id, r.message_uuid, r.session_id, r.content, r.file_path, r.is_error);
+        replay?.toolResults.set(r.tool_use_id, r);
         break;
+      }
       case 'summary':
         st.sum.run(
           r.id,
@@ -169,9 +269,15 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
       case 'workflow_agent':
         st.wa.run(r.agent_id, r.run_id, r.session_id, r.agent_type ?? null, r.description ?? null, r.phase ?? null, r.label ?? null, r.model ?? null, r.state ?? null, r.duration_ms ?? null, r.tokens ?? null, r.tool_calls ?? null);
         break;
-      case 'message-turn-duration':
+      case 'message-turn-duration': {
+        const previous = replay?.messages.get(r.uuid);
+        if (replay != null && (previous == null || previous.turn_duration_ms === r.turn_duration_ms)) break;
         st.turn.run(r.turn_duration_ms, r.uuid, r.turn_duration_ms);
+        if (replay != null && previous != null) {
+          replay.messages.set(r.uuid, { ...previous, turn_duration_ms: r.turn_duration_ms });
+        }
         break;
+      }
       case 'session': {
         const prev = st.getSession.get(r.id);
         // 'delta' accumulates onto the existing count (line-incremental adapters);
@@ -200,8 +306,30 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
     }
   };
 
+  let replayFiltering = false;
+  let batch: TranscriptRecord[] = [];
+  const flush = () => {
+    if (batch.length === 0) return;
+    if (batch.length >= REPLAY_FILTER_THRESHOLD) replayFiltering = true;
+    const replay = replayFiltering ? loadReplayState(db, batch) : null;
+    for (const record of batch) write(record, replay);
+    batch = [];
+  };
+
   let step = gen.next();
-  while (!step.done) { write(step.value); step = gen.next(); }
+  while (!step.done) {
+    // A stream-level deletion invalidates any prefetched state for the session.
+    // Flush around it so records after the tombstone observe the deletion.
+    if (step.value.kind === 'delete-session') {
+      flush();
+      write(step.value, null);
+    } else {
+      batch.push(step.value);
+      if (batch.length >= REPLAY_FILTER_THRESHOLD) flush();
+    }
+    step = gen.next();
+  }
+  flush();
   const cursor = step.value;
 
   if (cursor != null) {
