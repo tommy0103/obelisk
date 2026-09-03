@@ -270,8 +270,9 @@ function codexIsGuardianThread(meta: JsonRecord, records: CodexLineRecord[] = []
 }
 
 function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; lineNum: number } | null {
-  const records: CodexLineRecord[] = [];
   let metaRecord: CodexLineRecord | null = null;
+  let sawAutoReviewModel = false;
+  let guardian = false;
   let lineNum = 0;
   readLines(filePath, (line) => {
     lineNum++;
@@ -281,17 +282,24 @@ function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; l
     } catch {
       return;
     }
-    records.push({ lineNum, obj });
+    sawAutoReviewModel ||= obj?.payload?.model === 'codex-auto-review'
+      || obj?.model === 'codex-auto-review';
     if (obj?.type === 'session_meta' && obj.payload?.id) {
       metaRecord = { lineNum, obj };
-      if (obj.payload?.source?.subagent?.other === 'guardian') return false;
+      if (obj.payload?.source?.subagent?.other === 'guardian') {
+        guardian = true;
+        return false;
+      }
       if (obj.payload?.thread_source !== 'subagent') return false;
     }
-    if (metaRecord && codexIsGuardianThread(metaRecord.obj.payload, records)) return false;
+    if (metaRecord && sawAutoReviewModel) {
+      guardian = true;
+      return false;
+    }
   });
   const capturedMeta = metaRecord as CodexLineRecord | null;
   const meta = capturedMeta?.obj?.payload;
-  if (!meta || !codexIsGuardianThread(meta, records)) return null;
+  if (!meta || !guardian) return null;
   const threadRawId = codexRawId(meta.id);
   return threadRawId ? { threadRawId, lineNum } : null;
 }
