@@ -187,6 +187,55 @@ test('app indexer refreshes unchanged Claude usage when input token semantics ch
   refreshed.close();
 });
 
+test('app indexer replays unchanged Claude transcripts when custom-title indexing becomes available', () => {
+  const home = makeTempDir('obelisk-app-indexer-custom-title-');
+  const claudeDir = join(home, '.claude');
+  const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
+  mkdirSync(projectDir, { recursive: true });
+  const sessionId = 'session-custom-title-1';
+  const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(jsonlPath, [
+    JSON.stringify({
+      type: 'custom-title',
+      customTitle: 'Desktop generated title',
+      sessionId,
+    }),
+    JSON.stringify({
+      uuid: 'msg-custom-title-1',
+      type: 'user',
+      timestamp: '2026-06-13T10:00:00Z',
+      cwd: '/tmp/obelisk-app',
+      message: { role: 'user', content: 'hello from a titled session' },
+    }),
+    '',
+  ].join('\n'));
+
+  const dbPath = join(claudeDir, 'obelisk.sqlite');
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const stale = new TestDatabase(dbPath);
+  stale.prepare('UPDATE sessions SET title = NULL WHERE id = ?').run(sessionId);
+  stale.prepare('DELETE FROM index_state WHERE jsonl_path = ?')
+    .run(CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
+  stale.prepare(
+    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, 0, 0)',
+  ).run('__claude_canonical_transcript_v2__');
+  stale.close();
+
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const refreshed = new TestDatabase(dbPath);
+  assert.equal(
+    refreshed.prepare('SELECT title FROM sessions WHERE id = ?').get(sessionId).title,
+    'Desktop generated title',
+  );
+  assert.ok(
+    refreshed.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
+      .get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER),
+  );
+  refreshed.close();
+});
+
 test('force rebuild ignores stale JSONL index_state rows after session tables were cleared', () => {
   const home = makeTempDir('obelisk-app-indexer-force-');
   const claudeDir = join(home, '.claude');
