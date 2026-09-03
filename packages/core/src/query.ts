@@ -28,6 +28,7 @@ interface QueryOptions extends Record<string, any> {
   source?: string;
   includeMeta?: boolean;
   includeInactive?: boolean;
+  fallback?: 'or';
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
@@ -256,12 +257,12 @@ function assertEnglishMemoryText(value: unknown, label: string): void {
   }
 }
 
-function buildSafeFtsQuery(text: unknown): string {
+function buildSafeFtsQuery(text: unknown, separator = ' '): string {
   const tokens = String(text || '').match(/[\p{Letter}\p{Number}]+/gu) || [];
   return tokens
     .slice(0, 12)
     .map(token => `"${token}"`)
-    .join(' ');
+    .join(separator);
 }
 
 function createQueryApi(
@@ -296,6 +297,7 @@ function createQueryApi(
       source,
       includeMeta = false,
       includeInactive = false,
+      fallback,
     } = opts;
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
@@ -325,6 +327,10 @@ function createQueryApi(
     } catch {
       const safe = buildSafeFtsQuery(text);
       rows = safe ? runMatch(safe) : [];
+    }
+    if (rows.length === 0 && fallback === 'or') {
+      const broad = buildSafeFtsQuery(text, ' OR ');
+      rows = broad ? runMatch(broad) : [];
     }
     return rows.map((r: DbRow) => {
       const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
