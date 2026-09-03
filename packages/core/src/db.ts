@@ -4,20 +4,28 @@
 // node:sqlite lifecycle and migrations for the Core package.
 import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines } from './parsing.ts';
+import { resolveObeliskPaths, warnLegacyStorageIgnored } from './paths.ts';
 import { configureConnection } from './tx.ts';
 import { migrateCoreSchemaColumns } from './schema-migrations.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 
-const OBELISK_DIR = join(homedir(), '.obelisk');
-const LEGACY_DB_PATH = join(CLAUDE_DIR, 'obelisk.sqlite');
-const DB_PATH = join(OBELISK_DIR, 'obelisk.sqlite');
+const PATHS = resolveObeliskPaths();
+const OBELISK_DIR = PATHS.dataDir;
+const LEGACY_DB_PATH = PATHS.legacyDbPath;
+const DB_PATH = PATHS.dbPath;
 const SCHEMA = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
+let legacyStorageWarningShown = false;
 
 function migrateLegacyDbIfNeeded() {
+  if (PATHS.layout !== 'legacy') {
+    if (!legacyStorageWarningShown) {
+      legacyStorageWarningShown = warnLegacyStorageIgnored(PATHS) !== null;
+    }
+    return;
+  }
   if (existsSync(DB_PATH)) return;
   if (!existsSync(LEGACY_DB_PATH)) return;
   mkdirSync(dirname(DB_PATH), { recursive: true });

@@ -23,6 +23,7 @@
     "./providers/builtins": "./dist/providers/builtins.js",
     "./providers/types": "./dist/providers/types.js",
     "./query": "./dist/query.js",
+    "./paths": "./dist/paths.js",
     "./schema-migrations": "./dist/schema-migrations.js",
     "./sqlite-types": "./dist/sqlite-types.js",
     "./tx": "./dist/tx.js",

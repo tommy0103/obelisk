@@ -27,6 +27,21 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), Pi sessions from `~/.pi/agent/sessions`, and DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`).
 
+## Advanced configuration
+
+Storage customization is opt-in. `OBELISK_HOME` has highest precedence, expands
+a leading `~`, and must resolve to an absolute path; otherwise an existing
+`~/.obelisk` keeps precedence. With `OBELISK_USE_XDG=1`, settings use
+`$XDG_CONFIG_HOME/obelisk` (fallback `~/.config/obelisk`) and the database,
+writer lock, and `recap/` use `$XDG_DATA_HOME/obelisk` (fallback
+`~/.local/share/obelisk`). An `OBELISK_HOME` root contains `settings.json`,
+`obelisk.sqlite`, `writer.lock.sqlite`, and `recap/`. Without either option,
+Obelisk uses `~/.obelisk`.
+
+Custom and XDG layouts do not automatically migrate existing data, including
+`~/.claude/obelisk.sqlite`; move files manually if needed. Obelisk emits a
+one-time warning with a link to this section when that legacy database is found.
+
 ## Multi-provider support
 
 Obelisk indexes every provider into the same SQLite schema instead of keeping separate databases. Rows carry a `source` value, and non-Claude IDs are provider-prefixed so they cannot collide.

@@ -13,6 +13,7 @@ import {
   createProviderRegistry,
   type ProviderRegistry,
 } from './providers/registry.ts';
+import { resolveObeliskPaths } from './paths.ts';
 
 export type PersistedProviderSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -69,7 +70,7 @@ export function resolveProviderRoots(
 }
 
 export function readPersistedProviderSettings(
-  settingsPath = join(homedir(), '.obelisk', 'settings.json'),
+  settingsPath = resolveObeliskPaths().settingsPath,
 ): ProviderSettingsReadResult {
   if (!existsSync(settingsPath)) return { ok: true, settings: {} };
   try {
