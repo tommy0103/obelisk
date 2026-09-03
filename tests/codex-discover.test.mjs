@@ -76,6 +76,25 @@ test('codex discovery re-plans a guardian transcript rewritten at the same mtime
   assert.equal(units[0].meta.guardian, true, 'guardian detection runs for re-planned files');
 });
 
+test('codex discovery recognizes a legacy guardian model before session metadata', () => {
+  const rootDir = makeTempDir('obelisk-codex-discover-');
+  const dir = join(rootDir, 'sessions', '2026', '06', '15');
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `rollout-2026-06-15T10-00-00-${GUARDIAN_ID}.jsonl`);
+  writeFileSync(path, [
+    JSON.stringify({ type: 'turn_context', payload: { model: 'codex-auto-review' } }),
+    JSON.stringify({
+      type: 'session_meta',
+      payload: { id: GUARDIAN_ID, cwd: '/tmp/cdx', thread_source: 'subagent' },
+    }),
+    '',
+  ].join('\n'));
+
+  const units = discoverWith(rootDir, new Map());
+  assert.equal(units[0].sessionId, '');
+  assert.equal(units[0].meta.guardian, true);
+});
+
 test('codex discovery fails closed on a legacy mtime-only cursor, even at the current mtime', () => {
   const rootDir = makeTempDir('obelisk-codex-discover-');
   const guardianPath = writeRollout(rootDir, GUARDIAN_ID, GUARDIAN_META);
