@@ -366,7 +366,11 @@ function listJsonlFiles(root: string): {
     }
     for (const entry of entries) {
       const path = join(current, entry.name);
-      if (entry.isDirectory()) stack.push(path);
+      if (entry.isDirectory()) {
+        // Pi subagent integrations store exported transcripts here; they are
+        // not Pi sessions and have a different JSONL header contract.
+        if (entry.name.toLowerCase() !== 'subagent-artifacts') stack.push(path);
+      }
       else if (entry.name.toLowerCase().endsWith('.jsonl')) {
         if (entry.isFile()) {
           files.push(normalize(path));
