@@ -199,10 +199,12 @@ function handleGlobalKeydown(event) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleGlobalKeydown);
+  document.addEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates = window.obelisk?.onIndexUpdated?.(() => loadSourceDots()) ?? null;
 });
 onUnmounted(() => {
   window.removeEventListener('keydown', handleGlobalKeydown);
+  document.removeEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates?.();
   stopSourceUpdates = null;
   clearTimeout(searchTimer);
@@ -231,11 +233,17 @@ function setRecapKind(k) {
 
 // --- Source filter ---
 const showSourceFilter = ref(false);
+const sourceFilterWrapRef = ref(null);
 const sourceFilterActive = computed(() => state.sourceFilter !== 'all' && state.sourceFilter !== undefined);
 const sourceFilterLabel = computed(() => {
   if (!state.sourceFilter || state.sourceFilter === 'all') return 'All sources';
   return sourceLabel(state.sourceFilter, state.sources);
 });
+function handleDocumentPointerDown(event) {
+  if (showSourceFilter.value && !sourceFilterWrapRef.value?.contains(event.target)) {
+    showSourceFilter.value = false;
+  }
+}
 function toggleSourceFilter() { showSourceFilter.value = !showSourceFilter.value; }
 function setSourceFilter(id) {
   state.sourceFilter = id;
@@ -530,7 +538,11 @@ provide('recapGenerateOpen', recapGenerateOpen);
           </template>
 
           <!-- Source filter (session list only, multi-source) -->
-          <div v-if="showToolbar && route.name === 'SessionList' && sourceDots.length > 1" class="source-filter-wrap">
+          <div
+            v-if="showToolbar && route.name === 'SessionList' && sourceDots.length > 1"
+            ref="sourceFilterWrapRef"
+            class="source-filter-wrap"
+          >
             <button class="filter-btn" :class="{ active: sourceFilterActive }" @click="toggleSourceFilter">
               <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
                 <path d="M2 3h8M3.5 6h5M5 9h2"/>
