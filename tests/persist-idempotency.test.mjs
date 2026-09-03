@@ -105,8 +105,11 @@ function* canonicalRecords({ message = {}, toolCall = {}, toolResult = {}, durat
   return null;
 }
 
-function* oneRecord(record) {
+function* replaySizedRecord(record) {
   yield record;
+  for (let index = 0; index < 249; index += 1) {
+    yield { kind: 'message-turn-duration', uuid: `missing-${index}`, turn_duration_ms: null };
+  }
   return null;
 }
 
@@ -255,13 +258,13 @@ test('every authoritative field can independently trigger an in-place update', (
 
   for (const [table, key, base, changes] of cases) {
     for (const [column, value] of Object.entries(changes)) {
-      persist(db, unit, oneRecord({ ...base, [column]: value }));
+      persist(db, unit, replaySizedRecord({ ...base, [column]: value }));
       assert.equal(
         db.prepare(`SELECT ${column} AS value FROM ${table} WHERE ${key}=?`).get(base[key]).value,
         value,
         `${table}.${column} did not update`,
       );
-      persist(db, unit, oneRecord(base));
+      persist(db, unit, replaySizedRecord(base));
     }
   }
 

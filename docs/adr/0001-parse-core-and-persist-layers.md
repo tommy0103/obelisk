@@ -85,6 +85,27 @@ preserve their individual contracts. No provider cursor or canonical transcript
 marker changes for this amendment because the projected canonical values do not
 change.
 
+**Amendment (2026-09-04): bounded canonical replay filtering.** Conditional
+UPSERTs stop physical writes but still execute one primary-key probe for every
+record in a snapshot replay. Once a stream reaches 250 records, the shared
+persist layer fetches existing message/tool state in bounded 250-record batches
+and executes the established UPSERTs only for new or changed values. Shorter
+delta streams retain the direct conditional-UPSERT path and do not pay an extra
+read. Each lookup is further capped at 900 bound keys, below SQLite's portable
+variable limit, and the batch bound prevents a long transcript from being
+materialized in memory at the persistence seam.
+
+Comparison uses the same authoritative field sets as the conditional UPSERTs
+and simulates accepted changes in record order inside the batch. This preserves
+the final state when one key appears more than once, including message duration
+updates. A `delete-session` record is a hard batch boundary so later records
+observe the deletion rather than prefetched stale state. Retractions attached
+to an `IndexUnit` still run before any state is fetched. Sessions, summaries,
+subagents, workflows, workflow agents, and `index_state` retain their existing
+write and merge contracts. This optimization changes neither canonical values
+nor provider cursors and therefore requires no schema migration or canonical
+transcript marker bump.
+
 **Two indexing modes** share all of the above and differ only in trigger:
 **daemon mode** (the app, and potentially a future CLI daemon, watches and keeps
 the index fresh) and **passive pull mode** (a CLI command indexes on invocation
