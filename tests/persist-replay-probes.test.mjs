@@ -3,22 +3,18 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { performance } from 'node:perf_hooks';
 
+import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
+import { ensureFtsReady, refreshSessionProjectPaths } from '../packages/core/src/index-finalize.ts';
 import { persist } from '../packages/core/src/persist.ts';
-
-const require = createRequire(import.meta.url);
-const { DatabaseSync } = require('node:sqlite');
-const appDir = fileURLToPath(new URL('../app/', import.meta.url));
-const BetterSqlite3 = require(require.resolve('better-sqlite3', { paths: [appDir] }));
-const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
-
-const bindings = [
-  ['node:sqlite', () => new DatabaseSync(':memory:')],
-  ['better-sqlite3', () => new BetterSqlite3(':memory:')],
-];
+import {
+  bindings,
+  messageRecord,
+  SCHEMA,
+  toolCallRecord,
+  toolResultRecord,
+} from './persist-test-fixtures.mjs';
 
 function canonicalKind(sql) {
   const normalized = sql.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -63,55 +59,15 @@ function instrument(db) {
 }
 
 function message(id, changes = {}) {
-  return {
-    kind: 'message',
-    uuid: `message-${id}`,
-    session_id: 'session-1',
-    type: 'assistant',
-    parent_uuid: null,
-    timestamp: `2026-09-01T10:${String(id % 60).padStart(2, '0')}:00.000Z`,
-    role: 'assistant',
-    text: `stable searchable text ${id}`,
-    content_type: 'text',
-    is_meta: 0,
-    visibility: 'visible',
-    model: 'model-1',
-    is_sidechain: 0,
-    agent_id: null,
-    input_tokens: 10,
-    output_tokens: 20,
-    cwd: '/workspace',
-    skill: null,
-    source: 'codex',
-    ...changes,
-  };
+  return messageRecord(id, changes);
 }
 
 function toolCall(id, changes = {}) {
-  return {
-    kind: 'tool_call',
-    id: `call-${id}`,
-    message_uuid: `message-${id}`,
-    session_id: 'session-1',
-    name: 'exec_command',
-    presentation: 'default',
-    input_json: '{"cmd":"true"}',
-    file_path: null,
-    ...changes,
-  };
+  return toolCallRecord(id, changes);
 }
 
 function toolResult(id, changes = {}) {
-  return {
-    kind: 'tool_result',
-    tool_use_id: `call-${id}`,
-    message_uuid: `message-${id}`,
-    session_id: 'session-1',
-    content: 'done',
-    file_path: null,
-    is_error: 0,
-    ...changes,
-  };
+  return toolResultRecord(id, changes);
 }
 
 function* snapshot(count, changedId = null) {
@@ -127,6 +83,14 @@ function* snapshot(count, changedId = null) {
 
 function* records(items) {
   yield* items;
+  return null;
+}
+
+function* replaySizedRecords(items, fillerCount) {
+  yield* items;
+  for (let index = 0; index < fillerCount; index += 1) {
+    yield { kind: 'message-turn-duration', uuid: `missing-${index}`, turn_duration_ms: null };
+  }
   return null;
 }
 
@@ -150,6 +114,9 @@ for (const [binding, openDb] of bindings) {
   test(`${binding}: unchanged snapshot rows do not execute one SQLite statement each`, (t) => {
     const rawDb = openDb();
     rawDb.exec(SCHEMA);
+    rawDb.prepare('INSERT INTO sessions (id,project,source) VALUES (?,?,?)')
+      .run('session-1', 'workspace', 'codex');
+    ensureFtsReady(rawDb);
     const observed = instrument(rawDb);
     const unit = { key: 'unit-1', sessionId: 'session-1' };
 
@@ -161,7 +128,15 @@ for (const [binding, openDb] of bindings) {
     };
     observed.reset();
 
+    const persistenceStarted = performance.now();
     persist(observed.handle, unit, snapshot(1_001, 500));
+    const persistenceMs = performance.now() - persistenceStarted;
+
+    const finalizeStarted = performance.now();
+    refreshSessionProjectPaths(rawDb, new Set(['session-1']));
+    healWorkflowParentLinks(rawDb);
+    ensureFtsReady(rawDb);
+    const finalizeMs = performance.now() - finalizeStarted;
 
     const classification = {
       emitted: 4_004,
@@ -170,7 +145,11 @@ for (const [binding, openDb] of bindings) {
       modified: 4,
       unchanged: 3_996,
     };
-    t.diagnostic(JSON.stringify({ classification, sqlite: observed.metrics }));
+    t.diagnostic(JSON.stringify({
+      classification,
+      sqlite: observed.metrics,
+      timings: { persistenceMs, finalizeMs },
+    }));
     assert.equal(observed.metrics.writes, classification.new + classification.modified);
     assert.ok(
       observed.metrics.reads + observed.metrics.writes < 80,
@@ -195,24 +174,28 @@ for (const [binding, openDb] of bindings) {
   });
 
   test(`${binding}: replay filtering preserves repeated-key order and delete/reinsert order`, () => {
-    const db = openDb();
-    db.exec(SCHEMA);
+    const rawDb = openDb();
+    rawDb.exec(SCHEMA);
+    const observed = instrument(rawDb);
     const unit = { key: 'unit-1', sessionId: 'session-1' };
-    persist(db, unit, records([message(1)]));
-    const originalRowid = db.prepare('SELECT rowid FROM messages WHERE uuid=?').get('message-1').rowid;
+    persist(observed.handle, unit, records([message(1)]));
+    const originalRowid = rawDb.prepare('SELECT rowid FROM messages WHERE uuid=?').get('message-1').rowid;
 
-    persist(db, unit, records([
-      message(1, { text: 'temporary value' }),
-      message(1),
-    ]));
-    assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?').get('message-1').text, 'stable searchable text 1');
-    assert.equal(db.prepare('SELECT rowid FROM messages WHERE uuid=?').get('message-1').rowid, originalRowid);
+    observed.reset();
+    persist(observed.handle, unit, replaySizedRecords([
+      message(1, { text: 'temporary value' }), message(1),
+    ], 248));
+    assert.ok(observed.metrics.reads > 0, 'the repeated-key replay entered filtering');
+    assert.equal(rawDb.prepare('SELECT text FROM messages WHERE uuid=?').get('message-1').text, 'stable searchable text 1');
+    assert.equal(rawDb.prepare('SELECT rowid FROM messages WHERE uuid=?').get('message-1').rowid, originalRowid);
 
-    persist(db, unit, records([
+    observed.reset();
+    persist(observed.handle, unit, replaySizedRecords([
       { kind: 'delete-session', sessionId: 'session-1' },
       message(1),
-    ]));
-    assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?').get('message-1').text, 'stable searchable text 1');
-    db.close();
+    ], 249));
+    assert.ok(observed.metrics.reads > 0, 'the post-deletion replay entered filtering');
+    assert.equal(rawDb.prepare('SELECT text FROM messages WHERE uuid=?').get('message-1').text, 'stable searchable text 1');
+    rawDb.close();
   });
 }

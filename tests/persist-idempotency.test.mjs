@@ -3,66 +3,24 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 
 import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import {
+  bindings,
+  messageRecord,
+  openNodeSqlite,
+  SCHEMA,
+  toolCallRecord,
+  toolResultRecord,
+} from './persist-test-fixtures.mjs';
 
-const require = createRequire(import.meta.url);
-const { DatabaseSync } = require('node:sqlite');
-const appDir = fileURLToPath(new URL('../app/', import.meta.url));
-const BetterSqlite3 = require(require.resolve('better-sqlite3', { paths: [appDir] }));
-const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
-
-const bindings = [
-  ['node:sqlite', () => new DatabaseSync(':memory:')],
-  ['better-sqlite3', () => new BetterSqlite3(':memory:')],
-];
-
-const BASE_MESSAGE = {
-  kind: 'message',
-  uuid: 'message-1',
-  session_id: 'session-1',
-  type: 'assistant',
-  parent_uuid: null,
+const BASE_MESSAGE = messageRecord(1, {
   timestamp: '2026-09-01T10:00:00.000Z',
-  role: 'assistant',
   text: 'stable searchable text',
-  content_type: 'text',
-  is_meta: 0,
-  visibility: 'visible',
-  model: 'model-1',
-  is_sidechain: 0,
-  agent_id: null,
-  input_tokens: 10,
-  output_tokens: 20,
-  cwd: '/workspace',
-  skill: null,
-  source: 'codex',
-};
-
-const BASE_TOOL_CALL = {
-  kind: 'tool_call',
-  id: 'call-1',
-  message_uuid: 'message-1',
-  session_id: 'session-1',
-  name: 'exec_command',
-  presentation: 'default',
-  input_json: '{"cmd":"true"}',
-  file_path: null,
-};
-
-const BASE_TOOL_RESULT = {
-  kind: 'tool_result',
-  tool_use_id: 'call-1',
-  message_uuid: 'message-1',
-  session_id: 'session-1',
-  content: 'done',
-  file_path: null,
-  is_error: 0,
-};
+});
+const BASE_TOOL_CALL = toolCallRecord(1);
+const BASE_TOOL_RESULT = toolResultRecord(1);
 
 function installWriteAudit(db) {
   db.exec(`
@@ -110,6 +68,11 @@ function* replaySizedRecord(record) {
   for (let index = 0; index < 249; index += 1) {
     yield { kind: 'message-turn-duration', uuid: `missing-${index}`, turn_duration_ms: null };
   }
+  return null;
+}
+
+function* oneRecord(record) {
+  yield record;
   return null;
 }
 
@@ -233,46 +196,54 @@ for (const [binding, openDb] of bindings) {
   });
 }
 
-test('every authoritative field can independently trigger an in-place update', () => {
-  const db = new DatabaseSync(':memory:');
+const AUTHORITATIVE_FIELD_CASES = [
+  ['messages', 'uuid', BASE_MESSAGE, {
+    session_id: 'session-2', type: 'user', parent_uuid: 'parent-1', timestamp: null,
+    role: null, text: null, content_type: null, is_meta: 1, visibility: 'hidden',
+    model: null, is_sidechain: 1, agent_id: 'agent-1', input_tokens: null,
+    output_tokens: null, cwd: null, skill: 'review', source: 'claude',
+  }],
+  ['tool_calls', 'id', BASE_TOOL_CALL, {
+    message_uuid: 'message-2', session_id: 'session-2', name: 'read_file',
+    presentation: 'skill', input_json: '{}', file_path: '/tmp/input',
+  }],
+  ['tool_results', 'tool_use_id', BASE_TOOL_RESULT, {
+    message_uuid: 'message-2', session_id: 'session-2', content: 'changed',
+    file_path: '/tmp/output', is_error: 1,
+  }],
+];
+
+function assertEveryAuthoritativeField(recordStream) {
+  const db = openNodeSqlite();
   db.exec(SCHEMA);
   const unit = { key: 'unit-1', sessionId: 'session-1' };
   persist(db, unit, canonicalRecords());
 
-  const cases = [
-    ['messages', 'uuid', BASE_MESSAGE, {
-      session_id: 'session-2', type: 'user', parent_uuid: 'parent-1', timestamp: null,
-      role: null, text: null, content_type: null, is_meta: 1, visibility: 'hidden',
-      model: null, is_sidechain: 1, agent_id: 'agent-1', input_tokens: null,
-      output_tokens: null, cwd: null, skill: 'review', source: 'claude',
-    }],
-    ['tool_calls', 'id', BASE_TOOL_CALL, {
-      message_uuid: 'message-2', session_id: 'session-2', name: 'read_file',
-      presentation: 'skill', input_json: '{}', file_path: '/tmp/input',
-    }],
-    ['tool_results', 'tool_use_id', BASE_TOOL_RESULT, {
-      message_uuid: 'message-2', session_id: 'session-2', content: 'changed',
-      file_path: '/tmp/output', is_error: 1,
-    }],
-  ];
-
-  for (const [table, key, base, changes] of cases) {
+  for (const [table, key, base, changes] of AUTHORITATIVE_FIELD_CASES) {
     for (const [column, value] of Object.entries(changes)) {
-      persist(db, unit, replaySizedRecord({ ...base, [column]: value }));
+      persist(db, unit, recordStream({ ...base, [column]: value }));
       assert.equal(
         db.prepare(`SELECT ${column} AS value FROM ${table} WHERE ${key}=?`).get(base[key]).value,
         value,
         `${table}.${column} did not update`,
       );
-      persist(db, unit, replaySizedRecord(base));
+      persist(db, unit, recordStream(base));
     }
   }
 
   db.close();
+}
+
+test('direct path lets every authoritative field independently trigger an in-place update', () => {
+  assertEveryAuthoritativeField(oneRecord);
+});
+
+test('replay filtering lets every authoritative field independently trigger an in-place update', () => {
+  assertEveryAuthoritativeField(replaySizedRecord);
 });
 
 test('changed tool-result replay preserves workflow healer candidate order', () => {
-  const db = new DatabaseSync(':memory:');
+  const db = openNodeSqlite();
   db.exec(SCHEMA);
   const unit = { key: 'unit-1', sessionId: 'session-1' };
   const toolResult = (id, content) => ({
