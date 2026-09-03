@@ -10,10 +10,10 @@ import { ensureFtsReady, refreshSessionProjectPaths } from '../packages/core/src
 import { persist } from '../packages/core/src/persist.ts';
 import {
   bindings,
-  messageRecord,
+  messageRecord as message,
   SCHEMA,
-  toolCallRecord,
-  toolResultRecord,
+  toolCallRecord as toolCall,
+  toolResultRecord as toolResult,
 } from './persist-test-fixtures.mjs';
 
 function canonicalKind(sql) {
@@ -56,18 +56,6 @@ function instrument(db) {
       close() { return db.close(); },
     },
   };
-}
-
-function message(id, changes = {}) {
-  return messageRecord(id, changes);
-}
-
-function toolCall(id, changes = {}) {
-  return toolCallRecord(id, changes);
-}
-
-function toolResult(id, changes = {}) {
-  return toolResultRecord(id, changes);
 }
 
 function* snapshot(count, changedId = null) {
