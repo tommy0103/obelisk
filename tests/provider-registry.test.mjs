@@ -68,6 +68,7 @@ test('built-in provider registry exposes every source without caller-side branch
     codex: '/sources/codex',
     deepseek: '/sources/deepseek',
     kimi: '/sources/kimi',
+    omp: '/sources/omp',
     pi: '/sources/pi',
   });
 
@@ -76,6 +77,7 @@ test('built-in provider registry exposes every source without caller-side branch
     { id: 'codex', name: 'Codex' },
     { id: 'deepseek', name: 'DeepSeek Harness' },
     { id: 'kimi', name: 'Kimi Code' },
+    { id: 'omp', name: 'OMP' },
     { id: 'pi', name: 'Pi' },
   ]);
   assert.deepEqual(registry.watchTargets(), [
@@ -87,6 +89,7 @@ test('built-in provider registry exposes every source without caller-side branch
     { kind: 'tree', path: '/sources/deepseek' },
     { kind: 'tree', path: '/sources/kimi/sessions' },
     { kind: 'file', path: '/sources/kimi/session_index.jsonl' },
+    { kind: 'tree', path: '/sources/omp' },
     { kind: 'tree', path: '/sources/pi' },
   ]);
 });

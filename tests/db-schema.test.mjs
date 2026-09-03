@@ -233,9 +233,9 @@ test('schema reference stays focused on raw SQL structure', async () => {
 
   assert.ok(ref.split('\n').length < 420, 'schema.md should remain a quick SQL reference');
   assert.match(ref, /Raw SQL Quick Reference/i);
-  assert.match(ref, /Claude Code, Codex, DeepSeek Harness, Kimi Code, and Pi/);
+  assert.match(ref, /Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi/);
   assert.equal(
-    ref.match(/Provider ID: `claude`, `codex`, `deepseek`, `kimi`, or `pi`/g)?.length,
+    ref.match(/Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi`/g)?.length,
     2,
     'session and message source fields should document every provider',
   );
@@ -253,7 +253,7 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
-  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'pi'/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'omp' \| 'pi'/);
   assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
@@ -273,8 +273,10 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Claude Code, Codex, Kimi Code, and Pi/);
-  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'pi'/s);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
+  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);
   assert.match(skill, /Reference Map/);
   assert.match(skill, /references\/schema\.md.*raw SQL/i);
   assert.match(skill, /references\/api-reference\.md.*helper/i);

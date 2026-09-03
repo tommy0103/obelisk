@@ -29,7 +29,7 @@ promoted to an external tool surface.
 ## Indexing
 
 **Provider adapter**:
-A pure per-source module (claude, codex, kimi, later pi, …) that owns its
+A pure per-source module (claude, codex, kimi, omp, pi, …) that owns its
 descriptor, watch roots, discovery, parsing, cursor interpretation, and raw
 record lookup. It discovers `IndexUnit`s rather than assuming one transcript
 file per unit; Kimi uses a session directory containing multiple wire logs. It

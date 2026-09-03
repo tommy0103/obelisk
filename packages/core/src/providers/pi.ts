@@ -58,7 +58,7 @@ interface PiEntryLine extends PiLine {
 }
 
 interface PiSessionUnitMeta {
-  readonly kind: 'pi-session' | 'pi-tombstone';
+  readonly kind: string;
   readonly discoveredSessionId: string | null;
   readonly collisionPaths?: readonly string[];
 }
@@ -95,6 +95,15 @@ export interface PiRootResolution {
 
 export interface PiProvider extends ProviderAdapter {
   readonly rootResolution: PiRootResolution;
+}
+
+export interface PiFamilyConfig {
+  readonly source: string;
+  readonly displayName: string;
+  readonly vendor: string;
+  readonly color: string;
+  readonly indexVersionMarker: string;
+  readonly allowTitlePrelude?: boolean;
 }
 
 const SOURCE = 'pi';
@@ -244,7 +253,7 @@ function resolvePiRoot(rootDir: string | undefined, cwd: string | undefined): Pi
       };
 }
 
-function inspectHeader(path: string): PiHeader {
+function inspectHeader(path: string, config: PiFamilyConfig): PiHeader {
   const fd = openSync(path, 'r');
   let pending = Buffer.alloc(0);
   let scanned = 0;
@@ -259,6 +268,13 @@ function inspectHeader(path: string): PiHeader {
       // parsed entry. Full transcript parsing remains strict.
       return null;
     }
+    if (
+      config.allowTitlePrelude
+      && value !== null
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && (value as JsonRecord).type === 'title'
+    ) return null;
     return asHeader(value, path);
   };
   try {
@@ -322,22 +338,23 @@ function asHeader(value: unknown, path: string): PiHeader {
   return header as PiHeader;
 }
 
-export function piSessionId(header: PiHeader): string {
-  // Pi's --session-id lookup is project-local, so the header id alone is not
-  // globally unique. The immutable header cwd supplies a path-independent
-  // namespace. Pi's permissive v1 loader also accepts a missing cwd; those
-  // sessions share a deterministic legacy namespace rather than inheriting
-  // Obelisk's unrelated launch cwd.
+export function piFamilySessionId(header: PiHeader, source: string): string {
+  // Explicit session ids are project-local, so the immutable header cwd supplies
+  // a stable namespace while still allowing the same id in two projects.
   const cwd = normalizeObservedCwd(header.cwd) ?? header.cwd ?? '';
   const projectScope = createHash('sha256')
-    .update('pi-cwd-v1\0')
+    .update(`${source}-cwd-v1\0`)
     .update(cwd)
     .digest('hex');
-  return `pi:${encodeURIComponent(header.id)}:${projectScope}`;
+  return `${source}:${encodeURIComponent(header.id)}:${projectScope}`;
 }
 
-function invalidUnitId(path: string): string {
-  return `pi:invalid:${createHash('sha256').update(path).digest('hex').slice(0, 24)}`;
+export function piSessionId(header: PiHeader): string {
+  return piFamilySessionId(header, SOURCE);
+}
+
+function invalidUnitId(path: string, source: string): string {
+  return `${source}:invalid:${createHash('sha256').update(path).digest('hex').slice(0, 24)}`;
 }
 
 function listJsonlFiles(root: string): {
@@ -425,7 +442,7 @@ function fileDigest(path: string, expectedCursor: string): string {
   return digest;
 }
 
-function discoverAt(root: string, ctx: DiscoverContext): IndexUnit[] {
+function discoverAt(root: string, ctx: DiscoverContext, config: PiFamilyConfig): IndexUnit[] {
   const inventory = listJsonlFiles(root);
   const indexedSessions = (ctx.indexedSessions?.() ?? []).map((session) => ({
     sessionId: session.sessionId,
@@ -456,7 +473,7 @@ function discoverAt(root: string, ctx: DiscoverContext): IndexUnit[] {
       onIncomplete(inventoryIssue(path, cause));
     }
     try {
-      header = inspectHeader(path);
+      header = inspectHeader(path, config);
     } catch (cause) {
       error = cause instanceof Error ? cause : new Error(String(cause));
     }
@@ -481,7 +498,7 @@ function discoverAt(root: string, ctx: DiscoverContext): IndexUnit[] {
     return [{
       path,
       header,
-      sessionId: header === null ? invalidUnitId(path) : piSessionId(header),
+      sessionId: header === null ? invalidUnitId(path, config.source) : piFamilySessionId(header, config.source),
       error,
       currentCursor,
     }];
@@ -576,7 +593,7 @@ function discoverAt(root: string, ctx: DiscoverContext): IndexUnit[] {
       sessionId: indexed.sessionId,
       retractSessionIds: [indexed.sessionId],
       meta: {
-        kind: 'pi-tombstone',
+        kind: `${config.source}-tombstone`,
         discoveredSessionId: null,
       } satisfies PiSessionUnitMeta,
     });
@@ -610,7 +627,7 @@ function discoverAt(root: string, ctx: DiscoverContext): IndexUnit[] {
           ? undefined
           : projectSlugFromPath(normalizeObservedCwd(file.header.cwd)) ?? undefined,
         meta: {
-          kind: 'pi-session',
+          kind: `${config.source}-session`,
           discoveredSessionId: file.sessionId,
           ...(collisionPaths === undefined ? {} : { collisionPaths }),
         } satisfies PiSessionUnitMeta,
@@ -623,11 +640,12 @@ function discoverAt(root: string, ctx: DiscoverContext): IndexUnit[] {
   ));
 }
 
-function parseLines(path: string): {
+function parseLines(path: string, config: PiFamilyConfig): {
   header: PiHeader;
   entries: PiEntryLine[];
   cursor: string;
   snapshot: string;
+  externalTitle: string | null;
 } {
   const before = statSync(path);
   const raw = readFileSync(path, 'utf8');
@@ -661,9 +679,13 @@ function parseLines(path: string): {
     });
   }
   if (lines.length === 0) throw new Error(`Empty Pi session: ${path}`);
-  const header = asHeader(lines[0]!.record, path);
+  const hasTitlePrelude = config.allowTitlePrelude === true && lines[0]!.record.type === 'title';
+  const headerIndex = hasTitlePrelude ? 1 : 0;
+  const headerLine = lines[headerIndex];
+  if (headerLine === undefined) throw new Error(`Malformed Pi session header in ${path}`);
+  const header = asHeader(headerLine.record, path);
   const version = header.version ?? 1;
-  const sourceEntries = lines.slice(1).map(({ line, ordinal, raw: lineRaw, record }) => ({
+  const sourceEntries = lines.slice(headerIndex + 1).map(({ line, ordinal, raw: lineRaw, record }) => ({
     line,
     ordinal,
     raw: lineRaw,
@@ -707,11 +729,17 @@ function parseLines(path: string): {
     }
     return entry as PiEntryLine;
   });
+  const preludeTitle = hasTitlePrelude ? lines[0]!.record.title : null;
+  const headerTitle = config.allowTitlePrelude === true ? header.title : null;
+  const externalTitle = typeof preludeTitle === 'string' && preludeTitle.trim().length > 0
+    ? preludeTitle.trim()
+    : typeof headerTitle === 'string' && headerTitle.trim().length > 0 ? headerTitle.trim() : null;
   return {
     header,
     entries,
     cursor: snapshotCursor(after),
     snapshot: snapshotCursor(after),
+    externalTitle,
   };
 }
 
@@ -1001,6 +1029,8 @@ function projectSession(
   sessionId: string,
   active: ReadonlySet<string>,
   checkpoints: ReadonlySet<string>,
+  sourceName: string,
+  externalTitle: string | null,
 ): PiProjection {
   const records: TranscriptRecord[] = [];
   const tailByEntry = new Map<string, string | null>();
@@ -1056,7 +1086,7 @@ function projectSession(
       output_tokens: null,
       cwd: normalizeObservedCwd(header.cwd),
       skill: null,
-      source: SOURCE,
+      source: sourceName,
     };
     records.push(record);
     if (record.visibility === 'visible') messageCount++;
@@ -1214,7 +1244,7 @@ function projectSession(
           id: `${sessionId}:entry:${entry.ordinal}:summary${retainedIdentity}:${role}`,
           session_id: sessionId,
           timestamp,
-          source: role === 'branchSummary' ? 'pi:branch_summary' : 'pi:compaction',
+          source: role === 'branchSummary' ? `${sourceName}:branch_summary` : `${sourceName}:compaction`,
           content: trunc(message.summary),
           visibility,
           input_tokens: usage.input,
@@ -1292,7 +1322,7 @@ function projectSession(
         id: `${sessionId}:entry:${entry.ordinal}:summary:${source.type}`,
         session_id: sessionId,
         timestamp: normalizeTime(source.timestamp),
-        source: source.type === 'compaction' ? 'pi:compaction' : 'pi:branch_summary',
+        source: source.type === 'compaction' ? `${sourceName}:compaction` : `${sourceName}:branch_summary`,
         content: trunc(source.summary),
         visibility,
         input_tokens: usage.input,
@@ -1326,13 +1356,16 @@ function projectSession(
     if (entryTime !== null && (endedAt === null || entryTime > endedAt)) endedAt = entryTime;
   }
 
-  const title = latestName ?? firstUserTitle;
+  const title = externalTitle ?? latestName ?? firstUserTitle;
   return { records, messageCount, title, endedAt };
 }
 
-function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string } {
+function parsePiFamily(
+  unit: IndexUnit,
+  config: PiFamilyConfig,
+): { records: TranscriptRecord[]; cursor: string } {
   const meta = unit.meta as PiSessionUnitMeta | undefined;
-  if (meta?.kind === 'pi-tombstone') {
+  if (meta?.kind === `${config.source}-tombstone`) {
     return {
       records: [],
       // A zero watermark keeps recreation discoverable even if no watcher event is available.
@@ -1340,23 +1373,31 @@ function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string
     };
   }
   if (meta?.collisionPaths !== undefined) {
-    throw new Error(`Divergent Pi session copies share one header identity: ${meta.collisionPaths.join(', ')}`);
+    throw new Error(`Divergent ${config.displayName} session copies share one header identity: ${meta.collisionPaths.join(', ')}`);
   }
-  const { header, entries, cursor, snapshot } = parseLines(unit.key);
-  const sessionId = piSessionId(header);
+  const { header, entries, cursor, snapshot, externalTitle } = parseLines(unit.key, config);
+  const sessionId = piFamilySessionId(header, config.source);
   if (
-    meta?.kind !== 'pi-session'
+    meta?.kind !== `${config.source}-session`
     || typeof meta.discoveredSessionId !== 'string'
     || sessionId !== meta.discoveredSessionId
     || sessionId !== unit.sessionId
   ) {
-    throw new Error(`Pi session header changed after discovery: ${unit.key}`);
+    throw new Error(`${config.displayName} session header changed after discovery: ${unit.key}`);
   }
   const { active, checkpoints } = analyzeTree(entries);
-  const projected = projectSession(header, entries, sessionId, active, checkpoints);
+  const projected = projectSession(
+    header,
+    entries,
+    sessionId,
+    active,
+    checkpoints,
+    config.source,
+    externalTitle,
+  );
   const afterProjection = statSync(unit.key);
   if (snapshotCursor(afterProjection) !== snapshot) {
-    throw new Error(`Pi session changed while indexing: ${unit.key}`);
+    throw new Error(`${config.displayName} session changed while indexing: ${unit.key}`);
   }
   const session: TranscriptRecord = {
     kind: 'session',
@@ -1370,7 +1411,7 @@ function parsePi(unit: IndexUnit): { records: TranscriptRecord[]; cursor: string
     message_count: projected.messageCount,
     countMode: 'total',
     jsonl_path: unit.key,
-    source: SOURCE,
+    source: config.source,
   };
   return {
     records: [
@@ -1461,7 +1502,7 @@ function rawMessageBlock(message: JsonRecord, blockIndex: number): PiRawBlock {
     : MISSING_RAW_BLOCK;
 }
 
-function rawPi(input: RawLookup): RawRecord | null {
+function rawPiFamily(input: RawLookup, config: PiFamilyConfig): RawRecord | null {
   try {
     const path = typeof input.session?.jsonl_path === 'string' ? input.session.jsonl_path : null;
     const sessionId = typeof input.session?.id === 'string' ? input.session.id : null;
@@ -1483,9 +1524,9 @@ function rawPi(input: RawLookup): RawRecord | null {
       || blockIndex < 0
     ) return null;
 
-    const { header, entries, cursor } = parseLines(path);
+    const { header, entries, cursor } = parseLines(path, config);
     if (cursor !== input.cursor) return null;
-    if (piSessionId(header) !== sessionId) return null;
+    if (piFamilySessionId(header, config.source) !== sessionId) return null;
     const entry = entries.find((candidate) => candidate.ordinal === ordinal);
     if (entry === undefined) return null;
     const source = entry.record;
@@ -1530,27 +1571,34 @@ function rawPi(input: RawLookup): RawRecord | null {
   }
 }
 
-export function createPiProvider({
-  rootDir,
-  cwd,
+const PI_FAMILY_CONFIG: PiFamilyConfig = {
+  source: SOURCE,
+  displayName: 'Pi',
+  vendor: 'Pi',
+  color: '#f59e0b',
+  indexVersionMarker: PI_CANONICAL_TRANSCRIPT_MARKER,
+};
+
+export function createPiFamilyProvider({
+  rootResolution,
+  config,
 }: {
-  rootDir?: string;
-  cwd?: string;
-} = {}): PiProvider {
-  const rootResolution = resolvePiRoot(rootDir, cwd);
+  rootResolution: PiRootResolution;
+  config: PiFamilyConfig;
+}): PiProvider {
   const root = rootResolution.root;
   return {
-    name: SOURCE,
+    name: config.source,
     descriptor: {
-      id: SOURCE,
-      name: 'Pi',
-      vendor: 'Pi',
+      id: config.source,
+      name: config.displayName,
+      vendor: config.vendor,
       defaultRoot: root,
-      color: '#f59e0b',
+      color: config.color,
       requiresExplicitRoot: rootResolution.requiresExplicitRoot,
       rootResolutionReason: rootResolution.reason,
     },
-    indexVersionMarker: PI_CANONICAL_TRANSCRIPT_MARKER,
+    indexVersionMarker: config.indexVersionMarker,
     rootResolution,
     watchTargets: (configuredRoot) => {
       if (rootResolution.requiresExplicitRoot) return [];
@@ -1561,19 +1609,30 @@ export function createPiProvider({
       if (rootResolution.requiresExplicitRoot) {
         ctx.reportIncompleteInventory?.({
           path: root,
-          error: rootResolution.reason ?? 'Select a Pi session folder',
+          error: rootResolution.reason ?? `Select a ${config.displayName} session folder`,
         });
         return [];
       }
-      return discoverAt(root, ctx);
+      return discoverAt(root, ctx, config);
     },
     *parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
-      const parsed = parsePi(unit);
+      const parsed = parsePiFamily(unit, config);
       yield* parsed.records;
       return parsed.cursor;
     },
-    raw: rawPi,
+    raw: (input) => rawPiFamily(input, config),
   };
+}
+
+export function createPiProvider({
+  rootDir,
+  cwd,
+}: {
+  rootDir?: string;
+  cwd?: string;
+} = {}): PiProvider {
+  const rootResolution = resolvePiRoot(rootDir, cwd);
+  return createPiFamilyProvider({ rootResolution, config: PI_FAMILY_CONFIG });
 }
 
 export const piProvider = createPiProvider();

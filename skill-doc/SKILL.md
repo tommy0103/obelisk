@@ -1,7 +1,7 @@
 ---
 name: obelisk
 description: >
-  Search and query past Claude Code, Codex, Kimi Code, and Pi session history.
+  Search and query past Claude Code, Codex, Kimi Code, OMP, and Pi session history.
   Reactive: when the user asks "how did I fix X", "what did we do last time", "find the session where", "上次怎么修的", "之前的session", "历史记录".
   Proactive: when the user references past work you lack context for, when you're about to modify a file with complex edit history, when the user says "继续之前的" or "continue where we left off", or when understanding prior decisions would improve your current response.
   Memory: when the user says "记住这个", "remember this", "写入记忆", "save this conclusion", or when you determine a retrieval result contains a conclusion worth persisting.
@@ -13,15 +13,16 @@ allowed-tools:
 
 # obelisk
 
-Search and query local Claude Code, Codex, Kimi Code, and Pi session history.
+Search and query local Claude Code, Codex, Kimi Code, OMP, and Pi session history.
 Obelisk indexes sessions, messages, tool calls, tool results, summaries,
 subagents, workflows, workflow agents, parent chains, and raw JSONL lines into
 SQLite + FTS5.
 
-Obelisk has four transcript sources. Treat all of them as ordinary sessions by
+Obelisk has five transcript sources. Treat all of them as ordinary sessions by
 default: Claude rows use `source='claude'`, Codex rows use `source='codex'`,
-Kimi Code rows use `source='kimi'`, and Pi rows use `source='pi'`. Use `source`
-only when provenance matters or the user asks to scope to one provider.
+Kimi Code rows use `source='kimi'`, OMP rows use `source='omp'`, and Pi rows use
+`source='pi'`. Use `source` only when provenance matters or the user asks to
+scope to one provider.
 Provider-specific records are projected into the same canonical tables; some
 providers may not emit every kind of subagent or workflow metadata.
 
@@ -224,11 +225,11 @@ be treated as the user's request by default. `search()` and `thread()` omit meta
 messages unless `includeMeta: true` is passed; `context()` and `trace()` preserve
 the current causal chain and expose `is_meta` on returned rows.
 
-Pi can preserve a branch that was tried and later superseded as
-`visibility='inactive'`. Only Pi populates it: other sources either do not
-record supersession in their transcripts or discard it while indexing, so an
-empty inactive result never means nothing was abandoned -- only that this
-source cannot say. Default helpers return only `visible` evidence. Pass
+Pi and OMP can preserve a branch that was tried and later superseded as
+`visibility='inactive'`. Other sources either do not record supersession in
+their transcripts or discard it while indexing, so an empty inactive result
+never means nothing was abandoned -- only that this source cannot say.
+Default helpers return only `visible` evidence. Pass
 `includeInactive: true` to `search()`, `context()`, `trace()`, `thread()`,
 `summaries()`, `raw()`, `fileHistory()`, or `failures()` only when the abandoned
 path matters. Every returned message or evidence row is labeled with
@@ -245,8 +246,8 @@ identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
 Prefer returned order over manually interpreting numeric rank unless you are
 deliberately using FTS5 semantics.
 
-`source` can be `'claude'`, `'codex'`, `'deepseek'`, `'kimi'`, `'pi'`, or omitted. Omitted
-means search all indexed sources.
+`source` can be `'claude'`, `'codex'`, `'deepseek'`, `'kimi'`, `'omp'`, `'pi'`, or omitted.
+Omitted means search all indexed sources.
 
 ### `context(uuid, opts?)`
 
@@ -259,7 +260,7 @@ Returns the full story around one indexed message:
 Use this after `search()` finds a promising message. It is the usual way to
 expand vertically from one evidence point without dumping the whole session.
 The target and returned ancestors must be visible by default. Pass
-`{ includeInactive: true }` to follow an explicitly superseded Pi path.
+`{ includeInactive: true }` to follow an explicitly superseded Pi or OMP path.
 
 ### `sql(query, ...params)`
 
@@ -300,7 +301,7 @@ filters or return fields.
 - `fileHistory(filePath, opts?)` -- Read/Edit/Write tool calls for a file, oldest first; includes many `Read` rows and labels each result with `visibility`.
 - `failures(opts?)` -- failed tool results with tool/session context and `visibility`, newest first.
 - `trace(uuid, opts?)` -- parent chain from root to message.
-- `thread(sessionId, opts?)` -- session messages ordered by timestamp, omitting meta messages by default. Pass `{ includeMeta: true }` for injected context or `{ includeInactive: true }` for superseded Pi history.
+- `thread(sessionId, opts?)` -- session messages ordered by timestamp, omitting meta messages by default. Pass `{ includeMeta: true }` for injected context or `{ includeInactive: true }` for superseded Pi or OMP history.
 - `raw(uuid, opts?)` -- windowed source access for one visible message. Pi returns the selected source-message container whether it was stored directly or inside a retained tail. Inactive targets require `includeInactive: true`; hidden targets return `null`.
 - `memories(opts?)` -- recall memory layer. opts: `{ query, project, sessionId, sessions, after, before, branch, limit }`. Without `query`, returns active memory records newest first. With `query`, searches `summary`/`path` through safe FTS5 tokenization and returns `rank`; lower rank sorts earlier. Records may include nullable JSON `anchors` for explicit recall surfaces such as files. Read the file at `path` for full content.
 
@@ -312,10 +313,11 @@ Keep queries scoped, bounded, and structural.
 - Orient First: for a new task, normally call `overview({ limit: 6 })` before deeper retrieval unless the user gave an exact session/message/file locator. It is a navigation map; confirm facts with `memories()`, `search()`, helpers, or, only when needed, `sql()`.
 - Helper First: prefer `overview()`, `memories()`, `search()`, `sessions()`, `summaries()`, `fileHistory()`, and other helpers for first-pass retrieval. Escalate to raw `sql()` only when helpers cannot express the needed join, grouping, or exact schema-level check.
 - Plan Before Probe: for conclusion, broad history, failure investigation, or file evolution, write a bounded retrieval script instead of spending turns on intermediate results.
+- Correlate Within Scope: for questions shaped like "while working on X, did we discuss Y?", locate sessions from X first, then search Y only inside those sessions. Do not union independent global X and Y searches: nearby dates, shared files, and broad price terms can create false associations. Prefer visible user/assistant text for the conclusion; inspect inactive branches only as a labeled second pass when abandoned reasoning matters.
 - Structure Before Text: compute counts, joins, grouping, dedupe, and projection in SQL or JS; keep runtime JSON compact, ideally under 10k-12k chars for synthesis tasks.
 - Evidence Before Conclusion: return compact evidence with stable IDs (`session_id`, `uuid`, `tool_call_id`, `run_id`, `agent_id`) and short snippets, then synthesize in the final answer.
 - Exclude Meta By Default: `is_meta=1` rows are injected/control-plane transcript material. Helpers hide them by default; raw SQL for ordinary conversation evidence should include `COALESCE(m.is_meta,0)=0` unless meta rows are the investigation target.
-- Exclude Superseded Paths By Default: ordinary evidence must use exact visible-only filtering. Opt into inactive Pi history only to explain an abandoned path, and label it as tried then superseded.
+- Exclude Superseded Paths By Default: ordinary evidence must use exact visible-only filtering. Opt into inactive Pi or OMP history only to explain an abandoned path, and label it as tried then superseded.
 - Persist Durable Conclusions: after answering, if retrieval produced a durable conclusion that future sessions are likely to reuse and `memories()` does not already cover it, explicitly offer to write a memory. Keep the offer brief. Do not write the markdown file or run `--attune` until the user approves.
 
 If field, context, ordering, FTS, or helper semantics affect the query, read
