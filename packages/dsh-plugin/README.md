@@ -111,10 +111,10 @@ from Obelisk's shared retrieval contract but has its own lifecycle and may
 adopt DSH-specific guidance while preserving the common CLI, evidence, and
 human-approved memory boundaries.
 
-The Obelisk repository remains the source of this plugin directory. A future
-standalone plugin repository can be synchronized from it by GitHub Actions as a
-distribution mirror; no Git submodule or second hand-maintained source is
-required.
+The Obelisk repository remains the source of this plugin directory. GitHub
+Actions synchronizes an installable distribution mirror to
+[`tommy0103/obelisk-dsh-plugin`](https://github.com/tommy0103/obelisk-dsh-plugin);
+no Git submodule or second hand-maintained source is required.
 
 ## Presentation
 

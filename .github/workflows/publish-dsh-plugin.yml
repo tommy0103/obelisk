@@ -1,0 +1,60 @@
+name: Publish DSH Plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-dsh-plugin
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build:core
+
+      - run: npm run build --workspace @obelisk/dsh-obelisk-plugin
+
+      - name: Push to obelisk-dsh-plugin
+        env:
+          DEPLOY_KEY: ${{ secrets.DSH_PLUGIN_REPO_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_KEY:?Missing DSH_PLUGIN_REPO_DEPLOY_KEY}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/dsh_plugin_deploy
+          chmod 600 ~/.ssh/dsh_plugin_deploy
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/dsh_plugin_deploy -o StrictHostKeyChecking=no"
+
+          PLUGIN_DIR=$(mktemp -d)
+          git clone --depth 1 git@github.com:tommy0103/obelisk-dsh-plugin.git "$PLUGIN_DIR" || {
+            git init "$PLUGIN_DIR"
+            git -C "$PLUGIN_DIR" remote add origin git@github.com:tommy0103/obelisk-dsh-plugin.git
+          }
+
+          bash packaging/stage-dsh-plugin-repo.sh "$PLUGIN_DIR"
+
+          cd "$PLUGIN_DIR"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "publish: $(date -u +%Y-%m-%dT%H:%M:%SZ) from tommy0103/obelisk@${GITHUB_SHA::7}"
+          git push --force origin HEAD:main
