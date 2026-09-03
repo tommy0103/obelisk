@@ -156,16 +156,18 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
   return discoverAt(join(homedir(), '.codex'), ctx);
 }
 
-const CODEX_CURSOR_STATE_VERSION = 3;
+const CODEX_CURSOR_STATE_VERSION = 4;
 const CODEX_FINGERPRINT_CHUNK_BYTES = 8 * 1024 * 1024;
+const CODEX_DEDUP_BLOOM_BYTES = 32 * 1024;
+const CODEX_DEDUP_BLOOM_PROBES = 6;
 
 interface CodexCursorState {
   v: number;
   threadRawId: string;
   meta: Record<string, any>;
   chunkHashes: string[];
-  eventMessageKeys: string[];
-  responseMessageKeys: string[];
+  eventMessageBloom: string;
+  responseMessageBloom: string;
   openCallMessageUuids: Record<string, string>;
   terminated: boolean;
   currentCwd: string | null;
@@ -194,6 +196,43 @@ function isRecord(value: unknown): value is Record<string, any> {
 
 function nullableString(value: unknown): boolean {
   return value === null || typeof value === 'string';
+}
+
+function decodeBloom(value: unknown): Buffer | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const filter = Buffer.from(value, 'base64url');
+    return filter.length === CODEX_DEDUP_BLOOM_BYTES ? filter : null;
+  } catch {
+    return null;
+  }
+}
+
+function emptyBloom(): Buffer {
+  return Buffer.alloc(CODEX_DEDUP_BLOOM_BYTES);
+}
+
+function bloomAdd(filter: Buffer, key: string): void {
+  const digest = Buffer.from(key, 'base64url');
+  const first = digest.readUInt32LE(0);
+  const step = (digest.readUInt32LE(4) | 1) >>> 0;
+  const bits = filter.length * 8;
+  for (let probe = 0; probe < CODEX_DEDUP_BLOOM_PROBES; probe++) {
+    const bit = ((first + Math.imul(probe, step)) >>> 0) % bits;
+    filter[bit >>> 3]! |= 1 << (bit & 7);
+  }
+}
+
+function bloomMightContain(filter: Buffer, key: string): boolean {
+  const digest = Buffer.from(key, 'base64url');
+  const first = digest.readUInt32LE(0);
+  const step = (digest.readUInt32LE(4) | 1) >>> 0;
+  const bits = filter.length * 8;
+  for (let probe = 0; probe < CODEX_DEDUP_BLOOM_PROBES; probe++) {
+    const bit = ((first + Math.imul(probe, step)) >>> 0) % bits;
+    if ((filter[bit >>> 3]! & (1 << (bit & 7))) === 0) return false;
+  }
+  return true;
 }
 
 function isCheckpointMessage(value: unknown): value is MessageRecord {
@@ -235,10 +274,8 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
       || !isRecord(value.meta)
       || !Array.isArray(value.chunkHashes)
       || !value.chunkHashes.every(item => typeof item === 'string')
-      || !Array.isArray(value.eventMessageKeys)
-      || !value.eventMessageKeys.every(item => typeof item === 'string')
-      || !Array.isArray(value.responseMessageKeys)
-      || !value.responseMessageKeys.every(item => typeof item === 'string')
+      || decodeBloom(value.eventMessageBloom) === null
+      || decodeBloom(value.responseMessageBloom) === null
       || !isRecord(value.openCallMessageUuids)
       || !Object.values(value.openCallMessageUuids).every(item => typeof item === 'string')
       || typeof value.terminated !== 'boolean'
@@ -336,49 +373,73 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     && prior.inode === stat.ino
     && prior.terminated
     && fingerprint.prefixMatches;
-  const eventMessageKeys = new Set(appendCandidate ? prior.eventMessageKeys : []);
-  const responseMessageKeys = new Set(appendCandidate ? prior.responseMessageKeys : []);
+  const eventMessageKeys = new Set<string>();
   const appendedEventMessageKeys = new Set<string>();
+  const appendedResponseMessageKeys = new Set<string>();
   let lineNum = appendCandidate ? prior.lineCount : 0;
   let terminated = appendCandidate ? prior.terminated : true;
   let metaRecord: { lineNum: number; obj: any } | null = !appendCandidate
     ? null
     : { lineNum: 1, obj: { timestamp: prior.startedAt, payload: prior.meta } };
   let sawAutoReviewModel = false;
-  readLines(unit.key, (line: string, lineTerminated: boolean) => {
-    lineNum++;
-    terminated = lineTerminated;
-    // Prefix verification hashes every byte, but dedup/link discovery only
-    // needs metadata, event messages, and call records. Skipping JSON.parse for
-    // tool outputs and world-state snapshots is material on multi-gigabyte logs.
-    const head = line.length > 1024 ? line.slice(0, 1024) : line;
-    if (!CODEX_SCAN_HINT_RE.test(head)) return;
-    let obj: any;
-    try { obj = JSON.parse(line); } catch { return; }
-    if (metaRecord === null && obj?.type === 'session_meta' && obj.payload?.id) {
-      metaRecord = { lineNum, obj };
-    }
-    sawAutoReviewModel ||= obj?.payload?.model === 'codex-auto-review'
-      || obj?.model === 'codex-auto-review';
-    const payload = obj?.payload || {};
-    if (obj?.type === 'event_msg') {
-      if (payload.type === 'user_message' || payload.type === 'agent_message') {
-        const text = codexEventText(payload);
-        if (text !== null) {
-          const key = visibleMessageDigest(payload.type === 'user_message' ? 'user' : 'assistant', text);
-          eventMessageKeys.add(key);
-          appendedEventMessageKeys.add(key);
-        }
+  const scan = (start: number, collectAppendedResponses: boolean): void => {
+    readLines(unit.key, (line: string, lineTerminated: boolean) => {
+      lineNum++;
+      terminated = lineTerminated;
+      // Full snapshots can skip unrelated JSON during dedup/link discovery;
+      // append tails are parsed once here so both sides of a boundary duplicate
+      // are known before any records are emitted.
+      const head = line.length > 1024 ? line.slice(0, 1024) : line;
+      if (!collectAppendedResponses && !CODEX_SCAN_HINT_RE.test(head)) return;
+      let obj: any;
+      try { obj = JSON.parse(line); } catch { return; }
+      if (metaRecord === null && obj?.type === 'session_meta' && obj.payload?.id) {
+        metaRecord = { lineNum, obj };
       }
-    }
-  }, { start: appendCandidate ? prior.size : 0 });
+      sawAutoReviewModel ||= obj?.payload?.model === 'codex-auto-review'
+        || obj?.model === 'codex-auto-review';
+      const payload = obj?.payload || {};
+      if (obj?.type === 'event_msg') {
+        if (payload.type === 'user_message' || payload.type === 'agent_message') {
+          const text = codexEventText(payload);
+          if (text !== null) {
+            const key = visibleMessageDigest(payload.type === 'user_message' ? 'user' : 'assistant', text);
+            eventMessageKeys.add(key);
+            if (collectAppendedResponses) appendedEventMessageKeys.add(key);
+          }
+        }
+      } else if (collectAppendedResponses && obj?.type === 'response_item'
+        && payload.type === 'message' && payload.role !== 'developer') {
+        const text = codexMessagePayloadText(payload);
+        if (text !== null) appendedResponseMessageKeys.add(visibleMessageDigest(payload.role || 'assistant', text));
+      }
+    }, { start });
+  };
+  scan(appendCandidate ? prior.size : 0, appendCandidate);
   const afterScan = statSync(unit.key);
   if (!sameStat(stat, afterScan)) return _cursor;
-  // A response_item may be followed by its duplicate event_msg in a later
-  // append, with unrelated records in between. Rebuild that one session so
-  // every old response row that the full-file dedup would suppress retracts.
-  const fast = appendCandidate
-    && prior.responseMessageKeys.every(key => !appendedEventMessageKeys.has(key));
+  const priorEventBloom = appendCandidate ? decodeBloom(prior.eventMessageBloom)! : emptyBloom();
+  const priorResponseBloom = appendCandidate ? decodeBloom(prior.responseMessageBloom)! : emptyBloom();
+  // Bloom filters have no false negatives. A possible cross-boundary duplicate
+  // therefore falls back to the exact full replay; false positives cost time,
+  // never rows. This keeps the cursor bounded without weakening deduplication.
+  const possibleCrossBoundaryDuplicate = appendCandidate && (
+    [...appendedEventMessageKeys].some(key => bloomMightContain(priorResponseBloom, key))
+      || [...appendedResponseMessageKeys].some(key => bloomMightContain(priorEventBloom, key))
+  );
+  const fast = appendCandidate && !possibleCrossBoundaryDuplicate;
+  if (appendCandidate && !fast) {
+    eventMessageKeys.clear();
+    lineNum = 0;
+    terminated = true;
+    metaRecord = null;
+    sawAutoReviewModel = false;
+    scan(0, false);
+    if (!sameStat(stat, statSync(unit.key))) return _cursor;
+  }
+  const eventMessageBloom = fast ? priorEventBloom : emptyBloom();
+  const responseMessageBloom = fast ? priorResponseBloom : emptyBloom();
+  for (const key of eventMessageKeys) bloomAdd(eventMessageBloom, key);
   const previous = fast ? prior : null;
   const basicCursor = `${stat.mtimeMs}:${lineNum}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
   const capturedMeta = metaRecord as { lineNum: number; obj: any } | null;
@@ -538,7 +599,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       const key = text === null ? null : visibleMessageDigest(role, text);
       if (text !== null && key !== null && !eventMessageKeys.has(key)) {
         insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts });
-        responseMessageKeys.add(key);
+        bloomAdd(responseMessageBloom, key);
       }
       return;
     }
@@ -588,8 +649,8 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     threadRawId,
     meta,
     chunkHashes: fingerprint.chunkHashes,
-    eventMessageKeys: [...eventMessageKeys],
-    responseMessageKeys: [...responseMessageKeys],
+    eventMessageBloom: eventMessageBloom.toString('base64url'),
+    responseMessageBloom: responseMessageBloom.toString('base64url'),
     openCallMessageUuids: Object.fromEntries(openCallMessageUuids),
     terminated,
     currentCwd,

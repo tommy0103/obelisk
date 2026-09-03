@@ -28,6 +28,12 @@ function drain(gen) {
   return { values, ret: step.value };
 }
 
+function cursorState(cursor) {
+  const encoded = cursor.split(':', 6)[5];
+  assert.ok(encoded, 'cursor carries provider checkpoint state');
+  return JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+}
+
 const META = { id: '019e8951-3e7d-7343-a3e3-05bff48a317d', cwd: '/proj', git: { branch: 'main' }, cli_version: '1.2', timestamp: '2026-06-10T10:00:00Z' };
 
 test('codex parse() yields a deduped, tool-aware record stream with a total session', () => {
@@ -151,6 +157,42 @@ test('codex parse() retracts a response_item duplicated by a later event_msg', (
     second.values.filter(record => record.kind === 'message').map(record => record.text),
     ['boundary answer'],
     'the replay keeps the event message and retracts the previously persisted response item',
+  );
+});
+
+test('codex cursor keeps dedup state bounded without missing a distant cross-boundary duplicate', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    ...Array.from({ length: 4096 }, (_, index) => ({
+      type: 'response_item',
+      timestamp: '2026-06-10T10:00:01Z',
+      payload: {
+        type: 'message', role: 'assistant',
+        content: [{ type: 'output_text', text: `response ${index}` }],
+      },
+    })),
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  const state = cursorState(first.ret);
+
+  assert.equal(state.v, 4);
+  assert.equal(Buffer.from(state.eventMessageBloom, 'base64url').length, 32 * 1024);
+  assert.equal(Buffer.from(state.responseMessageBloom, 'base64url').length, 32 * 1024);
+  assert.equal('eventMessageKeys' in state, false);
+  assert.equal('responseMessageKeys' in state, false);
+  assert.ok(first.ret.length < 130_000, `cursor grew to ${first.ret.length} bytes`);
+
+  appendFileSync(path, `${JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z',
+    payload: { type: 'agent_message', message: 'response 0' },
+  })}\n`);
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+
+  assert.equal(second.values[0].kind, 'delete-session', 'a possible old match takes the exact replay path');
+  assert.equal(
+    second.values.filter(record => record.kind === 'message' && record.text === 'response 0').length,
+    1,
+    'the distant duplicate remains canonical after replay',
   );
 });
 
