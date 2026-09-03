@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
@@ -73,6 +73,85 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].countMode, 'total');
   assert.equal(sessions[0].message_count, 3);
   assert.equal(sessions[0].git_branch, 'main');
+});
+
+test('codex parse() resumes a verified append without replaying old records', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: '旧问题' } },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'old answer' } },
+    { type: 'response_item', timestamp: '2026-06-10T10:00:03Z', payload: { type: 'function_call', call_id: 'call_boundary', name: 'shell', arguments: '{}' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  appendFileSync(path, [
+    JSON.stringify({ type: 'response_item', timestamp: '2026-06-10T10:00:04Z', payload: { type: 'function_call_output', call_id: 'call_boundary', output: 'ok' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 7, output_tokens: 3 } } } }),
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-06-10T10:00:05Z', payload: { type: 'task_complete', duration_ms: 25 } }),
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-06-10T10:00:06Z', payload: { type: 'user_message', message: '新增问题' } }),
+    '',
+  ].join('\n'));
+
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  const messages = second.values.filter(record => record.kind === 'message');
+  const result = second.values.find(record => record.kind === 'tool_result');
+  const duration = second.values.find(record => record.kind === 'message-turn-duration');
+  const session = second.values.find(record => record.kind === 'session');
+
+  assert.deepEqual(messages.map(message => message.text), ['old answer', '新增问题']);
+  assert.deepEqual(
+    { input: messages[0].input_tokens, output: messages[0].output_tokens },
+    { input: 7, output: 3 },
+    'a usage event may patch the prior window assistant',
+  );
+  assert.equal(result.message_uuid, `codex:${META.id}:000004`, 'a result may link to a prior window call');
+  assert.equal(duration.uuid, `codex:${META.id}:000003`, 'duration may patch the prior window assistant');
+  assert.equal(messages[1].parent_uuid, `codex:${META.id}:000004`, 'the parent chain resumes at the checkpoint');
+  assert.equal(session.message_count, 4, 'the session record remains an authoritative total');
+});
+
+test('codex parse() falls back when an unterminated tail is completed', () => {
+  const path = writeFixture([]);
+  const prefix = [
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'partial tail' } },
+  ];
+  writeFileSync(path, prefix.map(line => JSON.stringify(line)).join('\n'));
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  appendFileSync(path, '\n' + JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'completed tail' },
+  }) + '\n');
+
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.deepEqual(
+    second.values.filter(record => record.kind === 'message').map(record => record.text),
+    ['partial tail', 'completed tail'],
+    'the completed prior line forces a complete snapshot instead of an unsafe byte seek',
+  );
+});
+
+test('codex parse() retracts a response_item duplicated by a later event_msg', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'response_item', timestamp: '2026-06-10T10:00:01Z', payload: {
+      type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'boundary answer' }],
+    } },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01.500Z', payload: {
+      type: 'token_count', info: { last_token_usage: { input_tokens: 1, output_tokens: 1 } },
+    } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  appendFileSync(path, `${JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z',
+    payload: { type: 'agent_message', message: 'boundary answer' },
+  })}\n`);
+
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.equal(second.values[0].kind, 'delete-session');
+  assert.deepEqual(
+    second.values.filter(record => record.kind === 'message').map(record => record.text),
+    ['boundary answer'],
+    'the replay keeps the event message and retracts the previously persisted response item',
+  );
 });
 
 test('codex parse() retracts a guardian thread via delete-session and emits nothing else', () => {

@@ -113,14 +113,24 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
-function readLines(filePath: string, callback: (line: string, terminated: boolean) => boolean | void): void {
+interface ReadLinesOptions {
+  start?: number;
+}
+
+function readLines(
+  filePath: string,
+  callback: (line: string, terminated: boolean) => boolean | void,
+  { start = 0 }: ReadLinesOptions = {},
+): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
   let remainder = '';
   let bytesRead;
+  let position = start;
   try {
-    while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
+    while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      position += bytesRead;
       const lines = buf.toString('utf8', 0, bytesRead).split('\n');
       lines[0] = remainder + lines[0];
       remainder = lines.pop() ?? '';

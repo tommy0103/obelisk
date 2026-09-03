@@ -4,14 +4,14 @@
 // Codex provider adapter in Core (see docs/adr/0001).
 //
 // Pure: discovers Codex rollout files and parses one into a record stream. It
-// never touches the Obelisk database. Unlike claude, codex is a FULL-REPARSE
-// adapter: it buffers every line and re-emits every record on each run, because
-// the event_msg ↔ response_item dedup needs whole-file (bidirectional) knowledge
-// (the matching pair sits ±1 line apart but in either order). Hence the session
-// record uses countMode 'total' (persist replaces the count, never accumulates).
-// The per-line logic mirrors the original indexCodexJsonl.
+// never touches the Obelisk database. A prefix-hash checkpoint lets append-only
+// growth parse just the new bytes; replacements, truncations, legacy cursors,
+// and unterminated tails fall back to a complete snapshot. The whole-file scan
+// remains necessary for event_msg ↔ response_item dedup, but it retains only
+// bounded checkpoint state instead of every parsed JSON object.
 
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, relative } from 'node:path';
 
@@ -43,6 +43,7 @@ const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
 const HIDDEN_CONTEXT_ENVELOPE_RE = /^\s*<(environment_context|codex_internal_context)\b[^>]*>[\s\S]*<\/\1>\s*$/;
+const CODEX_SCAN_HINT_RE = /"(?:session_meta|event_msg|function_call|custom_tool_call|tool_search_call|web_search_call|codex-auto-review)"/;
 
 function messageVisibility(role: string, text: string | null): 'visible' | 'hidden' {
   return role === 'user' && typeof text === 'string' && HIDDEN_CONTEXT_ENVELOPE_RE.test(text)
@@ -155,24 +156,239 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
   return discoverAt(join(homedir(), '.codex'), ctx);
 }
 
+const CODEX_CURSOR_STATE_VERSION = 3;
+const CODEX_FINGERPRINT_CHUNK_BYTES = 8 * 1024 * 1024;
+
+interface CodexCursorState {
+  v: number;
+  threadRawId: string;
+  meta: Record<string, any>;
+  chunkHashes: string[];
+  eventMessageKeys: string[];
+  responseMessageKeys: string[];
+  openCallMessageUuids: Record<string, string>;
+  terminated: boolean;
+  currentCwd: string | null;
+  currentModel: string | null;
+  lastMessageUuid: string | null;
+  lastTextAssistant: MessageRecord | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  gitBranch: string | null;
+  version: string | null;
+  threadTitle: string | null;
+  messageCount: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+}
+
+interface DecodedCodexCursor extends CodexCursorState {
+  lineCount: number;
+  size: number;
+  inode: number;
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nullableString(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+
+function isCheckpointMessage(value: unknown): value is MessageRecord {
+  if (!isRecord(value)) return false;
+  return value.kind === 'message'
+    && typeof value.uuid === 'string'
+    && typeof value.session_id === 'string'
+    && typeof value.type === 'string'
+    && nullableString(value.parent_uuid)
+    && nullableString(value.timestamp)
+    && nullableString(value.role)
+    && nullableString(value.text)
+    && nullableString(value.content_type)
+    && (value.is_meta === 0 || value.is_meta === 1)
+    && ['visible', 'inactive', 'hidden'].includes(value.visibility)
+    && nullableString(value.model)
+    && (value.is_sidechain === 0 || value.is_sidechain === 1)
+    && nullableString(value.agent_id)
+    && (value.input_tokens === null || typeof value.input_tokens === 'number')
+    && (value.output_tokens === null || typeof value.output_tokens === 'number')
+    && nullableString(value.cwd)
+    && nullableString(value.skill)
+    && typeof value.source === 'string';
+}
+
+function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
+  if (cursor === null) return null;
+  const parts = cursor.split(':');
+  if (parts.length < 6) return null;
+  const lineCount = Number(parts[1]);
+  const size = Number(parts[2]);
+  const inode = Number(parts[4]);
+  if (!Number.isSafeInteger(lineCount) || !Number.isSafeInteger(size) || !Number.isFinite(inode)) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(parts[5]!, 'base64url').toString('utf8'));
+    if (!isRecord(value)
+      || value.v !== CODEX_CURSOR_STATE_VERSION
+      || typeof value.threadRawId !== 'string'
+      || !isRecord(value.meta)
+      || !Array.isArray(value.chunkHashes)
+      || !value.chunkHashes.every(item => typeof item === 'string')
+      || !Array.isArray(value.eventMessageKeys)
+      || !value.eventMessageKeys.every(item => typeof item === 'string')
+      || !Array.isArray(value.responseMessageKeys)
+      || !value.responseMessageKeys.every(item => typeof item === 'string')
+      || !isRecord(value.openCallMessageUuids)
+      || !Object.values(value.openCallMessageUuids).every(item => typeof item === 'string')
+      || typeof value.terminated !== 'boolean'
+      || !nullableString(value.currentCwd)
+      || !nullableString(value.currentModel)
+      || !nullableString(value.lastMessageUuid)
+      || (value.lastTextAssistant !== null && !isCheckpointMessage(value.lastTextAssistant))
+      || !nullableString(value.startedAt)
+      || !nullableString(value.endedAt)
+      || !nullableString(value.gitBranch)
+      || !nullableString(value.version)
+      || !nullableString(value.threadTitle)
+      || !Number.isSafeInteger(value.messageCount)
+      || !Number.isFinite(value.totalInputTokens)
+      || !Number.isFinite(value.totalOutputTokens)) {
+      return null;
+    }
+    return { ...(value as unknown as CodexCursorState), lineCount, size, inode };
+  } catch {
+    return null;
+  }
+}
+
+function encodeCodexCursor(
+  stat: Stats,
+  lineCount: number,
+  state: CodexCursorState,
+): string {
+  const encoded = Buffer.from(JSON.stringify(state)).toString('base64url');
+  return `${stat.mtimeMs}:${lineCount}:${stat.size}:${stat.ctimeMs}:${stat.ino}:${encoded}`;
+}
+
+function sameStat(a: Stats, b: Stats): boolean {
+  return a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.size === b.size && a.ino === b.ino;
+}
+
+function sha256(bytes: string | Buffer): string {
+  return createHash('sha256').update(bytes).digest('base64url');
+}
+
+function visibleMessageDigest(role: unknown, text: unknown): string {
+  return sha256(codexVisibleMessageKey(role, text));
+}
+
+function fingerprintCodexFile(
+  filePath: string,
+  size: number,
+  prior: DecodedCodexCursor | null,
+): { chunkHashes: string[]; prefixMatches: boolean; bytesRead: number } {
+  const fd = openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(CODEX_FINGERPRINT_CHUNK_BYTES);
+  const chunkHashes: string[] = [];
+  const priorChunks = prior === null ? 0 : Math.ceil(prior.size / CODEX_FINGERPRINT_CHUNK_BYTES);
+  const completePriorChunks = prior === null ? 0 : Math.floor(prior.size / CODEX_FINGERPRINT_CHUNK_BYTES);
+  const priorTailBytes = prior === null ? 0 : prior.size % CODEX_FINGERPRINT_CHUNK_BYTES;
+  let prefixMatches = prior !== null && prior.size <= size && prior.chunkHashes.length === priorChunks;
+  let position = 0;
+  try {
+    while (position < size) {
+      const wanted = Math.min(buffer.length, size - position);
+      let filled = 0;
+      while (filled < wanted) {
+        const count = readSync(fd, buffer, filled, wanted - filled, position + filled);
+        if (count === 0) break;
+        filled += count;
+      }
+      if (filled === 0) break;
+      const index = chunkHashes.length;
+      const bytes = buffer.subarray(0, filled);
+      const digest = sha256(bytes);
+      chunkHashes.push(digest);
+      if (prior !== null && prefixMatches) {
+        if (index < completePriorChunks) {
+          prefixMatches = digest === prior.chunkHashes[index];
+        } else if (index === completePriorChunks && priorTailBytes > 0) {
+          prefixMatches = sha256(bytes.subarray(0, priorTailBytes)) === prior.chunkHashes[index];
+        }
+      }
+      position += filled;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { chunkHashes, prefixMatches: prefixMatches && position === size, bytesRead: position };
+}
+
 export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
-  const records: { lineNum: number; obj: any }[] = [];
-  let lineNum = 0;
-  readLines(unit.key, (line: string) => {
+  const prior = decodeCodexCursor(_cursor);
+  const fingerprint = fingerprintCodexFile(unit.key, stat.size, prior);
+  const afterFingerprint = statSync(unit.key);
+  if (fingerprint.bytesRead !== stat.size || !sameStat(stat, afterFingerprint)) return _cursor;
+  const appendCandidate = prior !== null
+    && prior.threadRawId === codexRawId(prior.meta.id)
+    && prior.inode === stat.ino
+    && prior.terminated
+    && fingerprint.prefixMatches;
+  const eventMessageKeys = new Set(appendCandidate ? prior.eventMessageKeys : []);
+  const responseMessageKeys = new Set(appendCandidate ? prior.responseMessageKeys : []);
+  const appendedEventMessageKeys = new Set<string>();
+  let lineNum = appendCandidate ? prior.lineCount : 0;
+  let terminated = appendCandidate ? prior.terminated : true;
+  let metaRecord: { lineNum: number; obj: any } | null = !appendCandidate
+    ? null
+    : { lineNum: 1, obj: { timestamp: prior.startedAt, payload: prior.meta } };
+  let sawAutoReviewModel = false;
+  readLines(unit.key, (line: string, lineTerminated: boolean) => {
     lineNum++;
-    try { records.push({ lineNum, obj: JSON.parse(line) }); } catch { /* skip malformed */ }
-  });
-  const outCursor = `${stat.mtimeMs}:${lineNum}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+    terminated = lineTerminated;
+    // Prefix verification hashes every byte, but dedup/link discovery only
+    // needs metadata, event messages, and call records. Skipping JSON.parse for
+    // tool outputs and world-state snapshots is material on multi-gigabyte logs.
+    const head = line.length > 1024 ? line.slice(0, 1024) : line;
+    if (!CODEX_SCAN_HINT_RE.test(head)) return;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { return; }
+    if (metaRecord === null && obj?.type === 'session_meta' && obj.payload?.id) {
+      metaRecord = { lineNum, obj };
+    }
+    sawAutoReviewModel ||= obj?.payload?.model === 'codex-auto-review'
+      || obj?.model === 'codex-auto-review';
+    const payload = obj?.payload || {};
+    if (obj?.type === 'event_msg') {
+      if (payload.type === 'user_message' || payload.type === 'agent_message') {
+        const text = codexEventText(payload);
+        if (text !== null) {
+          const key = visibleMessageDigest(payload.type === 'user_message' ? 'user' : 'assistant', text);
+          eventMessageKeys.add(key);
+          appendedEventMessageKeys.add(key);
+        }
+      }
+    }
+  }, { start: appendCandidate ? prior.size : 0 });
+  const afterScan = statSync(unit.key);
+  if (!sameStat(stat, afterScan)) return _cursor;
+  // A response_item may be followed by its duplicate event_msg in a later
+  // append, with unrelated records in between. Rebuild that one session so
+  // every old response row that the full-file dedup would suppress retracts.
+  const fast = appendCandidate
+    && prior.responseMessageKeys.every(key => !appendedEventMessageKeys.has(key));
+  const previous = fast ? prior : null;
+  const basicCursor = `${stat.mtimeMs}:${lineNum}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+  const capturedMeta = metaRecord as { lineNum: number; obj: any } | null;
+  if (capturedMeta === null) return basicCursor;
 
-  const metaRecord = records.find(r => r.obj?.type === 'session_meta' && r.obj.payload?.id);
-  if (!metaRecord) return outCursor;
-
-  const meta = metaRecord.obj.payload;
+  const meta = capturedMeta.obj.payload;
   const threadRawId = codexRawId(meta.id) as string;
-  if (codexIsGuardianThread(meta, records)) {
+  if (codexIsGuardianThread(meta, sawAutoReviewModel ? [{ lineNum: 0, obj: { model: 'codex-auto-review' } }] : [])) {
     yield { kind: 'delete-session', sessionId: codexDbId(threadRawId) as string };
-    return outCursor;
+    return basicCursor;
   }
 
   const parentRawId = codexParentThreadId(meta);
@@ -181,31 +397,36 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
   const isSidechain: 0 | 1 = agentId ? 1 : 0;
   const project = projectSlugFromPath(normalizeObservedCwd(meta.cwd));
   const lineUuid = (n: number): string => codexLineUuid(threadRawId, n) as string;
+  const callMessageUuids = new Map(Object.entries(previous?.openCallMessageUuids ?? {}));
+  const openCallMessageUuids = new Map(callMessageUuids);
 
   const out: TranscriptRecord[] = [];
+  if (_cursor !== null && !fast) out.push({ kind: 'delete-session', sessionId });
   const msgByUuid = new Map<string, MessageRecord>();
+  const emittedMessageUuids = new Set<string>();
   const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
-  const initialTimestamp = (meta.timestamp || metaRecord.obj.timestamp || null) as string | null;
+  const initialTimestamp = (meta.timestamp || capturedMeta.obj.timestamp || null) as string | null;
   const indexedUpdatedAt = indexedMeta?.indexedUpdatedAt ?? null;
   const sm = {
-    started_at: initialTimestamp,
-    ended_at: indexedUpdatedAt && (!initialTimestamp || indexedUpdatedAt > initialTimestamp)
-      ? indexedUpdatedAt
-      : initialTimestamp,
-    git_branch: (meta.git?.branch || null) as string | null,
-    version: (meta.cli_version || null) as string | null,
-    title: indexedMeta?.indexedTitle ?? null,
-    n: 0,
-    lastMessageUuid: null as string | null,
-    lastTextAssistantUuid: null as string | null,
-    totalInputTokens: 0,
-    totalOutputTokens: 0,
+    started_at: previous?.startedAt ?? initialTimestamp,
+    ended_at: previous?.endedAt ?? initialTimestamp,
+    git_branch: previous?.gitBranch ?? (meta.git?.branch || null) as string | null,
+    version: previous?.version ?? (meta.cli_version || null) as string | null,
+    threadTitle: previous?.threadTitle ?? null,
+    n: previous?.messageCount ?? 0,
+    lastMessageUuid: previous?.lastMessageUuid ?? null,
+    lastTextAssistantUuid: previous?.lastTextAssistant?.uuid ?? null,
+    totalInputTokens: previous?.totalInputTokens ?? 0,
+    totalOutputTokens: previous?.totalOutputTokens ?? 0,
   };
+  if (indexedUpdatedAt && (!sm.ended_at || indexedUpdatedAt > sm.ended_at)) sm.ended_at = indexedUpdatedAt;
 
-  let currentCwd = normalizeObservedCwd(meta.cwd);
-  let currentModel: string | null = null;
-  const eventMessageKeys = new Set<string>();
-  const callMessageUuids = new Map<string, string>();
+  let currentCwd = previous?.currentCwd ?? normalizeObservedCwd(meta.cwd);
+  let currentModel = previous?.currentModel ?? null;
+  let lastTextAssistant = previous?.lastTextAssistant === null || previous?.lastTextAssistant === undefined
+    ? null
+    : { ...previous.lastTextAssistant };
+  if (lastTextAssistant !== null) msgByUuid.set(lastTextAssistant.uuid, lastTextAssistant);
 
   const updateBounds = (ts: string | null) => {
     if (!ts) return;
@@ -227,44 +448,38 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       input_tokens: null, output_tokens: null, cwd: currentCwd, skill: null, source: 'codex',
     };
     out.push(rec);
+    emittedMessageUuids.add(uuid);
     msgByUuid.set(uuid, rec);
     sm.lastMessageUuid = uuid;
     if (!agentId && visibility === 'visible') sm.n++;
-    if (type === 'assistant' && contentType === 'text') sm.lastTextAssistantUuid = uuid;
+    if (type === 'assistant' && contentType === 'text') {
+      sm.lastTextAssistantUuid = uuid;
+      lastTextAssistant = rec;
+    }
     updateBounds(timestamp);
     return uuid;
   };
 
-  // First pass: collect visible event_msg keys so duplicate response_items drop.
-  for (const { obj } of records) {
-    if (obj?.type !== 'event_msg') continue;
-    const payload = obj.payload || {};
-    if (payload.type !== 'user_message' && payload.type !== 'agent_message') continue;
-    const text = codexEventText(payload);
-    if (text === null) continue;
-    eventMessageKeys.add(codexVisibleMessageKey(payload.type === 'user_message' ? 'user' : 'assistant', text));
-  }
-
-  for (const { lineNum: currentLine, obj } of records) {
+  const processRecord = (currentLine: number, obj: any): void => {
     const ts = obj.timestamp || null;
     if (obj.type === 'session_meta') {
       if (obj.payload?.cwd) currentCwd = normalizeObservedCwd(obj.payload.cwd) || currentCwd;
       if (obj.payload?.git?.branch) sm.git_branch = obj.payload.git.branch;
       if (obj.payload?.cli_version) sm.version = obj.payload.cli_version;
       updateBounds(obj.payload?.timestamp || ts);
-      continue;
+      return;
     }
     if (obj.type === 'turn_context') {
       currentCwd = normalizeObservedCwd(obj.payload?.cwd) || currentCwd;
       currentModel = obj.payload?.model || currentModel;
       updateBounds(ts);
-      continue;
+      return;
     }
     if (obj.type === 'event_msg') {
       const payload = obj.payload || {};
       if (payload.type === 'user_message' || payload.type === 'agent_message' || payload.type === 'agent_reasoning') {
         const text = codexEventText(payload);
-        if (text === null) continue;
+        if (text === null) return;
         const isReasoning = payload.type === 'agent_reasoning';
         insertMessage({
           uuid: lineUuid(currentLine),
@@ -272,7 +487,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
           role: payload.type === 'user_message' ? 'user' : 'assistant',
           text, contentType: isReasoning ? 'thinking' : 'text', timestamp: ts,
         });
-        continue;
+        return;
       }
       if (payload.type === 'collab_agent_spawn_end' && payload.call_id && payload.new_thread_id) {
         const uuid = insertMessage({ uuid: lineUuid(currentLine), type: 'assistant', role: 'assistant', text: null, contentType: 'tool_use', timestamp: ts });
@@ -284,15 +499,16 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
         };
         out.push({ kind: 'tool_call', id: toolId, message_uuid: uuid, session_id: sessionId, name: 'Agent', presentation: 'default', input_json: truncJson(input) as string, file_path: null });
         callMessageUuids.set(toolId, uuid);
+        openCallMessageUuids.set(toolId, uuid);
         out.push({ kind: 'subagent', agent_id: codexDbId(payload.new_thread_id) as string, session_id: sessionId, parent_tool_use_id: toolId, agent_type: payload.new_agent_role || null, description });
-        continue;
+        return;
       }
       if (payload.type === 'task_complete') {
         if (sm.lastTextAssistantUuid && payload.duration_ms !== undefined) {
           out.push({ kind: 'message-turn-duration', uuid: sm.lastTextAssistantUuid, turn_duration_ms: payload.duration_ms || null });
         }
         updateBounds(ts);
-        continue;
+        return;
       }
       if (payload.type === 'token_count') {
         const usage = codexUsage(payload);
@@ -300,22 +516,31 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
         if (usage.outputTokens != null) sm.totalOutputTokens = usage.outputTokens;
         if (sm.lastTextAssistantUuid && (usage.inputTokens != null || usage.outputTokens != null)) {
           const rec = msgByUuid.get(sm.lastTextAssistantUuid);
-          if (rec) { rec.input_tokens = usage.inputTokens; rec.output_tokens = usage.outputTokens; }
+          if (rec) {
+            rec.input_tokens = usage.inputTokens;
+            rec.output_tokens = usage.outputTokens;
+            if (!emittedMessageUuids.has(rec.uuid)) {
+              out.push(rec);
+              emittedMessageUuids.add(rec.uuid);
+            }
+          }
         }
-        continue;
+        return;
       }
-      if (payload.type === 'thread_name_updated' && payload.thread_name) sm.title = payload.thread_name;
-      continue;
+      if (payload.type === 'thread_name_updated' && payload.thread_name) sm.threadTitle = payload.thread_name;
+      return;
     }
-    if (obj.type !== 'response_item') continue;
+    if (obj.type !== 'response_item') return;
     const payload = obj.payload || {};
     if (payload.type === 'message' && payload.role !== 'developer') {
       const text = codexMessagePayloadText(payload);
       const role = payload.role || 'assistant';
-      if (text !== null && !eventMessageKeys.has(codexVisibleMessageKey(role, text))) {
+      const key = text === null ? null : visibleMessageDigest(role, text);
+      if (text !== null && key !== null && !eventMessageKeys.has(key)) {
         insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts });
+        responseMessageKeys.add(key);
       }
-      continue;
+      return;
     }
     if (['function_call', 'custom_tool_call', 'tool_search_call', 'web_search_call'].includes(payload.type) && payload.call_id) {
       const uuid = insertMessage({ uuid: lineUuid(currentLine), type: 'assistant', role: 'assistant', text: null, contentType: 'tool_use', timestamp: ts });
@@ -323,13 +548,23 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       const toolId = codexCallId(threadRawId, payload.call_id) as string;
       out.push({ kind: 'tool_call', id: toolId, message_uuid: uuid, session_id: sessionId, name, presentation: name === 'Skill' ? 'skill' : 'default', input_json: truncJson(codexToolInput(payload)) as string, file_path: null });
       callMessageUuids.set(toolId, uuid);
-      continue;
+      openCallMessageUuids.set(toolId, uuid);
+      return;
     }
     if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(payload.type) && payload.call_id) {
       const toolId = codexCallId(threadRawId, payload.call_id) as string;
       out.push({ kind: 'tool_result', tool_use_id: toolId, message_uuid: callMessageUuids.get(toolId) || '', session_id: sessionId, content: trunc(codexToolOutput(payload) || ''), file_path: null, is_error: payload.is_error ? 1 : 0 });
+      openCallMessageUuids.delete(toolId);
     }
-  }
+  };
+
+  let currentLine = fast ? prior!.lineCount : 0;
+  readLines(unit.key, (line: string) => {
+    currentLine++;
+    try { processRecord(currentLine, JSON.parse(line)); } catch { /* skip malformed */ }
+  }, { start: fast ? prior!.size : 0 });
+  const afterParse = statSync(unit.key);
+  if (currentLine !== lineNum || !sameStat(stat, afterParse)) return _cursor;
 
   if (agentId) {
     const started = sm.started_at ? new Date(sm.started_at).getTime() : null;
@@ -342,12 +577,34 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     });
   } else {
     out.push({
-      kind: 'session', id: sessionId, title: sm.title, project,
+      kind: 'session', id: sessionId, title: sm.threadTitle ?? indexedMeta?.indexedTitle ?? null, project,
       started_at: sm.started_at, ended_at: sm.ended_at, git_branch: sm.git_branch, version: sm.version,
       message_count: sm.n, countMode: 'total', jsonl_path: unit.key, source: 'codex',
     });
   }
 
+  const outCursor = encodeCodexCursor(stat, lineNum, {
+    v: CODEX_CURSOR_STATE_VERSION,
+    threadRawId,
+    meta,
+    chunkHashes: fingerprint.chunkHashes,
+    eventMessageKeys: [...eventMessageKeys],
+    responseMessageKeys: [...responseMessageKeys],
+    openCallMessageUuids: Object.fromEntries(openCallMessageUuids),
+    terminated,
+    currentCwd,
+    currentModel,
+    lastMessageUuid: sm.lastMessageUuid,
+    lastTextAssistant,
+    startedAt: sm.started_at,
+    endedAt: sm.ended_at,
+    gitBranch: sm.git_branch,
+    version: sm.version,
+    threadTitle: sm.threadTitle,
+    messageCount: sm.n,
+    totalInputTokens: sm.totalInputTokens,
+    totalOutputTokens: sm.totalOutputTokens,
+  });
   yield* out;
   return outCursor;
 }
