@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { getArgPreview, getToolIcon, renderTerminalTool } from '../app/src/renderer/src/tool-renderer.js';
+import { renderPrettyTool } from '../app/src/renderer/src/session-timeline-presentation.mjs';
 
 test('Codex exec renders source and decoded result instead of a Bash terminal', () => {
   const output = JSON.stringify([
@@ -112,4 +113,39 @@ test('Codex exec preview uses its string input', () => {
 
 test('Codex exec uses the Claude Bash terminal icon', () => {
   assert.equal(getToolIcon('exec'), getToolIcon('Bash'));
+});
+
+test('Codex apply_patch renders its string input as one multiline block', () => {
+  const patch = [
+    '*** Begin Patch',
+    '*** Update File: app.css',
+    '@@',
+    '-old',
+    '+new <value>',
+    '*** End Patch',
+  ].join('\n');
+  const html = renderPrettyTool({
+    name: 'apply_patch',
+    input_json: JSON.stringify(patch),
+    result: { content: 'Done!', is_error: 0 },
+  });
+
+  assert.match(html, /class="file-content"/);
+  assert.match(html, /<span class="label">Input<\/span><span class="meta">6 lines<\/span>/);
+  assert.match(html, /\*\*\* Begin Patch\n\*\*\* Update File: app\.css\n@@\n-old\n\+new &lt;value&gt;\n\*\*\* End Patch/);
+  assert.doesNotMatch(html, /<div class="field-(?:grid|key)">/);
+  assert.doesNotMatch(html, /<value>/);
+});
+
+test('generic object tool input continues to render as a field grid', () => {
+  const html = renderPrettyTool({
+    name: 'custom_tool',
+    input_json: JSON.stringify({ path: 'app.css', recursive: true }),
+    result: {},
+  });
+
+  assert.match(html, /class="field-grid"/);
+  assert.match(html, /class="field-key">path</);
+  assert.match(html, /class="field-key">recursive</);
+  assert.doesNotMatch(html, /class="file-content"/);
 });

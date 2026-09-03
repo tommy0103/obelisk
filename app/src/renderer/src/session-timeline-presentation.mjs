@@ -24,7 +24,7 @@ function formatToolInput(toolCall) {
   }
 }
 
-function renderFileContent(text) {
+function renderFileContent(text, label = 'File contents') {
   let lines = text.split('\n');
   const hasLineNums = lines.length > 1 && lines.slice(0, 5).every(line => /^\s*\d+\t/.test(line) || line === '');
   let gutter;
@@ -41,7 +41,7 @@ function renderFileContent(text) {
   const total = lines.length;
   const collapsed = total > 12;
   return `<div class="file-content">
-    <div class="file-content-head"><span class="label">File contents</span><span class="meta">${total} lines</span></div>
+    <div class="file-content-head"><span class="label">${escapeHtml(label)}</span><span class="meta">${total} lines</span></div>
     <div class="file-content-body ${collapsed ? 'collapsed' : ''}"><div class="gutter">${gutter}</div><div class="code">${escapeHtml(lines.join('\n'))}</div></div>
     ${collapsed ? `<button class="file-content-expand" onclick="this.previousElementSibling.classList.toggle('collapsed');this.textContent=this.previousElementSibling.classList.contains('collapsed')?'Show all ${total} lines':'Collapse'">Show all ${total} lines</button>` : ''}
   </div>`;
@@ -229,7 +229,10 @@ export function renderPrettyTool(toolCall) {
 
   const terminal = renderTerminalTool(toolCall.name, args, output, isError);
   if (terminal !== null) return terminal;
-  return `<div class="body-section"><div class="body-label">Input</div>${renderFieldGrid(args)}</div>`
+  const input = typeof args === 'string'
+    ? renderFileContent(args, 'Input')
+    : `<div class="body-section"><div class="body-label">Input</div>${renderFieldGrid(args)}</div>`;
+  return input
     + (output ? `<div class="body-section" style="margin-top:12px;"><div class="body-label">Output</div>${renderOutput(output, isError)}</div>` : '');
 }
 
