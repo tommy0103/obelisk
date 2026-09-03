@@ -326,20 +326,70 @@ function createQueryApi(
       const safe = buildSafeFtsQuery(text);
       rows = safe ? runMatch(safe) : [];
     }
+    const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
+    const contextWhere = `
+      session_id=$sessionId AND uuid!=$messageUuid ${metaClause}
+        AND ${visibilitySql('messages', includeInactive)}
+    `;
+    // All provider timestamps are normalized ISO-8601 strings, so their text
+    // order is chronological. Pull at most six candidates from each side via
+    // idx_messages_ts, then preserve the old JULIANDAY distance ordering.
+    const indexedContext = db.prepare(`
+      WITH
+        null_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp IS NULL
+          ORDER BY rowid LIMIT 6
+        ),
+        before_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp<=$timestamp
+          ORDER BY timestamp DESC, rowid ASC LIMIT 6
+        ),
+        after_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp>$timestamp
+          ORDER BY timestamp ASC, rowid ASC LIMIT 6
+        ),
+        candidates AS (
+          SELECT * FROM null_rows UNION ALL SELECT * FROM before_rows
+          UNION ALL SELECT * FROM after_rows
+        )
+      SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+             COALESCE(visibility,'visible') AS visibility,
+             COALESCE(source, 'claude') AS source
+      FROM candidates JOIN messages ON messages.rowid=candidates.message_rowid
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp)), message_rowid
+      LIMIT 6
+    `);
+    // Null or non-canonical hits have no safe lexical ordering; retain the
+    // original scan instead of forcing them through the indexed path.
+    const scanContext = db.prepare(`
+      SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+             COALESCE(visibility,'visible') AS visibility,
+             COALESCE(source, 'claude') AS source
+      FROM messages
+      WHERE ${contextWhere}
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp))
+      LIMIT 6
+    `);
     return rows.map((r: DbRow) => {
-      const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
-      const ctx = db.prepare(
-        `SELECT uuid,text,content_type,is_meta,role,timestamp,model,
-                COALESCE(visibility,'visible') AS visibility,
-                COALESCE(source, 'claude') as source
-         FROM messages
-         WHERE session_id=? AND uuid!=? ${metaClause}
-           AND ${visibilitySql('messages', includeInactive)}
-         ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?))
-         LIMIT 6`
-      ).all(r.session_id, r.uuid, r.timestamp)
+      const contextParams = {
+        $sessionId: r.session_id,
+        $messageUuid: r.uuid,
+        $timestamp: r.timestamp,
+      };
+      const indexedTimestamp = typeof r.timestamp === 'string'
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.timestamp);
+      const ctx = (indexedTimestamp ? indexedContext : scanContext)
+        .all(contextParams)
         .map(withVisibility)
-        .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
+        .sort((a: DbRow, b: DbRow) => {
+          if (a.timestamp === b.timestamp) return 0;
+          if (a.timestamp == null) return -1;
+          if (b.timestamp == null) return 1;
+          return a.timestamp < b.timestamp ? -1 : 1;
+        });
       const sourceValue = r.m_source || r.s_source || 'claude';
       const session: DbRow = { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue };
       // is_invoking marks the session that ran this query; it is the agent's

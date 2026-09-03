@@ -52,6 +52,7 @@ function searchDb() {
       uuid UNINDEXED, session_id UNINDEXED, text,
       content=messages, content_rowid=rowid
     );
+    CREATE INDEX idx_messages_ts ON messages(session_id, timestamp);
   `);
   db.prepare(`
     INSERT INTO sessions (id, title, project, started_at)
@@ -97,6 +98,44 @@ test('search exposes content_type on hits and temporal context', () => {
   assert.equal(rows[0].context[0].uuid, 'msg-thinking');
   assert.equal(rows[0].context[0].content_type, 'thinking');
   assert.equal(rows[0].context[0].is_meta, 0);
+  db.close();
+});
+
+test('search temporal context preserves null and duplicate-timestamp neighbors', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title) VALUES ('sid-neighbors', 'Neighbors')").run();
+  const insert = db.prepare(`
+    INSERT INTO messages (uuid, session_id, role, text, timestamp, is_meta, visibility)
+    VALUES (?, 'sid-neighbors', 'assistant', ?, ?, ?, ?)
+  `);
+  insert.run('hit', 'temporal-neighbor-needle', '2026-06-10T10:00:05.000Z', 0, 'visible');
+  insert.run('null-visible', 'context', null, 0, 'visible');
+  insert.run('equal-a', 'context', '2026-06-10T10:00:05.000Z', 0, 'visible');
+  insert.run('equal-meta', 'context', '2026-06-10T10:00:05.000Z', 1, 'visible');
+  insert.run('equal-b', 'context', '2026-06-10T10:00:05.000Z', 0, 'visible');
+  insert.run('before-1', 'context', '2026-06-10T10:00:04.000Z', 0, 'visible');
+  insert.run('after-1', 'context', '2026-06-10T10:00:06.000Z', 0, 'visible');
+  insert.run('before-2-inactive', 'context', '2026-06-10T10:00:03.000Z', 0, 'inactive');
+  insert.run('after-2', 'context', '2026-06-10T10:00:07.000Z', 0, 'visible');
+  insert.run('hidden', 'context', '2026-06-10T10:00:05.500Z', 0, 'hidden');
+  insert.run('before-3', 'context', '2026-06-10T10:00:02.000Z', 0, 'visible');
+  insert.run('after-3', 'context', '2026-06-10T10:00:08.000Z', 0, 'visible');
+  insert.run('null-hit', 'null-temporal-needle', null, 0, 'visible');
+
+  const api = createQueryApi(db);
+  const contextIds = api.search('temporal-neighbor-needle', { limit: 1 })[0]
+    .context.map(row => row.uuid);
+
+  assert.deepEqual(contextIds, [
+    'null-visible', 'null-hit', 'before-1', 'equal-a', 'equal-b', 'after-1',
+  ]);
+
+  assert.deepEqual(
+    api.search('null-temporal-needle', { limit: 1 })[0]
+      .context.map(row => row.uuid),
+    ['null-visible', 'before-1', 'hit', 'equal-a', 'equal-b', 'after-1'],
+  );
   db.close();
 });
 
