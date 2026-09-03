@@ -468,7 +468,12 @@ provide('recapGenerateOpen', recapGenerateOpen);
                   {{ currentRouteType === 'sessions' ? 'Sessions' : 'Memory' }}
                 </button>
                 <span class="crumb-sep">/</span>
-                <span class="crumb terminal">{{ formatProjectLabel(state.projectFilter) }}</span>
+                <span
+                  class="crumb terminal project-crumb"
+                  :title="formatProjectLabel(state.projectFilter)"
+                >
+                  {{ formatProjectLabel(state.projectFilter) }}
+                </span>
               </template>
               <template v-else>
                 <span class="crumb terminal">
