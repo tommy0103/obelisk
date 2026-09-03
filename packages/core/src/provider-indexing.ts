@@ -270,13 +270,34 @@ export function indexProviderPlan({
   const committed: ProviderIndexItem[] = [];
   const failedProviders = new Set<string>();
   const failedItems: ProviderIndexItem[] = [];
+  let replayStarted = plan.pendingMarkers.size === 0 && plan.replayKeys.size === 0;
   for (const item of plan.items) {
     try {
       const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
+        // Commit the replay schedule with its first completed unit. After an
+        // interruption, newly written cursors identify exactly what can resume.
+        if (!replayStarted) {
+          const clear = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
+          const keysToReplay = new Set(
+            plan.items
+              .filter(({ provider }) => plan.pendingMarkers.has(provider.name))
+              .map(({ unit }) => unit.key),
+          );
+          for (const keys of plan.replayKeys.values()) {
+            for (const key of keys) keysToReplay.add(key);
+          }
+          for (const key of keysToReplay) clear.run(key);
+          const write = db.prepare(
+            'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
+          );
+          const now = Date.now();
+          for (const marker of plan.pendingMarkers.values()) write.run(marker, now);
+        }
         const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
         onPersisted(item, nextCursor);
         return nextCursor;
       });
+      replayStarted = true;
       committed.push(item);
       onCommitted(item, cursor);
     } catch (error) {
