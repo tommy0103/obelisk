@@ -164,7 +164,10 @@ test('exports context-window as an opt-in package subpath without mounting it in
   const manifest = JSON.parse(readFileSync(resolve(pluginRoot, 'package.json'), 'utf8'))
   assert.equal(manifest.exports['./context-window'], './dist/context-window.js')
   assert.equal(manifest.dependencies?.['@obelisk/core'], undefined)
-  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-skill'], '0.1.2-alpha.4')
+  for (const [name, range] of Object.entries(manifest.peerDependencies)) {
+    if (!name.startsWith('@deepseek-ai/dsh-')) continue
+    assert.equal(range, '^0.1.2-alpha.4', `${name} must share the DSH prerelease compatibility range`)
+  }
   const bundle = readFileSync(resolve(pluginRoot, 'obelisk.cordis.yml'), 'utf8')
   assert.doesNotMatch(bundle, /context-window/)
   const skill = readFileSync(resolve(pluginRoot, 'skill', 'SKILL.md'), 'utf8')
