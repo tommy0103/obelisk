@@ -384,7 +384,12 @@ function createQueryApi(
       const ctx = (indexedTimestamp ? indexedContext : scanContext)
         .all(contextParams)
         .map(withVisibility)
-        .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
+        .sort((a: DbRow, b: DbRow) => {
+          if (a.timestamp === b.timestamp) return 0;
+          if (a.timestamp == null) return -1;
+          if (b.timestamp == null) return 1;
+          return a.timestamp < b.timestamp ? -1 : 1;
+        });
       const sourceValue = r.m_source || r.s_source || 'claude';
       const session: DbRow = { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue };
       // is_invoking marks the session that ran this query; it is the agent's

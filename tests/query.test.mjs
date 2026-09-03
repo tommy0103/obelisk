@@ -125,16 +125,16 @@ test('search temporal context preserves null and duplicate-timestamp neighbors',
 
   const api = createQueryApi(db);
   const contextIds = api.search('temporal-neighbor-needle', { limit: 1 })[0]
-    .context.map(row => row.uuid).sort();
+    .context.map(row => row.uuid);
 
   assert.deepEqual(contextIds, [
-    'after-1', 'before-1', 'equal-a', 'equal-b', 'null-hit', 'null-visible',
+    'null-visible', 'null-hit', 'before-1', 'equal-a', 'equal-b', 'after-1',
   ]);
 
   assert.deepEqual(
     api.search('null-temporal-needle', { limit: 1 })[0]
-      .context.map(row => row.uuid).sort(),
-    ['after-1', 'before-1', 'equal-a', 'equal-b', 'hit', 'null-visible'],
+      .context.map(row => row.uuid),
+    ['null-visible', 'before-1', 'hit', 'equal-a', 'equal-b', 'after-1'],
   );
   db.close();
 });
