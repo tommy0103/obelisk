@@ -1819,6 +1819,21 @@ test('a malformed Pi file does not force unrelated unchanged sessions to reparse
   assert.throws(() => drain(provider.parse(units[0], null)), /Empty Pi session/);
 });
 
+test('discovery ignores exported subagent artifact transcripts', () => {
+  const root = makeTempDir('obelisk-pi-subagent-artifacts-');
+  const session = writeSession(fixture('tool-session.jsonl'), { root });
+  writeSession(jsonl([{
+    version: 1,
+    recordType: 'message',
+    source: 'subagent',
+    text: 'not a Pi session',
+  }]), { root, relativePath: 'project/subagent-artifacts/worker_transcript.jsonl' });
+
+  const units = createPiProvider({ rootDir: root }).discover({ lastCursor: () => null });
+
+  assert.deepEqual(units.map(unit => unit.key), [session.path]);
+});
+
 test('a moved session with an unreadable identity cannot retract its last good snapshot', () => {
   const written = writeSession(jsonl([
     header({ id: 'moved-torn-session' }),
