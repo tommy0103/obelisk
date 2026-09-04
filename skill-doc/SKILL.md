@@ -56,7 +56,7 @@ the transcript records the command as typed, so a shell substitution like
 `$(uuidgen)` never expands there and can never resolve:
 
 ```bash
-obelisk --search "keyword" --nonce "obq-<unique-token-you-invent>"
+obelisk --search "keyword" --compact --limit 8 --context 0 --snippet-length 240 --nonce "obq-<unique-token-you-invent>"
 ```
 
 Custom query:
@@ -238,7 +238,11 @@ display-suppressed or transport-only records and is never returned by these
 helpers, even with the option enabled.
 
 Opts:
-`{ limit, sessionId, project, after, before, cwd, source, includeMeta, includeInactive }`.
+`{ limit, contextLimit, sessionId, sessions, project, projectPath, excludeInvoking, after, before, cwd, branch, source, includeMeta, includeInactive }`.
+
+`projectPath` exactly matches `sessions.project_path`; `excludeInvoking: true`
+excludes the current query session when the invocation nonce resolves.
+`contextLimit` controls neighboring messages per hit and accepts `0`.
 
 `project` is a SQL `LIKE` filter over `sessions.project`, not an exact project
 identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
@@ -286,12 +290,12 @@ not replace `sql()`, but they are the default first-pass surface. Use `sql()`
 when you need an exact aggregation or a join the helper does not expose.
 
 All list helpers accept a bounded `limit`. Many also accept:
-`{ project, after, before, sessionId, sessions, branch, source }`. Check
+`{ project, projectPath, excludeInvoking, after, before, sessionId, sessions, branch, source }`. Check
 `references/api-reference.md` or a tiny sample before relying on less common
 filters or return fields.
 
 - `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, the invoking session id (`current.session_id`) when the invocation nonce resolved, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
-- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded. The invoking session row carries `is_invoking: true`.
+- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern; `projectPath` is an exact absolute-path match. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded. The invoking session row carries `is_invoking: true` unless `excludeInvoking: true` removes it.
 - `recent(n?)` -- shorthand for recent sessions.
 - `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, visibility, session_title, project }`; inactive rows require `includeInactive: true`, hidden rows are never returned, and `source` is the summary kind rather than the transcript provider.
 - `subagents(opts?)` -- subagent metadata plus `messageCount`.
@@ -302,7 +306,7 @@ filters or return fields.
 - `trace(uuid, opts?)` -- parent chain from root to message.
 - `thread(sessionId, opts?)` -- session messages ordered by timestamp, omitting meta messages by default. Pass `{ includeMeta: true }` for injected context or `{ includeInactive: true }` for superseded Pi history.
 - `raw(uuid, opts?)` -- windowed source access for one visible message. Pi returns the selected source-message container whether it was stored directly or inside a retained tail. Inactive targets require `includeInactive: true`; hidden targets return `null`.
-- `memories(opts?)` -- recall memory layer. opts: `{ query, project, sessionId, sessions, after, before, branch, limit }`. Without `query`, returns active memory records newest first. With `query`, searches `summary`/`path` through safe FTS5 tokenization and returns `rank`; lower rank sorts earlier. Records may include nullable JSON `anchors` for explicit recall surfaces such as files. Read the file at `path` for full content.
+- `memories(opts?)` -- recall memory layer. opts: `{ query, project, projectPath, excludeInvoking, sessionId, sessions, after, before, branch, limit }`. Without `query`, returns active memory records newest first. With `query`, searches `summary`/`path` through safe FTS5 tokenization and returns `rank`; lower rank sorts earlier. Records may include nullable JSON `anchors` for explicit recall surfaces such as files. Read the file at `path` for full content.
 
 ## Retrieval Contract
 

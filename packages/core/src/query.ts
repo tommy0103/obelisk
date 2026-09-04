@@ -21,6 +21,8 @@ interface QueryOptions extends Record<string, any> {
   sessionId?: string;
   sessions?: string[];
   project?: string;
+  projectPath?: string;
+  excludeInvoking?: boolean;
   after?: string;
   before?: string;
   cwd?: string;
@@ -28,6 +30,7 @@ interface QueryOptions extends Record<string, any> {
   source?: string;
   includeMeta?: boolean;
   includeInactive?: boolean;
+  contextLimit?: number;
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
@@ -35,7 +38,9 @@ interface QueryOptions extends Record<string, any> {
 
 interface ColumnAliases {
   sessionId: string;
+  nullableSessionId?: boolean;
   project: string;
+  projectPath: string;
   timestamp: string;
   /** Optional per-direction overrides for range-typed rows (activity intervals). */
   timestampAfter?: string;
@@ -66,7 +71,7 @@ function normalizeOpts(optsOrScalar: QueryOptions | string | number | null | und
   return optsOrScalar;
 }
 
-function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
+function buildWhere(opts: QueryOptions, aliases: ColumnAliases, invokingSessionId?: string | null) {
   const clauses: string[] = [];
   const params: any[] = [];
   if (opts.sessionId) { clauses.push(`${aliases.sessionId} = ?`); params.push(opts.sessionId); }
@@ -75,6 +80,14 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
     params.push(...opts.sessions);
   }
   if (opts.project) { clauses.push(`${aliases.project} LIKE ?`); params.push(opts.project); }
+  if (opts.projectPath) { clauses.push(`${aliases.projectPath} = ?`); params.push(opts.projectPath); }
+  if (opts.excludeInvoking && invokingSessionId) {
+    const sessionClause = aliases.nullableSessionId
+      ? `(${aliases.sessionId} IS NULL OR ${aliases.sessionId} != ?)`
+      : `${aliases.sessionId} != ?`;
+    clauses.push(sessionClause);
+    params.push(invokingSessionId);
+  }
   if (opts.after) { clauses.push(`${aliases.timestampAfter ?? aliases.timestamp} > ?`); params.push(opts.after); }
   if (opts.before) { clauses.push(`${aliases.timestampBefore ?? aliases.timestamp} < ?`); params.push(opts.before); }
   if (opts.branch) { clauses.push(`${aliases.branch} = ?`); params.push(opts.branch); }
@@ -244,7 +257,6 @@ function prepareReadOnlyStatement(db: SqliteDb, sqlText: string): SqliteStatemen
   assertSingleStatement(sqlText, stmt);
   return stmt;
 }
-
 const CJK_TEXT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 function assertEnglishMemoryText(value: unknown, label: string): void {
@@ -289,21 +301,40 @@ function createQueryApi(
     const {
       limit = 20,
       sessionId,
+      sessions: sessionIds,
       project,
+      projectPath,
+      excludeInvoking = false,
       after,
       before,
       cwd,
+      branch,
       source,
       includeMeta = false,
       includeInactive = false,
     } = opts;
+    const contextLimit = typeof opts.contextLimit === 'number'
+      && Number.isSafeInteger(opts.contextLimit)
+      && opts.contextLimit >= 0
+      ? opts.contextLimit
+      : 6;
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
+    if (sessionIds?.length) {
+      where += ` AND mf.session_id IN (${sessionIds.map(() => '?').join(',')})`;
+      filterParams.push(...sessionIds);
+    }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
+    if (projectPath) { where += ' AND s.project_path=?'; filterParams.push(projectPath); }
+    if (excludeInvoking && invokingSessionId) {
+      where += ' AND mf.session_id!=?';
+      filterParams.push(invokingSessionId);
+    }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
     if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
+    if (branch)    { where += ' AND s.git_branch=?';   filterParams.push(branch); }
     if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
     where += ` AND ${visibilitySql('m', includeInactive)}`;
@@ -336,8 +367,8 @@ function createQueryApi(
          WHERE session_id=? AND uuid!=? ${metaClause}
            AND ${visibilitySql('messages', includeInactive)}
          ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?))
-         LIMIT 6`
-      ).all(r.session_id, r.uuid, r.timestamp)
+         LIMIT ?`
+      ).all(r.session_id, r.uuid, r.timestamp, contextLimit)
         .map(withVisibility)
         .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
       const sourceValue = r.m_source || r.s_source || 'claude';
@@ -414,7 +445,7 @@ function createQueryApi(
   const subagents = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
-    const needsJoin = opts.project || opts.branch || opts.source;
+    const needsJoin = opts.project || opts.projectPath || opts.branch || opts.source;
     // The subagents table has no timestamp column; scope time filters by the
     // subagent's activity interval instead of comparing session IDs. `after`
     // matches agents still active past the bound (latest message), `before`
@@ -422,7 +453,7 @@ function createQueryApi(
     // combined bounds select every agent active during the window.
     const firstMessageAt = '(SELECT MIN(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
     const lastMessageAt = '(SELECT MAX(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
-    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: firstMessageAt, timestampAfter: lastMessageAt, timestampBefore: firstMessageAt, branch: 's.git_branch', source: 's.source' });
+    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', projectPath: 's.project_path', timestamp: firstMessageAt, timestampAfter: lastMessageAt, timestampBefore: firstMessageAt, branch: 's.git_branch', source: 's.source' }, invokingSessionId);
     params.push(limit);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {
@@ -434,8 +465,8 @@ function createQueryApi(
   const workflows = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
-    const needsJoin = opts.project || opts.branch || opts.source;
-    const { where, params } = buildWhere(opts, { sessionId: 'w.session_id', project: 's.project', timestamp: 'w.timestamp', branch: 's.git_branch', source: 's.source' });
+    const needsJoin = opts.project || opts.projectPath || opts.branch || opts.source;
+    const { where, params } = buildWhere(opts, { sessionId: 'w.session_id', project: 's.project', projectPath: 's.project_path', timestamp: 'w.timestamp', branch: 's.git_branch', source: 's.source' }, invokingSessionId);
     params.push(limit);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=w.session_id' : '';
     return db.prepare(`SELECT w.* FROM workflows w ${join} WHERE ${where} ORDER BY w.timestamp DESC LIMIT ?`).all(...params);
@@ -454,12 +485,17 @@ function createQueryApi(
   };
 
   const fileHistory = (fp: string, opts: QueryOptions = {}) => {
-    const { limit = 200, after, before, source, includeInactive = false } = opts;
-    let where = `tc.file_path=? AND ${visibilitySql('m', includeInactive)}`;
-    const params: any[] = [fp];
-    if (after)  { where += ' AND m.timestamp > ?'; params.push(after); }
-    if (before) { where += ' AND m.timestamp < ?'; params.push(before); }
-    if (source && source !== 'all') { where += " AND COALESCE(s.source, 'claude') = ?"; params.push(source); }
+    const { limit = 200, includeInactive = false } = opts;
+    const { where: scopeWhere, params: scopeParams } = buildWhere(opts, {
+      sessionId: 'tc.session_id',
+      project: 's.project',
+      projectPath: 's.project_path',
+      timestamp: 'm.timestamp',
+      branch: 's.git_branch',
+      source: 's.source',
+    }, invokingSessionId);
+    const where = `tc.file_path=? AND ${visibilitySql('m', includeInactive)} AND ${scopeWhere}`;
+    const params: any[] = [fp, ...scopeParams];
     params.push(limit);
     return db.prepare(
       `SELECT tc.*,s.title as s_title,s.project as s_project,m.timestamp as ts,
@@ -482,8 +518,8 @@ function createQueryApi(
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50 } = opts;
     const includeInactive = opts.includeInactive === true;
-    const needsJoin = opts.project || opts.branch || opts.source;
-    const { where, params: filterParams } = buildWhere(opts, { sessionId: 'tr.session_id', project: 's.project', timestamp: 'rm.timestamp', branch: 's.git_branch', source: 's.source' });
+    const needsJoin = opts.project || opts.projectPath || opts.branch || opts.source;
+    const { where, params: filterParams } = buildWhere(opts, { sessionId: 'tr.session_id', project: 's.project', projectPath: 's.project_path', timestamp: 'rm.timestamp', branch: 's.git_branch', source: 's.source' }, invokingSessionId);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=tr.session_id' : '';
     const errorCond = [
       `(tr.is_error = 1 OR tr.content LIKE '${BASH_EXIT_PAT}')`,
@@ -533,7 +569,7 @@ function createQueryApi(
   const sessions = (optsOrN?: QueryOptions | number | string) => {
     const opts = normalizeOpts(optsOrN, 'sessionId');
     const { limit = 50 } = opts;
-    const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', projectPath: 's.project_path', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' }, invokingSessionId);
     params.push(limit);
     return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params)
       .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
@@ -545,7 +581,7 @@ function createQueryApi(
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
     const includeInactive = opts.includeInactive === true;
-    const { where, params } = buildWhere(opts, { sessionId: 'su.session_id', project: 's.project', timestamp: 'su.timestamp', branch: 's.git_branch', source: 's.source' });
+    const { where, params } = buildWhere(opts, { sessionId: 'su.session_id', project: 's.project', projectPath: 's.project_path', timestamp: 'su.timestamp', branch: 's.git_branch', source: 's.source' }, invokingSessionId);
     params.push(limit);
     return db.prepare(`
       SELECT su.*, s.title as session_title, s.project
@@ -776,14 +812,17 @@ function createQueryApi(
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50, query } = opts;
     assertEnglishMemoryText(query, 'memories() query');
-    const needsJoin = opts.branch || opts.source;
+    const needsJoin = opts.projectPath || opts.branch || opts.source
+      || (opts.excludeInvoking && invokingSessionId);
     const { where: baseWhere, params } = buildWhere(opts, {
       sessionId: 'mem.session_id',
+      nullableSessionId: true,
       project: 'mem.project',
+      projectPath: 's.project_path',
       timestamp: 'mem.created_at',
       branch: 's.git_branch',
       source: 's.source',
-    });
+    }, invokingSessionId);
     const where = baseWhere + ' AND mem.deleted_at IS NULL';
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=mem.session_id' : '';
     const hasQuery = String(query || '').trim().length > 0;
