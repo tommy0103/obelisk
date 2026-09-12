@@ -105,7 +105,7 @@ test('force project-path refresh recomputes an already resolved stable root', ()
 
   refreshSessionProjectPaths(db, new Set(['repair']), { recompute: true });
 
-  assert.equal(sessionProjectPath(db, 'repair'), '/Users/me/quiet-zero');
+  assert.equal(sessionProjectPath(db, 'repair'), normalize('/Users/me/quiet-zero'));
   db.close();
 });
 
@@ -173,7 +173,7 @@ test('project-path inference gives non-null timestamps precedence over null time
 
   refreshSessionProjectPaths(db, new Set(['null-order']));
 
-  assert.equal(sessionProjectPath(db, 'null-order'), '/repo/timestamped');
+  assert.equal(sessionProjectPath(db, 'null-order'), normalize('/repo/timestamped'));
   db.close();
 });
 
