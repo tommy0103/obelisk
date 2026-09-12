@@ -38,7 +38,7 @@ Use the narrowest scope before text search.
 | Field | Meaning | Raw SQL note |
 | --- | --- | --- |
 | `sessions.project` | Provider-normalized project slug | Use `LIKE ?` for fuzzy project filters |
-| `sessions.project_path` | Absolute project path inferred from cwd | Use for exact local project identity |
+| `sessions.project_path` | Stable absolute project-root approximation inferred from cwd | Use for exact local project identity |
 | `messages.cwd` | Working directory at message time | Useful when a session spans directories |
 | `sessions.source` / `messages.source` | Transcript provider | Use only when provider matters |
 | `messages.is_meta` | Injected/control-plane transcript material | Ordinary evidence should filter it out |
@@ -63,7 +63,7 @@ One row per root session.
 | `id` | Session ID (`codex:<thread-id>` for Codex roots) |
 | `title` | AI/session title |
 | `project` | Provider-normalized project slug |
-| `project_path` | Absolute project path when known |
+| `project_path` | Stable absolute project-root approximation when known |
 | `started_at`, `ended_at` | ISO timestamps |
 | `git_branch` | Branch at session time |
 | `version` | Provider CLI/app version |

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
+  backfillUnresolvedSessionProjectPathsOnce,
   dropMessageFtsTriggers,
   ensureFtsReady,
   refreshSessionProjectPaths,
@@ -385,10 +386,15 @@ function buildIndex({
         for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
       };
       const finalize = (providerResult) => {
-        const projectPathSessionIds = !force && Array.isArray(changedPaths)
-          ? new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds])
-          : null;
-        refreshSessionProjectPaths(db, projectPathSessionIds);
+        if (force) {
+          refreshSessionProjectPaths(db, null);
+        } else {
+          refreshSessionProjectPaths(
+            db,
+            new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds]),
+          );
+          backfillUnresolvedSessionProjectPathsOnce(db);
+        }
         healWorkflowParentLinks(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });

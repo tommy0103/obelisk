@@ -224,8 +224,10 @@ export interface DeleteSessionRecord {
 // title/ended_at may be enriched by the adapter from source-specific auxiliary
 // files (claude history.jsonl, codex session_index.jsonl); persist upserts with
 // fill-if-null (COALESCE) so those never clobber a value already present.
-// project_path is NOT set here — the orchestration's global pass derives it from
-// persisted message cwds (refreshSessionProjectPaths).
+// project_path is NOT set here — the orchestration derives it from persisted
+// message cwds when a session is first created or still unresolved
+// (refreshSessionProjectPaths). Resolved paths remain stable during ordinary
+// incremental indexing; explicit force/repair passes may recompute them.
 //
 // countMode tells persist how to treat message_count, because providers differ:
 // a line-incremental adapter (claude) yields only new messages ('delta', persist

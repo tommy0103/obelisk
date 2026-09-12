@@ -46,17 +46,30 @@ export function ensureFtsReady(db: SqliteDb, { force = false }: { force?: boolea
 }
 
 /**
- * Refresh project paths for every session (`null`) or exactly one affected set.
+ * Derive stable project roots for sessions that need a path.
+ *
+ * Scoped refreshes are used by ordinary incremental indexing and only select
+ * unresolved sessions. A non-empty path is intentionally stable: nested cwd
+ * values in later messages must not turn a project root into a subdirectory,
+ * and an affected long session must not be rescanned on every delta. A null
+ * session set is reserved for complete force/repair passes and recomputes all
+ * sessions.
  */
 export function refreshSessionProjectPaths(
   db: SqliteDb,
   sessionIds: ReadonlySet<string> | null = null,
+  { recompute = false }: { recompute?: boolean } = {},
 ): void {
   let sessions: SqliteRow[];
   if (sessionIds === null) {
     sessions = db.prepare('SELECT id, project FROM sessions').all();
   } else {
-    const sessionById = db.prepare('SELECT id, project FROM sessions WHERE id = ?');
+    const sessionById = db.prepare(
+      recompute
+        ? 'SELECT id, project FROM sessions WHERE id = ?'
+        : `SELECT id, project FROM sessions
+           WHERE id = ? AND (project_path IS NULL OR project_path = '')`,
+    );
     sessions = [...sessionIds]
       .map(sessionId => sessionById.get(sessionId))
       .filter((session): session is SqliteRow => session !== undefined);

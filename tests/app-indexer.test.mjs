@@ -100,12 +100,20 @@ test('app indexer records build success without claiming daemon ownership', () =
   const db2 = new TestDatabase(dbPath);
   assert.equal(db2.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'companion'").get().uuid, 'msg-app-2');
   assert.equal(db2.prepare('SELECT message_count FROM sessions WHERE id=?').get(sessionId).message_count, 2);
-  assert.equal(db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, normalize('/tmp/obelisk-app'));
+  assert.equal(
+    db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path,
+    '/tmp/stale-affected',
+    'ordinary incremental refresh preserves an already-resolved project root',
+  );
   assert.equal(
     db2.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
     '/tmp/stale-unaffected',
   );
   db2.close();
+
+  const unresolvedDb = new TestDatabase(dbPath);
+  unresolvedDb.prepare('UPDATE sessions SET project_path=NULL WHERE id=?').run('session-app-unaffected');
+  unresolvedDb.close();
 
   buildIndex({
     claudeDir,
@@ -114,6 +122,7 @@ test('app indexer records build success without claiming daemon ownership', () =
     changedPaths: [],
     retrySessionIds: ['session-app-unaffected'],
   });
+
   const retryDb = new TestDatabase(dbPath);
   assert.equal(
     retryDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
@@ -127,7 +136,8 @@ test('app indexer records build success without claiming daemon ownership', () =
   const repairedDb = new TestDatabase(dbPath);
   assert.equal(
     repairedDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
-    normalize('/tmp/unaffected'),
+    '/tmp/stale-unaffected',
+    'ordinary full-inventory refresh preserves an already-resolved project root',
   );
   repairedDb.close();
 });
