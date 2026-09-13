@@ -85,6 +85,28 @@ test('search falls back to safe tokenization for FTS-special input instead of th
   db.close();
 });
 
+test('search broadens only an empty query when the OR fallback is explicitly enabled', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+
+  assert.deepEqual(api.search('needle absent', { limit: 10 }), []);
+  assert.deepEqual(
+    api.search('needle absent', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+  );
+  assert.deepEqual(
+    new Set(api.search('needle absent', { fallback: 'or', includeInactive: true, limit: 10 }).map(row => row.message.uuid)),
+    new Set(['msg-text', 'msg-inactive']),
+    'the relaxed retry preserves visibility filtering',
+  );
+  assert.deepEqual(
+    api.search('needle reply', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+    'a non-empty primary result is not broadened',
+  );
+  db.close();
+});
+
 test('search exposes content_type on hits and temporal context', () => {
   const db = searchDb();
   const api = createQueryApi(db);
