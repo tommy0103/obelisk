@@ -159,3 +159,21 @@ test('Read output still moves its captured line numbers into the gutter', () => 
   assert.match(html, /<div class="gutter">12\n13<\/div>/);
   assert.match(html, /<div class="code">first\nsecond<\/div>/);
 });
+
+test('long apply_patch inputs preserve every line without creating character or line DOM rows', () => {
+  const renderPatch = count => {
+    const patch = ['*** Begin Patch', '*** Update File: example.txt', '@@',
+      ...Array.from({ length: count }, (_, i) => `+line ${i}: <tag> &amp;\tvalue`),
+      '*** End Patch', ''].join('\n');
+    const html = renderPrettyTool({ name: 'apply_patch', input_json: JSON.stringify(patch) });
+    const escaped = patch.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    assert.equal(html.match(/<div class="code">([\s\S]*?)<\/div>/)?.[1], escaped);
+    assert.equal((html.match(/class="file-content"/g) || []).length, 1);
+    assert.doesNotMatch(html, /class="field-(?:grid|key)"|<tag>/);
+    assert.match(html, /file-content-body collapsed/);
+    assert.ok(html.includes(`Show all ${patch.split('\n').length} lines`));
+    return (html.match(/<[a-z][^>]*>/g) || []).length;
+  };
+  assert.equal(renderPatch(4_000), renderPatch(20),
+    'increasing patch length must not increase the number of DOM elements');
+});
