@@ -135,7 +135,7 @@ function walkParentChain(
     if (visited.has(currentUuid)) break;
     visited.add(currentUuid);
     if ((!isStart || includeStart) && isQueryableMessage(current, includeInactive)) {
-      chain.unshift(withVisibility(current));
+      chain.push(withVisibility(current));
     }
     isStart = false;
 
@@ -145,7 +145,7 @@ function walkParentChain(
     current = findMessage.get(parentUuid);
     followedEdges++;
   }
-  return chain;
+  return chain.reverse();
 }
 
 function visibilitySql(alias: string, includeInactive = false): string {

@@ -72,8 +72,8 @@ function searchDb() {
   return db;
 }
 
-function guardParentReads(db, maxReads = 10) {
-  let parentReads = 0;
+function guardMessageReads(db, maxReads = 10) {
+  let messageReads = 0;
   return new Proxy(db, {
     get(target, property) {
       if (property !== 'prepare') {
@@ -89,8 +89,8 @@ function guardParentReads(db, maxReads = 10) {
               return Reflect.get(statementTarget, statementProperty, statementTarget);
             }
             return (...bindings) => {
-              parentReads++;
-              if (parentReads > maxReads) throw new Error('parent traversal did not stop');
+              messageReads++;
+              if (messageReads > maxReads) throw new Error('parent traversal did not stop');
               return statementTarget.get(...bindings);
             };
           },
@@ -249,7 +249,7 @@ test('context and trace reject hidden targets and omit hidden ancestors', () => 
 
 test('context and trace stop before repeating a self-referential target', () => {
   const db = parentChainDb('sid-self-cycle', 'Self cycle', [['self-cycle', 'self-cycle']]);
-  const api = createQueryApi(guardParentReads(db));
+  const api = createQueryApi(guardMessageReads(db));
   assert.deepEqual(api.context('self-cycle').parentChain, []);
   assert.deepEqual(api.trace('self-cycle').map(message => message.uuid), ['self-cycle']);
   db.close();
@@ -260,7 +260,7 @@ test('context and trace return each message once in a two-message parent cycle',
     ['cycle-a', 'cycle-b'],
     ['cycle-b', 'cycle-a'],
   ]);
-  const api = createQueryApi(guardParentReads(db));
+  const api = createQueryApi(guardMessageReads(db));
   assert.deepEqual(
     api.context('cycle-a').parentChain.map(message => message.uuid),
     ['cycle-b'],
@@ -276,7 +276,7 @@ test('context and trace stop cleanly when a parent message is missing', () => {
   const db = parentChainDb('sid-broken-chain', 'Broken chain', [
     ['orphan-child', 'missing-parent'],
   ]);
-  const api = createQueryApi(guardParentReads(db));
+  const api = createQueryApi(guardMessageReads(db));
   assert.deepEqual(api.context('orphan-child').parentChain, []);
   assert.deepEqual(api.trace('orphan-child').map(message => message.uuid), ['orphan-child']);
   db.close();
