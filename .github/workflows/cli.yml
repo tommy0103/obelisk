@@ -27,9 +27,6 @@ jobs:
       - name: Verify CLI package and runtime contract
         run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs
 
-      - name: Install renderer test dependencies
-        run: npm --prefix app ci --ignore-scripts
-
       - name: Verify tool input rendering and Codex patch round-trip
         run: node --experimental-test-module-mocks --test tests/app-tool-renderer.test.mjs tests/app-codex-patch-pipeline.test.mjs
 
