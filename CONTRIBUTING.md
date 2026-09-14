@@ -259,6 +259,9 @@ Every PR:
 - Do not ship a code path you have flagged to yourself as unverified. Writing
   "this call site is worth another look" is honest, but it belongs in a follow-up
   issue, not in the diff.
+- Use commit messages to preserve why a change was made, with any key tradeoff
+  needed to understand the decision. Keep the explanation brief and self-contained;
+  reference a commit, issue, or PR when useful, without repeating its discussion.
 
 ### Clarify the need for new concepts
 
