@@ -201,6 +201,9 @@ For multiple statements passed to `sql()`, compare these message bodies
 
 ## Indexing, daemon, and write ownership
 
+- For retry and recovery paths, check both transient and persistent failures.
+  Preserve safe partial progress without claiming completion, keep unresolved
+  failures visible, and limit the frequency and cost of repeated attempts.
 - **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
   is read-only: no write connection, no schema migration, no PRAGMA change, no
   checkpoint, no indexing. Two narrow carve-outs, both recorded in ADR 0006:
