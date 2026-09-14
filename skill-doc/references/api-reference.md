@@ -112,12 +112,18 @@ Array<{
   message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, visibility, source },
   session: { id, title, project, started_at, source, is_invoking? },
   rank,
-  context
+  context,
+  snippet?,
+  degraded?
 }>
 ```
 
 `session.is_invoking` is `true` when the hit belongs to the invoking session
 (see Invocation Identity) and omitted otherwise.
+
+`snippet` is a hit-centered window into `message.text`: long messages often
+match far past the head, so read `snippet` first and fall back to `text` when
+it is absent (a raw-syntax query whose terms do not appear literally).
 
 `context` is temporal neighbor context in the same session, not a parent chain.
 Hits and neighbors carry `visibility`.
@@ -129,6 +135,15 @@ Valid FTS5 syntax in `text` is honored. Input that FTS5 would reject as
 malformed (for example a hyphenated term like `foo-bar`) does not error: it
 falls back to safe per-token quoting — the same tokenization `memories()` uses —
 so ordinary text never crashes the query.
+
+When `messages_fts` is built with the trigram tokenizer, terms shorter than
+three code points cannot go through MATCH (alone they match nothing; next to
+longer terms they silently match everything). Plain queries route around this
+automatically and say so via `degraded`: `"short-token-post-filter"` means the
+longer terms were MATCHed and the short ones enforced as literal substrings
+(rank preserved), `"like-scan"` means every term was short and the content
+table was scanned directly (`rank` is `null`, recency orders the hits).
+Queries using explicit FTS5 operators bypass the guard and are sent as-is.
 
 #### `context(uuid, opts?)`
 
