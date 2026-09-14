@@ -204,6 +204,8 @@ interface BuildIndexOptions {
   DatabaseImpl?: new (dbPath: string) => any;
   LockDatabaseImpl?: new (dbPath: string) => any;
   force?: boolean;
+  reason?: string;
+  readMode?: 'normal' | 'strict';
   changedPaths?: string[];
   retrySessionIds?: string[];
   preserveDbPath?: string | null;
@@ -267,6 +269,8 @@ function buildIndex({
   DatabaseImpl = Database,
   LockDatabaseImpl = DatabaseImpl,
   force = false,
+  reason = undefined,
+  readMode = reason === 'reconcile' || reason === 'repair' ? 'strict' : 'normal',
   changedPaths = undefined,
   retrySessionIds = [],
   preserveDbPath = null,
@@ -326,6 +330,7 @@ function buildIndex({
         force,
         changedPaths,
         priorSessions,
+        readMode,
       });
       let latestSourceMtime = providerPlan.items.reduce((latest, { unit }) => {
         const providerCursor = (unit.meta as { currentCursor?: unknown } | undefined)?.currentCursor;
