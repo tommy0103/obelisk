@@ -72,6 +72,49 @@ function searchDb() {
   return db;
 }
 
+function guardParentReads(db, maxReads = 10) {
+  let parentReads = 0;
+  return new Proxy(db, {
+    get(target, property) {
+      if (property !== 'prepare') {
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+      return (sql) => {
+        const statement = target.prepare(sql);
+        if (sql !== 'SELECT * FROM messages WHERE uuid=?') return statement;
+        return new Proxy(statement, {
+          get(statementTarget, statementProperty) {
+            if (statementProperty !== 'get') {
+              return Reflect.get(statementTarget, statementProperty, statementTarget);
+            }
+            return (...bindings) => {
+              parentReads++;
+              if (parentReads > maxReads) throw new Error('parent traversal did not stop');
+              return statementTarget.get(...bindings);
+            };
+          },
+        });
+      };
+    },
+  });
+}
+
+function parentChainDb(sessionId, title, messages) {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run(sessionId, title, 'pi');
+  const insert = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,parent_uuid,role,text,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+  for (const [uuid, parentUuid] of messages) {
+    insert.run(uuid, sessionId, 'user', parentUuid, 'user', uuid, 'visible', 'pi');
+  }
+  return db;
+}
+
 test('search falls back to safe tokenization for FTS-special input instead of throwing', () => {
   const db = searchDb();
   const api = createQueryApi(db);
@@ -201,6 +244,63 @@ test('context and trace reject hidden targets and omit hidden ancestors', () => 
     api.trace('visible-child').map(message => message.uuid),
     ['visible-root', 'visible-child'],
   );
+  db.close();
+});
+
+test('context and trace stop before repeating a self-referential target', () => {
+  const db = parentChainDb('sid-self-cycle', 'Self cycle', [['self-cycle', 'self-cycle']]);
+  const api = createQueryApi(guardParentReads(db));
+  assert.deepEqual(api.context('self-cycle').parentChain, []);
+  assert.deepEqual(api.trace('self-cycle').map(message => message.uuid), ['self-cycle']);
+  db.close();
+});
+
+test('context and trace return each message once in a two-message parent cycle', () => {
+  const db = parentChainDb('sid-pair-cycle', 'Pair cycle', [
+    ['cycle-a', 'cycle-b'],
+    ['cycle-b', 'cycle-a'],
+  ]);
+  const api = createQueryApi(guardParentReads(db));
+  assert.deepEqual(
+    api.context('cycle-a').parentChain.map(message => message.uuid),
+    ['cycle-b'],
+  );
+  assert.deepEqual(
+    api.trace('cycle-a').map(message => message.uuid),
+    ['cycle-b', 'cycle-a'],
+  );
+  db.close();
+});
+
+test('context and trace stop cleanly when a parent message is missing', () => {
+  const db = parentChainDb('sid-broken-chain', 'Broken chain', [
+    ['orphan-child', 'missing-parent'],
+  ]);
+  const api = createQueryApi(guardParentReads(db));
+  assert.deepEqual(api.context('orphan-child').parentChain, []);
+  assert.deepEqual(api.trace('orphan-child').map(message => message.uuid), ['orphan-child']);
+  db.close();
+});
+
+test('context and trace follow at most 1000 parent edges', () => {
+  const db = parentChainDb(
+    'sid-deep-chain',
+    'Deep chain',
+    Array.from({ length: 1003 }, (_, index) => [
+      `deep-${index}`,
+      index === 0 ? null : `deep-${index - 1}`,
+    ]),
+  );
+  const api = createQueryApi(db);
+  const contextChain = api.context('deep-1002').parentChain.map(message => message.uuid);
+  assert.equal(contextChain.length, 1000);
+  assert.equal(contextChain[0], 'deep-2');
+  assert.equal(contextChain.at(-1), 'deep-1001');
+
+  const trace = api.trace('deep-1002').map(message => message.uuid);
+  assert.equal(trace.length, 1001);
+  assert.equal(trace[0], 'deep-2');
+  assert.equal(trace.at(-1), 'deep-1002');
   db.close();
 });
 
