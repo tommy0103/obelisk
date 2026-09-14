@@ -15,6 +15,39 @@ import {
   executeAttune,
 } from '../../core/src/core.ts';
 
+function parseIntegerOption(name: string, value: string | undefined, minimum: number): number {
+  if (value === undefined || !/^\d+$/.test(value)) {
+    throw new Error(`${name} requires an integer >= ${minimum}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw new Error(`${name} requires an integer >= ${minimum}`);
+  }
+  return parsed;
+}
+
+function compactSearchResults(value: unknown, snippetLength: number): unknown {
+  if (!Array.isArray(value)) return value;
+  const compactMessage = (message: any) => ({
+    uuid: message?.uuid,
+    role: message?.role,
+    timestamp: message?.timestamp,
+    content_type: message?.content_type,
+    is_meta: message?.is_meta,
+    visibility: message?.visibility,
+    source: message?.source,
+    snippet: typeof message?.text === 'string'
+      ? message.text.replace(/\s+/g, ' ').trim().slice(0, snippetLength)
+      : null,
+  });
+  return value.map((hit: any) => ({
+    message: compactMessage(hit?.message),
+    session: hit?.session,
+    rank: hit?.rank,
+    context: Array.isArray(hit?.context) ? hit.context.map(compactMessage) : [],
+  }));
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const fail = (value: unknown): void => {
@@ -60,17 +93,46 @@ async function main() {
     } catch (error) { fail(error); }
     return;
   }
-  if (args[0] === '--search' && args[1]) {
+  if (args[0] === '--search') {
     try {
       // --nonce <token> marks this invocation in the transcript so the query
       // layer can identify the invoking session; it is not part of the FTS text.
       let nonce: string | undefined;
+      let compact = false;
+      let snippetLength = 240;
+      const searchOptions: Record<string, unknown> = {};
       const textParts: string[] = [];
       const rest = args.slice(1);
       for (let i = 0; i < rest.length; i++) {
-        if (rest[i] === '--nonce' && rest[i + 1]) { nonce = rest[i + 1]; i++; } else { textParts.push(rest[i]); }
+        const arg = rest[i];
+        if (arg === '--compact') {
+          compact = true;
+          continue;
+        }
+        if (arg === '--nonce') {
+          if (!rest[i + 1]) throw new Error('--nonce requires a token');
+          nonce = rest[++i];
+          continue;
+        }
+        if (arg === '--limit') {
+          searchOptions.limit = parseIntegerOption(arg, rest[++i], 1);
+          continue;
+        }
+        if (arg === '--context') {
+          searchOptions.contextLimit = parseIntegerOption(arg, rest[++i], 0);
+          continue;
+        }
+        if (arg === '--snippet-length') {
+          snippetLength = parseIntegerOption(arg, rest[++i], 1);
+          compact = true;
+          continue;
+        }
+        if (arg.startsWith('--')) throw new Error(`Unknown --search option: ${arg}`);
+        textParts.push(arg);
       }
-      emit(searchText(textParts.join(' '), undefined, { invocationNonce: nonce }));
+      if (textParts.length === 0) throw new Error('--search requires text');
+      const results = searchText(textParts.join(' '), searchOptions, { invocationNonce: nonce });
+      emit(compact ? compactSearchResults(results, snippetLength) : results);
     } catch (error) { fail(error); }
     return;
   }
@@ -113,7 +175,7 @@ async function main() {
     }
     return;
   }
-  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text" [--nonce <token>]\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
+  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text" [--limit N] [--context N] [--compact] [--snippet-length N] [--nonce <token>]\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
   process.exitCode = 1;
 }
 

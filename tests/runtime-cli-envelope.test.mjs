@@ -52,6 +52,50 @@ test('--search emits a JSON array envelope', () => {
   assert.ok(Array.isArray(payload), 'search must return a JSON array');
 });
 
+test('--search compact mode bounds hits, context, and snippets', () => {
+  const home = tempHome();
+  const projectDir = join(home, '.claude', 'projects', '-tmp-compact');
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, 'compact-session.jsonl'), [
+    {
+      uuid: 'compact-user',
+      type: 'user',
+      timestamp: '2026-08-25T10:00:00.000Z',
+      cwd: '/tmp/compact',
+      message: { role: 'user', content: 'compact needle with a deliberately long payload' },
+    },
+    {
+      uuid: 'compact-assistant',
+      type: 'assistant',
+      parentUuid: 'compact-user',
+      timestamp: '2026-08-25T10:00:01.000Z',
+      cwd: '/tmp/compact',
+      message: { role: 'assistant', content: 'nearby context that should be omitted' },
+    },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n');
+
+  const result = runRuntime([
+    '--search', 'compact needle',
+    '--compact', '--limit', '1', '--context', '0', '--snippet-length', '12',
+  ], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.length, 1);
+  assert.equal(payload[0].message.snippet, 'compact need');
+  assert.equal('text' in payload[0].message, false);
+  assert.deepEqual(payload[0].context, []);
+  assert.equal(payload[0].session.id, 'compact-session');
+});
+
+test('--search rejects invalid output bounds', () => {
+  const home = tempHome();
+  const result = runRuntime(['--search', 'needle', '--context', '-1'], { home });
+
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /--context requires an integer >= 0/);
+});
+
 test('--query returns a pretty-printed JSON result on success', () => {
   const home = tempHome();
   const scriptPath = join(home, 'ok.mjs');

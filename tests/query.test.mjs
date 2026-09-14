@@ -97,6 +97,7 @@ test('search exposes content_type on hits and temporal context', () => {
   assert.equal(rows[0].context[0].uuid, 'msg-thinking');
   assert.equal(rows[0].context[0].content_type, 'thinking');
   assert.equal(rows[0].context[0].is_meta, 0);
+  assert.deepEqual(api.search('needle', { limit: 1, contextLimit: 0 })[0].context, []);
   db.close();
 });
 
@@ -457,6 +458,89 @@ test('memories follows list-helper scalar opts and filters by query within scope
     api.memories({ project: '%quiet-zero%', query: 'parallel agents', limit: 5 }).map(m => m.id),
     ['mem-1'],
   );
+
+  db.close();
+});
+
+test('memories keeps unattributed records when excluding the invoking session', () => {
+  const db = memoryDb();
+  db.prepare(`
+    INSERT INTO memories (id, session_id, project, path, summary, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    'mem-unattributed',
+    null,
+    'quiet-zero',
+    '.obelisk/memories/unattributed.md',
+    'Unattributed memory record.',
+    '2026-06-12T12:00:00Z',
+  );
+  const api = createQueryApi(db, { invokingSessionId: 'sid-2' });
+
+  assert.deepEqual(
+    api.memories({ excludeInvoking: true }).map(memory => memory.id),
+    ['mem-unattributed', 'mem-3', 'mem-1'],
+  );
+
+  db.close();
+});
+
+test('list helpers share exact project-path and invoking-session filters', () => {
+  const db = memoryDb();
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,visibility,agent_id,source)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `);
+  const insertCall = db.prepare(`
+    INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json,file_path)
+    VALUES (?,?,?,?,?,?)
+  `);
+  const insertResult = db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `);
+  const insertAgent = db.prepare(`
+    INSERT INTO subagents (agent_id,session_id,agent_type,description)
+    VALUES (?,?,?,?)
+  `);
+  const insertWorkflow = db.prepare(`
+    INSERT INTO workflows (run_id,session_id,timestamp,status,workflow_name)
+    VALUES (?,?,?,?,?)
+  `);
+  const insertSummary = db.prepare(`
+    INSERT INTO summaries (id,session_id,timestamp,source,content,visibility)
+    VALUES (?,?,?,?,?,?)
+  `);
+  for (const [index, sessionId] of ['sid-1', 'sid-2', 'sid-3'].entries()) {
+    const timestamp = `2026-06-${String(index + 9).padStart(2, '0')}T10:30:00Z`;
+    const messageId = `scope-message-${sessionId}`;
+    const callId = `scope-call-${sessionId}`;
+    const agentId = `scope-agent-${sessionId}`;
+    insertMessage.run(messageId, sessionId, 'assistant', 'assistant', 'scoped needle evidence', timestamp, 'visible', agentId, 'claude');
+    insertCall.run(callId, messageId, sessionId, 'read', '{}', '/tmp/scoped.ts');
+    insertResult.run(callId, messageId, sessionId, 'scoped failure', 1);
+    insertAgent.run(agentId, sessionId, 'review', 'Scoped review');
+    insertWorkflow.run(`scope-run-${sessionId}`, sessionId, timestamp, 'completed', 'Scoped workflow');
+    insertSummary.run(`scope-summary-${sessionId}`, sessionId, timestamp, 'compact', 'Scoped summary', 'visible');
+  }
+
+  const api = createQueryApi(db, { invokingSessionId: 'sid-2' });
+  const scope = {
+    projectPath: '/tmp/quiet-zero-test',
+    excludeInvoking: true,
+  };
+
+  assert.deepEqual(api.sessions(scope).map(row => row.id), ['sid-1']);
+  assert.deepEqual(
+    api.search('scoped needle', { ...scope, contextLimit: 0 }).map(row => row.session.id),
+    ['sid-1'],
+  );
+  assert.deepEqual(api.memories(scope).map(row => row.id), ['mem-1']);
+  assert.deepEqual(api.subagents(scope).map(row => row.session_id), ['sid-1']);
+  assert.deepEqual(api.workflows(scope).map(row => row.session_id), ['sid-1']);
+  assert.deepEqual(api.fileHistory('/tmp/scoped.ts', scope).map(row => row.session.id), ['sid-1']);
+  assert.deepEqual(api.failures(scope).map(row => row.session.id), ['sid-1']);
+  assert.deepEqual(api.summaries(scope).map(row => row.session_id), ['sid-1']);
 
   db.close();
 });
