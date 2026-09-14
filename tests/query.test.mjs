@@ -282,7 +282,7 @@ test('context and trace stop cleanly when a parent message is missing', () => {
   db.close();
 });
 
-test('context and trace follow at most 1000 parent edges', () => {
+test('context and trace return a complete chain deeper than 1000 parent edges', () => {
   const db = parentChainDb(
     'sid-deep-chain',
     'Deep chain',
@@ -293,13 +293,13 @@ test('context and trace follow at most 1000 parent edges', () => {
   );
   const api = createQueryApi(db);
   const contextChain = api.context('deep-1002').parentChain.map(message => message.uuid);
-  assert.equal(contextChain.length, 1000);
-  assert.equal(contextChain[0], 'deep-2');
+  assert.equal(contextChain.length, 1002);
+  assert.equal(contextChain[0], 'deep-0');
   assert.equal(contextChain.at(-1), 'deep-1001');
 
   const trace = api.trace('deep-1002').map(message => message.uuid);
-  assert.equal(trace.length, 1001);
-  assert.equal(trace[0], 'deep-2');
+  assert.equal(trace.length, 1003);
+  assert.equal(trace[0], 'deep-0');
   assert.equal(trace.at(-1), 'deep-1002');
   db.close();
 });

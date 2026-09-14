@@ -86,7 +86,6 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
 }
 
 const BASH_EXIT_PAT = 'Exit code %';
-const MAX_PARENT_EDGES = 1000;
 
 type QueryVisibility = 'visible' | 'inactive' | 'hidden';
 
@@ -126,7 +125,6 @@ function walkParentChain(
   const findMessage = db.prepare('SELECT * FROM messages WHERE uuid=?');
   const chain: DbRow[] = [];
   const visited = new Set<string>();
-  let followedEdges = 0;
   let current: DbRow | undefined = start;
   let isStart = true;
 
@@ -139,11 +137,10 @@ function walkParentChain(
     }
     isStart = false;
 
-    if (!current.parent_uuid || followedEdges >= MAX_PARENT_EDGES) break;
+    if (!current.parent_uuid) break;
     const parentUuid = String(current.parent_uuid);
     if (visited.has(parentUuid)) break;
     current = findMessage.get(parentUuid);
-    followedEdges++;
   }
   return chain.reverse();
 }

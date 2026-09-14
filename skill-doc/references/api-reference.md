@@ -151,8 +151,7 @@ to a subagent or workflow agent, `subagent` or `workflow` is populated when the
 metadata exists. Hidden targets always return `null`, and hidden ancestors are
 always omitted.
 
-Traversal stops before a repeated UUID or a missing parent. It also stops after
-following 1,000 parent edges.
+Traversal stops before a repeated UUID or a missing parent.
 
 #### `sql(query, ...params)`
 
@@ -336,7 +335,7 @@ Walk the `parent_uuid` chain from a message to the conversation root.
 Pass `{ includeInactive: true }` to follow a superseded path. Returns labeled
 messages ordered root-first. A hidden target returns an empty array, and hidden
 ancestors are omitted. Traversal stops before a repeated UUID or a missing
-parent. It also stops after following 1,000 parent edges.
+parent.
 
 #### `thread(sessionId, opts?)`
 
