@@ -225,3 +225,13 @@ Every PR:
 - Do not ship a code path you have flagged to yourself as unverified. Writing
   "this call site is worth another look" is honest, but it belongs in a follow-up
   issue, not in the diff.
+
+### Clarify the need for new concepts
+
+When a contributor proposes a new concept, field, state, or file type, help
+clarify the problem it solves, why it is needed, and how it differs from existing
+concepts before committing to a design. Bring relevant implementation facts and
+design decisions into the discussion: explain where reuse fits and where it would
+erase a meaningful distinction. Apply the same reasoning to abstractions an agent
+proposes. Record the resulting rationale concisely in the issue or PR, carrying
+forward decisions already settled there.
