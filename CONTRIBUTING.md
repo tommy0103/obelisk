@@ -180,6 +180,19 @@ interactions, or the full Electron suites.
 - **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
   `checkJs: false`, so a `.mjs` module has no type coverage at all.
 
+## CLI and tool error messages
+
+State what failed and the known cause, with only the context needed to diagnose
+or correct the problem. Preserve the underlying error; do not invent a cause or
+mask failure as success. Keep the message concise. Add corrective guidance only
+when it is specific and immediately useful.
+
+For multiple statements passed to `sql()`, compare these message bodies
+(the preferred message already exists in [`query.ts`](packages/core/src/query.ts)):
+
+- **Prefer:** `sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls`
+- **Avoid:** `sql() failed: invalid query`
+
 ## Indexing, daemon, and write ownership
 
 - **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
