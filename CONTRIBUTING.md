@@ -220,6 +220,9 @@ Every PR:
 ## Scope and review
 
 - One PR does one thing. Note explicitly anything you deliberately left out.
+- Keep the PR title and description aligned with the final diff and verification.
+  Include incidental behavior changes and remove claims or limitations that no
+  longer apply.
 - If you are unsure about a design decision, say so in the PR instead of
   guessing — an open question is cheaper to resolve than a silent assumption.
 - Do not ship a code path you have flagged to yourself as unverified. Writing
