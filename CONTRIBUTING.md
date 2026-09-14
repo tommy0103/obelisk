@@ -50,8 +50,9 @@ start heal itself?
 
 **4. Read the neighbouring implementation first, and reuse the concepts that
 already exist.**
-Adding a provider means reading `claude.ts`, `codex.ts`, and `kimi.ts` in full
-first. Needing "don't display this row" means grepping for `visibility` before
+Adding a provider means reading all provider implementations in
+[`packages/core/src/providers/`](packages/core/src/providers/) in full first.
+Needing "don't display this row" means grepping for `visibility` before
 inventing a field. The burden of proof for a new concept, field, state, or file
 type is on the PR: say why the existing one is insufficient. The ADRs in
 `docs/adr/` are constraints, not suggestions.
@@ -107,7 +108,9 @@ interactions, or the full Electron suites.
 
 ## Provider adapters
 
-- **Read `claude.ts`, `codex.ts`, and `kimi.ts` before writing a new adapter.**
+- **Read all provider implementations in
+  [`packages/core/src/providers/`](packages/core/src/providers/) before writing a
+  new adapter.**
   The conventions there are earned: zero-padded ordinals in ids
   (`parsing.ts` uses `padStart(6, '0')`), the
   `__<provider>_canonical_transcript_vN__` marker, how `git_branch` is handled.
