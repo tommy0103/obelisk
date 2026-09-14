@@ -216,6 +216,9 @@ Every PR:
    section in the PR description explaining why the original was wrong.
 5. **Fixtures are real provider output**, not hand-written approximations.
 6. **Confirm your new tests actually run in CI** (`.github/workflows/`).
+7. For shared logic, choose coverage from the affected callers and provider
+   contracts. Exercise behavior that differs across providers or entry points;
+   do not let mocks erase those differences.
 
 ## Scope and review
 
