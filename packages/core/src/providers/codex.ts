@@ -23,7 +23,7 @@ import {
   codexEventText, codexMessagePayloadText, codexVisibleMessageKey,
   codexToolInput, codexToolOutput,
   extractMessageIsMeta, isSkillInstructions,
-  readCodexGuardianThreadInfo,
+  readCodexGuardianThreadInfo, normalizeTranscriptTimestamp,
 } from '../parsing.ts';
 
 import type {
@@ -38,7 +38,7 @@ import type {
 } from './types.ts';
 
 export const name = 'codex';
-const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v3__';
+const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v4__';
 const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
@@ -185,8 +185,8 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
   const out: TranscriptRecord[] = [];
   const msgByUuid = new Map<string, MessageRecord>();
   const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
-  const initialTimestamp = (meta.timestamp || metaRecord.obj.timestamp || null) as string | null;
-  const indexedUpdatedAt = indexedMeta?.indexedUpdatedAt ?? null;
+  const initialTimestamp = normalizeTranscriptTimestamp(meta.timestamp || metaRecord.obj.timestamp);
+  const indexedUpdatedAt = normalizeTranscriptTimestamp(indexedMeta?.indexedUpdatedAt ?? null);
   const sm = {
     started_at: initialTimestamp,
     ended_at: indexedUpdatedAt && (!initialTimestamp || indexedUpdatedAt > initialTimestamp)
@@ -246,12 +246,12 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
   }
 
   for (const { lineNum: currentLine, obj } of records) {
-    const ts = obj.timestamp || null;
+    const ts = normalizeTranscriptTimestamp(obj.timestamp);
     if (obj.type === 'session_meta') {
       if (obj.payload?.cwd) currentCwd = normalizeObservedCwd(obj.payload.cwd) || currentCwd;
       if (obj.payload?.git?.branch) sm.git_branch = obj.payload.git.branch;
       if (obj.payload?.cli_version) sm.version = obj.payload.cli_version;
-      updateBounds(obj.payload?.timestamp || ts);
+      updateBounds(normalizeTranscriptTimestamp(obj.payload?.timestamp) || ts);
       continue;
     }
     if (obj.type === 'turn_context') {

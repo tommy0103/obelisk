@@ -73,8 +73,8 @@ test('claude parse() yields the expected record stream for a main session', () =
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].title, 'My Session');
   assert.equal(sessions[0].message_count, 3);
-  assert.equal(sessions[0].started_at, '2026-06-10T10:00:00Z');
-  assert.equal(sessions[0].ended_at, '2026-06-10T10:00:10Z');
+  assert.equal(sessions[0].started_at, '2026-06-10T10:00:00.000Z');
+  assert.equal(sessions[0].ended_at, '2026-06-10T10:00:10.000Z');
   assert.equal(sessions[0].git_branch, 'main');
 
   const detail = assembleSessionDetail(values);
@@ -93,6 +93,39 @@ test('claude parse() emits no session record for a subagent transcript', () => {
   assert.equal(values.filter(r => r.kind === 'session').length, 0);
   // Subagent messages carry the unit's agent id.
   assert.equal(values.filter(r => r.kind === 'message').every(m => m.agent_id === 'agent-7'), true);
+});
+
+test('claude parse() normalizes zone-carrying timestamps and keeps zone-less ones verbatim', () => {
+  const dir = makeTempDir('obelisk-claude-ts-');
+  const path = join(dir, 'sid-ts.jsonl');
+  const lines = [
+    { uuid: 'o1', type: 'user', timestamp: '2026-06-10T18:00:04+08:00', message: { role: 'user', content: 'offset' } },
+    { uuid: 'n1', type: 'assistant', timestamp: '2026-06-10T10:00:05Z', message: { role: 'assistant', content: [{ type: 'text', text: 'no millis' }] } },
+    { uuid: 'm1', type: 'assistant', timestamp: '2026-06-10T10:00:06.123456Z', message: { role: 'assistant', content: [{ type: 'text', text: 'micros' }] } },
+    { uuid: 'z1', type: 'user', timestamp: '2026-06-10T10:00:07', message: { role: 'user', content: 'zone-less' } },
+    { uuid: 'x1', type: 'user', message: { role: 'user', content: 'no timestamp' } },
+  ];
+  writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+
+  const { values } = drain(parse({ key: path, sessionId: 'sid-ts', project: 'quiet-zero' }, null));
+  const messages = values.filter(r => r.kind === 'message');
+
+  // Zone-carrying values are stored in canonical .sssZ form — the shape whose
+  // text order is chronological — whatever offset or precision the provider
+  // wrote. A zone-less value has no unambiguous UTC reading (JS would assume
+  // local time, SQLite UTC), so it is stored verbatim instead of being
+  // silently shifted; a missing value stays null.
+  assert.deepEqual(messages.map(m => [m.uuid, m.timestamp]), [
+    ['o1', '2026-06-10T10:00:04.000Z'],
+    ['n1', '2026-06-10T10:00:05.000Z'],
+    ['m1', '2026-06-10T10:00:06.123Z'],
+    ['z1', '2026-06-10T10:00:07'],
+    ['x1', null],
+  ]);
+
+  const session = values.find(r => r.kind === 'session');
+  assert.equal(session.started_at, '2026-06-10T10:00:04.000Z');
+  assert.equal(session.ended_at, '2026-06-10T10:00:07');
 });
 
 test('claude parse() resumes from a cursor, skipping already-indexed lines', () => {

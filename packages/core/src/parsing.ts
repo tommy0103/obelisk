@@ -148,6 +148,23 @@ function normalizeObservedCwd(cwd: unknown): string | null {
   return normalize(cwd);
 }
 
+// Canonical message timestamps are YYYY-MM-DDTHH:mm:ss.sssZ, the one shape
+// whose text order is chronological; the query layer's indexed lookups,
+// time-range filters, and session bounds all compare timestamps as text.
+// Only zone-carrying ISO strings have an unambiguous UTC reading — Date.parse
+// treats a zone-less string as local time while SQLite's date functions treat
+// it as UTC — so zone-less or unparseable values pass through verbatim instead
+// of being silently shifted.
+const ISO_ZONED_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/;
+
+function normalizeTranscriptTimestamp(value: unknown): string | null {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string') return null;
+  if (!ISO_ZONED_TIMESTAMP_RE.test(value)) return value;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? value : new Date(ms).toISOString();
+}
+
 function projectSlugFromPath(projectPath: string | null): string | null {
   const normalized = normalizeObservedCwd(projectPath);
   if (!normalized) return null;
@@ -401,7 +418,7 @@ export {
   CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
-  discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,
+  discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue, normalizeTranscriptTimestamp,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
   readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole, parseCodexJsonInput,
   codexUsage, codexEventText, codexMessagePayloadText, codexVisibleMessageKey, codexToolInput, codexToolOutput,
