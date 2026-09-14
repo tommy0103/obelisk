@@ -146,3 +146,16 @@ test('generic object tool input continues to render as a field grid', () => {
   assert.match(html, /class="field-key">recursive</);
   assert.doesNotMatch(html, /class="file-content"/);
 });
+
+test('string tool inputs preserve numeric prefixes, tabs, blank lines and trailing newlines', () => {
+  const input = '  12\t<value> &amp;\n13\tsecond\n\n14\tlast\n';
+  const html = renderPrettyTool({ name: 'custom_tool', input_json: JSON.stringify(input) });
+  assert.equal(html.match(/<div class="code">([\s\S]*?)<\/div>/)?.[1],
+    '  12\t&lt;value&gt; &amp;amp;\n13\tsecond\n\n14\tlast\n');
+});
+
+test('Read output still moves its captured line numbers into the gutter', () => {
+  const html = renderPrettyTool({ name: 'Read', result: { content: '12\tfirst\n13\tsecond' } });
+  assert.match(html, /<div class="gutter">12\n13<\/div>/);
+  assert.match(html, /<div class="code">first\nsecond<\/div>/);
+});

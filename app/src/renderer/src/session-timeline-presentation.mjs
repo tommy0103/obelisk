@@ -21,9 +21,9 @@ function formatToolInput(toolCall) {
   }
 }
 
-function renderFileContent(text, label = 'File contents') {
+function renderFileContent(text, label = 'File contents', stripLineNumbers = true) {
   let lines = text.split('\n');
-  const hasLineNums = lines.length > 1 && lines.slice(0, 5).every(line => /^\s*\d+\t/.test(line) || line === '');
+  const hasLineNums = stripLineNumbers && lines.length > 1 && lines.slice(0, 5).every(line => /^\s*\d+\t/.test(line) || line === '');
   let gutter;
   if (hasLineNums) {
     const parsed = lines.map(line => {
@@ -227,7 +227,7 @@ export function renderPrettyTool(toolCall) {
   const terminal = renderTerminalTool(toolCall.name, args, output, isError);
   if (terminal !== null) return terminal;
   const input = typeof args === 'string'
-    ? renderFileContent(args, 'Input')
+    ? renderFileContent(args, 'Input', false)
     : `<div class="body-section"><div class="body-label">Input</div>${renderFieldGrid(args)}</div>`;
   return input
     + (output ? `<div class="body-section" style="margin-top:12px;"><div class="body-label">Output</div>${renderOutput(output, isError)}</div>` : '');
