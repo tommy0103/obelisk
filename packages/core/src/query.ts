@@ -117,6 +117,34 @@ function isQueryableMessage(
   return visibility === 'visible' || (includeInactive && visibility === 'inactive');
 }
 
+function walkParentChain(
+  db: SqliteDb,
+  start: DbRow,
+  { includeInactive = false, includeStart = false } = {},
+): DbRow[] {
+  const findMessage = db.prepare('SELECT * FROM messages WHERE uuid=?');
+  const chain: DbRow[] = [];
+  const visited = new Set<string>();
+  let current: DbRow | undefined = start;
+  let isStart = true;
+
+  while (current) {
+    const currentUuid = String(current.uuid);
+    if (visited.has(currentUuid)) break;
+    visited.add(currentUuid);
+    if ((!isStart || includeStart) && isQueryableMessage(current, includeInactive)) {
+      chain.push(withVisibility(current));
+    }
+    isStart = false;
+
+    if (!current.parent_uuid) break;
+    const parentUuid = String(current.parent_uuid);
+    if (visited.has(parentUuid)) break;
+    current = findMessage.get(parentUuid);
+  }
+  return chain.reverse();
+}
+
 function visibilitySql(alias: string, includeInactive = false): string {
   const column = `${alias}.visibility`;
   return includeInactive
@@ -425,12 +453,7 @@ function createQueryApi(
     if (!isQueryableMessage(msg, includeInactive)) return null;
     const message = withVisibility(msg);
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id);
-    const chain: DbRow[] = [];
-    let cur: DbRow | undefined = msg;
-    while (cur?.parent_uuid) {
-      cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid);
-      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
-    }
+    const chain = walkParentChain(db, msg, { includeInactive });
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
     if (subagent) subagent.total_tokens = subagent.total_tokens ?? deriveSubagentTokens(db, msg.agent_id);
     let workflow = null;
@@ -443,14 +466,9 @@ function createQueryApi(
 
   const trace = (uuid: string, opts: QueryOptions = {}) => {
     const includeInactive = opts.includeInactive === true;
-    const chain: DbRow[] = [];
-    let cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-    if (!isQueryableMessage(cur, includeInactive)) return chain;
-    while (cur) {
-      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
-      cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined;
-    }
-    return chain;
+    const message = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
+    if (!isQueryableMessage(message, includeInactive)) return [];
+    return walkParentChain(db, message, { includeInactive, includeStart: true });
   };
 
   const thread = (sid: string, opts: QueryOptions = {}) => {
