@@ -7,6 +7,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
+import { querySessionCatalogue } from './session-catalogue.ts';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
 import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
@@ -612,6 +613,13 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
   params.push(limit);
   return db.prepare(sql).all(...params);
 });
+
+ipcMain.handle('db:getSessionCatalogue', (_, opts = {}) => {
+  if (!db) return { sessions: [], total: 0 };
+  return querySessionCatalogue(db, opts);
+});
+
+ipcMain.handle('db:getSessionMetadata', (_, sessionId: string) => querySessionMetadata(sessionId));
 
 ipcMain.handle('db:getSessionMessages', (_, sessionId) => {
   return querySessionMessages(sessionId);

@@ -21,6 +21,8 @@ const nearTailEscapeAppendIndex = scrollingAppendIndex + 1;
 const tailAppendIndex = nearTailEscapeAppendIndex + 1;
 const channels = [
   'db:getSessions',
+  'db:getSessionMetadata',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -514,6 +516,8 @@ async function traceStationaryAppend(win, index, expectedTotal, runIndex) {
 }
 
 function registerHandlers() {
+  ipcMain.handle('db:getSessionMetadata', (_event, id) => sessionSummary());
+  ipcMain.handle('db:getSessionCatalogue', () => ({ sessions: sessionSummaries(), total: sessionSummaries().length }));
   ipcMain.handle('db:getSessions', async () => {
     globalReads.sessions++;
     if (firstSessionListRead) {
@@ -645,17 +649,30 @@ async function run() {
       requestAnimationFrame(sample);
     }
     requestAnimationFrame(sample);
+    // Signal from the actual cold-layout phase instead of assuming that a
+    // fixed 10ms timer runs after IPC has established the initial snapshot.
+    window.__coldLayoutReady = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { observer.disconnect(); reject(new Error('Cold layout did not appear')); }, 8000);
+      const observer = new MutationObserver(() => {
+        if (document.querySelector('.flap-number')?.getAttribute('aria-label') !== '${messageCount}') return;
+        const header = document.querySelector('.session-header');
+        if (!header || getComputedStyle(header).visibility !== 'hidden') return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      });
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+    });
     window.location.hash = ${JSON.stringify(`/sessions/${sessionId}`)};
   })()`, true);
-  const coldOpenUpdateTimer = setTimeout(() => {
-    win.webContents.send('obelisk:session-updated', { sessionId });
-  }, 10);
+  await win.webContents.executeJavaScript('window.__coldLayoutReady', true);
+  win.webContents.send('obelisk:session-updated', { sessionId });
   await waitFor(
     win.webContents,
     `document.querySelector('.flap-number')?.getAttribute('aria-label') === '${messageCount}'`,
     'the cold-start session snapshot',
   );
-  clearTimeout(coldOpenUpdateTimer);
+
   for (let attempt = 0; attempt < 100 && ipcReads.patches === 0; attempt++) {
     await delay(10);
   }

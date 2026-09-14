@@ -48,9 +48,9 @@ function commitStoredSessionMetadata(sessionId, metadata) {
 export async function fetchInitialData() {
   const [rawMemories, rawSessions, stats, projects] = await Promise.all([
     window.obelisk.getMemories(),
-    window.obelisk.getSessions({ source: 'all', limit: 1000 }),
-    window.obelisk.getStats(),
-    window.obelisk.getProjects()
+    window.obelisk.getSessions({ source: 'all', limit: 100 }),
+    window.obelisk.getStats({ source: 'all' }),
+    window.obelisk.getProjects({ source: 'all' })
   ]);
   return { rawMemories, rawSessions, stats, projects };
 }
@@ -68,8 +68,12 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects })
   }));
 
   // The catalogue now owns the latest metadata; route overlays can retire.
-  state.sessionTitleOverrides.clear();
+  for (const session of rawSessions || []) {
+    state.sessionTitleOverrides.delete(session.id);
+  }
 
+  // Small metadata cache for cross-view labels. SessionList owns its paged
+  // catalogue separately; refreshing this cache must not reset its loaded rows.
   // Sessions: merge with existing data to preserve already-loaded messages
   const existingSessions = new Map(state.sessions.map(s => [s.id, s]));
   state.sessions = (rawSessions || []).map(s => {
@@ -92,6 +96,9 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects })
  * Returns the assembled session object (also updates state.sessions entry).
  */
 export async function loadSessionDetail(sessionId) {
+  const metadata = sessionMetadata(await window.obelisk.getSessionMetadata(sessionId));
+  if (!metadata) return null;
+  commitStoredSessionMetadata(sessionId, metadata);
   const [messages, toolCalls, toolResults, subagents, workflows, summaries] = await Promise.all([
     window.obelisk.getSessionMessages(sessionId),
     window.obelisk.getSessionToolCalls(sessionId),
@@ -106,7 +113,6 @@ export async function loadSessionDetail(sessionId) {
     workflows: detail.workflows,
     summaries: detail.summaries,
   };
-  const metadata = sessionMetadata(state.sessions.find(candidate => candidate.id === sessionId));
   rememberSessionMessageSnapshot(sessionId, {
     snapshot,
     cursor: createSessionPatchCursor(snapshot),

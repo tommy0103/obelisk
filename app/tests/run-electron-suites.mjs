@@ -11,6 +11,7 @@ import electron from 'electron'
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const suites = [
   'electron-concurrency.mjs',
+  'electron-session-catalogue.mjs',
   'electron-session-images.mjs',
   'electron-session-virtualization.mjs',
   'electron-session-reader-state.mjs',

@@ -19,6 +19,7 @@ class SqliteCompatDatabase {
   constructor(dbFile) {
     this.db = new DatabaseSync(dbFile);
   }
+  function(...args) { return this.db.function(...args); }
   pragma(statement) { this.db.exec(`PRAGMA ${statement}`); }
   exec(sql) { return this.db.exec(sql); }
   close() { return this.db.close(); }
@@ -798,6 +799,11 @@ test('main process migrates an existing app database before source-filtered IPC 
     const sessions = ipcHandlers.get('db:getSessions')(null, {});
     assert.equal(sessions[0].id, 'legacy-session');
     assert.equal(sessions[0].source, 'claude');
+    const page = ipcHandlers.get('db:getSessionCatalogue')(null, { source: 'all', limit: 100 });
+    assert.equal(page.total, 1);
+    assert.equal(page.sessions[0].id, 'legacy-session');
+    assert.equal(ipcHandlers.get('db:getSessionMetadata')(null, 'legacy-session').title, 'Legacy session');
+    assert.equal(ipcHandlers.get('db:getSessionMetadata')(null, 'missing'), null);
     assert.deepEqual(ipcHandlers.get('db:getStats')(null, {}), {
       sessions: 1,
       memories: 0,

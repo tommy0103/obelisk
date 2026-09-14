@@ -48,6 +48,8 @@ const appRoot = join(here, '..');
 const sessionId = 'session-image-test';
 const channels = [
   'db:getSessions',
+  'db:getSessionMetadata',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -190,6 +192,8 @@ function sessionSummary() {
 }
 
 function registerHandlers() {
+  ipcMain.handle('db:getSessionMetadata', (_event, id) => sessionSummary());
+  ipcMain.handle('db:getSessionCatalogue', () => ({ sessions: [sessionSummary()], total: [sessionSummary()].length }));
   ipcMain.handle('db:getSessions', () => [sessionSummary()]);
   ipcMain.handle('db:getSessionMessages', () => messages);
   ipcMain.handle('db:getSessionToolCalls', () => []);

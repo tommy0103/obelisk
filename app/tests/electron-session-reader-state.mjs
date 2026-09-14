@@ -13,6 +13,8 @@ const focusUuid = 'a-message-180';
 const expandedTextSentinel = 'RESTORED FULL TEXT SENTINEL';
 const channels = [
   'db:getSessions',
+  'db:getSessionMetadata',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -99,6 +101,8 @@ async function waitFor(webContents, expression, message, timeoutMs = 8_000) {
 }
 
 function registerHandlers() {
+  ipcMain.handle('db:getSessionMetadata', (_event, id) => summary(id));
+  ipcMain.handle('db:getSessionCatalogue', () => ({ sessions: [summary(sessionA), summary(sessionB)], total: [summary(sessionA), summary(sessionB)].length }));
   ipcMain.handle('db:getSessions', () => [summary(sessionA), summary(sessionB)]);
   ipcMain.handle('db:getSessionMessages', (_event, sessionId) => fixtures[sessionId]?.messages || []);
   ipcMain.handle('db:getSessionToolCalls', (_event, sessionId) => fixtures[sessionId]?.toolCalls || []);

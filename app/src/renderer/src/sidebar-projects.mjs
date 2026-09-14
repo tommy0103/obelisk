@@ -39,7 +39,9 @@ export function buildSidebarProjects({
   const items = routeType === 'sessions'
     ? sessions
     : memories.filter(memory => view === 'archived' ? memory.archived : !memory.archived);
-  const counts = countByProject(items);
+  const counts = routeType === 'sessions'
+    ? Object.fromEntries(projects.map(project => [project.project, project.session_count || 0]))
+    : countByProject(items);
   const q = search.trim().toLowerCase();
 
   return orderedProjectSlugs(counts, projects, formatProjectLabel)

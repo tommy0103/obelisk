@@ -13,6 +13,8 @@ const sessionId = 'file-ref-session';
 const cwd = '/tmp/obelisk-file-ref-fixture';
 const channels = [
   'db:getSessions',
+  'db:getSessionMetadata',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -91,6 +93,8 @@ async function waitFor(webContents, expression, message, timeoutMs = 8_000) {
 }
 
 function registerHandlers() {
+  ipcMain.handle('db:getSessionMetadata', (_event, id) => summary());
+  ipcMain.handle('db:getSessionCatalogue', () => ({ sessions: [summary()], total: [summary()].length }));
   ipcMain.handle('db:getSessions', () => [summary()]);
   ipcMain.handle('db:getSessionMessages', () => messages);
   ipcMain.handle('db:getSessionToolCalls', () => []);

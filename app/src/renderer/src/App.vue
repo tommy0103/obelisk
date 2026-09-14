@@ -36,7 +36,7 @@ const routeSession = computed(() => {
 const activeCount = computed(() => state.memories.filter(m => !m.archived).length);
 const archivedCount = computed(() => state.memories.filter(m => m.archived).length);
 const totalMemoryCount = computed(() => state.memories.length);
-const sessionCount = computed(() => state.sessions.length);
+const sessionCount = computed(() => state.stats.sessions ?? 0);
 
 const currentRouteType = computed(() => {
   const name = route.name;
@@ -313,7 +313,7 @@ provide('recapGenerateOpen', recapGenerateOpen);
               <path d="M5.5 7h5M5.5 9.5h3" stroke-linecap="round"/>
             </svg>
             <span class="label">Sessions</span>
-            <span class="badge">{{ sessionCount }}</span>
+            <span class="badge" title="All indexed sessions · all sources">{{ sessionCount }}</span>
           </button>
           <button
             class="sidebar-item"

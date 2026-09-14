@@ -119,6 +119,7 @@ test('a skipped live patch does not advance the visible patch baseline', async t
 
   globalThis.window = {
     obelisk: {
+      getSessionMetadata: async () => ({ id: sessionId, title: 'Initial title', message_count: 1 }),
       getSessionMessages: async () => rows,
       getSessionToolCalls: async () => [],
       getSessionToolResults: async () => [],
