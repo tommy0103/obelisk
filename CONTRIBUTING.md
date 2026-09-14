@@ -201,6 +201,15 @@ interactions, or the full Electron suites.
   `recursive_triggers` is off, so a trigger-based refresh would leave stale text
   behind.
 
+## Performance changes
+
+Measure the affected workload before optimizing, then compare the same workload
+before and after the change. Report enough context to judge the result, including
+workload size and measurement variability. Preserve required behavior, data
+ownership, merge semantics, and recovery guarantees; check those contracts before
+extending an optimization to another path. Make remaining costs and deliberate
+tradeoffs explicit.
+
 ---
 
 ## Verification contract
