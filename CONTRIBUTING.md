@@ -34,6 +34,9 @@ The single most common failure is a capability that is advertised but
 unreachable. If you describe a config option, use that option from the outermost
 entry point before submitting. If you post a screenshot, the input in that
 screenshot must be an input the code can actually handle.
+When changing build output, package contents, or runtime resource loading, verify
+the built or packaged artifact through the entry point users run, including its
+required resources. Source-level tests alone do not cover that boundary.
 
 **2. Write assertions in the words of the requirement, not the shape of the
 implementation.**
