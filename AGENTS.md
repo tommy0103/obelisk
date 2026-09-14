@@ -29,7 +29,8 @@ before making a decision that depends on it.
 | Provider discovery, parsing, and history | [Provider requirements](CONTRIBUTING.md#provider-adapters), [canonical transcript contract](docs/adr/0007-canonical-transcript-session-detail-seam.md), and [retrieval semantics](skill-doc/references/retrieval-semantics.md) |
 | Renderer and Electron | [Renderer requirements](CONTRIBUTING.md#renderer--electron-ui-changes), [main process and untrusted input](CONTRIBUTING.md#main-process-and-untrusted-input), and [Electron source/build decision](docs/adr/0005-app-electron-vite-ts-esm.md) |
 | Schema, indexing, and write ownership | [Schema requirements](CONTRIBUTING.md#schema-and-migrations), [indexing requirements](CONTRIBUTING.md#indexing-daemon-and-write-ownership), and [transaction and concurrency contract](docs/adr/0006-write-transaction-rollback-and-concurrency.md) |
-| CLI and query/tool interfaces | [Runtime contract](docs/adr/0002-two-tier-runtime-contract.md), authoritative [API reference](skill-doc/references/api-reference.md), and [CLI package guidance](packages/cli/README.md) |
+| CLI and query/tool interfaces | [Runtime contract](docs/adr/0002-two-tier-runtime-contract.md), authoritative [API reference](skill-doc/references/api-reference.md), [error message requirements](CONTRIBUTING.md#cli-and-tool-error-messages), and [CLI package guidance](packages/cli/README.md) |
+| Performance changes | [Performance requirements](CONTRIBUTING.md#performance-changes) |
 | Packaging, skills, and DSH integration | [Skill artifact decision](docs/adr/0004-skill-artifact-readable-not-bundled.md), [plugin contract](docs/adr/0012-obelisk-as-dsh-optional-retrieval-plugin.md), and [plugin package guidance](packages/dsh-plugin/README.md) |
 
 ## Before delivery
