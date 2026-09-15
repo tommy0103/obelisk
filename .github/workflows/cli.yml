@@ -27,10 +27,13 @@ jobs:
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
         run: npm --prefix app ci
+      - run: npm run build:cli
+      - name: Verify storage path contracts
+        if: runner.os == 'Linux'
+        run: node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/paths.test.mjs tests/app-storage-paths.test.mjs tests/app-main-storage.test.mjs
       - name: Verify complete repository suite
         if: runner.os == 'Linux'
         run: npm test
-      - run: npm run build:cli
       - name: Verify CLI package and runtime contract
         run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs tests/codex-index.test.mjs
 

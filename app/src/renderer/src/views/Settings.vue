@@ -47,7 +47,7 @@ async function loadSettings({ preserveRecapPath = false } = {}) {
   const s = await window.obelisk.getSettings();
   sources.value = s.sources || [];
   dbPath.value = s.dbPath || '';
-  if (!preserveRecapPath) recapPath.value = s.recapDir || '~/.obelisk/recap';
+  if (!preserveRecapPath) recapPath.value = s.recapDir || '';
   autoRefresh.value = s.autoRefresh !== false;
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
