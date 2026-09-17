@@ -5,6 +5,19 @@ export interface SourceQueryOptions {
   source?: string;
 }
 
+export interface SessionCatalogueOptions extends SourceQueryOptions {
+  project?: string;
+  query?: string;
+  sortDesc?: boolean;
+  limit?: number;
+  anchorId?: string;
+}
+
+export interface SessionCataloguePage {
+  sessions: SessionMetadata[];
+  total: number;
+}
+
 export type UsageStatsOptions = SourceQueryOptions;
 
 export type SessionPatchTable =

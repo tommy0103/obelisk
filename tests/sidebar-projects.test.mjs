@@ -10,12 +10,12 @@ test('session sidebar projects follow database recency order instead of label or
     { project: '-Users-dev-Code-sample-cli-' },
     { project: '-Users-dev-Code-quiet-zero' },
     { project: '-Users-dev-Code-quiet-zero' },
-    { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444' },
+    { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444', session_count: 1 },
   ];
   const projects = [
-    { project: '-Users-dev-Code-quiet-zero' },
-    { project: '-Users-dev-Code-sample-cli-' },
-    { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444' },
+    { project: '-Users-dev-Code-quiet-zero', session_count: 2 },
+    { project: '-Users-dev-Code-sample-cli-', session_count: 1 },
+    { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444', session_count: 1 },
   ];
   const labels = {
     '-Users-dev-Code-sample-cli-': 'sample-cli+',
@@ -56,4 +56,11 @@ test('memory sidebar projects filter by archive state and label search', () => {
   });
 
   assert.deepEqual(result, [{ slug: 'quiet-zero', label: 'quiet-zero', count: 1 }]);
+});
+
+test('session project counts include older-only projects without loaded sessions', () => {
+  const result = buildSidebarProjects({ routeType: 'sessions', sessions: [], projects: [
+    { project: 'older-only', session_count: 55 }, { project: 'current', session_count: 1050 },
+  ] });
+  assert.deepEqual(result.map(p => [p.slug, p.count]), [['older-only', 55], ['current', 1050]]);
 });

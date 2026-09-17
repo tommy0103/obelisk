@@ -5,10 +5,12 @@
 // holds only data and cross-view UI preferences.
 
 import { reactive, shallowReactive, markRaw } from 'vue';
+import { createSessionCatalogueState } from './session-catalogue.mjs';
 
 export const state = reactive({
   memories: [],
   sessions: [],
+  sessionCatalogue: createSessionCatalogueState(),
   sessionTitleOverrides: shallowReactive(new Map()),
   projects: [],
   sources: [],
@@ -27,7 +29,8 @@ export const state = reactive({
 
 export function getSessionSummary(sessionId) {
   const id = String(sessionId || '');
-  const session = state.sessions.find(candidate => candidate.id === id);
+  const session = state.sessionCatalogue.rows.find(candidate => candidate.id === id)
+    || state.sessions.find(candidate => candidate.id === id);
   const title = state.sessionTitleOverrides.get(id);
   if (title === undefined) return session;
   return { ...(session || { id }), title };

@@ -2,9 +2,10 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { state } from '../store.js';
+import { createSessionCatalogue } from '../session-catalogue.mjs';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
 
 defineOptions({ name: 'SessionList' });
@@ -22,29 +23,61 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
 
 const homePath = (typeof process !== 'undefined' && process.env?.HOME) || '~';
 
-const visibleSessions = computed(() => {
-  const q = state.query.trim().toLowerCase();
-  return state.sessions
-    .filter(s => state.projectFilter === 'all' || s.project === state.projectFilter)
-    .filter(s => state.sourceFilter === 'all' || (s.source || 'claude') === state.sourceFilter)
-    .map(s => {
-      if (!q) return { ...s, messageHit: null };
-      const topMatch = (s.title || '').toLowerCase().includes(q) ||
-                       (s.project || '').toLowerCase().includes(q) ||
-                       (s.git_branch || '').toLowerCase().includes(q);
-      if (topMatch) return { ...s, messageHit: null };
-      return null;
-    })
-    .filter(Boolean)
-    .sort((a, b) => {
-      const ta = new Date(a.ended_at || a.started_at || 0).getTime();
-      const tb = new Date(b.ended_at || b.started_at || 0).getTime();
-      return state.sortDesc ? tb - ta : ta - tb;
-    });
+const wrap = ref(null);
+const catalogue = state.sessionCatalogue;
+const visibleSessions = computed(() => catalogue.rows);
+
+function capturePosition() {
+  const element = wrap.value;
+  if (!element || element.scrollTop < 1) return null;
+  const top = element.getBoundingClientRect().top;
+  const row = [...element.querySelectorAll('[data-session-id]')]
+    .find(item => item.getBoundingClientRect().bottom > top);
+  return row ? { id: row.dataset.sessionId, offset: row.getBoundingClientRect().top - top } : null;
+}
+
+async function restorePosition(position) {
+  await nextTick();
+  const element = wrap.value;
+  if (!element || !position) return;
+  const row = [...element.querySelectorAll('[data-session-id]')]
+    .find(item => item.dataset.sessionId === position.id);
+  if (row) element.scrollTop += row.getBoundingClientRect().top - element.getBoundingClientRect().top - position.offset;
+}
+
+const loader = createSessionCatalogue({
+  state: catalogue,
+  query: options => window.obelisk.getSessionCatalogue(options),
+  capture: capturePosition,
+  restore: restorePosition,
+});
+let stopUpdates;
+let mounted = false;
+watch(() => [state.query, state.projectFilter, state.sourceFilter, state.sortDesc], () => {
+  void loader.configure({ query: state.query, project: state.projectFilter, source: state.sourceFilter, sortDesc: state.sortDesc });
+});
+function refreshOnVisible() {
+  if (document.visibilityState === 'visible') void loader.refresh();
+}
+onMounted(async () => {
+  mounted = true;
+  await restorePosition(catalogue.position);
+  if (!mounted) return;
+  void loader.configure({ query: state.query, project: state.projectFilter, source: state.sourceFilter, sortDesc: state.sortDesc });
+  stopUpdates = window.obelisk.onIndexUpdated(() => { void loader.refresh(); });
+  document.addEventListener('visibilitychange', refreshOnVisible);
+});
+onBeforeUnmount(() => {
+  mounted = false;
+  catalogue.position = capturePosition();
+  catalogue.showNoise = showNoise.value;
+  loader.dispose();
+  stopUpdates?.();
+  document.removeEventListener('visibilitychange', refreshOnVisible);
 });
 
 const showProjectPrefix = computed(() => state.projectFilter === 'all');
-const showNoise = ref(false);
+const showNoise = ref(catalogue.showNoise);
 
 function isNoise(s) {
   return !s.title;
@@ -103,9 +136,10 @@ function obeliskStyle(session) {
 </script>
 
 <template>
-  <div class="session-list-wrap">
+  <div ref="wrap" class="session-list-wrap" :aria-busy="catalogue.loading">
+    <div v-if="!catalogue.loaded && !catalogue.error" class="catalogue-status" role="status">Loading sessions…</div>
     <!-- Empty state: no data source / debug toggle -->
-    <div v-if="state.loaded && (debugEmpty || (!visibleSessions.length && !state.query))" class="empty-content">
+    <div v-if="catalogue.loaded && (debugEmpty || (!state.stats.sessions && !visibleSessions.length && !state.query))" class="empty-content">
       <div class="empty-eyebrow">
         <span class="diamond"></span>
         <span>No data source connected</span>
@@ -140,12 +174,12 @@ function obeliskStyle(session) {
     </div>
 
     <!-- Empty state: search returned nothing -->
-    <div v-else-if="state.loaded && !visibleSessions.length" class="empty">
+    <div v-else-if="catalogue.loaded && !visibleSessions.length" class="empty">
       No sessions here.
       <span class="hint">{{ state.query ? 'Try a different search term.' : 'Press / to search.' }}</span>
     </div>
 
-    <div v-else class="session-list">
+    <div v-else-if="catalogue.rows.length" class="session-list">
       <div
         v-for="s in normalSessions"
         :key="s.id"
@@ -180,7 +214,7 @@ function obeliskStyle(session) {
       </div>
 
       <!-- Noise sessions (collapsed by default) -->
-      <div v-if="showNoise && noiseSessions.length" class="noise-group">
+      <div v-if="(showNoise || state.query) && noiseSessions.length" class="noise-group">
         <div class="noise-group-head">
           {{ noiseSessions.length }} sessions · untitled
         </div>
@@ -188,6 +222,7 @@ function obeliskStyle(session) {
           v-for="s in noiseSessions"
           :key="s.id"
           class="srow noise"
+          :data-session-id="s.id"
           @click="openSession(s)"
         >
           <div class="srow-body">
@@ -202,7 +237,7 @@ function obeliskStyle(session) {
           </div>
           <div class="srow-right">{{ timeLabel(s) }}</div>
         </div>
-        <button class="noise-fold-bottom" @click.stop="showNoise = false">
+        <button v-if="!state.query" class="noise-fold-bottom" @click.stop="showNoise = false">
           <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
             <path d="M4 2.5l3 3.5-3 3.5"/>
           </svg>
@@ -210,11 +245,32 @@ function obeliskStyle(session) {
         </button>
       </div>
     </div>
+    <div v-if="catalogue.error" class="catalogue-status" role="alert">
+      {{ catalogue.error }} <button class="toolbar-action" @click="loader.refresh()">Retry</button>
+    </div>
+    <div v-if="catalogue.loaded && catalogue.rows.length < catalogue.total" class="catalogue-status">
+      <button class="toolbar-action load-more" :disabled="catalogue.loading" @click="loader.more()">
+        {{ catalogue.loading ? 'Loading…' : 'Load more' }}
+      </button>
+      <span>{{ catalogue.rows.length }} of {{ catalogue.total }} sessions</span>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.catalogue-status {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+.session-list { flex-shrink: 0; }
 .session-list-wrap {
+  overflow-anchor: none;
   flex: 1;
   overflow-y: auto;
   min-height: 0;

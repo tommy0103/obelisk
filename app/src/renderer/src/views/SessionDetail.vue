@@ -225,12 +225,6 @@ onUnmounted(() => {
   removeSessionUpdated = null;
 });
 
-watch(() => session.value?.id, async sessionId => {
-  if (sessionId === props.id && messages.value.length === 0) {
-    await loadMessages({ force: true });
-  }
-});
-
 watch(() => route.query.focus, async focus => {
   pendingFocusUuid.value = typeof focus === 'string' ? focus : null;
   if (
@@ -288,10 +282,8 @@ async function fetchSessionSnapshot(sessionId, { force = false } = {}) {
   const messageSnapshot = force ? null : getCachedSessionDetail(sessionId);
   if (messageSnapshot) return messageSnapshot;
   const cached = state.sessions.find(session => session.id === sessionId);
-  if (cached && (force || !cached.messages || cached.messages.length === 0)) {
-    return loadSessionDetail(sessionId);
-  }
-  return cached;
+  if (cached?.messages?.length && !force) return cached;
+  return loadSessionDetail(sessionId);
 }
 
 async function loadLiveSnapshot() {

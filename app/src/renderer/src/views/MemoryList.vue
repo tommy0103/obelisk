@@ -4,7 +4,7 @@
 <script setup>
 import { computed, ref, nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { state, FOLDER_SVG, setSelection, clearSelection } from '../store.js';
+import { state, getSessionSummary, FOLDER_SVG, setSelection, clearSelection } from '../store.js';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative, renderMarkdown } from '../utils.js';
 import { loadMemoryMarkdown, archiveMemory, restoreMemory } from '../data.js';
 import { resolveMemoryShortcut } from '../keyboard-shortcuts.mjs';
@@ -36,6 +36,23 @@ const showProjectPrefix = computed(() => state.projectFilter === 'all');
 
 const detailMemory = computed(() => props.id ? state.memories.find(memory => memory.id === props.id) : null);
 const detailMarkdown = ref(null);
+const sourceSession = ref(null);
+watch(() => detailMemory.value?.session_id, async (id, _previous, onCleanup) => {
+  sourceSession.value = null;
+  if (!id) return;
+  let current = true;
+  let timer;
+  onCleanup(() => { current = false; clearTimeout(timer); });
+  try {
+    const metadata = await Promise.race([
+      window.obelisk.getSessionMetadata(id),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Session title lookup timed out')), 15000); }),
+    ]);
+    if (current) sourceSession.value = metadata;
+  } catch {
+    // The existing ID label remains usable if a title lookup fails.
+  } finally { clearTimeout(timer); }
+}, { immediate: true });
 const showSource = ref(false);
 const loadingMarkdown = ref(false);
 
@@ -82,7 +99,7 @@ function summaryHTML(m) {
 
 function sourceSessionTitle(m) {
   if (!m.session_id) return '';
-  const s = state.sessions.find(x => x.id === m.session_id);
+  const s = sourceSession.value?.id === m.session_id ? sourceSession.value : getSessionSummary(m.session_id);
   return s?.title || m.session_id.slice(0, 8);
 }
 
