@@ -27,6 +27,12 @@ jobs:
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
         run: npm --prefix app ci
+      - name: Verify types
+        if: runner.os == 'Linux'
+        run: npm run typecheck
+      - name: Verify lint
+        if: runner.os == 'Linux'
+        run: npm run lint
       - name: Verify complete repository suite
         if: runner.os == 'Linux'
         run: npm test
