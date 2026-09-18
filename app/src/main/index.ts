@@ -22,6 +22,10 @@ import {
   readPersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
+  resolveObeliskPaths,
+  warnLegacyStorageIgnored,
+} from '../../../packages/core/src/paths.ts';
+import {
   buildSourceCatalog,
   setPersistedSetting,
   type ProviderSourceIssue,
@@ -45,6 +49,11 @@ import { createSessionPatch } from '../shared/session-patch.mjs';
 import { assembleSessionDetail } from '../shared/session-detail-assembly.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const OBELISK_PATHS = resolveObeliskPaths();
+const OBELISK_DIR = OBELISK_PATHS.dataDir;
+const RECAP_DIR = OBELISK_PATHS.recapDir;
+const SETTINGS_PATH = OBELISK_PATHS.settingsPath;
+let legacyStorageWarningShown = false;
 
 function detectClaudeDir() {
   // macOS / Linux: ~/.claude
@@ -104,7 +113,10 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
     providerRegistry,
     claudeDir,
     codexDir,
-    dbPath: path.join(OBELISK_DIR, 'obelisk.sqlite'),
+    configDir: OBELISK_PATHS.configDir,
+    dataDir: OBELISK_PATHS.dataDir,
+    settingsPath: OBELISK_PATHS.settingsPath,
+    dbPath: OBELISK_PATHS.dbPath,
     projectsDir: path.join(claudeDir, 'projects'),
   };
 }
@@ -113,6 +125,12 @@ function migrateLegacyDbIfNeeded(
   paths = getRuntimePaths(),
   { writerLeaseMode = 'acquire' }: { writerLeaseMode?: WriterLeaseMode } = {},
 ) {
+  if (OBELISK_PATHS.layout !== 'legacy') {
+    if (!legacyStorageWarningShown) {
+      legacyStorageWarningShown = warnLegacyStorageIgnored(OBELISK_PATHS) !== null;
+    }
+    return false;
+  }
   if (fs.existsSync(paths.dbPath)) return;
   const legacyDbPath = path.join(paths.claudeDir, 'obelisk.sqlite');
   if (!fs.existsSync(legacyDbPath)) return;
@@ -429,8 +447,6 @@ function createWindow() {
   }
 }
 
-const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
-const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
 let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
 let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingObeliskChanges = new Set<string>();
@@ -931,8 +947,6 @@ ipcMain.handle('recap:read', (_, filename) => {
 
 // --- Settings ---
 
-const SETTINGS_PATH = path.join(OBELISK_DIR, 'settings.json');
-
 function loadPersistedSettings() {
   const result = readPersistedProviderSettings(SETTINGS_PATH);
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
@@ -941,7 +955,9 @@ function loadPersistedSettings() {
 }
 
 function savePersistedSettings(settings) {
-  if (!fs.existsSync(OBELISK_DIR)) fs.mkdirSync(OBELISK_DIR, { recursive: true });
+  if (!fs.existsSync(path.dirname(SETTINGS_PATH))) {
+    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+  }
   const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
@@ -958,7 +974,16 @@ function savePersistedSettings(settings) {
 ipcMain.handle('settings:get', () => {
   const persisted = loadPersistedSettings();
   const paths = getRuntimePaths(persisted);
-  const { providerRoots, providerRegistry, claudeDir, codexDir, dbPath: dbFile } = paths;
+  const {
+    providerRoots,
+    providerRegistry,
+    claudeDir,
+    codexDir,
+    configDir,
+    dataDir,
+    settingsPath,
+    dbPath: dbFile,
+  } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
   const sourceStats = new Map<string, { sessionCount: number; lastIndexed: string }>();
@@ -998,6 +1023,9 @@ ipcMain.handle('settings:get', () => {
     providerRoots,
     claudeDir,
     codexDir,
+    configDir,
+    dataDir,
+    settingsPath,
     dbPath: dbFile,
     recapDir,
     autoRefresh: persisted.autoRefresh !== false,
