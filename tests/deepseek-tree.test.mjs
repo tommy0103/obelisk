@@ -22,7 +22,7 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
 import { JsonlSessionPersistence } from '@deepseek-ai/dsh-session-persistence-jsonl';
 
-import { createDeepseekProvider } from '../packages/core/src/providers/deepseek.ts';
+import { createDeepseekProvider, SESSION_FILE_RE } from '../packages/core/src/providers/deepseek.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
@@ -802,8 +802,10 @@ test('fixtures stay free of user-identifying absolute paths', () => {
     for (const sid of readdirSync(join(fixtureRoot, proj))) {
       // Canonical artifacts only, any generation and either compression
       // (ADR-0014): skip session.lock, staging tmp files, and non-artifacts.
+      // The basename rule is the adapter's own exported regex — restating it
+      // here would silently scan the wrong files if the source changed.
       for (const entry of readdirSync(join(fixtureRoot, proj, sid))) {
-        if (!/^session(?:\.v[1-9][0-9]*)?\.jsonl(\.zstd)?$/.test(entry)) continue;
+        if (!SESSION_FILE_RE.test(entry)) continue;
         const text = entry.endsWith('.zstd')
           ? (() => {
             const buf = readFileSync(join(fixtureRoot, proj, sid, entry));
@@ -1280,10 +1282,37 @@ function parseFirst(provider, cursor = null) {
   return { unit, ...drain(provider.parse(unit, cursor)) };
 }
 
+// ADR-0007 canonical transcript invariant (hard gate per CONTRIBUTING):
+// assembling directly from the adapter must equal assembling after a SQLite
+// round-trip. Shared by every ADR-0014 scenario test below so dispatch
+// records and seeded-child folding stay inside the gate.
+function assertCanonicalRoundTrip(provider, unit, values) {
+  const db = freshDb();
+  persist(db, unit, provider.parse(unit, null));
+  const persisted = assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions').get(),
+    messages: db.prepare('SELECT * FROM messages ORDER BY timestamp, uuid').all(),
+    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+    toolResults: db.prepare('SELECT * FROM tool_results').all(),
+    subagents: db.prepare('SELECT * FROM subagents').all(),
+  });
+  db.close();
+  assert.deepEqual(persisted, assembleSessionDetail(values));
+}
+
+// Inspect / rewrite the opaque cursor blob (field 3 is base64url JSON).
+function cursorState(cursor) {
+  return JSON.parse(Buffer.from(cursor.split(':')[2], 'base64url').toString('utf8'));
+}
+function recodeCursor(cursor, state) {
+  const [mtime, count] = cursor.split(':');
+  return `${mtime}:${count}:${Buffer.from(JSON.stringify(state)).toString('base64url')}`;
+}
+
 test('v3 zstd artifacts are discovered and projected; system prompts stay unindexed', () => {
   const dir = makeTempDir('obelisk-v3-basic-');
   const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-basic']) });
-  const { values } = parseFirst(provider);
+  const { unit, values } = parseFirst(provider);
   const session = values.find((r) => r.kind === 'session');
   assert.equal(session.version, '3');
   assert.equal(session.title, 'v3 basic session');
@@ -1301,18 +1330,7 @@ test('v3 zstd artifacts are discovered and projected; system prompts stay uninde
 
   // Canonical transcript invariant (ADR-0007): direct assembly equals the
   // SQLite round-trip.
-  const unit = provider.discover({ lastCursor: () => null })[0];
-  const db = freshDb();
-  persist(db, unit, provider.parse(unit, null));
-  const persisted = assembleSessionDetail({
-    session: db.prepare('SELECT * FROM sessions').get(),
-    messages: db.prepare('SELECT * FROM messages ORDER BY timestamp, uuid').all(),
-    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
-    toolResults: db.prepare('SELECT * FROM tool_results').all(),
-    subagents: db.prepare('SELECT * FROM subagents').all(),
-  });
-  assert.deepEqual(persisted, assembleSessionDetail(values));
-  db.close();
+  assertCanonicalRoundTrip(provider, unit, values);
 });
 
 test('a multi-generation directory indexes only the highest generation', () => {
@@ -1330,12 +1348,14 @@ test('a multi-generation directory indexes only the highest generation', () => {
   const sub = values.find((r) => r.kind === 'tool_call' && r.name === 'read');
   assert.ok(sub.id.endsWith(encodeURIComponent('call-9:code:0')));
   assert.ok(values.some((r) => r.kind === 'tool_result' && r.content === 'legacy dispatch content'));
+  // Dispatch records stay inside the ADR-0007 gate.
+  assertCanonicalRoundTrip(provider, units[0], values);
 });
 
 test('a v2-only artifact parses: code-dispatch spelling, system prompt unindexed', () => {
   const dir = makeTempDir('obelisk-v2-only-');
   const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-migrated'], { include: ['session.v2.jsonl'] }) });
-  const { values } = parseFirst(provider);
+  const { unit, values } = parseFirst(provider);
   const session = values.find((r) => r.kind === 'session');
   assert.equal(session.version, '2');
   const texts = values.filter((r) => r.kind === 'message').map((m) => m.text).filter(Boolean);
@@ -1344,6 +1364,7 @@ test('a v2-only artifact parses: code-dispatch spelling, system prompt unindexed
   const sub = values.find((r) => r.kind === 'tool_call' && r.name === 'read');
   assert.ok(sub, 'tool/code-dispatch settle projects a tool_call');
   assert.ok(values.some((r) => r.kind === 'tool_result' && r.content === 'legacy dispatch content'));
+  assertCanonicalRoundTrip(provider, unit, values);
 });
 
 test('compaction replace rows stay indexed: pre-compaction history remains searchable (ADR-0014)', () => {
@@ -1374,6 +1395,8 @@ test('a v3 seeded subagent skips the inherited prefix at the end-seed marker', (
   const sub = values.find((r) => r.kind === 'subagent');
   assert.equal(sub.agent_type, 'deepseek');
   assert.equal(sub.description, 'seeded child');
+  // Seeded-child folding stays inside the ADR-0007 gate.
+  assertCanonicalRoundTrip(provider, units[0], values);
 });
 
 test('PTC dispatches index as tool_call/tool_result under the outer run_code anchor', () => {
@@ -1394,6 +1417,8 @@ test('PTC dispatches index as tool_call/tool_result under the outer run_code anc
   assert.ok(results.includes('wrote b.ts'));
   const readCall = values.find((r) => r.kind === 'tool_call' && r.name === 'read');
   assert.equal(readCall.file_path, '/dsh-fixtures/a.ts');
+  // Dispatch-produced records stay inside the ADR-0007 gate.
+  assertCanonicalRoundTrip(provider, unit, values);
 });
 
 test('a replace surfaceOp in a new window stays on the fast path (no retraction, by design)', () => {
@@ -1471,4 +1496,301 @@ test('raw() resolves v3 (zstd) source lines', () => {
   const userMsg = values.find((r) => r.kind === 'message' && r.text === 'please read a.ts');
   const raw = provider.raw({ source: 'deepseek', messageUuid: userMsg.uuid, session: { jsonl_path: unit.key }, agentId: null });
   assert.ok(raw.text.includes('please read a.ts'));
+});
+
+// A session write-opened by a newer DSH publishes a higher-generation twin
+// beside the frozen original (issue #181's "silent staleness": the old path
+// still exists, so no tombstone fires — but it will never grow again).
+test('an upstream v2→v3 migration continues the indexed session: no tombstone, no duplicate, no staleness', () => {
+  const dir = makeTempDir('obelisk-v3-mig-cursor-');
+  // Phase 1: only the v2 generation exists (the pre-migration on-disk state).
+  const sessionsDir = stageV3(dir, ['v3-migrated'], { include: ['session.v2.jsonl'] });
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  assert.ok(unit, 'the v2 tree is discovered');
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+  assert.ok(dumpDb(db).messages.some((m) => m.text === 'legacy v2 question'));
+  const sessionId = unit.sessionId;
+
+  // Phase 2: the real write-open migration publishes the v3 twin beside the
+  // frozen v2 original. The checkpoint and the indexed rows still reference
+  // the v2 path.
+  copyFileSync(
+    join(V3_FIXTURES, 'v3-migrated', 'session.v3.jsonl'),
+    join(sessionsDir, '--dsh-v3--', 'v3-migrated', 'session.v3.jsonl'),
+  );
+  const units = provider.discover({
+    ...store.ctx(),
+    indexedSessions: () => [{ sessionId, jsonlPath: unit.key }],
+  });
+  assert.equal(units.length, 1, 'the twin pair is one unit — no duplicate, no divergent suppression');
+  assert.equal(units[0].sessionId, sessionId, 'identity survives the migration');
+  assert.ok(!units.some((u) => (u.retractSessionIds ?? []).length > 0), 'no tombstone: the identity is still live');
+  assert.ok(units[0].key.endsWith('session.v3.jsonl'), 'the unit keys on the highest generation');
+
+  // The new unit key has no cursor in production: the member-path change
+  // forces the snapshot fallback, which retracts and re-emits under the SAME
+  // session id — never a second session row.
+  const { values } = drain(provider.parse(units[0], store.ctx().lastCursor(units[0].key)));
+  assert.ok(values.some((r) => r.kind === 'delete-session'), 'the changed member path forces the snapshot fallback');
+  assert.equal(values.find((r) => r.kind === 'session').countMode, 'total');
+  assertCanonicalRoundTrip(provider, units[0], values);
+  persist(db, units[0], provider.parse(units[0], null));
+  const dump = dumpDb(db);
+  assert.equal(dump.sessions.length, 1, 'exactly one session row after the migration');
+  assert.equal(dump.sessions[0].id, sessionId);
+  assert.equal(dump.sessions[0].title, 'migrated session', 'the post-migration append (v3-only) is indexed');
+  assert.ok(dump.messages.some((m) => m.text === 'legacy v2 question'), 'pre-migration history carries over');
+  assert.equal(db.prepare('SELECT jsonl_path FROM sessions').get().jsonl_path, units[0].key,
+    'provenance follows the new generation');
+  db.close();
+});
+
+// The gate accepts 0–3 and nothing beyond: a version-4 file must never be
+// parsed as a known format, and per CONTRIBUTING it must not poison the
+// provider — skip, record, and suppress the project directory.
+test('a version-4 header is rejected at the gate and suppresses its whole project directory (fail closed)', () => {
+  const dir = makeTempDir('obelisk-version4-');
+  const sessionsDir = join(dir, 'sessions');
+  // A v4 artifact (the first rejectable generation) beside a healthy v0
+  // sibling in the SAME project directory.
+  const projectDir = join(sessionsDir, '--tmp-dsh-project--');
+  const write = (name, file, header, text) => {
+    const d = join(projectDir, name);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, file), [
+      JSON.stringify(header),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+    ].join('\n') + '\n');
+  };
+  write('v4-session', 'session.v4.jsonl', { ...HEADER, version: 4, id: 'v4-session' }, 'from the future');
+  write('healthy-session', 'session.jsonl', { ...HEADER, id: 'healthy-session' }, 'healthy');
+  // An unrelated project stays live.
+  const otherDir = join(sessionsDir, '--other--', 'other-session');
+  mkdirSync(otherDir, { recursive: true });
+  writeFileSync(join(otherDir, 'session.jsonl'), [
+    JSON.stringify({ ...HEADER, id: 'other-session', cwd: '/other' }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'other' }], source: { kind: 'user' }, role: 'user', id: 'm-2' } }),
+  ].join('\n') + '\n');
+
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'other projects stay live');
+  assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v4-session')),
+    'the whole project directory is suppressed — no partial snapshot');
+  assert.ok(issues.some((i) => i.error === 'Unsupported session format version 4'));
+});
+
+// v1 was never shipped in a tagged release but is physically v0: the gate
+// accepts it and the projection takes the v0 path (header seedLength honored).
+test('a version-1 header takes the v0 path: header seedLength still marks the inherited prefix', () => {
+  const dir = makeTempDir('obelisk-version1-');
+  const sessionsDir = join(dir, 'sessions');
+  const projectDir = join(sessionsDir, '--tmp-dsh-project--');
+  mkdirSync(join(projectDir, 'v1-root'), { recursive: true });
+  writeFileSync(join(projectDir, 'v1-root', 'session.v1.jsonl'), [
+    JSON.stringify({ ...HEADER, version: 1, id: 'v1-root' }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'root question' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+  ].join('\n') + '\n');
+  mkdirSync(join(projectDir, 'v1-child'), { recursive: true });
+  writeFileSync(join(projectDir, 'v1-child', 'session.v1.jsonl'), [
+    JSON.stringify({ ...CHILD_HEADER, version: 1, id: 'v1-child', parentSession: 'v1-root', seedLength: 2 }),
+    JSON.stringify({ type: 'user/message', seq: 0, time: 1753005601000, data: { content: [{ type: 'text', text: 'inherited question' }], source: { kind: 'user' }, role: 'user', id: 'm-i1' } }),
+    JSON.stringify({ type: 'assistant/message', seq: 1, time: 1753005602000, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'inherited answer' }], source: { kind: 'model', model: 'deepseek-v4-flash' }, id: 'm-i2' } } }),
+    JSON.stringify({ type: 'subagent/descriptor', seq: 2, time: 1753005602200, data: { version: 1, mode: 'continuable', provider: 'spawn', label: 'v1 child', agentProvider: 'deepseek-official' } }),
+    JSON.stringify({ type: 'user/message', seq: 3, time: 1753005603000, data: { content: [{ type: 'text', text: 'child owned' }], source: { kind: 'user' }, role: 'user', id: 'm-c1' } }),
+  ].join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  assert.ok(unit, 'the v1 tree passes the gate');
+  const { values } = drain(provider.parse(unit, null));
+  assert.equal(values.find((r) => r.kind === 'session').version, '1');
+  const childTexts = values.filter((r) => r.kind === 'message' && r.agent_id !== null).map((m) => m.text).filter(Boolean);
+  assert.deepEqual(childTexts, ['child owned'], 'seedLength excludes the inherited prefix on the v0 path');
+});
+
+// The resolved v2/v3 seed prefix is checkpointed per member so fast-path
+// windows never re-read the head; a pre-ADR-0014 checkpoint (no seededPrefix)
+// must self-heal by recomputing the marker once (ADR-0014).
+test('seeded v3 appends stay on the fast path: the checkpointed seededPrefix (or a head recompute) keeps inherited rows out', () => {
+  const dir = makeTempDir('obelisk-v3-seeded-fast-');
+  const sessionsDir = stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  assert.ok(unit);
+  const cursor = drain(provider.parse(unit, null)).ret;
+  store.set(unit.key, cursor);
+
+  // The resolved inherited prefix (the end-seed marker's seq) is checkpointed
+  // on the member's own record (cursor shape v2 — ADR-0014).
+  const childPath = join(sessionsDir, '--dsh-v3--', 'v3-seeded-child', 'session.v3.jsonl');
+  assert.equal(cursorState(cursor).members[childPath].seededPrefix, 4);
+
+  // Window 2: child-owned events append; the fast path excludes the inherited
+  // rows via the checkpoint — delta only, no retraction.
+  appendFileSync(childPath, [
+    { type: 'turn/start', seq: 12, time: 1200, data: { turn: 3 } },
+    { type: 'user/message', seq: 13, time: 1210, data: { id: 'u-child-2', role: 'user', content: [{ type: 'text', text: 'child follow-up' }], source: { kind: 'user' }, surfaceOp: 'append' } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const unit2 = provider.discover(store.ctx())[0];
+  assert.ok(unit2);
+  const parsed = drain(provider.parse(unit2, store.ctx().lastCursor(unit2.key)));
+  assert.equal(parsed.values.find((r) => r.kind === 'session').countMode, 'delta');
+  assert.ok(!parsed.values.some((r) => r.kind === 'delete-session'));
+  assert.deepEqual(
+    parsed.values.filter((r) => r.kind === 'message').map((m) => m.text).filter(Boolean),
+    ['child follow-up'],
+    'the inherited parent rows stay excluded on the fast path',
+  );
+  assert.equal(cursorState(parsed.ret).members[childPath].seededPrefix, 4, 'the checkpoint survives the round-trip');
+  store.set(unit2.key, parsed.ret);
+
+  // Window 3: a checkpoint whose member record lacks seededPrefix (written
+  // before the field existed) — the parse recomputes the marker from the file
+  // head once, still excluding inherited.
+  const legacy = cursorState(parsed.ret);
+  delete legacy.members[childPath].seededPrefix;
+  store.set(unit2.key, recodeCursor(parsed.ret, legacy));
+  appendFileSync(childPath, [
+    { type: 'user/message', seq: 14, time: 1220, data: { id: 'u-child-3', role: 'user', content: [{ type: 'text', text: 'after legacy cursor' }], source: { kind: 'user' }, surfaceOp: 'append' } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const unit3 = provider.discover(store.ctx())[0];
+  const parsed3 = drain(provider.parse(unit3, store.ctx().lastCursor(unit3.key)));
+  assert.equal(parsed3.values.find((r) => r.kind === 'session').countMode, 'delta');
+  assert.deepEqual(
+    parsed3.values.filter((r) => r.kind === 'message').map((m) => m.text).filter(Boolean),
+    ['after legacy cursor'],
+    'the recompute-from-head path also excludes inherited rows',
+  );
+  assert.equal(cursorState(parsed3.ret).members[childPath].seededPrefix, 4, 'recomputed and re-checkpointed');
+});
+
+// Cursor shape v1 (six parallel path-keyed maps, before the ADR-0014
+// consolidation) must never be lenient-read into the v2 per-member shape:
+// missing optional fields would silently break parent chains on the fast
+// path. It decodes as null and the parse self-heals via the snapshot
+// fallback (ADR-0014).
+test('a v1-shape cursor is rejected whole and self-heals via snapshot (never lenient-read)', () => {
+  const dir = makeTempDir('obelisk-v1-cursor-');
+  const sessionsDir = stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = drain(provider.parse(unit, null)).ret;
+
+  // Forge the pre-consolidation shape: six top-level path-keyed maps, v: 1.
+  const current = cursorState(cursor);
+  const legacy = { v: 1, sessionId: current.sessionId, members: {}, lastMessageUuid: {}, lastMessageParentUuid: {}, anchorSteps: {}, seededPrefix: {}, ptcAnchors: {} };
+  for (const [path, m] of Object.entries(current.members)) {
+    legacy.members[path] = { agentId: m.agentId, headerHash: m.headerHash, inode: m.inode, count: m.count, prefixHash: m.prefixHash };
+    if (m.lastMessageUuid !== undefined) legacy.lastMessageUuid[path] = m.lastMessageUuid;
+    if (m.lastMessageParentUuid !== undefined) legacy.lastMessageParentUuid[path] = m.lastMessageParentUuid;
+    if (m.anchorSteps !== undefined) legacy.anchorSteps[path] = m.anchorSteps;
+    if (m.seededPrefix !== undefined) legacy.seededPrefix[path] = m.seededPrefix;
+    if (m.ptcAnchors !== undefined) legacy.ptcAnchors[path] = m.ptcAnchors;
+  }
+  store.set(unit.key, recodeCursor(cursor, legacy));
+
+  const childPath = join(sessionsDir, '--dsh-v3--', 'v3-seeded-child', 'session.v3.jsonl');
+  appendFileSync(childPath, JSON.stringify({ type: 'user/message', seq: 12, time: 1300, data: { id: 'u-child-9', role: 'user', content: [{ type: 'text', text: 'post-legacy append' }], source: { kind: 'user' } }, surfaceOp: 'append' }) + '\n');
+
+  const unit2 = provider.discover(store.ctx())[0];
+  assert.ok(unit2);
+  const parsed = drain(provider.parse(unit2, store.ctx().lastCursor(unit2.key)));
+  assert.equal(parsed.values[0].kind, 'delete-session', 'foreign-shape cursor → snapshot fallback, not a lenient delta');
+  assert.equal(parsed.values.find((r) => r.kind === 'session').countMode, 'total');
+  const childTexts = parsed.values.filter((r) => r.kind === 'message' && r.agent_id !== null).map((m) => m.text).filter(Boolean);
+  assert.deepEqual(childTexts.sort(), ['child answer', 'child task', 'post-legacy append'],
+    'the snapshot re-parse keeps the parent chain AND the inherited-prefix exclusion');
+  assert.equal(cursorState(parsed.ret).v, 2, 'the replacement checkpoint is the v2 shape');
+});
+
+// When the outer tool/call predates the checkpoint window and the parent map
+// misses (a cursor from an older build), the dispatch must mint a
+// deterministic synthetic anchor — once — instead of dangling (ADR-0014).
+test('a dispatch on a parent-map miss mints a deterministic anchor once, never dangling', () => {
+  const dir = makeTempDir('obelisk-v3-ptc-mint-');
+  const sessionsDir = stageV3(dir, ['v3-ptc']);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const store = cursorStore();
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const cursor = drain(provider.parse(unit, null)).ret;
+  store.set(unit.key, cursor);
+
+  // Strip the parent-callId map from the member's checkpoint record (an older
+  // build's cursor): the outer run_code tool/call is outside this window and
+  // unresolvable.
+  const stripped = cursorState(cursor);
+  const ptcPath = join(sessionsDir, '--dsh-v3--', 'v3-ptc', 'session.v3.jsonl');
+  delete stripped.members[ptcPath].ptcAnchors;
+  store.set(unit.key, recodeCursor(cursor, stripped));
+
+  const path = join(sessionsDir, '--dsh-v3--', 'v3-ptc', 'session.v3.jsonl');
+  appendFileSync(path, [
+    { type: 'tool/ptc-dispatch', seq: 13, time: 1753005608000, data: { rootCallId: 'call-1', parentCallId: 'call-1', subCallId: 'call-1:ptc:9', name: 'edit', arguments: { file_path: '/dsh-fixtures/c.ts' }, isError: false, content: [{ type: 'text', text: 'minted anchor edit' }] } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const unit2 = provider.discover(store.ctx())[0];
+  const parsed = drain(provider.parse(unit2, store.ctx().lastCursor(unit2.key)));
+  const minted = `${unit.sessionId}:ptc:${encodeURIComponent('call-1')}`;
+  const call = parsed.values.find((r) => r.kind === 'tool_call' && r.name === 'edit');
+  assert.ok(call, 'the dispatch projects despite the map miss');
+  assert.equal(call.message_uuid, minted, 'the miss mints the deterministic synthetic anchor');
+  assert.ok(parsed.values.some((r) => r.kind === 'message' && r.uuid === minted && r.content_type === 'tool_use'),
+    'the minted anchor message is emitted');
+  assert.ok(parsed.values.some((r) => r.kind === 'tool_result' && r.content === 'minted anchor edit'));
+  store.set(unit2.key, parsed.ret);
+
+  // A later window dispatching under the same parent reuses the checkpointed
+  // mint — the anchor message must NOT be re-emitted.
+  appendFileSync(path, [
+    { type: 'tool/ptc-dispatch', seq: 14, time: 1753005608100, data: { rootCallId: 'call-1', parentCallId: 'call-1', subCallId: 'call-1:ptc:10', name: 'read', arguments: { file_path: '/dsh-fixtures/d.ts' }, isError: false, content: [{ type: 'text', text: 'second window read' }] } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const unit3 = provider.discover(store.ctx())[0];
+  const parsed3 = drain(provider.parse(unit3, store.ctx().lastCursor(unit3.key)));
+  const second = parsed3.values.find((r) => r.kind === 'tool_call' && r.name === 'read');
+  assert.ok(second);
+  assert.equal(second.message_uuid, minted, 'the minted uuid resolves from the checkpoint');
+  assert.ok(!parsed3.values.some((r) => r.kind === 'message' && r.uuid === minted),
+    'the minted anchor is not re-emitted in later windows');
+});
+
+// A nested run_code's dispatches carry the OUTER SUB-CALL's subCallId as
+// parentCallId — the anchor must chain through it to the outer call's anchor.
+// isError and the newer `error` field both mark a failed settle.
+test('nested run_code dispatches chain to the outer anchor; isError and error both mark failures', () => {
+  const dir = makeTempDir('obelisk-v3-ptc-nested-');
+  const sessionsDir = stageV3(dir, ['v3-ptc']);
+  const path = join(sessionsDir, '--dsh-v3--', 'v3-ptc', 'session.v3.jsonl');
+  appendFileSync(path, [
+    { type: 'turn/start', seq: 13, time: 1753005608500, data: { turn: 2 } },
+    { type: 'step/start', seq: 14, time: 1753005608550, data: { turn: 2, step: 1 } },
+    { type: 'tool/call', seq: 15, time: 1753005608600, data: { turn: 2, step: 1, callId: 'call-2', name: 'run_code', arguments: '{"code":"nested"}' } },
+    { type: 'tool/ptc-dispatch', seq: 16, time: 1753005608700, data: { rootCallId: 'call-2', parentCallId: 'call-2', subCallId: 'call-2:ptc:1', name: 'run_code', arguments: { code: 'nested' }, isError: false, content: [{ type: 'text', text: 'nested run finished' }] } },
+    { type: 'tool/ptc-dispatch', seq: 17, time: 1753005608800, data: { rootCallId: 'call-2', parentCallId: 'call-2:ptc:1', subCallId: 'call-2:ptc:1:ptc:1', name: 'read', arguments: { file_path: '/dsh-fixtures/e.ts' }, isError: true, content: [{ type: 'text', text: 'inner read failed' }] } },
+    { type: 'tool/ptc-dispatch', seq: 18, time: 1753005608900, data: { rootCallId: 'call-2', parentCallId: 'call-2', subCallId: 'call-2:ptc:2', name: 'bash', arguments: { cmd: 'ls' }, error: 'spawn failed', content: [{ type: 'text', text: '' }] } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const { unit, values } = parseFirst(provider);
+  const anchor2 = `${unit.sessionId}:t2:s1:tool_use`;
+  const bySuffix = (suffix) => values.find((r) => r.kind === 'tool_call' && r.id.endsWith(encodeURIComponent(suffix)));
+  const nestedRun = bySuffix('call-2:ptc:1');
+  const innerRead = bySuffix('call-2:ptc:1:ptc:1');
+  const bash = bySuffix('call-2:ptc:2');
+  assert.ok(nestedRun && innerRead && bash, 'all three dispatches project');
+  assert.equal(nestedRun.message_uuid, anchor2);
+  assert.equal(innerRead.message_uuid, anchor2, 'the nested sub-call resolves through the outer sub-call to the same anchor');
+  assert.equal(bash.message_uuid, anchor2);
+  assert.equal(values.filter((r) => r.kind === 'message' && r.uuid === anchor2).length, 1,
+    'one anchor message serves the whole nested group');
+  // is_error: the isError flag and the newer error field both mark failure.
+  const innerResult = values.find((r) => r.kind === 'tool_result' && r.tool_use_id === innerRead.id);
+  assert.equal(innerResult.is_error, 1, 'isError: true marks the result failed');
+  const bashResult = values.find((r) => r.kind === 'tool_result' && r.tool_use_id === bash.id);
+  assert.equal(bashResult.is_error, 1, 'a settle event with only the error field still marks failure');
+  assertCanonicalRoundTrip(provider, unit, values);
 });

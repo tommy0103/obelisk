@@ -24,8 +24,9 @@ version has silently lost their content.
 
 **Decision.** The deepseek provider supports format versions 0–3 in one
 adapter, following the pi provider's normalize-forward pattern: accept a
-version range at the header gate, normalize per version at load time, keep one
-projection path.
+version range at the header gate, normalize per member at load time (the
+v2/v3 seed marker is resolved once per member, before its records project),
+keep one projection path.
 
 - **Discovery**: match the upstream canonical basename
   `session(?:.vN)?.jsonl[.zstd]` and keep only the single highest generation
@@ -41,9 +42,26 @@ projection path.
 - **Seed-prefix marker**: v0/v1 keep using `header.seedLength`; v2/v3 drop it,
   so the inherited parent prefix ends at the last `session/end-seed` event
   with `data.inherited === true` (skip `seq <` that event's seq). The resolved
-  count is checkpointed per member (`seededPrefix`, optional — cursor state
-  stays at version 1 via defensive defaults); on a stale cursor it is
-  recomputed from the file head once.
+  count is checkpointed on the member's own record (see the cursor revision
+  below); on a cursor lacking it, it is recomputed from the file head once.
+- **Cursor checkpoint: per-member records (shape v2).** The cursor grew six
+  parallel `Record<path, …>` maps — a data clump: they describe one thing (a
+  member file's incremental parse state), always appear together, and admit
+  half-populated states with no type-level key correlation. They consolidate
+  into `members: Record<path, MemberState>` where `MemberState` carries the
+  required fast-path gates (`agentId`, `headerHash`, `inode`, `count`,
+  `prefixHash`) plus optional facets (`lastMessageUuid(+parent)`,
+  `anchorSteps`, `seededPrefix`, `ptcAnchors`). `CURSOR_STATE_VERSION` bumps
+  to 2 with a STRICT guard — the v1 six-map shape decodes as null and
+  self-heals via snapshot fallback; lenient-reading it as "new shape, all
+  optionals absent" would silently drop the parent-chain seed on the fast
+  path, which is worse than a crash. Timing: this change ships with the
+  `indexVersionMarker` bump below, which already forces a full reindex that
+  rewrites every checkpoint — so the one-time re-parse the version bump
+  would otherwise cost is free here, and deferring the consolidation would
+  charge every deployment a second full re-parse later.
+  (This revises the first draft's "cursor state stays at version 1 via
+  defensive defaults", written before the clump was named.)
 - **`surfaceOp` replace is deliberately NOT applied.** Obelisk indexes the
   append-only log verbatim: shadowed originals stay searchable (finding
   pre-compaction work is the product's purpose), and the replacement row
@@ -53,16 +71,18 @@ projection path.
   replacement converges on resume"), which requires pruned/replaced content
   to remain searchable; a shadow-skipping variant was implemented first and
   broke exactly that contract, which is why this point is explicit here.
-- **PTC dispatch indexing**: settle events (`tool/ptc-dispatch`, and
-  `tool/code-dispatch` for v0–v2) project as one `tool_call` + one
-  `tool_result` each, keyed by `subCallId`. They carry no `turn`/`step`, so
-  sub-calls anchor to the outer `run_code` call's tool_use anchor via a
-  per-member `parentCallId → anchor uuid` map (file order suffices — upstream
-  appends `tool/call` before its dispatches; the map is checkpointed for
-  fast-path windows, with a deterministic synthetic provisional anchor as the
-  miss fallback). Dispatch `arguments` are already-parsed JSON, unlike
-  `tool/call`'s JSON string. `*-dispatch-start` carries only timing and is
-  skipped.
+- **PTC dispatch indexing**: settle events project as one `tool_call` + one
+  `tool_result` each, keyed by `subCallId`. Both spellings
+  (`tool/ptc-dispatch`, `tool/code-dispatch`) are matched regardless of the
+  log's version: the spelling carries no semantic weight, and a migrated v3
+  log can still carry historical `code-dispatch` rows. They carry no
+  `turn`/`step`, so sub-calls anchor to the outer `run_code` call's tool_use
+  anchor via a per-member `parentCallId → anchor uuid` map (file order
+  suffices — upstream appends `tool/call` before its dispatches; the map is
+  checkpointed for fast-path windows, with a deterministic synthetic
+  provisional anchor as the miss fallback). Dispatch `arguments` are
+  already-parsed JSON, unlike `tool/call`'s JSON string. `*-dispatch-start`
+  carries only timing and is skipped.
 - **`indexVersionMarker` is bumped** (`__deepseek_canonical_transcript_v4__`):
   dispatch indexing adds records to already-indexed v0 sessions, which only a
   reindex backfills (CONTRIBUTING: bump the marker when already-stored rows

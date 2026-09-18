@@ -1,6 +1,6 @@
 # DeepSeek Harness session format v0–v3 multi-version adapter plan
 
-Status: plan, not yet implemented. Supersedes the v0-only assumption documented in
+Status: implemented (ADR-0014, PR #182). Supersedes the v0-only assumption documented in
 `docs/deepseek-harness-0.1.2-alpha.4-obelisk-dsh-adapter-impact-research.md`.
 
 ## Background
@@ -100,11 +100,12 @@ child-owned (DSH `session-format-v1-to-v2/src/codec.ts:114-127`).
     marker.
   - v2/v3, fast path: the marker is almost always in an earlier frame window, so
     persist the resolved count in the cursor checkpoint as an optional
-    `seededPrefix: Record<memberPath, number>` (kept at
-    `CURSOR_STATE_VERSION = 1` — `decodeCursorState` already defaults missing
-    fields defensively). When the field is absent (old cursor), recompute by
-    decoding from frame 0 until the marker is found; the seed prefix is small
-    and this happens once per member.
+    `seededPrefix` facet on the member's own record. (During implementation the
+    cursor consolidated from six parallel path-keyed maps into per-member
+    `MemberState` records, `CURSOR_STATE_VERSION` 1 → 2 — see the ADR revision;
+    the v1 shape decodes as null and self-heals via snapshot fallback.) When
+    the facet is absent, recompute by decoding from frame 0 until the marker is
+    found; the seed prefix is small and this happens once per member.
 - Unseeded v2/v3 sessions have no marker → inherited count 0. No header
   `isSeeded` validation needed beyond "marker present ⇒ honor it".
 
@@ -179,8 +180,11 @@ Projection per settle event (one record = complete tool_call + tool_result):
 - New fixtures under `tests/fixtures/deepseek/`, generated with the real DSH
   0.1.6 writer (script lives in `tmp/`, artifacts committed):
   - a v3 root session (with `system/message`, dense seq);
-  - a multi-generation directory: `session.jsonl.zstd` + `session.v3.jsonl.zstd`
-    → only v3 is read, identity preserved, no divergent suppression;
+  - a multi-generation directory — shipped as `session.v2.jsonl` +
+    `session.v3.jsonl` (frozen v2 codec + the real write-open migration; a
+    v0 artifact cannot be produced by the current writer stack): only v3 is
+    read, identity preserved, no divergent suppression, including when the
+    v2 generation was already indexed;
   - a v3 seeded subagent (end-seed marker) → inherited prefix skipped;
   - a v3 session with compaction replace → shadowed originals AND the
     replacement stay indexed (verbatim-log semantics, item 4);
