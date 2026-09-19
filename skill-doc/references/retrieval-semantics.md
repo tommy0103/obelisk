@@ -31,6 +31,12 @@ multiple steps, but the first locator should be the narrowest semantic fit. If a
 scope locator finds the relevant project/session/file, do not also run broad FTS
 unless scoped evidence is insufficient and `query_plan` says why.
 
+Session references resolve through `sessions()`: a raw provider uuid (pi-family
+canonical ids are `source:uuid:project-scope`, so the uuid is only a fragment)
+expands to every containing session. All other helpers match `sessionId`
+exactly; feed them the canonical `id` from the `sessions()` row, never the
+raw uuid.
+
 Project-like fields are distinct:
 
 - `sessions.project`: provider-normalized project slug.

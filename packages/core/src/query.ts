@@ -584,8 +584,39 @@ function createQueryApi(
     });
   };
 
+  // sessions() is the identifier-resolution surface. Pi-family providers
+  // scope session ids per project (`source:uuid:cwd-hash` in pi.ts), so the
+  // raw uuid a user hands over is only a fragment of the canonical id. Exact
+  // refs pass through untouched; a non-exact ref expands to every canonical
+  // id containing it, so an ambiguous fragment returns several labeled rows
+  // (project_path/started_at) instead of failing the script. instr() matches
+  // the ref literally, so caller-supplied SQL wildcards never gain wildcard
+  // semantics of their own. Every other helper keeps exact sessionId
+  // matching: resolve through sessions() first.
+  const expandSessionRefs = (opts: QueryOptions): QueryOptions => {
+    if (!opts.sessionId && !opts.sessions?.length) return opts;
+    const expand = (ref: string): string[] => {
+      // instr() treats every character literally, which also makes an empty
+      // ref match everything; an empty entry must stay an empty result like
+      // the exact-match IN ('') it replaces.
+      if (!ref) return [];
+      if (db.prepare('SELECT 1 FROM sessions WHERE id=?').get(ref)) return [ref];
+      const hits = db.prepare('SELECT id FROM sessions WHERE instr(id, ?) > 0').all(ref);
+      return hits.map((row: DbRow) => String(row.id));
+    };
+    const ids = new Set<string>();
+    if (opts.sessionId) expand(opts.sessionId).forEach((id) => ids.add(id));
+    (opts.sessions ?? []).forEach((ref) => expand(ref).forEach((id) => ids.add(id)));
+    // No expansion hit: keep the original refs so the query returns the same
+    // empty result an unknown exact id always produced.
+    if (!ids.size) return opts;
+    const next: QueryOptions = { ...opts, sessions: [...ids] };
+    delete next.sessionId;
+    return next;
+  };
+
   const sessions = (optsOrN?: QueryOptions | number | string) => {
-    const opts = normalizeOpts(optsOrN, 'sessionId');
+    const opts = expandSessionRefs(normalizeOpts(optsOrN, 'sessionId'));
     const { limit = 50 } = opts;
     const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
     params.push(limit);

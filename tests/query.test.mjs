@@ -7,6 +7,10 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
+import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
+import { codexDbId } from '../packages/core/src/parsing.ts';
+import { namespacedSessionId as kimiSessionId } from '../packages/core/src/providers/kimi.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -552,6 +556,113 @@ test('overview returns a compact current-project map with bounded sessions', () 
   assert.ok(view.projects.some(p => p.project === 'quiet-zero' && p.session_count === 2 && p.memory_count === 2));
 
   db.close();
+});
+
+test('sessions resolves raw provider native ids to canonical ids', () => {
+  const db = memoryDb();
+  const rawPi = '11111111-2222-4333-8444-555555555551';
+  const rawOmp = '22222222-2222-4333-8444-555555555552';
+  const rawKimi = '33333333-3333-4333-8444-555555555553';
+  const rawCodex = '44444444-4444-4333-8444-555555555554';
+  const rawDeepseek = '55555555-5555-4333-8444-555555555555';
+  // Canonical ids in each provider's own shape: pi/omp/deepseek namespace by
+  // project, kimi/codex prefix the native id, claude keeps the bare uuid.
+  const piHeader = (cwd) => ({ type: 'session', id: rawPi, cwd });
+  const canonicalPiA = piFamilySessionId(piHeader('/Users/me/a'), 'pi');
+  const canonicalPiB = piFamilySessionId(piHeader('/Users/me/b'), 'pi');
+  const canonicalOmp = piFamilySessionId({ type: 'session', id: rawOmp, cwd: '/Users/me/omp' }, 'omp');
+  const canonicalKimi = kimiSessionId(rawKimi);
+  const canonicalCodex = codexDbId(rawCodex);
+  const canonicalDeepseek = canonicalDeepseekTreeSessionId(rawDeepseek, deepseekProjectScope('/Users/me/ds'));
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertSession.run(canonicalPiA, 'Pi session in project A', '-Users-me-a', '/Users/me/a', '2026-09-18T10:00:00Z', '2026-09-18T11:00:00Z', null, 7, 'pi');
+  insertSession.run(canonicalPiB, 'Same raw uuid in project B', '-Users-me-b', '/Users/me/b', '2026-09-18T09:00:00Z', '2026-09-18T12:00:00Z', null, 3, 'pi');
+  insertSession.run(canonicalOmp, 'Omp session', '-Users-me-omp', '/Users/me/omp', '2026-09-18T08:00:00Z', '2026-09-18T09:00:00Z', null, 2, 'omp');
+  insertSession.run(canonicalKimi, 'Kimi session', '-Users-me-kimi', '/Users/me/kimi', '2026-09-18T07:00:00Z', '2026-09-18T08:00:00Z', null, 4, 'kimi');
+  insertSession.run(canonicalCodex, 'Codex session', '-Users-me-codex', '/Users/me/codex', '2026-09-18T06:00:00Z', '2026-09-18T07:00:00Z', null, 5, 'codex');
+  insertSession.run(canonicalDeepseek, 'Deepseek session', '-Users-me-ds', '/Users/me/ds', '2026-09-18T05:00:00Z', '2026-09-18T06:00:00Z', null, 6, 'deepseek');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
+    VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
+  `);
+  insertMessage.run('mu-1', canonicalPiA, '2026-09-18T10:01:00Z');
+  db.prepare(`
+    INSERT INTO summaries (id, session_id, timestamp, source, content, visibility)
+    VALUES ('sum-1', ?, '2026-09-18T10:02:00Z', 'summary', 'summary text', 'visible')
+  `).run(canonicalPiA);
+  const api = createQueryApi(db);
+
+  // Each provider's native id resolves through that provider's own id shape.
+  assert.deepEqual(api.sessions({ sessionId: rawOmp }).map(row => row.id), [canonicalOmp]);
+  assert.deepEqual(api.sessions({ sessionId: rawKimi }).map(row => row.id), [canonicalKimi]);
+  assert.deepEqual(api.sessions({ sessionId: rawCodex }).map(row => row.id), [canonicalCodex]);
+  assert.deepEqual(api.sessions({ sessionId: rawDeepseek }).map(row => row.id), [canonicalDeepseek]);
+
+  // The same uuid scoped to two projects returns every containing row, each
+  // labeled with project_path/started_at; other filters narrow as usual.
+  assert.deepEqual(
+    api.sessions({ sessionId: rawPi }).map(row => [row.id, row.project_path]),
+    [[canonicalPiB, '/Users/me/b'], [canonicalPiA, '/Users/me/a']],
+  );
+  assert.deepEqual(
+    api.sessions({ sessionId: rawPi, project: '-Users-me-a' }).map(row => row.id),
+    [canonicalPiA],
+  );
+
+  // Exact canonical ids keep today's behavior, in all input forms.
+  assert.equal(api.sessions({ sessionId: canonicalPiA }).length, 1);
+  assert.equal(api.sessions({ sessionId: 'sid-1' })[0].id, 'sid-1');
+  assert.deepEqual(api.sessions('sid-2').map(row => row.id), ['sid-2']);
+  assert.deepEqual(
+    api.sessions({ sessions: [rawKimi, 'sid-3', rawCodex] })
+      .map(row => row.id).sort(),
+    [canonicalKimi, 'sid-3', canonicalCodex].sort(),
+  );
+
+  // Unknown refs and SQL wildcards stay literal: no error, no fuzzy misses.
+  assert.deepEqual(api.sessions({ sessionId: 'ffffffff-0000-4000-8000-000000000000' }), []);
+  assert.deepEqual(api.sessions({ sessionId: 'sid-1%' }), []);
+  assert.deepEqual(api.sessions({ sessionId: 'sid_1' }), []);
+  // An empty array entry matches nothing, exactly as IN ('') always did.
+  assert.deepEqual(api.sessions({ sessions: ['', 'sid-1'] }).map(row => row.id), ['sid-1']);
+  assert.deepEqual(api.sessions({ sessions: [''] }), []);
+
+  // Other helpers keep exact matching; resolution is sessions()-only.
+  assert.equal(api.thread(rawPi).length, 0);
+  assert.equal(api.thread(canonicalPiA).length, 1);
+  assert.equal(api.summaries({ sessionId: canonicalPiA }).length, 1);
+  assert.deepEqual(api.summaries({ sessionId: rawPi }), []);
+
+  db.close();
+});
+
+test('every provider embeds the native session id verbatim in its canonical id', () => {
+  // Fragment resolution in sessions() depends on this: a native id is only
+  // findable while it appears verbatim inside the canonical id. pi-family and
+  // deepseek run the native id through encodeURIComponent, identity for the
+  // uuid-shaped ids every provider emits today; a future provider with
+  // URL-unsafe native ids must not break the invariant silently.
+  const native = '99999999-9999-4999-8999-999999999999';
+  const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
+  const canonical = {
+    // claude has no namespacing step: the canonical id is the native uuid.
+    claude: native,
+    codex: codexDbId(native),
+    kimi: kimiSessionId(native),
+    pi: piFamilySessionId(piHeader, 'pi'),
+    omp: piFamilySessionId(piHeader, 'omp'),
+    deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),
+  };
+  for (const [source, id] of Object.entries(canonical)) {
+    assert.equal(
+      typeof id === 'string' && id.includes(native),
+      true,
+      `${source} canonical id ${id} must embed the native id verbatim`,
+    );
+  }
 });
 
 test('query api is read-only and does not expose attune helpers', () => {
