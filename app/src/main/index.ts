@@ -13,6 +13,7 @@ import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/in
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
+import { createDeferredQuit } from './quit-teardown.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
@@ -502,21 +503,13 @@ app.whenReady().then(() => {
 
 // Quit must not tear the JS environment down while a watcher is still live: a
 // @parcel/watcher callback firing during CleanupHandles throws with no JS
-// frame to catch it, and napi_throw fatals the process (#187). Electron does
-// not wait for async before-quit handlers, so the first quit request is
-// deferred until the background stop completes. The stop is not cached: a
-// macOS pause (window-all-closed) can be followed by activate → restart, and
-// a later quit must stop the restarted singletons. The wait is bounded so a
-// wedged indexer cannot make the app unquittable.
-let quitting = false;
-app.on('before-quit', (event) => {
-  if (quitting) return;
-  quitting = true;
-  event.preventDefault();
-  const stopped = stopBackgroundResources({ stopWorker: true }).catch(() => {});
-  const bounded = Promise.race([stopped, new Promise(resolve => setTimeout(resolve, 5000))]);
-  void bounded.finally(() => app.quit());
-});
+// frame to catch it, and napi_throw fatals the process (#187). The stop is
+// not cached: a macOS pause (window-all-closed) can be followed by activate →
+// restart, and a later quit must stop the restarted singletons.
+app.on('before-quit', createDeferredQuit({
+  quit: () => app.quit(),
+  stop: () => stopBackgroundResources({ stopWorker: true }),
+}));
 
 app.on('window-all-closed', () => {
   void stopBackgroundResources({ stopWorker: true });
