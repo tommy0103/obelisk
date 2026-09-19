@@ -334,18 +334,26 @@ async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
 }
 
 async function stopBackgroundResources({ stopWorker = false } = {}) {
-  await stopIndexerServiceAndWait();
-  if (stopWorker && indexerWorker) {
-    indexerWorker.stop();
-    indexerWorker = null;
-  }
+  // Close the ~/.obelisk watcher before the first await. close() flips its
+  // `closed` flag synchronously and every parcel event callback guards on it,
+  // so once this function yields, no teardown-time FSEvents delivery can
+  // enter user code — even when the bounded quit path (#187) cuts the
+  // remaining waits short. The service watcher's close() works the same way
+  // inside service.stop().
+  let watcherClosed: Promise<unknown> | null = null;
   if (obeliskWatcher) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
     pendingObeliskChanges.clear();
-    if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
+    if (typeof watcher.close === 'function') watcherClosed = Promise.resolve(watcher.close()).catch(() => {});
   }
+  await stopIndexerServiceAndWait();
+  if (stopWorker && indexerWorker) {
+    indexerWorker.stop();
+    indexerWorker = null;
+  }
+  if (watcherClosed) await watcherClosed;
   closeDb();
 }
 
@@ -492,8 +500,22 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  void stopBackgroundResources({ stopWorker: true });
+// Quit must not tear the JS environment down while a watcher is still live: a
+// @parcel/watcher callback firing during CleanupHandles throws with no JS
+// frame to catch it, and napi_throw fatals the process (#187). Electron does
+// not wait for async before-quit handlers, so the first quit request is
+// deferred until the background stop completes. The stop is not cached: a
+// macOS pause (window-all-closed) can be followed by activate → restart, and
+// a later quit must stop the restarted singletons. The wait is bounded so a
+// wedged indexer cannot make the app unquittable.
+let quitting = false;
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  quitting = true;
+  event.preventDefault();
+  const stopped = stopBackgroundResources({ stopWorker: true }).catch(() => {});
+  const bounded = Promise.race([stopped, new Promise(resolve => setTimeout(resolve, 5000))]);
+  void bounded.finally(() => app.quit());
 });
 
 app.on('window-all-closed', () => {
