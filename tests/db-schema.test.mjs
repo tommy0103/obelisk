@@ -127,6 +127,35 @@ test('tool results schema indexes live session patch lookups', async () => {
   }
 });
 
+test('tool results schema limits failure scans to failure rows', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    const plan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tr.*
+      FROM tool_results tr
+      LEFT JOIN messages rm ON rm.uuid=tr.message_uuid
+      LEFT JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      LEFT JOIN messages cm ON cm.uuid=tc.message_uuid
+      LEFT JOIN sessions s ON s.id=tr.session_id
+      WHERE (tr.is_error = 1 OR tr.content LIKE 'Exit code %')
+        AND COALESCE(rm.visibility,'visible')='visible'
+        AND COALESCE(cm.visibility,'visible')='visible'
+        AND COALESCE(s.source, 'claude') = ?
+      ORDER BY rm.timestamp DESC
+      LIMIT ?
+    `).all('codex', 50);
+
+    assert.ok(
+      plan.some(row => /USING INDEX idx_tr_failure_session/.test(String(row.detail))),
+      `expected partial failure index, got: ${plan.map(row => row.detail).join('; ')}`,
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test('session detail queries use the visible main timeline index', async () => {
   const db = new DatabaseSync(':memory:');
   try {
