@@ -116,6 +116,8 @@ interface DshHeader {
   origin?: unknown;
   delegationDepth?: unknown;
   seedLength?: unknown;
+  /** v2/v3: whether the log begins with an inherited prefix + end-seed marker. */
+  isSeeded?: unknown;
 }
 
 interface SessionFile {
@@ -1002,9 +1004,11 @@ function treeMatchesState(members: TreeMember[], state: TreeCursorState): boolea
 /** v2/v3 seeded subagents carry no header.seedLength: the inherited parent
  * prefix ends at the LAST session/end-seed event whose data.inherited ===
  * true, and that marker's own seq is the inherited event count (the marker
- * itself is child-owned). 0 when no marker exists (unseeded). */
-function resolveSeededPrefix(snap: MemberSnapshot): number {
-  let count = 0;
+ * itself is child-owned). null when no marker has been observed — for a live
+ * file that means the seed batch has not landed yet (the header is persisted
+ * first, the marker with the seed batch), NOT that the session is unseeded. */
+function resolveSeededPrefix(snap: MemberSnapshot): number | null {
+  let count: number | null = null;
   for (const record of readLogRecords(memberText(snap, 0))) {
     if (record.type === 'session/end-seed' && record.data.inherited === true && record.seq >= 0) {
       count = record.seq;
@@ -1104,14 +1108,33 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     const fromCount = priorMember?.count ?? 0;
     const formatVersion = typeof header.version === 'number' ? header.version : 0;
     let inheritedEventCount = 0;
+    /** The observed seed cut; null means "never resolved" (unseeded, or the
+     * marker is not durable yet) — never checkpoint an unobserved value. */
+    let seededPrefixObserved: number | null = null;
     if (isSubagent && formatVersion >= 2) {
-      // v2/v3 headers dropped seedLength: resolve the inherited prefix from
-      // the session/end-seed marker and checkpoint it so fast-path windows
-      // never re-read the head (ADR-0014).
-      const cached = priorMember?.seededPrefix;
-      inheritedEventCount = typeof cached === 'number' && Number.isSafeInteger(cached) && cached >= 0
-        ? cached
-        : resolveSeededPrefix(snap);
+      if (header.isSeeded === true) {
+        // v2/v3 headers dropped seedLength: the inherited prefix ends at the
+        // session/end-seed marker, resolved once and checkpointed (ADR-0014).
+        const cached = priorMember?.seededPrefix;
+        if (typeof cached === 'number' && Number.isSafeInteger(cached) && cached >= 0) {
+          seededPrefixObserved = cached;
+        } else {
+          const resolved = resolveSeededPrefix(snap);
+          if (resolved === null) {
+            // Seeded, but the marker is not durable yet (a header-only or
+            // mid-seed file). Parsing now would leak the inherited parent
+            // prefix into the child's sidechain — and worse, checkpointing
+            // the phony cut 0 would make the leak STICKY across later windows.
+            // Fail closed for the whole tree this round (same pattern as an
+            // unreadable member snapshot); the marker lands with the seed
+            // batch, one watcher tick later.
+            return cursor;
+          }
+          seededPrefixObserved = resolved;
+        }
+        inheritedEventCount = seededPrefixObserved;
+      }
+      // isSeeded !== true: no marker will ever exist — nothing inherited.
     } else if (isSubagent) {
       inheritedEventCount = typeof header.seedLength === 'number'
         && Number.isSafeInteger(header.seedLength)
@@ -1315,6 +1338,14 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           const source = isRecord(message.source) ? message.source : {};
           if (typeof source.callId !== 'string') break;
           const toolId = callId(dbId, source.callId);
+          // A settled call can never gain new PTC dispatches — upstream settles
+          // every sub-call before the outer result lands — so prune its anchor
+          // mapping (and any nested sub-call ids under it): the checkpointed
+          // map holds only in-flight calls, not every call the log ever saw.
+          ptcParentAnchors.delete(source.callId);
+          for (const key of [...ptcParentAnchors.keys()]) {
+            if (key.startsWith(`${source.callId}:`)) ptcParentAnchors.delete(key);
+          }
           const content = toolResultContent(message.content);
           recordsOut.push({
             kind: 'tool_result', tool_use_id: toolId,
@@ -1415,7 +1446,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       memberState.lastMessageParentUuid = lastMessageParentUuid;
     }
     if (anchorSteps.size > 0) memberState.anchorSteps = [...anchorSteps];
-    if (isSubagent && formatVersion >= 2) memberState.seededPrefix = inheritedEventCount;
+    if (seededPrefixObserved !== null) memberState.seededPrefix = seededPrefixObserved;
     if (ptcParentAnchors.size > 0) memberState.ptcAnchors = Object.fromEntries(ptcParentAnchors);
     nextState.members[member.path] = memberState;
     maxMtime = Math.max(maxMtime, snap.stat.mtimeMs);

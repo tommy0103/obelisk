@@ -1449,29 +1449,54 @@ test('a replace surfaceOp in a new window stays on the fast path (no retraction,
   assert.ok(texts.includes('corrected ptc prompt'), 'replacement indexed as an ordinary append');
 });
 
-test('a later-window PTC dispatch resolves its anchor from the checkpoint', () => {
+test('PTC anchors resolve across windows while the parent is in flight, and prune at its result', () => {
   const dir = makeTempDir('obelisk-v3-ptc-anchor-');
   const sessionsDir = stageV3(dir, ['v3-ptc']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
-  const unit = provider.discover({ lastCursor: () => null })[0];
-  store.set(unit.key, drain(provider.parse(unit, null)).ret);
 
+  // Realistic interleaving: dispatches land across watcher windows WHILE the
+  // outer run_code call is still executing — upstream settles every sub-call
+  // before the outer tool/result. Truncate the fixture right before that
+  // result (header + seq 0..9: both dispatches seen, parent still open).
   const path = join(sessionsDir, '--dsh-v3--', 'v3-ptc', 'session.v3.jsonl');
-  appendFileSync(path, [
-    { type: 'tool/ptc-dispatch-start', seq: 13, time: 1753005608000, data: { rootCallId: 'call-1', parentCallId: 'call-1', subCallId: 'call-1:ptc:3', name: 'edit', arguments: { file_path: '/dsh-fixtures/c.ts' } } },
-    { type: 'tool/ptc-dispatch', seq: 14, time: 1753005608100, data: { rootCallId: 'call-1', parentCallId: 'call-1', subCallId: 'call-1:ptc:3', name: 'edit', arguments: { file_path: '/dsh-fixtures/c.ts' }, isError: false, content: [{ type: 'text', text: 'edited c.ts' }] } },
-  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const lines = readFileSync(path, 'utf8').split('\n').filter((l) => l.trim().length > 0);
+  const cutoff = lines.findIndex((l) => JSON.parse(l).type === 'tool/result');
+  assert.ok(cutoff > 0);
+  writeFileSync(path, lines.slice(0, cutoff).join('\n') + '\n');
 
-  const unit2 = provider.discover(store.ctx())[0];
-  const { values } = drain(provider.parse(unit2, store.ctx().lastCursor(unit2.key)));
+  const unit = provider.discover({ lastCursor: () => null })[0];
   const anchor = `${unit.sessionId}:t1:s1:tool_use`;
+  store.set(unit.key, drain(provider.parse(unit, null)).ret);
+  assert.equal(cursorState(store.ctx().lastCursor(unit.key)).members[path].ptcAnchors['call-1'], anchor,
+    'an in-flight parent keeps its anchor mapping');
+
+  // A dispatch in a later window resolves via the checkpointed map.
+  appendFileSync(path, [
+    { type: 'tool/ptc-dispatch-start', seq: 10, time: 1753005608000, data: { rootCallId: 'call-1', parentCallId: 'call-1', subCallId: 'call-1:ptc:3', name: 'edit', arguments: { file_path: '/dsh-fixtures/c.ts' } } },
+    { type: 'tool/ptc-dispatch', seq: 11, time: 1753005608100, data: { rootCallId: 'call-1', parentCallId: 'call-1', subCallId: 'call-1:ptc:3', name: 'edit', arguments: { file_path: '/dsh-fixtures/c.ts' }, isError: false, content: [{ type: 'text', text: 'edited c.ts' }] } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const unit2 = provider.discover(store.ctx())[0];
+  const parsed2 = drain(provider.parse(unit2, store.ctx().lastCursor(unit2.key)));
+  const { values } = parsed2;
   const call = values.find((r) => r.kind === 'tool_call' && r.name === 'edit');
   assert.ok(call, 'new dispatch projected');
   assert.equal(call.message_uuid, anchor, 'anchor resolved from the checkpointed map, not a synthetic fallback');
-  assert.ok(values.some((r) => r.kind === 'tool_result' && r.content === 'edited c.ts'));
   assert.ok(!values.some((r) => r.kind === 'message' && r.uuid === anchor), 'existing anchor is not re-emitted');
   assert.equal(values.find((r) => r.kind === 'session').countMode, 'delta');
+  store.set(unit2.key, parsed2.ret);
+
+  // The parent's result lands: its mapping (and any nested sub-call ids) is
+  // pruned — the checkpointed map holds only in-flight calls.
+  appendFileSync(path, JSON.stringify({
+    type: 'tool/result', seq: 12, time: 1753005608200, data: {
+      turn: 1, step: 1,
+      message: { id: 'tr-call-1', role: 'user', content: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'run_code finished' }] }], source: { kind: 'tool', callId: 'call-1' } },
+    }, surfaceOp: 'append',
+  }) + '\n');
+  const unit3 = provider.discover(store.ctx())[0];
+  const ret3 = drain(provider.parse(unit3, store.ctx().lastCursor(unit3.key))).ret;
+  assert.equal(cursorState(ret3).members[path].ptcAnchors?.['call-1'] ?? null, null, 'settled parent is pruned from the checkpoint');
 });
 
 test('watcher routing matches versioned filenames and ignores lock/tmp noise', () => {
@@ -1668,6 +1693,45 @@ test('seeded v3 appends stay on the fast path: the checkpointed seededPrefix (or
     'the recompute-from-head path also excludes inherited rows',
   );
   assert.equal(cursorState(parsed3.ret).members[childPath].seededPrefix, 4, 'recomputed and re-checkpointed');
+});
+
+// Regression (reproduced against the real writer): a seeded v3 subagent whose
+// FIRST index happens before the seed batch lands — DSH persists the header
+// first, so a header-only file is a real intermediate state. The adapter must
+// fail closed, not checkpoint a phony cut of 0 that leaks the inherited
+// parent prefix into the child's sidechain on every later window (ADR-0014).
+test('a seeded child indexed before its seed batch lands fails closed (no sticky cut 0)', () => {
+  const dir = makeTempDir('obelisk-v3-seed-race-');
+  const sessionsDir = stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']);
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const store = cursorStore();
+
+  // Truncate the child to its header only — the seed batch has not landed.
+  const childPath = join(sessionsDir, '--dsh-v3--', 'v3-seeded-child', 'session.v3.jsonl');
+  const full = readFileSync(join(V3_FIXTURES, 'v3-seeded-child', 'session.v3.jsonl'), 'utf8');
+  writeFileSync(childPath, `${full.split('\n')[0]}\n`);
+
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  assert.ok(unit);
+  const first = drain(provider.parse(unit, null));
+  assert.equal(first.values.length, 0, 'nothing is emitted before the seed marker is durable');
+  assert.equal(first.ret, null, 'no cursor is recorded — nothing is checkpointed');
+
+  // The seed batch lands: the inherited prefix stays excluded from the start.
+  writeFileSync(childPath, full);
+  const unit2 = provider.discover(store.ctx())[0];
+  const second = drain(provider.parse(unit2, store.ctx().lastCursor(unit2.key)));
+  const childTexts = second.values.filter((r) => r.kind === 'message' && r.agent_id !== null).map((m) => m.text).filter(Boolean);
+  assert.deepEqual(childTexts.sort(), ['child answer', 'child task']);
+  assert.equal(cursorState(second.ret).members[childPath].seededPrefix, 4, 'the observed marker is checkpointed');
+  store.set(unit2.key, second.ret);
+
+  // A later append window stays clean — no leak via a sticky 0.
+  appendFileSync(childPath, JSON.stringify({ type: 'user/message', seq: 12, time: 1250, data: { id: 'u-child-late', role: 'user', content: [{ type: 'text', text: 'later append' }], source: { kind: 'user' } }, surfaceOp: 'append' }) + '\n');
+  const unit3 = provider.discover(store.ctx())[0];
+  const third = drain(provider.parse(unit3, store.ctx().lastCursor(unit3.key)));
+  const thirdTexts = third.values.filter((r) => r.kind === 'message').map((m) => m.text).filter(Boolean);
+  assert.deepEqual(thirdTexts, ['later append'], 'delta window contains only child-owned rows');
 });
 
 // Cursor shape v1 (six parallel path-keyed maps, before the ADR-0014

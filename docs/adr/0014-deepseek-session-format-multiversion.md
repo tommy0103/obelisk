@@ -44,6 +44,11 @@ keep one projection path.
   with `data.inherited === true` (skip `seq <` that event's seq). The resolved
   count is checkpointed on the member's own record (see the cursor revision
   below); on a cursor lacking it, it is recomputed from the file head once.
+  A seeded subagent whose marker is not durable yet (the header is persisted
+  before the seed batch, so a header-only file is a real intermediate state)
+  FAILS CLOSED for the whole tree that round — parsing with a phony cut of 0
+  would leak the inherited parent prefix into the child's sidechain, and
+  checkpointing that 0 would make the leak sticky across windows.
 - **Cursor checkpoint: per-member records (shape v2).** The cursor grew six
   parallel `Record<path, …>` maps — a data clump: they describe one thing (a
   member file's incremental parse state), always appear together, and admit
@@ -80,9 +85,12 @@ keep one projection path.
   anchor via a per-member `parentCallId → anchor uuid` map (file order
   suffices — upstream appends `tool/call` before its dispatches; the map is
   checkpointed for fast-path windows, with a deterministic synthetic
-  provisional anchor as the miss fallback). Dispatch `arguments` are
-  already-parsed JSON, unlike `tool/call`'s JSON string. `*-dispatch-start`
-  carries only timing and is skipped.
+  provisional anchor as the miss fallback). The map is pruned when a call's
+  `tool/result` lands — upstream settles every sub-call before the outer
+  result, so a settled call can never gain new dispatches; the checkpoint
+  holds only in-flight calls, never every call the log ever saw. Dispatch
+  `arguments` are already-parsed JSON, unlike `tool/call`'s JSON string.
+  `*-dispatch-start` carries only timing and is skipped.
 - **`indexVersionMarker` is bumped** (`__deepseek_canonical_transcript_v4__`):
   dispatch indexing adds records to already-indexed v0 sessions, which only a
   reindex backfills (CONTRIBUTING: bump the marker when already-stored rows
