@@ -112,12 +112,18 @@ Array<{
   message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, visibility, source },
   session: { id, title, project, started_at, source, is_invoking? },
   rank,
-  context
+  context,
+  snippet?,
+  degraded?
 }>
 ```
 
 `session.is_invoking` is `true` when the hit belongs to the invoking session
 (see Invocation Identity) and omitted otherwise.
+
+`snippet` is a hit-centered window into `message.text`: long messages often
+match far past the head, so read `snippet` first and fall back to `text` when
+it is absent (a raw-syntax query whose terms do not appear literally).
 
 `context` is temporal neighbor context in the same session, not a parent chain.
 Hits and neighbors carry `visibility`.
@@ -129,6 +135,29 @@ Valid FTS5 syntax in `text` is honored. Input that FTS5 would reject as
 malformed (for example a hyphenated term like `foo-bar`) does not error: it
 falls back to safe per-token quoting — the same tokenization `memories()` uses —
 so ordinary text never crashes the query.
+
+When `messages_fts` is built with the trigram tokenizer, terms shorter than
+three code points cannot go through MATCH (alone they match nothing; next to
+longer terms they silently match everything). `search()` routes around this and
+says so via `degraded`:
+
+| `degraded` | Meaning | `rank` |
+| --- | --- | --- |
+| `"short-token-post-filter"` | The indexable terms were MATCHed and the short ones enforced as literal substrings. | preserved |
+| `"like-scan"` | Every term was short, so the content table was scanned directly; recency orders the hits. | `null` |
+| `"short-token-unguarded"` | The short terms could not be enforced and did **not** constrain the result. | preserved |
+
+`"short-token-unguarded"` happens only with raw FTS5 syntax, in the two cases
+where an added substring condition would answer a different question than the
+one asked: when `OR`, `NOT`, or `NEAR` is present, and when no term is long
+enough to MATCH. Rewrite the query as plain terms to get the guard back.
+
+Two limits worth knowing. A query that returns no rows carries no `degraded`
+marker at all, because the marker rides on each hit — an empty result for a
+query containing a sub-3-code-point term may be a dropped term rather than an
+absent one, so retry it as plain terms before concluding the history lacks it.
+And `sql()` is not covered: a hand-written `MATCH` there gets FTS5's raw
+behavior, short terms included.
 
 #### `context(uuid, opts?)`
 
