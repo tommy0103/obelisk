@@ -15,7 +15,11 @@ import {
   setQuery,
   setProjectSearch,
   toggleSort,
-  toggleIncludeMessageBodies
+  toggleIncludeMessageBodies,
+  MINIMIZE_SVG,
+  RESTORE_SVG,
+  MAXIMIZE_SVG,
+  CLOSE_SVG
 } from './store.js';
 import { formatProjectLabel } from './utils.js';
 import { buildSidebarProjects } from './sidebar-projects.mjs';
@@ -26,10 +30,14 @@ const router = useRouter();
 const route = useRoute();
 let searchTimer = null;
 let stopSourceUpdates = null;
+let stopWindowState = null;
 
 const routeSession = computed(() => {
   return getSessionSummary(route.params.id);
 });
+
+// --- Platform ---
+const platform = window.obelisk?.platform ?? null;
 
 // --- Sidebar data ---
 
@@ -80,6 +88,10 @@ const showSearchMsgsToggle = computed(() => {
 });
 
 // --- Window title ---
+
+const maximized = ref(false);
+function windowControl(action) { window.obelisk?.windowControl?.(action); }
+function onTitlebarDbClick() { if (platform === 'linux') windowControl('toggle-maximize'); }
 
 const windowTitle = computed(() => {
   const appName = 'Obelisk';
@@ -199,12 +211,17 @@ function handleGlobalKeydown(event) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleGlobalKeydown);
+  document.addEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates = window.obelisk?.onIndexUpdated?.(() => loadSourceDots()) ?? null;
+  stopWindowState = window.obelisk?.onWindowState?.((s) => { maximized.value = !!s?.maximized; }) ?? null;
 });
 onUnmounted(() => {
   window.removeEventListener('keydown', handleGlobalKeydown);
+  document.removeEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates?.();
   stopSourceUpdates = null;
+  stopWindowState?.();
+  stopWindowState = null;
   clearTimeout(searchTimer);
 });
 
@@ -231,11 +248,17 @@ function setRecapKind(k) {
 
 // --- Source filter ---
 const showSourceFilter = ref(false);
+const sourceFilterWrapRef = ref(null);
 const sourceFilterActive = computed(() => state.sourceFilter !== 'all' && state.sourceFilter !== undefined);
 const sourceFilterLabel = computed(() => {
   if (!state.sourceFilter || state.sourceFilter === 'all') return 'All sources';
   return sourceLabel(state.sourceFilter, state.sources);
 });
+function handleDocumentPointerDown(event) {
+  if (showSourceFilter.value && !sourceFilterWrapRef.value?.contains(event.target)) {
+    showSourceFilter.value = false;
+  }
+}
 function toggleSourceFilter() { showSourceFilter.value = !showSourceFilter.value; }
 function setSourceFilter(id) {
   state.sourceFilter = id;
@@ -247,11 +270,22 @@ provide('recapGenerateOpen', recapGenerateOpen);
 <template>
   <router-view v-if="isExportRoute" />
   <div class="app" v-else>
-    <div class="titlebar">
+    <div class="titlebar" :class="{ mac: platform === 'darwin', 'has-controls': platform === 'linux' }" @dblclick="onTitlebarDbClick">
       <div class="titlebar-text" id="titlebar-text">
         <span class="app-name">{{ windowTitle.appName }}</span>
         <span class="sep">—</span>
         <span class="scope">{{ windowTitle.scopeText }}</span>
+      </div>
+      <div v-if="platform === 'linux'" class='titlebar-controls' @dblclick.stop>
+        <button type="button" class="titlebar-btn" aria-label="Minimize" @click="windowControl('minimize')">
+          <span class="titlebar-icon" v-html="MINIMIZE_SVG"></span>
+        </button>
+        <button type="button" class="titlebar-btn" aria-label="Maximize or restore" @click="windowControl('toggle-maximize')">
+          <span class="titlebar-icon" v-html="maximized ? RESTORE_SVG : MAXIMIZE_SVG"></span>
+        </button>
+        <button type="button" class="titlebar-btn titlebar-btn-close" aria-label="Close" @click="windowControl('close')">
+          <span class="titlebar-icon" v-html="CLOSE_SVG"></span>
+        </button>
       </div>
     </div>
 
@@ -468,7 +502,12 @@ provide('recapGenerateOpen', recapGenerateOpen);
                   {{ currentRouteType === 'sessions' ? 'Sessions' : 'Memory' }}
                 </button>
                 <span class="crumb-sep">/</span>
-                <span class="crumb terminal">{{ formatProjectLabel(state.projectFilter) }}</span>
+                <span
+                  class="crumb terminal project-crumb"
+                  :title="formatProjectLabel(state.projectFilter)"
+                >
+                  {{ formatProjectLabel(state.projectFilter) }}
+                </span>
               </template>
               <template v-else>
                 <span class="crumb terminal">
@@ -530,7 +569,11 @@ provide('recapGenerateOpen', recapGenerateOpen);
           </template>
 
           <!-- Source filter (session list only, multi-source) -->
-          <div v-if="showToolbar && route.name === 'SessionList' && sourceDots.length > 1" class="source-filter-wrap">
+          <div
+            v-if="showToolbar && route.name === 'SessionList' && sourceDots.length > 1"
+            ref="sourceFilterWrapRef"
+            class="source-filter-wrap"
+          >
             <button class="filter-btn" :class="{ active: sourceFilterActive }" @click="toggleSourceFilter">
               <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
                 <path d="M2 3h8M3.5 6h5M5 9h2"/>

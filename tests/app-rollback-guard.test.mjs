@@ -14,6 +14,7 @@ import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 import { buildIndex } from '../app/src/main/indexer.ts';
+import { createClaudeProvider } from '../packages/core/src/providers/claude.ts';
 const { DatabaseSync } = require('node:sqlite');
 
 // Wraps node:sqlite and simulates SQLite auto-rollback-on-error: a poisoned write
@@ -223,6 +224,49 @@ test('BEGIN contention during finalize defers the build', () => {
   });
   assert.equal(result.deferred, true);
   assert.equal(result.reason, 'database_busy');
+});
+
+test('a marker replay resumes after the last committed file when the next transaction defers', () => {
+  const { home, dbPath, projectsDir } = subagentHome();
+  const StableDb = makeDbClass(() => false);
+  assert.equal(run(home, dbPath, projectsDir, StableDb).complete, true);
+
+  const marker = createClaudeProvider({ rootDir: join(home, '.claude') }).indexVersionMarker;
+  let db = new DatabaseSync(dbPath);
+  db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(marker);
+  db.close();
+
+  const InterruptedDb = makeBeginBusyDbClass(beginCall => beginCall === 2);
+  const interrupted = buildIndex({
+    force: false,
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    projectsDir,
+    dbPath,
+    DatabaseImpl: InterruptedDb,
+  });
+  assert.equal(interrupted.deferred, true);
+  assert.equal(interrupted.reason, 'database_busy');
+
+  db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(marker).c, 1);
+  db.close();
+
+  const resumed = buildIndex({
+    force: false,
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    projectsDir,
+    dbPath,
+    DatabaseImpl: StableDb,
+  });
+  assert.equal(resumed.files, 1, 'the committed file is not replayed after restart');
+  assert.equal(resumed.complete, true);
+
+  db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM sessions').get().c, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM messages').get().c, 2);
+  db.close();
 });
 
 test('a finalize database error is propagated instead of swallowed as malformed input', () => {

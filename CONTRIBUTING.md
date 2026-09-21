@@ -34,6 +34,9 @@ The single most common failure is a capability that is advertised but
 unreachable. If you describe a config option, use that option from the outermost
 entry point before submitting. If you post a screenshot, the input in that
 screenshot must be an input the code can actually handle.
+When changing build output, package contents, or runtime resource loading, verify
+the built or packaged artifact through the entry point users run, including its
+required resources. Source-level tests alone do not cover that boundary.
 
 **2. Write assertions in the words of the requirement, not the shape of the
 implementation.**
@@ -50,8 +53,9 @@ start heal itself?
 
 **4. Read the neighbouring implementation first, and reuse the concepts that
 already exist.**
-Adding a provider means reading `claude.ts`, `codex.ts`, and `kimi.ts` in full
-first. Needing "don't display this row" means grepping for `visibility` before
+Adding a provider means reading all provider implementations in
+[`packages/core/src/providers/`](packages/core/src/providers/) in full first.
+Needing "don't display this row" means grepping for `visibility` before
 inventing a field. The burden of proof for a new concept, field, state, or file
 type is on the PR: say why the existing one is insufficient. The ADRs in
 `docs/adr/` are constraints, not suggestions.
@@ -107,7 +111,17 @@ interactions, or the full Electron suites.
 
 ## Provider adapters
 
-- **Read `claude.ts`, `codex.ts`, and `kimi.ts` before writing a new adapter.**
+- **Before requesting review, pass the adapter-review skill in a clean session.**
+  Run [`maintainer-skills/adapter-review/SKILL.md`](maintainer-skills/adapter-review/SKILL.md)
+  from a fresh agent session — not the session that wrote the code — and resolve
+  every blocking finding first. The authoring session shares the implementation's
+  assumptions; the skill encodes the failure patterns this repo's adapter reviews
+  keep hitting (identity/key asymmetry, destructive tombstones, migration
+  convergence, fixture authenticity), and it only works when the reviewer is not
+  the author.
+- **Read all provider implementations in
+  [`packages/core/src/providers/`](packages/core/src/providers/) before writing a
+  new adapter.**
   The conventions there are earned: zero-padded ordinals in ids
   (`parsing.ts` uses `padStart(6, '0')`), the
   `__<provider>_canonical_transcript_vN__` marker, how `git_branch` is handled.
@@ -180,8 +194,24 @@ interactions, or the full Electron suites.
 - **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
   `checkJs: false`, so a `.mjs` module has no type coverage at all.
 
+## CLI and tool error messages
+
+State what failed and the known cause, with only the context needed to diagnose
+or correct the problem. Preserve the underlying error; do not invent a cause or
+mask failure as success. Keep the message concise. Add corrective guidance only
+when it is specific and immediately useful.
+
+For multiple statements passed to `sql()`, compare these message bodies
+(the preferred message already exists in [`query.ts`](packages/core/src/query.ts)):
+
+- **Prefer:** `sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls`
+- **Avoid:** `sql() failed: invalid query`
+
 ## Indexing, daemon, and write ownership
 
+- For retry and recovery paths, check both transient and persistent failures.
+  Preserve safe partial progress without claiming completion, keep unresolved
+  failures visible, and limit the frequency and cost of repeated attempts.
 - **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
   is read-only: no write connection, no schema migration, no PRAGMA change, no
   checkpoint, no indexing. Two narrow carve-outs, both recorded in ADR 0006:
@@ -201,6 +231,15 @@ interactions, or the full Electron suites.
   `recursive_triggers` is off, so a trigger-based refresh would leave stale text
   behind.
 
+## Performance changes
+
+Measure the affected workload before optimizing, then compare the same workload
+before and after the change. Report enough context to judge the result, including
+workload size and measurement variability. Preserve required behavior, data
+ownership, merge semantics, and recovery guarantees; check those contracts before
+extending an optimization to another path. Make remaining costs and deliberate
+tradeoffs explicit.
+
 ---
 
 ## Verification contract
@@ -216,12 +255,31 @@ Every PR:
    section in the PR description explaining why the original was wrong.
 5. **Fixtures are real provider output**, not hand-written approximations.
 6. **Confirm your new tests actually run in CI** (`.github/workflows/`).
+7. For shared logic, choose coverage from the affected callers and provider
+   contracts. Exercise behavior that differs across providers or entry points;
+   do not let mocks erase those differences.
 
 ## Scope and review
 
 - One PR does one thing. Note explicitly anything you deliberately left out.
+- Keep the PR title and description aligned with the final diff and verification.
+  Include incidental behavior changes and remove claims or limitations that no
+  longer apply.
 - If you are unsure about a design decision, say so in the PR instead of
   guessing — an open question is cheaper to resolve than a silent assumption.
 - Do not ship a code path you have flagged to yourself as unverified. Writing
   "this call site is worth another look" is honest, but it belongs in a follow-up
   issue, not in the diff.
+- Use commit messages to preserve why a change was made, with any key tradeoff
+  needed to understand the decision. Keep the explanation brief and self-contained;
+  reference a commit, issue, or PR when useful, without repeating its discussion.
+
+### Clarify the need for new concepts
+
+When a contributor proposes a new concept, field, state, or file type, help
+clarify the problem it solves, why it is needed, and how it differs from existing
+concepts before committing to a design. Bring relevant implementation facts and
+design decisions into the discussion: explain where reuse fits and where it would
+erase a meaningful distinction. Apply the same reasoning to abstractions an agent
+proposes. Record the resulting rationale concisely in the issue or PR, carrying
+forward decisions already settled there.

@@ -113,22 +113,46 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
-function readLines(filePath: string, callback: (line: string) => boolean | void): void {
+interface ReadLinesOptions {
+  start?: number;
+  onBytesRead?: (bytes: number) => void;
+}
+
+function readLines(
+  filePath: string,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+  { start = 0, onBytesRead }: ReadLinesOptions = {},
+): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
-  let remainder = '';
+  let remainder = Buffer.alloc(0);
   let bytesRead;
+  let position = start;
   try {
-    while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
-      const lines = buf.toString('utf8', 0, bytesRead).split('\n');
-      lines[0] = remainder + lines[0];
-      remainder = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line && callback(line) === false) return;
+    while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      onBytesRead?.(bytesRead);
+      const chunkStart = position;
+      position += bytesRead;
+      const chunk = buf.subarray(0, bytesRead);
+      const combinedStart = chunkStart - remainder.length;
+      const data = remainder.length === 0 ? chunk : Buffer.concat([remainder, chunk]);
+      let lineStart = 0;
+      while (true) {
+        const newline = data.indexOf(0x0a, lineStart);
+        if (newline < 0) break;
+        const line = data.toString('utf8', lineStart, newline);
+        lineStart = newline + 1;
+        if (line && callback(line, true, combinedStart + lineStart) === false) return;
       }
+      // `buf` is reused by the next readSync; retain an owned copy so a line
+      // spanning chunks is never overwritten before it is completed.
+      remainder = Buffer.from(data.subarray(lineStart));
     }
-    if (remainder) callback(remainder);
+    // `terminated: false` — the final chunk had no trailing newline, so this
+    // tail may still be growing (or may simply be an unterminated last line;
+    // the caller cannot tell, and must decide what that means).
+    if (remainder.length > 0) callback(remainder.toString('utf8'), false);
   } finally {
     closeSync(fd);
   }
@@ -259,16 +283,21 @@ function codexParentThreadId(meta: JsonRecord): string | null {
     || null;
 }
 
+// Legacy guardian threads surface as records from the internal auto-review
+// model rather than as explicit subagent metadata.
+const CODEX_AUTO_REVIEW_MODEL = 'codex-auto-review';
+
 function codexIsGuardianThread(meta: JsonRecord, records: CodexLineRecord[] = []): boolean {
   const subagent = meta?.source?.subagent;
   if (subagent?.other === 'guardian') return true;
   if (meta?.thread_source !== 'subagent') return false;
-  return records.some(({ obj }) => obj?.payload?.model === 'codex-auto-review' || obj?.model === 'codex-auto-review');
+  return records.some(({ obj }) => obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL || obj?.model === CODEX_AUTO_REVIEW_MODEL);
 }
 
 function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; lineNum: number } | null {
-  const records: CodexLineRecord[] = [];
   let metaRecord: CodexLineRecord | null = null;
+  let sawAutoReviewModel = false;
+  let guardian = false;
   let lineNum = 0;
   readLines(filePath, (line) => {
     lineNum++;
@@ -278,17 +307,24 @@ function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; l
     } catch {
       return;
     }
-    records.push({ lineNum, obj });
+    sawAutoReviewModel ||= obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL
+      || obj?.model === CODEX_AUTO_REVIEW_MODEL;
     if (obj?.type === 'session_meta' && obj.payload?.id) {
       metaRecord = { lineNum, obj };
-      if (obj.payload?.source?.subagent?.other === 'guardian') return false;
+      if (obj.payload?.source?.subagent?.other === 'guardian') {
+        guardian = true;
+        return false;
+      }
       if (obj.payload?.thread_source !== 'subagent') return false;
     }
-    if (metaRecord && codexIsGuardianThread(metaRecord.obj.payload, records)) return false;
+    if (metaRecord && sawAutoReviewModel) {
+      guardian = true;
+      return false;
+    }
   });
   const capturedMeta = metaRecord as CodexLineRecord | null;
   const meta = capturedMeta?.obj?.payload;
-  if (!meta || !codexIsGuardianThread(meta, records)) return null;
+  if (!meta || !guardian) return null;
   const threadRawId = codexRawId(meta.id);
   return threadRawId ? { threadRawId, lineNum } : null;
 }

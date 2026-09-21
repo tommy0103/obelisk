@@ -3,13 +3,19 @@
 
 // Passive-pull indexing orchestration for the Core package.
 import { existsSync } from 'node:fs';
-import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts } from './db.ts';
+import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
+import {
+  backfillUnresolvedSessionProjectPathsOnce,
+  ensureFtsReady,
+  refreshSessionProjectPaths,
+} from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
   createProviderIndexPlan,
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readRecentTranscriptHints,
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
@@ -21,7 +27,8 @@ import {
 } from './provider-settings.ts';
 import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { NodeSqliteDb, SqliteDb, SqliteRow } from './sqlite-types.ts';
+import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
+import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 
 interface SkippedFile {
   provider: string;
@@ -49,28 +56,17 @@ interface BuildIndexOptions {
   // imply this; the carve-out is always explicit (ADR 0006 amendment).
   ignoreDaemonOwnership?: boolean;
   providerRegistry?: ProviderRegistry;
+  // 'strict' disables cooperative append: a full-inventory refresh that acts
+  // as its caller's reconciliation verifies prefixes instead of trusting
+  // append-only growth (RFC #172). Defaults to 'normal'; force builds are
+  // readMode-independent because they replay every unit from a null cursor.
+  readMode?: 'normal' | 'strict';
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-
-function refreshSessionProjectPaths(db: NodeSqliteDb): void {
-  const sessions = db.prepare('SELECT id, project FROM sessions').all();
-  const cwdStmt = db.prepare(`
-    SELECT cwd
-    FROM messages
-    WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
-  `);
-  const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
-  for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map((row: SqliteRow) => row.cwd);
-    const projectPath = inferProjectPath(session.project, cwds);
-    if (projectPath) update.run(projectPath, session.id);
-  }
-}
 
 // A workflow unit links to its parent Workflow tool call by matching the unique
 // run id in the tool_result text — but the run json can reach the index before
@@ -184,7 +180,7 @@ function ensureReadableSchema(): { ready: boolean; reason?: string } {
   }
 }
 
-function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false, providerRegistry }: BuildIndexOptions = {}) {
+function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false, providerRegistry, readMode = 'normal' }: BuildIndexOptions = {}) {
   const ownership = inspectBuildOwnership({ force, ignoreRecentBuild, ignoreDaemonOwnership });
   if (ownership.skip) return ownership;
   const lease = acquireWriterLease({
@@ -202,14 +198,16 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       if (!settings.ok) {
         return { skip: true, reason: 'settings_unavailable', error: settings.error };
       }
-      registry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
+      registry = createConfiguredBuiltinProviderRuntime(settings.settings, {
+        openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+      }).registry;
     }
 
     const db = openDb();
     const txDb = nodeSqliteTransactionAdapter(db);
     const skippedFiles: SkippedFile[] = [];
     try {
-      const providerPlan = createProviderIndexPlan(db, registry, { force });
+      const providerPlan = createProviderIndexPlan(db, registry, { force, readMode });
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
       if (force && incompleteProviders.length > 0) {
@@ -238,10 +236,10 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               db,
               plan: providerPlan,
             });
-            refreshSessionProjectPaths(db);
+            refreshSessionProjectPaths(db, null);
+            backfillUnresolvedSessionProjectPathsOnce(db);
             healWorkflowParentLinks(db);
-            db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-            rebuildMemoryFts(db);
+            ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
           }, { label: 'force-rebuild' });
@@ -287,6 +285,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           inventoryIssues,
           skipped: 0,
           skippedFiles,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 
@@ -294,6 +293,12 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         db,
         plan: providerPlan,
         runTransaction: (label, work) => runRetryableWriteTransaction(txDb, work, { label }),
+        onPersisted: ({ unit }) => {
+          refreshSessionProjectPaths(db, new Set([
+            unit.sessionId,
+            ...(unit.retractSessionIds ?? []),
+          ]));
+        },
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
@@ -324,10 +329,11 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       // the build (a half-finalized index would be inconsistent).
       try {
         runRetryableWriteTransaction(txDb, () => {
-          refreshSessionProjectPaths(db);
+          // Per-unit paths commit atomically with their provider cursors above;
+          // legacy unresolved rows use one explicit, convergent backfill.
+          backfillUnresolvedSessionProjectPathsOnce(db);
           healWorkflowParentLinks(db);
-          db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-          rebuildMemoryFts(db);
+          ensureFtsReady(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
           writeProviderIndexMarkers(db, providerPlan, providerResult);
         }, { label: 'finalize' });
@@ -352,6 +358,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         inventoryIssues,
         skipped: skippedFiles.length,
         skippedFiles,
+        watchHints: readRecentTranscriptHints(db),
       };
     } finally {
       db.close();

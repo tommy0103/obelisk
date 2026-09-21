@@ -61,6 +61,51 @@ binding-agnostic and does not need a per-binding implementation.
   (CLI) and `better-sqlite3` (app) run the same code — there is no
   per-binding persist layer.
 
+**Amendment (2026-09-01): idempotent exact-value persistence.** Snapshot
+providers may correctly replay a complete canonical session after a small
+source change. The shared persist layer must not turn an identical replay into
+physical database churn. `messages`, `tool_calls`, and `tool_results` therefore
+use primary-key UPSERTs whose update branch runs only when at least one
+authoritative persisted value differs, using NULL-safe comparison. Message
+comparison deliberately excludes `turn_duration_ms`, which is owned by the
+separate `message-turn-duration` record; that targeted update is itself skipped
+when the stored duration already matches. A skipped message update also skips
+the schema's `AFTER UPDATE` FTS maintenance, while a real message change retains
+the existing atomic content-row and FTS update behavior. Tool rowids remain
+stable across both identical and changed replay, preserving insertion order for
+consumers such as workflow-parent healing.
+
+This is a table-specific rule, not permission to mechanically replace every
+write in `persist()`. Sessions derive merge values and counts from prior state;
+subagents and workflow agents merge multiple contributors with `COALESCE`;
+summaries and workflows retain whole-row replacement semantics; and
+`index_state` must continue publishing provider progress. Any later no-op
+optimization for those records must compare their computed post-merge state and
+preserve their individual contracts. No provider cursor or canonical transcript
+marker changes for this amendment because the projected canonical values do not
+change.
+
+**Amendment (2026-09-04): bounded canonical replay filtering.** Conditional
+UPSERTs stop physical writes but still execute one primary-key probe for every
+record in a snapshot replay. Once a stream reaches 250 records, the shared
+persist layer fetches existing message/tool state in bounded 250-record batches
+and executes the established UPSERTs only for new or changed values. Shorter
+delta streams retain the direct conditional-UPSERT path and do not pay an extra
+read. Each lookup is further capped at 900 bound keys, below SQLite's portable
+variable limit, and the batch bound prevents a long transcript from being
+materialized in memory at the persistence seam.
+
+Comparison uses the same authoritative field sets as the conditional UPSERTs
+and simulates accepted changes in record order inside the batch. This preserves
+the final state when one key appears more than once, including message duration
+updates. A `delete-session` record is a hard batch boundary so later records
+observe the deletion rather than prefetched stale state. Retractions attached
+to an `IndexUnit` still run before any state is fetched. Sessions, summaries,
+subagents, workflows, workflow agents, and `index_state` retain their existing
+write and merge contracts. This optimization changes neither canonical values
+nor provider cursors and therefore requires no schema migration or canonical
+transcript marker bump.
+
 **Two indexing modes** share all of the above and differ only in trigger:
 **daemon mode** (the app, and potentially a future CLI daemon, watches and keeps
 the index fresh) and **passive pull mode** (a CLI command indexes on invocation
@@ -69,6 +114,81 @@ a fresh daemon via heartbeat markers in `index_state` (**daemon arbitration**).
 One narrow exception: the invocation-nonce freshness build may index
 incrementally under a fresh daemon heartbeat, arbitrated by the writer lease
 (see the 2026-08-11 amendment in ADR-0006).
+
+**Amendment (2026-09-01): Kimi session-manifest cursors.** A Kimi session
+directory remains one atomic `IndexUnit`: `state.json`, the main wire, and
+subagent wires jointly define one canonical timeline, and a genuinely changed
+unit may still require a complete replay for undo, clear, compaction, member
+removal, and cross-wire tool relationships. That snapshot policy does not
+justify reading every unchanged wire body during discovery. Passive-pull
+discovery must scale with member metadata, not total transcript bytes.
+
+Kimi therefore separates three internal operations behind the unchanged
+provider interface: collect one normalized session-member snapshot, encode that
+snapshot as a cursor, and classify a stored cursor as current, upgradeable, or
+requiring replay. The snapshot contains the sorted relative member paths and
+their identity/change metadata (`dev`, `ino`, `size`, `mtime`, and `ctime`) for
+`state.json`, current agent wires, and the legacy root wire when applicable.
+Discovery hashes only this metadata; it never hashes or counts wire contents to
+decide that an unhinted session is unchanged. The cursor keeps the two numeric
+compatibility slots followed by a provider-owned format tag and digest, for
+example `maxMtime:0:kimi-manifest-v1:<digest>`. Path normalization, sort order,
+included fields, serialization, and digest algorithm are all part of that
+cursor-format version.
+
+The discovery snapshot travels in `IndexUnit.meta`. Parse takes a fresh snapshot
+before reading and another after projection; a member-set or metadata change at
+either boundary rejects the torn unit and leaves its prior cursor and canonical
+rows intact. A watcher hint continues to re-plan its session even when the
+stored cursor matches. An indexed session that loses a member, including its
+last wire, is a changed/tombstone unit rather than an unchanged session to skip.
+An enumeration/stat race is reported as incomplete or unstable inventory and is
+retried; it must not publish a cursor for a snapshot the adapter did not prove.
+
+Kimi deletion reconciliation is identity-based, not path-ordered. The
+namespaced native session id remains stable when Kimi moves a session directory
+between workspaces, so discovery first builds a provider-wide identity census
+and then routes work to the current directory. A missing old path never produces
+a tombstone while the same identity is live elsewhere; the current directory is
+replayed instead, updating canonical provenance atomically. Duplicate live
+directories for one identity make the census ambiguous and fail closed.
+
+`changedPaths` is an invalidation/routing hint, not evidence that a missing path
+was intentionally deleted. Discovery-known retractions are emitted through
+`IndexUnit.retractSessionIds` only after the complete identity census proves the
+identity absent. If the sessions root, a workspace, or a required member cannot
+be inventoried, Kimi may still replay source-local readable units, but it must
+withhold tombstones and moved-provenance replacement until a later complete
+census. This preserves the last-good canonical snapshot across unmounts,
+permission failures, and observation races.
+
+Cursor-format versions and canonical-transcript markers have different
+lifecycles. A legacy or unknown Kimi cursor never proves that a unit is
+unchanged, but it also does not throw: it fails closed to replay and is replaced
+atomically only after that unit succeeds. For a future manifest version, the
+adapter may compute both old and new fingerprints from one metadata snapshot;
+when the stored old fingerprint still matches, `parse` may yield no transcript
+records and return only the new cursor, giving a per-unit cursor-only migration.
+If the old format cannot validate the current snapshot, the unit replays once.
+Failed units retain their old cursor and retry independently.
+
+`indexVersionMarker` is not bumped for a cursor-format change alone. It is the
+provider-wide repair boundary for changes that affect already-stored canonical
+rows (UUIDs, roles, visibility, projection semantics, or stale rows requiring
+retraction). Using it for manifest serialization would conflate control-state
+migration with transcript migration and force an unnecessary destructive
+provider replay. The former `maxMtime:totalLines` Kimi cursor violated this
+decision because computing it reread the complete wire corpus merely to return
+no changed units; issue #128 records the measured impact and migration context.
+
+Rejected alternatives are: directory mtime alone, which cannot prove nested
+member stability; content hashing or line counting during every discovery,
+which makes unchanged cost proportional to transcript bytes; and bumping the
+canonical marker merely to change cursor encoding. Metadata cannot detect a
+rewrite for which a platform exposes no changed path, identity, size, mtime, or
+ctime; watcher hints remain the live invalidation path, while reconciliation
+provides the strongest portable metadata check required by the provider cursor
+contract.
 
 **Consequences.** Golden tests anchor on each adapter's `parse` output (feed
 fixture JSONL, assert the yielded record sequence) — independent of binding and

@@ -103,6 +103,7 @@ const toolResults = [{
   is_error: 0,
 }, {
   tool_use_id: 'call-codex-exec',
+  message_uuid: focusMessageUuid,
   content: codexExecOutput,
   is_error: 0,
 }];

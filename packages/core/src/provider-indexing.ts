@@ -1,6 +1,9 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { readdirSync, statSync, type Dirent } from 'node:fs';
+import { join } from 'node:path';
+
 import { persist } from './persist.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type {
@@ -25,6 +28,8 @@ export interface ProviderIndexItem {
 export interface ProviderInventoryIssue extends InventoryIssue {
   readonly provider: string;
 }
+
+export type ProviderReadMode = 'normal' | 'strict';
 
 export interface ProviderIndexPlan {
   readonly items: ProviderIndexItem[];
@@ -53,8 +58,89 @@ export class ProviderIndexFailure extends Error {
   }
 }
 
-export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
-  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
+// Hot-file seeding for the adaptive watcher (ADR-0009): after a build, the
+// most recently written transcripts are the best guess for what is still
+// being appended through long-lived descriptors. index_state.mtime holds the
+// source file mtime per unit; marker rows carry `__` prefixes and are not
+// transcripts. Keep the limit in sync with the watcher's DEFAULT_MAX_HOT_FILES.
+//
+// Unit keys are not always files: Kimi's key is the session directory, whose
+// mtime does not track appends to the wire files inside. Directory keys are
+// expanded to the transcripts they contain (bounded, mtime-ranked); missing
+// keys are dropped. Both run in the indexer worker, never on the Electron
+// main thread. The authoritative wire-layout knowledge lives in the Kimi
+// provider (kimi.ts sessionDirectoryFromWirePath and its discover walk) —
+// this generic expansion deliberately relies on file mtime instead of
+// duplicating that layout logic; if the Kimi wire layout changes, revisit
+// both.
+const WATCH_HINT_LIMIT = 64;
+const HINT_DIRECTORY_FILE_LIMIT = 4;
+// Candidates collected before ranking by mtime — a Kimi session dir holds
+// several wire files (main + agents), and readdir order says nothing about
+// which one is actively appended.
+const HINT_DIRECTORY_CANDIDATE_LIMIT = 16;
+
+function expandHintDirectory(dir: string): string[] {
+  const candidates: string[] = [];
+  const walk = (current: string, depth: number) => {
+    if (candidates.length >= HINT_DIRECTORY_CANDIDATE_LIMIT || depth > 4) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (candidates.length >= HINT_DIRECTORY_CANDIDATE_LIMIT) return;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.name.endsWith('.jsonl')) candidates.push(full);
+    }
+  };
+  walk(dir, 0);
+  // Rank by file mtime: the actively appended wire (the main one in
+  // practice) is the most recently written, while a plain readdir/DFS order
+  // would systematically pick stale agent wires first.
+  return candidates
+    .map((file) => {
+      try {
+        return { file, mtimeMs: statSync(file).mtimeMs };
+      } catch {
+        return { file, mtimeMs: 0 };
+      }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, HINT_DIRECTORY_FILE_LIMIT)
+    .map(({ file }) => file);
+}
+
+export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT): string[] {
+  const rows = db.prepare(
+    "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC LIMIT ?",
+  ).all(limit * 4);
+  const hints: string[] = [];
+  for (const row of rows) {
+    if (hints.length >= limit) break;
+    const key = String(row.jsonl_path);
+    let isDirectory: boolean;
+    try {
+      isDirectory = statSync(key).isDirectory();
+    } catch {
+      continue; // deleted between build and hint collection
+    }
+    if (!isDirectory) {
+      hints.push(key);
+      continue;
+    }
+    for (const file of expandHintDirectory(key)) {
+      if (hints.length >= limit) break;
+      hints.push(file);
+    }
+  }
+  return hints;
+}
+
+export function storedProviderCursor(db: SqliteDb, key: string): Cursor {  const row = db.prepare('SELECT mtime, lines_processed, cursor FROM index_state WHERE jsonl_path = ?').get(key);
   if (!row) return null;
   return typeof row.cursor === 'string'
     ? row.cursor
@@ -102,10 +188,12 @@ export function createProviderIndexPlan(
     force = false,
     changedPaths,
     priorSessions,
+    readMode = 'normal',
   }: {
     force?: boolean;
     changedPaths?: string[];
     priorSessions?: readonly ProviderSessionProvenance[];
+    readMode?: ProviderReadMode;
   } = {},
 ): ProviderIndexPlan {
   const items: ProviderIndexItem[] = [];
@@ -159,7 +247,15 @@ export function createProviderIndexPlan(
     for (const unit of units) {
       items.push({
         provider,
-        unit,
+        unit: readMode === 'normal'
+          ? unit
+          : {
+            ...unit,
+            meta: {
+              ...(unit.meta && typeof unit.meta === 'object' ? unit.meta : {}),
+              readMode,
+            },
+          },
         cursor: fullReindex ? null : storedProviderCursor(db, unit.key),
       });
     }
@@ -171,23 +267,45 @@ export function indexProviderPlan({
   db,
   plan,
   runTransaction,
+  onPersisted = () => {},
   onCommitted = () => {},
   onError,
 }: {
   db: SqliteDb;
   plan: ProviderIndexPlan;
   runTransaction: <T>(label: string, work: () => T) => T;
+  /** Runs after persist but inside the same transaction, before its commit. */
+  onPersisted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onCommitted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onError: (error: unknown, item: ProviderIndexItem) => 'skip' | 'stop';
 }): ProviderIndexResult {
   const committed: ProviderIndexItem[] = [];
   const failedProviders = new Set<string>();
   const failedItems: ProviderIndexItem[] = [];
+  let replayScheduleCommitted = plan.pendingMarkers.size === 0 && plan.replayKeys.size === 0;
   for (const item of plan.items) {
     try {
-      const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => (
-        persist(db, item.unit, item.provider.parse(item.unit, item.cursor))
-      ));
+      const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
+        // Commit the replay schedule with its first completed unit. After an
+        // interruption, newly written cursors identify exactly what can resume.
+        if (!replayScheduleCommitted) {
+          const clear = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
+          const keysToReplay = new Set(
+            plan.items
+              .filter(({ provider }) => plan.pendingMarkers.has(provider.name))
+              .map(({ unit }) => unit.key),
+          );
+          for (const keys of plan.replayKeys.values()) {
+            for (const key of keys) keysToReplay.add(key);
+          }
+          for (const key of keysToReplay) clear.run(key);
+          writePendingMarkers(db, plan);
+        }
+        const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
+        onPersisted(item, nextCursor);
+        return nextCursor;
+      });
+      replayScheduleCommitted = true;
       committed.push(item);
       onCommitted(item, cursor);
     } catch (error) {
@@ -216,21 +334,33 @@ export function indexProviderPlan({
 export function indexProviderPlanStrict({
   db,
   plan,
+  onPersisted = () => {},
   onCommitted = () => {},
 }: {
   db: SqliteDb;
   plan: ProviderIndexPlan;
+  onPersisted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onCommitted?: (item: ProviderIndexItem, cursor: Cursor) => void;
 }): ProviderIndexResult {
   return indexProviderPlan({
     db,
     plan,
     runTransaction: (_label, work) => work(),
+    onPersisted,
     onCommitted,
     onError: (error, item) => {
       throw new ProviderIndexFailure(error, item);
     },
   });
+}
+
+/** Write every pending version marker, so the first-unit transaction and finalize share one marker row shape. */
+function writePendingMarkers(db: SqliteDb, plan: ProviderIndexPlan): void {
+  const write = db.prepare(
+    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
+  );
+  const now = Date.now();
+  for (const marker of plan.pendingMarkers.values()) write.run(marker, now);
 }
 
 export function writeProviderIndexMarkers(
@@ -240,9 +370,6 @@ export function writeProviderIndexMarkers(
 ): void {
   if (result.stopped !== undefined) return;
   const retry = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
-  const write = db.prepare(
-    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
-  );
   const committed = new Set(result.committed.map(
     (item) => `${item.provider.name}\0${item.unit.key}`,
   ));
@@ -257,7 +384,5 @@ export function writeProviderIndexMarkers(
   for (const item of result.failedItems) {
     if (plan.pendingMarkers.has(item.provider.name)) retry.run(item.unit.key);
   }
-  for (const marker of plan.pendingMarkers.values()) {
-    write.run(marker, Date.now());
-  }
+  writePendingMarkers(db, plan);
 }

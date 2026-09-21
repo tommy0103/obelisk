@@ -224,8 +224,10 @@ export interface DeleteSessionRecord {
 // title/ended_at may be enriched by the adapter from source-specific auxiliary
 // files (claude history.jsonl, codex session_index.jsonl); persist upserts with
 // fill-if-null (COALESCE) so those never clobber a value already present.
-// project_path is NOT set here — the orchestration's global pass derives it from
-// persisted message cwds (refreshSessionProjectPaths).
+// project_path is NOT set here — the orchestration derives it from persisted
+// message cwds when a session is first created or still unresolved
+// (refreshSessionProjectPaths). Resolved paths remain stable during ordinary
+// incremental indexing; explicit force/repair passes may recompute them.
 //
 // countMode tells persist how to treat message_count, because providers differ:
 // a line-incremental adapter (claude) yields only new messages ('delta', persist
@@ -295,6 +297,17 @@ export interface RawRecord {
   readonly messageText?: string | null;
 }
 
+/**
+ * A watchable provider source: a directory `tree` (recursive subscription)
+ * or an exact `file` (metadata polling). Structurally identical to the
+ * adaptive-watcher package's WatchTarget (ADR-0009); duplicated here so
+ * @obelisk/core carries no watcher dependency.
+ */
+export interface WatchTarget {
+  readonly kind: 'tree' | 'file';
+  readonly path: string;
+}
+
 /** Complete adapter interface used by every indexing and presentation caller. */
 export interface ProviderAdapter extends Provider {
   readonly descriptor: ProviderDescriptor;
@@ -305,6 +318,6 @@ export interface ProviderAdapter extends Provider {
    * canonical source path. File-backed providers normally omit this.
    */
   sessionUnitKey?(session: IndexedSession): string;
-  watchRoots(configuredRoot: string): string[];
+  watchTargets(configuredRoot: string): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }

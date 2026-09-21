@@ -24,6 +24,10 @@
   .crumb:hover { background: var(--surface-strong); color: var(--fg-2); }
   .crumb.terminal { color: var(--fg); font-weight: 600; cursor: default; }
   .crumb.terminal:hover { background: transparent; }
+  .crumb.project-crumb {
+    display: block; flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis;
+  }
   .crumb svg { width: 13px; height: 13px; color: var(--muted); }
   .crumb.filename {
     font-family: var(--font-mono); font-weight: 500; color: var(--fg);
@@ -101,7 +105,7 @@
   .tab-group button.active { background: var(--accent-soft); color: var(--accent-2); }
 
   /* Source filter */
-  .source-filter-wrap { position: relative; }
+  .source-filter-wrap { position: relative; flex-shrink: 0; }
   .filter-btn {
     display: inline-flex; align-items: center; gap: 6px;
     height: 26px; padding: 0 10px;

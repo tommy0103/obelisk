@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
@@ -17,8 +18,11 @@ function fakeProvider(id, root) {
       defaultRoot: root,
       color: '#123456',
     },
-    watchRoots(configuredRoot) {
-      return [`${configuredRoot}/sessions`, `${configuredRoot}/session-index`];
+    watchTargets(configuredRoot) {
+      return [
+        { kind: 'tree', path: `${configuredRoot}/sessions` },
+        { kind: 'file', path: `${configuredRoot}/session-index` },
+      ];
     },
     discover() {
       return [];
@@ -43,11 +47,11 @@ test('provider registry drives source catalog, watch roots, and raw lookup', () 
     { id: 'alpha', name: 'alpha display', vendor: 'alpha vendor', defaultRoot: '/default/alpha', color: '#123456' },
     { id: 'beta', name: 'beta display', vendor: 'beta vendor', defaultRoot: '/default/beta', color: '#123456' },
   ]);
-  assert.deepEqual(registry.watchRoots({ alpha: '/custom/alpha' }), [
-    '/custom/alpha/sessions',
-    '/custom/alpha/session-index',
-    '/default/beta/sessions',
-    '/default/beta/session-index',
+  assert.deepEqual(registry.watchTargets({ alpha: '/custom/alpha' }), [
+    { kind: 'tree', path: '/custom/alpha/sessions' },
+    { kind: 'file', path: '/custom/alpha/session-index' },
+    { kind: 'tree', path: '/default/beta/sessions' },
+    { kind: 'file', path: '/default/beta/session-index' },
   ]);
   assert.deepEqual(
     registry.raw({ source: 'beta', messageUuid: 'message-1', session: null, agentId: null }),
@@ -63,24 +67,35 @@ test('built-in provider registry exposes every source without caller-side branch
   const registry = createBuiltinProviderRegistry({
     claude: '/sources/claude',
     codex: '/sources/codex',
+    copilot: '/sources/copilot',
+    deepseek: '/sources/deepseek',
     kimi: '/sources/kimi',
+    omp: '/sources/omp',
     pi: '/sources/pi',
   });
 
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
     { id: 'claude', name: 'Claude Code' },
     { id: 'codex', name: 'Codex' },
+    { id: 'copilot', name: 'GitHub Copilot' },
+    { id: 'deepseek', name: 'DeepSeek Harness' },
     { id: 'kimi', name: 'Kimi Code' },
+    { id: 'omp', name: 'OMP' },
     { id: 'pi', name: 'Pi' },
   ]);
-  assert.deepEqual(registry.watchRoots(), [
-    '/sources/claude/projects',
-    '/sources/claude/history.jsonl',
-    '/sources/codex/sessions',
-    '/sources/codex/archived_sessions',
-    '/sources/codex/session_index.jsonl',
-    '/sources/kimi/sessions',
-    '/sources/kimi/session_index.jsonl',
-    '/sources/pi',
+  assert.deepEqual(registry.watchTargets(), [
+    { kind: 'tree', path: join('/sources/claude', 'projects') },
+    { kind: 'file', path: join('/sources/claude', 'history.jsonl') },
+    { kind: 'tree', path: join('/sources/codex', 'sessions') },
+    { kind: 'tree', path: join('/sources/codex', 'archived_sessions') },
+    { kind: 'file', path: join('/sources/codex', 'session_index.jsonl') },
+    { kind: 'file', path: join('/sources/copilot', 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+    { kind: 'file', path: join('/sources/copilot', 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+    { kind: 'tree', path: join('/sources/copilot', 'workspaceStorage') },
+    { kind: 'tree', path: '/sources/deepseek' },
+    { kind: 'tree', path: join('/sources/kimi', 'sessions') },
+    { kind: 'file', path: join('/sources/kimi', 'session_index.jsonl') },
+    { kind: 'tree', path: join('/sources/omp') },
+    { kind: 'tree', path: join('/sources/pi') },
   ]);
 });

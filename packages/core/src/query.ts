@@ -5,10 +5,12 @@
 import { statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
+import { constants as sqliteConstants } from 'node:sqlite';
 import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
+import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { SqliteDb, SqliteRow, SqliteStatement } from './sqlite-types.ts';
 
 type DbRow = SqliteRow;
 
@@ -98,6 +100,15 @@ function withVisibility(row: DbRow): DbRow {
   return { ...row, visibility: normalizedVisibility(row.visibility) };
 }
 
+// Subagent total tokens (ADR-0010): a provider-stored value wins; when the
+// provider did not store one (deepseek's incremental adapter cannot), derive
+// it from the sidechain messages' usage as a presentation-layer null-fill.
+function deriveSubagentTokens(db: SqliteDb, agentId: unknown): number | null {
+  // Null only means "no usage-bearing messages"; a legitimate 0 stays 0.
+  const row = db.prepare('SELECT SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) AS t, COUNT(*) AS n FROM messages WHERE agent_id=? AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)').get(agentId);
+  return row && typeof row.n === 'number' && row.n > 0 && typeof row.t === 'number' ? row.t : null;
+}
+
 function isQueryableMessage(
   row: DbRow | undefined,
   includeInactive = false,
@@ -114,14 +125,125 @@ function visibilitySql(alias: string, includeInactive = false): string {
     : `COALESCE(${column},'visible')='visible'`;
 }
 
-function assertReadOnlySql(sql: unknown): void {
-  const text = String(sql || '').trim();
-  if (!/^(SELECT|WITH)\b/i.test(text)) {
-    throw new Error('sql() only supports read-only SELECT/WITH queries');
+// #107: the read-only contract follows the statement's actual database
+// effects instead of scanning the SQL text for mutation keywords (which
+// false-positive on literals, comments, and quoted identifiers).
+const READ_ONLY_SQL_MESSAGE = 'sql() only supports read-only SELECT/WITH queries';
+const MULTI_STATEMENT_SQL_MESSAGE =
+  'sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls';
+
+// The lexical prefix check stays: it is the cheap, stable entry contract and
+// it keeps statement-level PRAGMA (allowed by the authorizer for pragma
+// table-valued functions) out of the sandbox.
+function assertReadOnlySqlPrefix(text: string): void {
+  if (!/^\s*(SELECT|WITH)\b/i.test(text)) {
+    throw new Error(READ_ONLY_SQL_MESSAGE);
   }
-  if (/\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM|ATTACH|DETACH)\b/i.test(text)) {
-    throw new Error('sql() only supports read-only SELECT/WITH queries');
+}
+
+// Write and schema-mutation action codes from SQLite's authorizer API
+// (sqlite3_set_authorizer). Everything not listed — SELECT, READ, FUNCTION,
+// TRANSACTION, PRAGMA, RECURSIVE, and any future read action — is allowed by
+// default: a denylist cannot false-positive on read syntax the way the old
+// keyword scan did, and the read-only connection opened by openReadDb()
+// remains the final mutation boundary for anything missed here. DENY is the
+// only correct rejection code: SQLITE_IGNORE on SQLITE_READ would silently
+// null out columns instead of failing.
+const DENIED_SQLITE_ACTIONS: ReadonlySet<number> = new Set([
+  sqliteConstants.SQLITE_INSERT,
+  sqliteConstants.SQLITE_UPDATE,
+  sqliteConstants.SQLITE_DELETE,
+  sqliteConstants.SQLITE_CREATE_INDEX,
+  sqliteConstants.SQLITE_CREATE_TABLE,
+  sqliteConstants.SQLITE_CREATE_TEMP_INDEX,
+  sqliteConstants.SQLITE_CREATE_TEMP_TABLE,
+  sqliteConstants.SQLITE_CREATE_TEMP_TRIGGER,
+  sqliteConstants.SQLITE_CREATE_TEMP_VIEW,
+  sqliteConstants.SQLITE_CREATE_TRIGGER,
+  sqliteConstants.SQLITE_CREATE_VIEW,
+  sqliteConstants.SQLITE_CREATE_VTABLE,
+  sqliteConstants.SQLITE_DROP_INDEX,
+  sqliteConstants.SQLITE_DROP_TABLE,
+  sqliteConstants.SQLITE_DROP_TEMP_INDEX,
+  sqliteConstants.SQLITE_DROP_TEMP_TABLE,
+  sqliteConstants.SQLITE_DROP_TEMP_TRIGGER,
+  sqliteConstants.SQLITE_DROP_TEMP_VIEW,
+  sqliteConstants.SQLITE_DROP_TRIGGER,
+  sqliteConstants.SQLITE_DROP_VIEW,
+  sqliteConstants.SQLITE_DROP_VTABLE,
+  sqliteConstants.SQLITE_ALTER_TABLE,
+  sqliteConstants.SQLITE_REINDEX,
+  sqliteConstants.SQLITE_ANALYZE,
+  sqliteConstants.SQLITE_ATTACH,
+  sqliteConstants.SQLITE_DETACH,
+  sqliteConstants.SQLITE_SAVEPOINT,
+]);
+
+// Prepare-time semantic classification. node:sqlite exposes the authorizer
+// (setAuthorizer, Node 24.10+); on older supported runtimes and on drivers
+// without it, classification degrades to the read-only connection, which
+// still fails every write at execute time — the boundary never fails open.
+// better-sqlite3 has no authorizer either; there statement classification
+// happens through the statement's readonly flag in assertReadOnlyStatement.
+function installWriteDenylist(db: SqliteDb): void {
+  if (typeof db.setAuthorizer !== 'function') return;
+  db.setAuthorizer((action) =>
+    DENIED_SQLITE_ACTIONS.has(action) ? sqliteConstants.SQLITE_DENY : sqliteConstants.SQLITE_OK);
+}
+
+// better-sqlite3 path: no authorizer, but prepare() already rejected
+// multi-statement input and the readonly flag classifies write effects.
+function assertReadOnlyStatement(stmt: SqliteStatement): void {
+  if (stmt.readonly === false) throw new Error(READ_ONLY_SQL_MESSAGE);
+}
+
+// A tail is inert only when it is whitespace and comments — no quotes to
+// track, because anything else is a second statement SQLite never compiled
+// (node:sqlite prepare compiles the first statement and silently ignores the
+// rest, so this check is what makes multi-statement input fail clearly).
+function isBlankOrCommentTail(text: string): boolean {
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') { i += 1; continue; }
+    if (ch === '-' && text[i + 1] === '-') {
+      const end = text.indexOf('\n', i + 2);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      if (end === -1) return false;
+      i = end + 2;
+      continue;
+    }
+    return false;
   }
+  return true;
+}
+
+function assertSingleStatement(sqlText: string, stmt: SqliteStatement): void {
+  if (typeof stmt.sourceSQL !== 'string') return;
+  if (!isBlankOrCommentTail(sqlText.slice(stmt.sourceSQL.length))) {
+    throw new Error(MULTI_STATEMENT_SQL_MESSAGE);
+  }
+}
+
+function prepareReadOnlyStatement(db: SqliteDb, sqlText: string): SqliteStatement {
+  let stmt: SqliteStatement;
+  try {
+    stmt = db.prepare(sqlText);
+  } catch (error) {
+    // node:sqlite reports an authorizer denial as SQLITE_AUTH ("not
+    // authorized"); surface the sandbox contract instead of the raw code.
+    if (error instanceof Error && /not authorized/i.test(error.message)) {
+      throw new Error(READ_ONLY_SQL_MESSAGE, { cause: error });
+    }
+    throw error;
+  }
+  assertReadOnlyStatement(stmt);
+  assertSingleStatement(sqlText, stmt);
+  return stmt;
 }
 
 const CJK_TEXT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -201,13 +323,17 @@ function makeSnippet(rawText: unknown, terms: string[]): string | null {
 function createQueryApi(
   db: SqliteDb,
   {
-    providerRegistry = createBuiltinProviderRegistry(),
+    providerRegistry = createBuiltinProviderRegistry({}, {
+      openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+    }),
     invokingSessionId = null,
   }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
 ) {
+  installWriteDenylist(db);
   const q = (sql: string, ...p: any[]) => {
-    assertReadOnlySql(sql);
-    return db.prepare(sql).all(...p);
+    const text = String(sql || '');
+    assertReadOnlySqlPrefix(text);
+    return prepareReadOnlyStatement(db, text).all(...p);
   };
 
   const normalizeOverviewOpts = (optsOrScalar: QueryOptions | string | number | null | undefined): QueryOptions => {
@@ -316,20 +442,74 @@ function createQueryApi(
       }
     }
     const snippetTerms = queryTokens(text);
+    const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
+    const contextWhere = `
+      session_id=$sessionId AND uuid!=$messageUuid ${metaClause}
+        AND ${visibilitySql('messages', includeInactive)}
+    `;
+    // Correctness relies on an ingest-convention invariant: every timestamp in
+    // the session is canonical YYYY-MM-DDTHH:mm:ss.sssZ, so text order is
+    // chronological. pi/kimi/deepseek normalize via toISOString(); claude and
+    // codex pass provider strings through, which are canonical in practice.
+    // Only the hit's own format is verified (below); neighbor rows are
+    // trusted. Pull at most six candidates from each side via idx_messages_ts,
+    // then preserve the old JULIANDAY distance ordering.
+    const indexedContext = db.prepare(`
+      WITH
+        null_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp IS NULL
+          ORDER BY rowid LIMIT 6
+        ),
+        before_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp<=$timestamp
+          ORDER BY timestamp DESC, rowid ASC LIMIT 6
+        ),
+        after_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp>$timestamp
+          ORDER BY timestamp ASC, rowid ASC LIMIT 6
+        ),
+        candidates AS (
+          SELECT * FROM null_rows UNION ALL SELECT * FROM before_rows
+          UNION ALL SELECT * FROM after_rows
+        )
+      SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+             COALESCE(visibility,'visible') AS visibility,
+             COALESCE(source, 'claude') AS source
+      FROM candidates JOIN messages ON messages.rowid=candidates.message_rowid
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp)), message_rowid
+      LIMIT 6
+    `);
+    // Null or non-canonical hits have no safe lexical ordering; retain the
+    // original scan instead of forcing them through the indexed path.
+    const scanContext = db.prepare(`
+      SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+             COALESCE(visibility,'visible') AS visibility,
+             COALESCE(source, 'claude') AS source
+      FROM messages
+      WHERE ${contextWhere}
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp))
+      LIMIT 6
+    `);
     return rows.map((r: DbRow) => {
-      const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
-      const ctx = db.prepare(
-        `SELECT uuid,text,content_type,is_meta,role,timestamp,model,
-                COALESCE(visibility,'visible') AS visibility,
-                COALESCE(source, 'claude') as source
-         FROM messages
-         WHERE session_id=? AND uuid!=? ${metaClause}
-           AND ${visibilitySql('messages', includeInactive)}
-         ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?))
-         LIMIT 6`
-      ).all(r.session_id, r.uuid, r.timestamp)
+      const contextParams = {
+        $sessionId: r.session_id,
+        $messageUuid: r.uuid,
+        $timestamp: r.timestamp,
+      };
+      const indexedTimestamp = typeof r.timestamp === 'string'
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.timestamp);
+      const ctx = (indexedTimestamp ? indexedContext : scanContext)
+        .all(contextParams)
         .map(withVisibility)
-        .sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
+        .sort((a: DbRow, b: DbRow) => {
+          if (a.timestamp === b.timestamp) return 0;
+          if (a.timestamp == null) return -1;
+          if (b.timestamp == null) return 1;
+          return a.timestamp < b.timestamp ? -1 : 1;
+        });
       const sourceValue = r.m_source || r.s_source || 'claude';
       const session: DbRow = { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue };
       // is_invoking marks the session that ran this query; it is the agent's
@@ -372,6 +552,7 @@ function createQueryApi(
       if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
     }
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
+    if (subagent) subagent.total_tokens = subagent.total_tokens ?? deriveSubagentTokens(db, msg.agent_id);
     let workflow = null;
     if (msg.agent_id) {
       const wa = db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id);
@@ -420,7 +601,7 @@ function createQueryApi(
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {
       const c = db.prepare('SELECT COUNT(*) as c FROM messages WHERE agent_id=?').get(r.agent_id);
-      return { ...r, messageCount: c?.c || 0 };
+      return { ...r, messageCount: c?.c || 0, total_tokens: r.total_tokens ?? deriveSubagentTokens(db, r.agent_id) };
     });
   };
 

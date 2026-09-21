@@ -9,13 +9,14 @@
     "packages/*"
   ],
   "scripts": {
-    "pretest": "npm run build:cli",
+    "pretest": "npm run build:core && npm run build:cli && npm run build --workspace @obelisk/dsh-obelisk-plugin",
     "test": "node --experimental-test-module-mocks --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json",
     "lint": "eslint .",
     "build:core": "npm run build --workspace @obelisk/core",
     "build:cli": "npm run build --workspace @obelisk-apps/cli",
     "build:skill": "node packaging/build-skill.mjs",
+    "eval:context-window": "node scripts/context-window-ab-eval.mjs",
     "publish:skill": "npm run build:skill && packaging/publish-skill.sh"
   },
   "devDependencies": {

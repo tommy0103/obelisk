@@ -556,7 +556,7 @@ test('runtime skips Codex guardian review threads', () => {
   });
 });
 
-test('runtime removes stale Codex guardian rows when the JSONL was already indexed', () => {
+test('runtime retracts stale Codex guardian rows via the marker-driven replay', () => {
   const home = tempHome();
   const codexSessionDir = join(home, '.codex', 'sessions', '2026', '06', '15');
   mkdirSync(codexSessionDir, { recursive: true });
@@ -600,6 +600,10 @@ test('runtime removes stale Codex guardian rows when the JSONL was already index
   db.prepare('INSERT INTO subagents (agent_id,session_id) VALUES (?,?)').run(guardianSessionId, guardianSessionId);
   db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path,mtime,lines_processed) VALUES (?,?,?)')
     .run(jsonlPath, statSync(jsonlPath).mtimeMs, 2);
+  // Simulate a pre-fix database: the old marker is present and the current
+  // one is absent, so the next build runs one marker-driven full replay.
+  db.prepare("DELETE FROM index_state WHERE jsonl_path LIKE '\\_\\_codex\\_canonical\\_transcript%' ESCAPE '\\'").run();
+  db.prepare("INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__codex_canonical_transcript_v2__', 0, 0)").run();
   db.prepare("UPDATE index_state SET mtime=? WHERE jsonl_path='__last_build__'").run(Date.now() - 31000);
   db.close();
 

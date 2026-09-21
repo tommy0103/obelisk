@@ -76,9 +76,21 @@ async function main() {
   }
   if (args[0] === '--query' && args[1]) {
     try {
-      // The nonce is the query file path as typed (not resolved): the
-      // transcript records what the agent typed.
-      emit(await executeQuery(readFileSync(resolve(args[1]), 'utf8'), { invocationNonce: args[1] }));
+      const script = readFileSync(resolve(args[1]), 'utf8');
+      // Nonce candidates, tried in order: the file path as typed (not
+      // resolved), then the script content itself. The transcript records the
+      // content verbatim (Write input, heredoc command text) even when the
+      // path sits behind a shell variable — the documented mktemp flow — and
+      // never reaches the transcript. Short scripts are not distinctive enough
+      // to safely identify a session, so the path stands alone there. Content
+      // is not unique by construction, so it resolves in strict mode: exactly
+      // one recent matching session that itself invoked the CLI, else null.
+      const CONTENT_NONCE_MIN_CHARS = 40;
+      const trimmed = script.trim();
+      const nonceCandidates = trimmed.length >= CONTENT_NONCE_MIN_CHARS
+        ? [args[1], { value: trimmed, strict: true }]
+        : [args[1]];
+      emit(await executeQuery(script, { invocationNonce: nonceCandidates }));
     } catch (error) { fail(error); }
     return;
   }

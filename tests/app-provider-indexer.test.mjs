@@ -27,7 +27,7 @@ test('app indexer persists every provider through one registry-driven loop', () 
   const registry = createProviderRegistry([{
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover(ctx) {
       return ctx.lastCursor('alpha:unit') === '10:1'
         ? []
@@ -109,7 +109,7 @@ test('an invalid provider root cannot erase a previously indexed source snapshot
   const registry = createProviderRegistry([{
     name: 'claude',
     descriptor: { id: 'claude', name: 'Claude', vendor: 'Test', defaultRoot: join(home, '.claude'), color: '#123456' },
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover: (ctx) => ctx.lastCursor(sourcePath) === '10:1'
       ? []
       : [{ key: sourcePath, sessionId: 'claude:preserved' }],
@@ -165,7 +165,7 @@ test('an incomplete canonical inventory converges without replaying readable uni
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
     indexVersionMarker: marker,
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover(ctx) {
       if (incomplete) {
         ctx.reportIncompleteInventory({
@@ -251,7 +251,7 @@ test('marker replay invalidates provider unit keys that differ from source paths
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
     indexVersionMarker: marker,
     sessionUnitKey: () => unitKey,
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover(ctx) {
       if (incomplete) {
         ctx.reportIncompleteInventory({ path: '/alpha/locked', error: 'EACCES' });
@@ -305,7 +305,7 @@ test('a provider can withhold inventory-dependent tombstones from a partial cens
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
     indexVersionMarker: marker,
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover(ctx) {
       if (removeSession) {
         ctx.reportIncompleteInventory({
@@ -375,7 +375,7 @@ test('force rebuild resets arbitrary provider keys and rewrites arbitrary provid
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
     indexVersionMarker: marker,
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover(ctx) {
       if (!present || ctx.lastCursor(unitKey) === '10:1') return [];
       return [{ key: unitKey, sessionId: 'alpha:session' }];
@@ -422,7 +422,7 @@ test('force rebuild keeps legacy providers without inventory certification compa
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
     indexVersionMarker: marker,
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover(ctx) {
       return ctx.lastCursor(unitKey) === '10:1'
         ? []

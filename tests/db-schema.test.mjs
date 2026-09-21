@@ -49,9 +49,29 @@ test('messages schema stores the raw content block type', async () => {
 
   assert.match(source, /content_type TEXT/);
   assert.match(source, /is_meta INTEGER DEFAULT 0/);
+  assert.match(source, /CREATE INDEX IF NOT EXISTS idx_messages_usage_day/);
+  assert.match(source, /CREATE INDEX IF NOT EXISTS idx_messages_turn_duration/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages/);
+});
+
+test('usage indexes accept provider timestamps without normalizing them', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    db.prepare(`
+      INSERT INTO messages (uuid, timestamp, input_tokens, source)
+      VALUES (?, ?, ?, ?)
+    `).run('raw-timestamp', 'now', 1, 'claude');
+
+    assert.equal(
+      db.prepare("SELECT timestamp FROM messages WHERE uuid='raw-timestamp'").get().timestamp,
+      'now',
+    );
+  } finally {
+    db.close();
+  }
 });
 
 test('summaries preserve usage from provider-owned summary model calls', async () => {
@@ -101,6 +121,54 @@ test('tool results schema indexes live session patch lookups', async () => {
     assert.ok(
       plan.some(row => /USING INDEX idx_tr_session/.test(String(row.detail))),
       `expected idx_tr_session lookup, got: ${plan.map(row => row.detail).join('; ')}`,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('session detail queries use the visible main timeline index', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    const messagePlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT m.uuid FROM messages m
+      WHERE m.session_id = ? AND m.agent_id IS NULL
+        AND COALESCE(m.visibility, 'visible') = 'visible'
+      ORDER BY m.timestamp, m.uuid
+    `).all('session-1');
+    const toolCallPlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tc.* FROM messages m
+      CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+      WHERE m.session_id = ? AND m.agent_id IS NULL
+        AND COALESCE(m.visibility, 'visible') = 'visible'
+        AND tc.session_id = ?
+    `).all('session-1', 'session-1');
+    const toolResultPlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tr.* FROM messages m
+      CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
+      WHERE m.session_id = ? AND m.agent_id IS NULL
+        AND COALESCE(m.visibility, 'visible') = 'visible'
+        AND tr.session_id = ?
+    `).all('session-1', 'session-1');
+
+    const details = plan => plan.map(row => String(row.detail));
+    assert.ok(
+      details(messagePlan).some(detail => /USING INDEX idx_messages_main_timeline/.test(detail)),
+      `expected main timeline index, got: ${details(messagePlan).join('; ')}`,
+    );
+    assert.ok(
+      /USING INDEX idx_messages_main_timeline/.test(details(toolCallPlan)[0])
+        && details(toolCallPlan).some(detail => /USING INDEX idx_tc_message/.test(detail)),
+      `expected main-timeline-first tool call lookup, got: ${details(toolCallPlan).join('; ')}`,
+    );
+    assert.ok(
+      /USING INDEX idx_messages_main_timeline/.test(details(toolResultPlan)[0])
+        && details(toolResultPlan).some(detail => /USING INDEX idx_tr_message/.test(detail)),
+      `expected main-timeline-first tool result lookup, got: ${details(toolResultPlan).join('; ')}`,
     );
   } finally {
     db.close();
@@ -165,9 +233,9 @@ test('schema reference stays focused on raw SQL structure', async () => {
 
   assert.ok(ref.split('\n').length < 420, 'schema.md should remain a quick SQL reference');
   assert.match(ref, /Raw SQL Quick Reference/i);
-  assert.match(ref, /Claude Code, Codex, Kimi Code, and Pi/);
+  assert.match(ref, /Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi/);
   assert.equal(
-    ref.match(/Provider ID: `claude`, `codex`, `kimi`, or `pi`/g)?.length,
+    ref.match(/Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi`/g)?.length,
     2,
     'session and message source fields should document every provider',
   );
@@ -185,7 +253,7 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
-  assert.match(ref, /'claude' \| 'codex' \| 'kimi' \| 'pi'/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'omp' \| 'pi'/);
   assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
@@ -205,8 +273,10 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Claude Code, Codex, Kimi Code, and Pi/);
-  assert.match(skill, /'claude'.*'codex'.*'kimi'.*'pi'/s);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
+  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);
   assert.match(skill, /Reference Map/);
   assert.match(skill, /references\/schema\.md.*raw SQL/i);
   assert.match(skill, /references\/api-reference\.md.*helper/i);

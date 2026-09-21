@@ -69,10 +69,20 @@ test('kimi provider discovers a changed session directory and returns a stable c
   assert.equal(units.length, 1);
   assert.equal(units[0].key, sessionDir);
   assert.equal(units[0].sessionId, 'kimi:session-native-1');
-  assert.match(units[0].meta.currentCursor, /^\d+(?:\.\d+)?:\d+$/);
+  assert.match(
+    units[0].meta.currentCursor,
+    /^\d+:0:kimi-manifest-v1:[A-Za-z0-9_-]{43}$/,
+  );
 
   const unchanged = provider.discover({ lastCursor: () => units[0].meta.currentCursor });
   assert.deepEqual(unchanged, []);
+
+  const legacyCursor = units[0].meta.currentCursor.split(':').slice(0, 2).join(':');
+  assert.deepEqual(
+    provider.discover({ lastCursor: () => legacyCursor }).map(unit => unit.key),
+    [sessionDir],
+    'a legacy cursor cannot prove that the session is unchanged',
+  );
 });
 
 test('kimi provider folds main and subagent wire logs into the canonical transcript language', () => {

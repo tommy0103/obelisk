@@ -53,7 +53,7 @@ Closes #
 <details>
 <summary><b>Provider adapter</b> — expand if you touched <code>packages/core/src/providers</code></summary>
 
-- [ ] Read `claude.ts`, `codex.ts`, and `kimi.ts` in full first
+- [ ] Read all provider implementations in `packages/core/src/providers/` in full first
 - [ ] Session identity is composite (e.g. normalized cwd + header id), not the
       source id alone
 - [ ] A test actually calls `discover()` against each supported directory layout

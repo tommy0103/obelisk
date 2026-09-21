@@ -13,6 +13,7 @@ import {
   createProviderRegistry,
   type ProviderRegistry,
 } from './providers/registry.ts';
+import type { CopilotChronicleOpener } from './providers/copilot.ts';
 
 export type PersistedProviderSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -22,6 +23,24 @@ export interface ProviderSettingsReadResult {
   readonly ok: boolean;
   readonly settings: PersistedProviderSettings;
   readonly error?: string;
+}
+
+function hasExplicitProviderRoot(
+  persisted: PersistedProviderSettings,
+  providerId: string,
+): boolean {
+  const configured = (
+    persisted.providerRoots !== null
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
+  ) ? persisted.providerRoots : {};
+  return (
+    Object.prototype.hasOwnProperty.call(configured, providerId)
+    && configured[providerId] !== null
+  ) || (
+    Object.prototype.hasOwnProperty.call(persisted, `${providerId}Dir`)
+    && persisted[`${providerId}Dir`] !== null
+  );
 }
 
 function configuredPath(value: unknown, homeDir: string): string | null {
@@ -101,15 +120,26 @@ export function createConfiguredBuiltinProviderRuntime(
     homeDir = homedir(),
     cwd = process.cwd(),
     baseRoots = {},
+    openCopilotChronicle,
   }: {
     homeDir?: string;
     cwd?: string;
     baseRoots?: BuiltinProviderRoots;
+    openCopilotChronicle?: CopilotChronicleOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, openCopilotChronicle });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir });
-  const configured = createBuiltinProviderRegistry({ ...baseRoots, ...roots }, { cwd });
+  const copilotUsesAutomaticRoots = baseRoots.copilot === undefined
+    && !hasExplicitProviderRoot(persisted, 'copilot');
+  const configured = createBuiltinProviderRegistry(
+    {
+      ...baseRoots,
+      ...roots,
+      ...(copilotUsesAutomaticRoots ? { copilot: undefined } : {}),
+    },
+    { cwd, openCopilotChronicle },
+  );
   return {
     roots,
     registry: createProviderRegistry(configured.list().map((provider) => {
@@ -123,7 +153,7 @@ export function createConfiguredBuiltinProviderRuntime(
           requiresExplicitRoot: true,
           rootResolutionReason: reason,
         },
-        watchRoots: () => [],
+        watchTargets: () => [],
         discover: (ctx) => {
           const indexed = ctx.indexedSessions?.()[0];
           if (indexed) {

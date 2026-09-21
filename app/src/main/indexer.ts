@@ -7,6 +7,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import {
+  backfillUnresolvedSessionProjectPathsOnce,
+  dropMessageFtsTriggers,
+  ensureFtsReady,
+  refreshSessionProjectPaths,
+} from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
 import {
@@ -18,6 +24,7 @@ import {
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readRecentTranscriptHints,
   writeProviderIndexMarkers,
   type ProviderInventoryIssue,
   type ProviderSessionProvenance,
@@ -26,9 +33,7 @@ import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapte
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
-import {
-  inferProjectPath,
-} from '../../../packages/core/src/parsing.ts';
+import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -146,26 +151,6 @@ function sessionIdFromChangedPath(projectsDir, changedPath) {
   return null;
 }
 
-function refreshSessionProjectPaths(db) {
-  const sessions = db.prepare('SELECT id, project FROM sessions').all();
-  const cwdStmt = db.prepare(`
-    SELECT cwd FROM messages
-    WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
-  `);
-  const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
-  for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map(row => row.cwd);
-    const projectPath = inferProjectPath(session.project, cwds);
-    if (projectPath) update.run(projectPath, session.id);
-  }
-}
-
-function rebuildFts(db) {
-  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-  db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
-}
-
 // PASSIVE by default: it checkpoints what it can without blocking concurrent
 // readers/writers, so it is safe to run after every build. A blocking TRUNCATE
 // (which reclaims the -wal file but needs exclusive access and can contend with
@@ -174,27 +159,6 @@ function checkpointDb(db, mode = 'PASSIVE') {
   try {
     db.pragma(`wal_checkpoint(${mode})`);
   } catch {}
-}
-
-const MESSAGE_FTS_TRIGGERS = [
-  'messages_fts_ai',
-  'messages_fts_ad',
-  'messages_fts_au',
-];
-
-function dropMessageFtsTriggers(db) {
-  for (const trigger of MESSAGE_FTS_TRIGGERS) {
-    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-  }
-}
-
-function ensureFtsReady(db, { force = false } = {}) {
-  const marker = '__fts_triggers_ready__';
-  const ready = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(marker);
-  if (ready && !force) return false;
-  rebuildFts(db);
-  writeIndexMarker(db, marker);
-  return true;
 }
 
 function writeIndexMarker(db, key, value = Date.now()) {
@@ -240,7 +204,10 @@ interface BuildIndexOptions {
   DatabaseImpl?: new (dbPath: string) => any;
   LockDatabaseImpl?: new (dbPath: string) => any;
   force?: boolean;
+  reason?: string;
+  readMode?: 'normal' | 'strict';
   changedPaths?: string[];
+  retrySessionIds?: string[];
   preserveDbPath?: string | null;
   writerLeasePath?: string;
   writerLeaseWaitMs?: number;
@@ -265,6 +232,8 @@ interface BuildIndexResult {
   complete: boolean;
   incompleteProviders: string[];
   inventoryIssues: ProviderInventoryIssue[];
+  /** Most recently written transcripts (ADR-0009 hot-set seeding). */
+  watchHints?: string[];
   reason?: string;
 }
 
@@ -300,7 +269,10 @@ function buildIndex({
   DatabaseImpl = Database,
   LockDatabaseImpl = DatabaseImpl,
   force = false,
+  reason = undefined,
+  readMode = reason === 'reconcile' || reason === 'repair' ? 'strict' : 'normal',
   changedPaths = undefined,
+  retrySessionIds = [],
   preserveDbPath = null,
   writerLeasePath = writerLockPathFor(dbPath),
   writerLeaseWaitMs = 2000,
@@ -350,14 +322,21 @@ function buildIndex({
         codex: codexDir,
         ...providerRoots,
       };
+      const openCopilotChronicle = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots)
-          : createConfiguredBuiltinProviderRuntime(providerSettings, { baseRoots: roots }).registry);
+          ? createBuiltinProviderRegistry(roots, { openCopilotChronicle })
+          : createConfiguredBuiltinProviderRuntime(providerSettings, {
+            baseRoots: roots,
+            openCopilotChronicle,
+          }).registry);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
         changedPaths,
         priorSessions,
+        readMode,
       });
       let latestSourceMtime = providerPlan.items.reduce((latest, { unit }) => {
         const providerCursor = (unit.meta as { currentCursor?: unknown } | undefined)?.currentCursor;
@@ -418,7 +397,15 @@ function buildIndex({
         for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
       };
       const finalize = (providerResult) => {
-        refreshSessionProjectPaths(db);
+        if (force) {
+          refreshSessionProjectPaths(db, null);
+        } else {
+          refreshSessionProjectPaths(
+            db,
+            new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds]),
+          );
+          backfillUnresolvedSessionProjectPathsOnce(db);
+        }
         healWorkflowParentLinks(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
@@ -500,6 +487,7 @@ function buildIndex({
           complete: true,
           incompleteProviders,
           inventoryIssues,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 
@@ -561,6 +549,7 @@ function buildIndex({
         complete: providerResult.complete,
         incompleteProviders,
         inventoryIssues,
+        watchHints: readRecentTranscriptHints(db),
       };
     } finally {
       if (messageFtsTriggersDropped) {

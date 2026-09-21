@@ -21,7 +21,15 @@ test('build:core emits an importable package with its schema resource', async ()
   assert.equal(typeof core.executeQuery, 'function');
   assert.equal(typeof core.executeAttune, 'function');
 
+  const omp = await import(`${pathToFileURL(join(coreDist, 'providers', 'omp.js')).href}?test=${Date.now()}`);
+  assert.equal(typeof omp.createOmpProvider, 'function');
+  assert.equal(omp.ompProvider.descriptor.id, 'omp');
+
   const pi = await import(`${pathToFileURL(join(coreDist, 'providers', 'pi.js')).href}?test=${Date.now()}`);
   assert.equal(typeof pi.createPiProvider, 'function');
   assert.equal(pi.piProvider.descriptor.id, 'pi');
+
+  const copilot = await import(`${pathToFileURL(join(coreDist, 'providers', 'copilot.js')).href}?test=${Date.now()}`);
+  assert.equal(typeof copilot.createCopilotProvider, 'function');
+  assert.equal(copilot.copilotProvider.descriptor.id, 'copilot');
 });

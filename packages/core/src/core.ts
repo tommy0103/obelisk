@@ -21,6 +21,7 @@ import {
   readPersistedProviderSettings,
 } from './provider-settings.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
+import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import { createQueryApi, createAttuneApi } from './query.ts';
 import type { SqliteDb } from './sqlite-types.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
@@ -31,7 +32,15 @@ export { buildIndex, DB_PATH };
 type SandboxApi = Record<string, unknown>;
 
 interface InvocationOptions {
-  invocationNonce?: string;
+  // One nonce, or candidates tried in order (first match wins). The CLI passes
+  // the as-typed --query path first and the script content second: transcripts
+  // record the content verbatim (Write input, heredoc command text) even when
+  // the path sits behind a shell variable and never reaches the transcript.
+  // A strict candidate (used for script content, which is not unique by
+  // construction — boilerplate queries recur across sessions) resolves only
+  // when exactly one recent session matches and that session itself holds a
+  // recent CLI invocation record; anything else is honest null.
+  invocationNonce?: string | readonly (string | { value: string; strict?: boolean })[];
 }
 
 interface InventoryIssue {
@@ -61,7 +70,9 @@ function reportIncompleteInventory(build: unknown): void {
 
 function refreshQueryIndex(): ProviderRegistry {
   const settings = readPersistedProviderSettings();
-  const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
+  const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings, {
+    openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+  }).registry;
   if (!settings.ok) {
     const schema = ensureReadableSchema();
     if (!schema.ready) {
@@ -70,7 +81,11 @@ function refreshQueryIndex(): ProviderRegistry {
     process.stderr.write(`Warning: ${settings.error}; index refresh skipped\n`);
     return providerRegistry;
   }
-  reportIncompleteInventory(buildIndex({ providerRegistry }));
+  // The pre-query refresh is a full-inventory pass, and for a CLI-only user
+  // it is their reconciliation: there is no watcher to reconcile against.
+  // It therefore verifies prefixes (strict) instead of trusting cooperative
+  // append checkpoints (RFC #172).
+  reportIncompleteInventory(buildIndex({ providerRegistry, readMode: 'strict' }));
   return providerRegistry;
 }
 
@@ -112,13 +127,16 @@ interface InvocationResolveOptions {
   collisionMs?: number;
 }
 
-// Resolve the session that invoked this query via a unique nonce embedded in
-// the CLI's argv (a uuidgen token for --search, the as-typed query file path
-// for --query). Every provider writes the tool-call record before the tool
+// Resolve the session that invoked this query via a unique nonce observed in
+// the transcript (the --nonce token for --search; for --query the as-typed
+// file path, falling back to the script content, which heredoc/Write tool-call
+// records carry verbatim even when the path hides behind a shell variable).
+// Every provider writes the tool-call record before the tool
 // finishes, so once the nonce reaches the index it identifies the invoking
 // session. Both legs are bounded to the last INVOCATION_RECENCY_MS (see
 // above), which keeps weeks-old fixed-path reuse out of the candidate set and
-// makes cross-leg timestamps comparable.
+// makes cross-leg timestamps comparable. Candidates are tried in order and the
+// first one with any match resolves.
 //
 // The invoking record is always written "now", so matches far apart in time
 // are unrelated history, not ambiguity: each session tracks its newest
@@ -132,10 +150,25 @@ interface InvocationResolveOptions {
 // resolveInvokingSessionIdWithWait below.
 export function resolveInvokingSessionId(
   db: SqliteDb,
-  nonce: string | null | undefined,
-  { nowMs = Date.now(), recencyMs = INVOCATION_RECENCY_MS, collisionMs = INVOCATION_COLLISION_MS }: InvocationResolveOptions = {},
+  nonce: string | readonly (string | { value: string; strict?: boolean })[] | null | undefined,
+  opts: InvocationResolveOptions = {},
 ): string | null {
-  if (!nonce) return null;
+  const raw = Array.isArray(nonce) ? nonce : [nonce];
+  for (const entry of raw) {
+    const candidate = typeof entry === 'string' ? { value: entry } : entry;
+    if (!candidate?.value) continue;
+    const hit = resolveSingleInvocationNonce(db, candidate.value, opts, candidate.strict === true);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function resolveSingleInvocationNonce(
+  db: SqliteDb,
+  nonce: string,
+  { nowMs = Date.now(), recencyMs = INVOCATION_RECENCY_MS, collisionMs = INVOCATION_COLLISION_MS }: InvocationResolveOptions,
+  strict = false,
+): string | null {
   // The query path is read-only and may face a partially built index (for
   // example only index_state exists while a writer lease is held). A missing
   // schema simply means the nonce cannot resolve: honest unknown.
@@ -191,6 +224,18 @@ export function resolveInvokingSessionId(
     }
   }
   if (newestBySession.size === 0) return null;
+  if (strict) {
+    // Content-derived candidates are not unique by construction (boilerplate
+    // queries recur across sessions), so newest-wins is not enough. Resolve
+    // only when exactly one recent session matches AND that session itself
+    // holds a recent CLI invocation record — the invoker's transcript always
+    // contains both the file write and the `obelisk --query` call, while a
+    // stranger who merely wrote or quoted the same content does not invoke.
+    // Zero or multiple eligible sessions are honest null, never a guess.
+    const invokers = recentCliInvokerSessions(db, cutoff, indexedTables);
+    const eligible = [...newestBySession.keys()].filter(id => invokers.has(id));
+    return eligible.length === 1 ? eligible[0] : null;
+  }
   const ranked = [...newestBySession.entries()]
     .map(([sessionId, timestamp]) => ({ sessionId, ms: Date.parse(timestamp) }))
     .sort((a, b) => b.ms - a.ms);
@@ -200,10 +245,44 @@ export function resolveInvokingSessionId(
   return ranked[0].sessionId;
 }
 
+// Sessions holding a recent record of an actual CLI invocation (`obelisk
+// --query ...` / `obelisk --search ...` in a tool-call command line or message
+// text). Bounded to the same recency window as the nonce legs.
+function recentCliInvokerSessions(
+  db: SqliteDb,
+  cutoff: string,
+  indexedTables: Set<string>,
+): Set<string> {
+  const invokers = new Set<string>();
+  const patterns = ['%obelisk --%', '%obelisk.js --%'];
+  if (indexedTables.has('tool_calls') && indexedTables.has('messages')) {
+    const rows = db.prepare(`
+      SELECT DISTINCT tc.session_id AS session_id
+      FROM messages m CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+      WHERE m.timestamp >= ? AND (tc.input_json LIKE ? OR tc.input_json LIKE ?)
+    `).all(cutoff, ...patterns);
+    for (const row of rows) {
+      if (typeof row.session_id === 'string') invokers.add(row.session_id);
+    }
+  }
+  if (indexedTables.has('messages')) {
+    const rows = db.prepare(`
+      SELECT DISTINCT session_id FROM messages
+      WHERE timestamp >= ? AND (text LIKE ? OR text LIKE ?)
+    `).all(cutoff, ...patterns);
+    for (const row of rows) {
+      if (typeof row.session_id === 'string') invokers.add(row.session_id);
+    }
+  }
+  return invokers;
+}
+
 // Poll bounds for the nonce freshness fallback. The poll runs only when the
 // incremental recovery build loses the writer lease (writer_busy); the cap
-// gives a concurrent build — the daemon's watcher-driven build is chokidar
-// debounced ~2s plus 0.5s write stability — time to publish the nonce.
+// gives a concurrent build — the daemon's watcher-driven build (bounded
+// batching: ~250 ms trailing debounce, 0.5 s stability, 1.5 s max wait) —
+// time to publish the nonce. Cold-build cost on large corpora is a separate
+// concern tracked in #105.
 const INVOCATION_POLL_INTERVAL_MS = 300;
 const INVOCATION_POLL_CAP_MS = 4000;
 
@@ -239,23 +318,33 @@ function sleepSync(ms: number): void {
 // honest null. Queries without a nonce or with an immediate hit pay zero
 // added latency.
 export function resolveInvokingSessionIdWithWait(
-  nonce: string | null | undefined,
+  nonce: string | readonly (string | { value: string; strict?: boolean })[] | null | undefined,
   providerRegistry: ProviderRegistry,
   {
     openRead = openReadDb,
-    build = () => buildIndex({ ignoreRecentBuild: true, ignoreDaemonOwnership: true, providerRegistry }),
+    build = () => buildIndex({
+      ignoreRecentBuild: true,
+      ignoreDaemonOwnership: true,
+      providerRegistry,
+      // This freshness build is also a full-inventory pass and the CLI-only
+      // user's reconciliation; verify prefixes rather than trusting
+      // cooperative checkpoints (RFC #172).
+      readMode: 'strict',
+    }),
     pollIntervalMs = INVOCATION_POLL_INTERVAL_MS,
     pollCapMs = INVOCATION_POLL_CAP_MS,
     resolveOpts,
   }: InvocationWaitOptions = {},
 ): string | null {
-  if (!nonce) return null;
+  const candidates = (Array.isArray(nonce) ? nonce : [nonce])
+    .filter(c => Boolean(typeof c === 'string' ? c : c?.value));
+  if (candidates.length === 0) return null;
   // Open a fresh read snapshot per attempt: another writer (the daemon or a
   // concurrent agent's build) may publish a newer index between ticks.
   const tryResolve = (): string | null => {
     const db = openRead();
     try {
-      return resolveInvokingSessionId(db, nonce, resolveOpts);
+      return resolveInvokingSessionId(db, candidates, resolveOpts);
     } finally {
       db.close();
     }

@@ -18,7 +18,7 @@ test('raw query delegates source semantics to the registered provider', () => {
   const registry = createProviderRegistry([{
     name: 'alpha',
     descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: '/alpha', color: '#123456' },
-    watchRoots: () => [],
+    watchTargets: () => [],
     discover: () => [],
     *parse() { yield* []; return null; },
     raw(input) {
