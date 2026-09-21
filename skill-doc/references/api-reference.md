@@ -138,12 +138,26 @@ so ordinary text never crashes the query.
 
 When `messages_fts` is built with the trigram tokenizer, terms shorter than
 three code points cannot go through MATCH (alone they match nothing; next to
-longer terms they silently match everything). Plain queries route around this
-automatically and say so via `degraded`: `"short-token-post-filter"` means the
-longer terms were MATCHed and the short ones enforced as literal substrings
-(rank preserved), `"like-scan"` means every term was short and the content
-table was scanned directly (`rank` is `null`, recency orders the hits).
-Queries using explicit FTS5 operators bypass the guard and are sent as-is.
+longer terms they silently match everything). `search()` routes around this and
+says so via `degraded`:
+
+| `degraded` | Meaning | `rank` |
+| --- | --- | --- |
+| `"short-token-post-filter"` | The indexable terms were MATCHed and the short ones enforced as literal substrings. | preserved |
+| `"like-scan"` | Every term was short, so the content table was scanned directly; recency orders the hits. | `null` |
+| `"short-token-unguarded"` | The short terms could not be enforced and did **not** constrain the result. | preserved |
+
+`"short-token-unguarded"` happens only with raw FTS5 syntax, in the two cases
+where an added substring condition would answer a different question than the
+one asked: when `OR`, `NOT`, or `NEAR` is present, and when no term is long
+enough to MATCH. Rewrite the query as plain terms to get the guard back.
+
+Two limits worth knowing. A query that returns no rows carries no `degraded`
+marker at all, because the marker rides on each hit — an empty result for a
+query containing a sub-3-code-point term may be a dropped term rather than an
+absent one, so retry it as plain terms before concluding the history lacks it.
+And `sql()` is not covered: a hand-written `MATCH` there gets FTS5's raw
+behavior, short terms included.
 
 #### `context(uuid, opts?)`
 

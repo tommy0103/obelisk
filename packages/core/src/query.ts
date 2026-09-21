@@ -271,6 +271,10 @@ function queryTokens(text: unknown): string[] {
 
 const FTS5_OPERATOR_TOKENS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
 
+// Operators that make an added AND term change the question rather than
+// narrow it. AND is absent on purpose: it is already the implicit connector.
+const FTS5_DISJUNCTION = /\b(?:OR|NOT|NEAR)\b/;
+
 // A plain query is tokens and whitespace only — no phrases, parens, column
 // filters, or prefix stars — and none of its tokens is an FTS5 operator.
 // Anything else is honored as raw FTS5 syntax and left untouched.
@@ -425,13 +429,33 @@ function createQueryApi(
     if (trigram && isPlainQuery(text)) {
       ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
     } else {
+      // FTS5 drops sub-3-codepoint terms from raw syntax exactly as it does
+      // from a plain query, and it does not fail on them, so this path used to
+      // return the silent false positives the guard exists to remove:
+      // search('"quick" ok') answered with rows that never contained 'ok'.
+      // Requiring the short terms as substrings restores the constraint, but
+      // only where it means the same thing — with OR / NOT / NEAR present an
+      // added AND would answer a different question, and with no indexable
+      // term there is nothing to intersect with. Those two are reported
+      // instead of rewritten, so a caller that gets no help still knows it.
+      const rawTerms = [...new Set(queryTokens(text))].filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
+      const rawShort = rawTerms.filter((token) => [...token].length < 3);
+      const enforceable = trigram && rawShort.length > 0
+        && rawTerms.some((token) => [...token].length >= 3)
+        && !FTS5_DISJUNCTION.test(text);
       // Honor raw FTS5 syntax when the query is valid, but never crash on
       // ordinary input (hyphens, punctuation) that FTS5 would parse as
       // operators: fall back to safe per-token quoting — routed through the
       // same short-token guard under trigram, since the extracted tokens can
       // be short too ('gen-itgc ok').
       try {
-        rows = runMatch(text);
+        if (enforceable) {
+          rows = runMatchWithSubstrings(text, rawShort);
+          degraded = 'short-token-post-filter';
+        } else {
+          rows = runMatch(text);
+          if (trigram && rawShort.length > 0) degraded = 'short-token-unguarded';
+        }
       } catch {
         if (trigram) {
           ({ rows, degraded } = runTokensGuarded(queryTokens(text)));

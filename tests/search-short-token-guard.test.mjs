@@ -116,6 +116,35 @@ test('trigram: raw FTS5 syntax is honored untouched', () => {
   assert.equal(hits[0].degraded, undefined, 'operator queries bypass the guard');
 });
 
+test('trigram: a short term in raw FTS5 syntax filters instead of silently matching everything', () => {
+  const api = createQueryApi(trigramDb());
+  // Quoting one term makes the query non-plain, so the token guard never ran.
+  // FTS5 accepts the query, drops 'ok', and returns rows that lack it — the
+  // same silent false positive the guard was written to remove.
+  const hits = api.search('"quick" ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-quick-ok'],
+    "rows without 'ok' must not match a query that asks for it");
+  assert.equal(hits[0].degraded, 'short-token-post-filter');
+  assert.equal(typeof hits[0].rank, 'number', 'the raw MATCH keeps relevance ranking');
+});
+
+test('trigram: a short term that cannot be enforced is reported rather than dropped in silence', () => {
+  const api = createQueryApi(trigramDb());
+  // Requiring 'ok' as a substring would turn OR into AND, so the rows stay as
+  // FTS5 answered them and the caller is told the short term did not apply.
+  const hits = api.search('quick OR ok');
+  assert.deepEqual(new Set(hits.map((h) => h.message.uuid)),
+    new Set(['m-quick-only', 'm-quick-ok']), 'the disjunction is answered unchanged');
+  assert.equal(hits[0].degraded, 'short-token-unguarded');
+});
+
+test('unicode61 default: raw FTS5 syntax with a short term is untouched', () => {
+  const api = createQueryApi(unicodeDb());
+  const hits = api.search('"quick" ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-quick-ok']);
+  assert.equal(hits[0].degraded, undefined, 'short terms are real tokens here');
+});
+
 test('unicode61 default: short terms are real tokens and the guard stays out of the way', () => {
   const api = createQueryApi(unicodeDb());
   const hits = api.search('quick ok');
