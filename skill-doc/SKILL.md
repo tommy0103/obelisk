@@ -13,16 +13,19 @@ allowed-tools:
 
 # obelisk
 
-Search and query local Claude Code, Codex, Kimi Code, OMP, and Pi session history.
+Search and query local Claude Code, Codex, DeepSeek Harness, GitHub Copilot,
+Kimi Code, OMP, Pi, and ZCode session history.
 Obelisk indexes sessions, messages, tool calls, tool results, summaries,
 subagents, workflows, workflow agents, parent chains, and raw JSONL lines into
 SQLite + FTS5.
 
-Obelisk has five transcript sources. Treat all of them as ordinary sessions by
+Obelisk has several transcript sources. Treat all of them as ordinary sessions by
 default: Claude rows use `source='claude'`, Codex rows use `source='codex'`,
-Kimi Code rows use `source='kimi'`, OMP rows use `source='omp'`, and Pi rows use
-`source='pi'`. Use `source` only when provenance matters or the user asks to
-scope to one provider.
+DeepSeek Harness rows use `source='deepseek'`, GitHub Copilot rows use
+`source='copilot'`, Kimi Code rows use `source='kimi'`, OMP rows use
+`source='omp'`, Pi rows use `source='pi'`, and ZCode rows use `source='zcode'`.
+Use `source` only when provenance matters or the user asks to scope to one
+provider.
 Provider-specific records are projected into the same canonical tables; some
 providers may not emit every kind of subagent or workflow metadata.
 
@@ -246,7 +249,8 @@ identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
 Prefer returned order over manually interpreting numeric rank unless you are
 deliberately using FTS5 semantics.
 
-`source` can be `'claude'`, `'codex'`, `'deepseek'`, `'kimi'`, `'omp'`, `'pi'`, or omitted.
+`source` can be `'claude'`, `'codex'`, `'deepseek'`, `'kimi'`, `'omp'`, `'pi'`,
+`'zcode'`, or omitted.
 Omitted means search all indexed sources.
 
 ### `context(uuid, opts?)`

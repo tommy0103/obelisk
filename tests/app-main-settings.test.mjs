@@ -338,6 +338,8 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite-wal') },
     ]);
     assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });

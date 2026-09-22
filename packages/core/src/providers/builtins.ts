@@ -8,6 +8,7 @@ import { createDeepseekProvider } from './deepseek.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createOmpProvider } from './omp.ts';
 import { createPiProvider } from './pi.ts';
+import { createZcodeProvider } from './zcode.ts';
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 
 export type BuiltinProviderRoots = Readonly<Record<string, string | undefined>>;
@@ -30,5 +31,6 @@ export function createBuiltinProviderRegistry(
     createKimiProvider({ rootDir: roots['kimi'] }),
     createOmpProvider({ rootDir: roots['omp'] }),
     createPiProvider({ rootDir: roots['pi'], cwd }),
+    createZcodeProvider({ rootDir: roots['zcode'] }),
   ]);
 }

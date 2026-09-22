@@ -72,6 +72,7 @@ test('built-in provider registry exposes every source without caller-side branch
     kimi: '/sources/kimi',
     omp: '/sources/omp',
     pi: '/sources/pi',
+    zcode: '/sources/zcode',
   });
 
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
@@ -82,6 +83,7 @@ test('built-in provider registry exposes every source without caller-side branch
     { id: 'kimi', name: 'Kimi Code' },
     { id: 'omp', name: 'OMP' },
     { id: 'pi', name: 'Pi' },
+    { id: 'zcode', name: 'ZCode' },
   ]);
   assert.deepEqual(registry.watchTargets(), [
     { kind: 'tree', path: join('/sources/claude', 'projects') },
@@ -97,5 +99,7 @@ test('built-in provider registry exposes every source without caller-side branch
     { kind: 'file', path: join('/sources/kimi', 'session_index.jsonl') },
     { kind: 'tree', path: join('/sources/omp') },
     { kind: 'tree', path: join('/sources/pi') },
+    { kind: 'file', path: join('/sources/zcode', 'db', 'db.sqlite') },
+    { kind: 'file', path: join('/sources/zcode', 'db', 'db.sqlite-wal') },
   ]);
 });
