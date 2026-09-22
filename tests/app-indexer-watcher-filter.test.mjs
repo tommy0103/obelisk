@@ -43,10 +43,11 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     const sourceDb = join(dir, 'db.sqlite');
     const pinnedTranscript = join(dir, 'history.jsonl');
     writeFileSync(sourceDb, 'sqlite fixture');
+    writeFileSync(pinnedTranscript, '');
     const service = createIndexerService({
       buildIndex: async (args) => builds.push(args),
       watchTargets: [
-        { kind: 'tree', path: '/tmp/sessions' },
+        { kind: 'tree', path: dir },
         { kind: 'file', path: sourceDb },
         { kind: 'file', path: pinnedTranscript },
       ],
@@ -57,9 +58,9 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     service.start({ buildOnStart: false });
 
     // Only transcripts discovered under a tree join the hot overlay.
-    assert.equal(captured.shouldPromote('/x/session.jsonl.zstd'), true, '.jsonl.zstd promotes');
-    assert.equal(captured.shouldPromote('/x/session.jsonl'), true);
-    assert.equal(captured.shouldPromote('/x/notes.txt'), false);
+    assert.equal(captured.shouldPromote(join(dir, 'session.jsonl.zstd')), true, '.jsonl.zstd promotes');
+    assert.equal(captured.shouldPromote(join(dir, 'session.jsonl')), true);
+    assert.equal(captured.shouldPromote(join(dir, 'notes.txt')), false);
     assert.equal(captured.shouldPromote(pinnedTranscript), false, 'pinned .jsonl stays out of the hot overlay');
 
     mkdirSync(join(dir, 'repo.v2')); // dotted directory name
