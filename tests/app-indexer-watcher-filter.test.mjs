@@ -41,12 +41,14 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     const builds = [];
     const dir = mkdtempSync(join(tmpdir(), 'obelisk-wf-'));
     const sourceDb = join(dir, 'db.sqlite');
+    const pinnedTranscript = join(dir, 'history.jsonl');
     writeFileSync(sourceDb, 'sqlite fixture');
     const service = createIndexerService({
       buildIndex: async (args) => builds.push(args),
       watchTargets: [
         { kind: 'tree', path: '/tmp/sessions' },
         { kind: 'file', path: sourceDb },
+        { kind: 'file', path: pinnedTranscript },
       ],
       writeHeartbeat: () => {},
       timers,
@@ -54,10 +56,11 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     });
     service.start({ buildOnStart: false });
 
-    // Hot-set promotion stays transcript-gated.
+    // Only transcripts discovered under a tree join the hot overlay.
     assert.equal(captured.shouldPromote('/x/session.jsonl.zstd'), true, '.jsonl.zstd promotes');
     assert.equal(captured.shouldPromote('/x/session.jsonl'), true);
     assert.equal(captured.shouldPromote('/x/notes.txt'), false);
+    assert.equal(captured.shouldPromote(pinnedTranscript), false, 'pinned .jsonl stays out of the hot overlay');
 
     mkdirSync(join(dir, 'repo.v2')); // dotted directory name
     writeFileSync(join(dir, 'notes.txt'), 'x'); // plain non-transcript file
@@ -72,7 +75,6 @@ test('caller routes provider-declared exact files regardless of suffix', async (
 
     // Exact file targets are provider-declared sources. Their suffix is not a
     // caller-side concern, and they are already pinned in the file poller.
-    assert.equal(captured.shouldPromote(sourceDb), false, 'exact file stays out of the hot overlay');
     captured.onInvalidate({ type: 'paths', paths: [sourceDb] });
     timers.flush();
     await new Promise((resolve) => setImmediate(resolve));

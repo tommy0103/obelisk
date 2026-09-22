@@ -139,9 +139,11 @@ function createIndexerService({
       retryDelayMs: watchRetryMs,
       hotPolling,
       pollIntervalMs: watchPollMs,
-      // The caller knows its transcripts; the package does not. Native events
-      // for transcripts promote the path into the hot set before delivery.
-      shouldPromote: (targetPath) => isTreeTranscriptCandidate(targetPath),
+      // The caller knows its transcripts; the package does not. Promote
+      // transcript files discovered under a tree. Exact file targets already
+      // have pinned polling, even when their name has a transcript suffix.
+      shouldPromote: (targetPath) =>
+        !exactFiles.has(path.normalize(targetPath)) && isTreeTranscriptCandidate(targetPath),
       onInvalidate: (invalidation) => {
         // A rescan means anything under the root may have changed — full
         // inventory. Path invalidations filter to transcripts here, at the
