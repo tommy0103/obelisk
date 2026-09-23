@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Kimi Code, OMP, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
+Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Hermes Agent, Kimi Code, OMP, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
 
 </div>
 
@@ -25,7 +25,7 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 **App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
 
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code Stable and Insiders user-data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
+Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code Stable and Insiders user-data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Hermes Agent sessions from `~/.hermes/state.db` (or `$HERMES_HOME/state.db`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
 
 ## Multi-provider support
 
@@ -50,12 +50,13 @@ ZCode stores its transcripts in one SQLite database (`~/.zcode/cli/db/db.sqlite`
 | OMP | Branch, leaf, and compaction state attests inactive history |
 | ZCode | Rewind retention and compaction attest inactive history |
 | Kimi Code | Undo/clear can attest supersession; preservation is a follow-up |
+| Hermes Agent | Superseded history is not split: compaction-archived and rewound rows are both stored as `inactive` |
 | Claude Code | The source does not attest rewind or current-leaf state |
 | Codex | Sessions have no branching semantics |
 
-Because Pi and OMP explicit session IDs are project-local, Obelisk combines each provider's header ID with a deterministic hash of the normalized header `cwd`; this keeps identities stable across file moves while allowing two projects to use the same custom ID. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
+Because Pi and OMP explicit session IDs are project-local, Obelisk combines each provider's header ID with a deterministic hash of the normalized header `cwd`; this keeps identities stable across file moves while allowing two projects to use the same custom ID. Hermes Agent sessions are scoped by the store they were read from as well as the profile name, so a copied or migrated `state.db` cannot collide with the original. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
 
-For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite` plus its WAL sidecar. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
+For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.hermes/state.db` with `~/.hermes/profiles`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite` plus its WAL sidecar. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
 
 Pi chooses its session directory in this order: `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in settings, then the default under `~/.pi/agent/sessions`. Obelisk automatically follows absolute or `~`-prefixed environment/global settings and the project setting for Obelisk's launch cwd; a relative project setting is resolved against that cwd. CLI-only roots, relative environment/global settings, and project settings from another launch cwd cannot be inferred safely, so select the resolved directory in Obelisk **Settings** instead of letting Obelisk guess.
 
@@ -206,7 +207,7 @@ run `npm ci` again.
 
 | Layer | Source | What's captured |
 |-------|--------|----------------|
-| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Copilot Chronicle plus workspace `transcripts/*.jsonl`; Kimi session directories; Pi recursive `*.jsonl`; DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]`; ZCode `session` rows in `~/.zcode/cli/db/db.sqlite` | Title, project, timestamps, git branch, source |
+| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Copilot Chronicle plus workspace `transcripts/*.jsonl`; Hermes `state.db`; Kimi session directories; Pi recursive `*.jsonl`; DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]`; ZCode `session` rows in `~/.zcode/cli/db/db.sqlite` | Title, project, timestamps, git branch, source |
 | **Messages** | user + assistant turns | Full text, model, token usage, parent chain |
 | **Tool calls** | every tool invocation | Tool name, input, file paths |
 | **Subagents** | Claude `subagents/agent-<id>.jsonl`; Codex child threads; DeepSeek Harness child sessions (folded into the root session); ZCode `task_type='subagent_child'` sessions | Agent type, description, full conversation |

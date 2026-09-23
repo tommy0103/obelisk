@@ -11,6 +11,7 @@ import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type { SqliteDb, SqliteRow, SqliteStatement } from './sqlite-types.ts';
+import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
 
 type DbRow = SqliteRow;
 
@@ -274,6 +275,7 @@ function createQueryApi(
   {
     providerRegistry = createBuiltinProviderRegistry({}, {
       openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+      openHermesStore: openHermesStoreWithNodeSqlite,
     }),
     invokingSessionId = null,
   }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
@@ -533,7 +535,7 @@ function createQueryApi(
        LEFT JOIN sessions s ON s.id=tc.session_id
        LEFT JOIN messages m ON m.uuid=tc.message_uuid
        WHERE ${where}
-       ORDER BY m.timestamp
+       ORDER BY m.timestamp, m.uuid, tc.rowid
        LIMIT ?`
     ).all(...params).map((r: DbRow) => ({
       toolCall: { id: r.id, message_uuid: r.message_uuid, name: r.name, input_json: r.input_json },

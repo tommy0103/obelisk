@@ -47,14 +47,27 @@ interface CodexLineRecord {
 }
 
 // ---- message/text helpers ----
+/**
+ * Slice a string to `limit` UTF-16 code units without leaving half of a surrogate pair at the cut.
+ * A lone surrogate has no UTF-8 form, so every store that persists the text rewrites it (SQLite
+ * writes U+FFFD) and the record no longer matches what the provider emitted — which ADR-0007
+ * forbids. Rare, but it is exactly what a limit that lands on an emoji produces.
+ */
+function sliceText(s: string, limit: number): string {
+  if (s.length <= limit) return s;
+  const boundary = s.charCodeAt(limit - 1);
+  const splitsPair = boundary >= 0xd800 && boundary <= 0xdbff;
+  return s.slice(0, splitsPair ? limit - 1 : limit);
+}
+
 function trunc(s: any): any {
-  return typeof s === 'string' && s.length > TEXT_LIMIT ? s.slice(0, TEXT_LIMIT) : s;
+  return typeof s === 'string' ? sliceText(s, TEXT_LIMIT) : s;
 }
 
 function truncJson(obj: JsonValue, limit = TEXT_LIMIT): string | null {
   if (obj === null || obj === undefined) return null;
   const walk = (v: JsonValue): JsonValue => {
-    if (typeof v === 'string') return v.length > limit ? v.slice(0, limit) + '...[truncated]' : v;
+    if (typeof v === 'string') return v.length > limit ? sliceText(v, limit) + '...[truncated]' : v;
     if (Array.isArray(v)) return v.map(walk);
     if (typeof v === 'object' && v !== null) {
       const out: JsonRecord = {};

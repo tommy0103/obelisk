@@ -5,6 +5,7 @@ import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
 import { createCopilotProvider, type CopilotChronicleOpener } from './copilot.ts';
 import { createDeepseekProvider } from './deepseek.ts';
+import { createHermesProvider, type HermesStoreOpener } from './hermes.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createOmpProvider } from './omp.ts';
 import { createPiProvider } from './pi.ts';
@@ -18,10 +19,12 @@ export function createBuiltinProviderRegistry(
   {
     cwd,
     openCopilotChronicle,
+    openHermesStore,
     openZcodeDatabase,
   }: {
     cwd?: string;
     openCopilotChronicle?: CopilotChronicleOpener;
+    openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
   } = {},
 ): ProviderRegistry {
@@ -30,6 +33,7 @@ export function createBuiltinProviderRegistry(
     createCodexProvider({ rootDir: roots['codex'] }),
     createCopilotProvider({ rootDir: roots['copilot'], openChronicle: openCopilotChronicle }),
     createDeepseekProvider({ rootDir: roots['deepseek'] }),
+    createHermesProvider({ rootDir: roots['hermes'], openStore: openHermesStore }),
     createKimiProvider({ rootDir: roots['kimi'] }),
     createOmpProvider({ rootDir: roots['omp'] }),
     createPiProvider({ rootDir: roots['pi'], cwd }),

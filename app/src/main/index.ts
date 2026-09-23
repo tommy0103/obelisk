@@ -547,12 +547,16 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
 
 function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   if (!db) return [];
+  // Insertion order is the provider's source order, and the assembled session detail keeps a
+  // message's calls the way they arrive here: `tool_calls` carries a `(session_id, name)` index, so
+  // an explicit order is what stops the planner from returning them sorted by tool name (ADR-0007).
   return db.prepare(`
     SELECT tc.* FROM messages m
     CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
     WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tc.session_id = ?
+    ORDER BY tc.rowid
   `).all(sessionId, sessionId) as SessionToolCallRow[];
 }
 
@@ -693,10 +697,12 @@ ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
 
 ipcMain.handle('db:getSubagentToolCalls', (_, agentId) => {
   if (!db) return [];
+  // Same as querySessionToolCalls: insertion order, not the `(session_id, name)` index order.
   return db.prepare(`
     SELECT tc.* FROM tool_calls tc
     JOIN messages m ON m.uuid = tc.message_uuid
     WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY tc.rowid
   `).all(agentId);
 });
 
@@ -742,11 +748,12 @@ ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
     subagent,
     workflowAgent,
   };
-  // The ZCode source is SQLite, so open/read it in the existing indexer
-  // worker rather than blocking Electron's main thread on a custom root.
-  if (lookup.source === 'zcode') {
+  // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
+  if (lookup.source === 'zcode' || lookup.source === 'hermes') {
     try {
-      const messageText = await indexerWorker?.readZcodeMessageText(lookup);
+      const messageText = lookup.source === 'zcode'
+        ? await indexerWorker?.readZcodeMessageText(lookup)
+        : await indexerWorker?.readHermesMessageText(lookup);
       return messageText ?? msg.text ?? null;
     } catch {
       return msg.text ?? null;

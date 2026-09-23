@@ -29,6 +29,7 @@ import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
+import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
 
 interface SkippedFile {
   provider: string;
@@ -200,6 +201,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       }
       registry = createConfiguredBuiltinProviderRuntime(settings.settings, {
         openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+        openHermesStore: openHermesStoreWithNodeSqlite,
       }).registry;
     }
 
