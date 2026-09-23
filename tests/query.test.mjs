@@ -115,6 +115,50 @@ test('search falls back to safe tokenization for FTS-special input instead of th
   db.close();
 });
 
+test('search broadens only an empty query when the OR fallback is explicitly enabled', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+
+  assert.deepEqual(api.search('needle absent', { limit: 10 }), []);
+  assert.deepEqual(
+    api.search('needle absent', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+  );
+  assert.deepEqual(
+    new Set(api.search('needle absent', { fallback: 'or', includeInactive: true, limit: 10 }).map(row => row.message.uuid)),
+    new Set(['msg-text', 'msg-inactive']),
+    'the relaxed retry preserves visibility filtering',
+  );
+  assert.deepEqual(
+    api.search('needle reply', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+    'a non-empty primary result is not broadened',
+  );
+  db.close();
+});
+
+test('OR fallback retains scope, source, time, cwd and limit filters', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+  const opts = { fallback: 'or', limit: 10 };
+  for (const scope of [
+    { sessionId: 'missing-session' }, { project: 'missing-project' },
+    { source: 'codex' }, { cwd: '/other/project' },
+    { after: '2026-06-11T00:00:00Z' }, { before: '2026-06-09T00:00:00Z' },
+  ]) {
+    assert.deepEqual(api.search('needle absent', { ...opts, ...scope }), [], JSON.stringify(scope));
+  }
+  const scoped = { ...opts, sessionId: 'sid-search', project: 'quiet-zero',
+    source: 'claude', cwd: '/tmp/quiet-zero',
+    after: '2026-06-10T10:00:00Z', before: '2026-06-10T10:03:00Z' };
+  assert.deepEqual(api.search('needle absent', scoped).map(r => r.message.uuid), ['msg-text']);
+  assert.equal(api.search('needle absent', { ...scoped, includeMeta: true }).length, 2);
+  assert.equal(api.search('needle absent', { ...scoped, includeMeta: true, limit: 1 }).length, 1);
+  assert.deepEqual(api.search('needle absent', { ...scoped, limit: 0 }), []);
+  assert.deepEqual(api.search('---', opts), []);
+  db.close();
+});
+
 test('search exposes content_type on hits and temporal context', () => {
   const db = searchDb();
   const api = createQueryApi(db);
