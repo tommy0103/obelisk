@@ -427,7 +427,11 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
         };
         messages.push(message);
         messagesByUuid.set(message.uuid, message);
-        if (record.agent_id === null) mainMessageUuids.add(message.uuid);
+        // A child with its own session is a first-class detail page as well
+        // as a subagent of its parent. Its agent id equals its session id.
+        if (record.agent_id === null || record.agent_id === record.session_id) {
+          mainMessageUuids.add(message.uuid);
+        }
         break;
       }
       case 'tool_call':

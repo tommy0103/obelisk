@@ -20,6 +20,7 @@ import { buildIndex } from '../app/src/main/indexer.ts';
 import { createIndexerService } from '../app/src/main/indexer-service.ts';
 import { createZcodeProvider } from '../packages/core/src/providers/zcode.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
@@ -100,6 +101,10 @@ test('real-model aggregate indexes end to end: sessions, messages, tools, subage
 
   const subagents = db.prepare("SELECT COUNT(*) c FROM subagents WHERE session_id LIKE 'zcode:%'").get().c;
   assert.equal(subagents, 2, 'exactly the two subagent_child sessions emit subagent records');
+  const queriedSubagents = createQueryApi(db).subagents({ source: 'zcode', after: '2000-01-01T00:00:00Z', before: '2100-01-01T00:00:00Z' });
+  assert.equal(queriedSubagents.length, 2, 'both children have a queryable activity interval');
+  assert.ok(queriedSubagents.every(agent => agent.messageCount > 0), 'child messages contribute to subagent counts');
+  assert.ok(queriedSubagents.every(agent => agent.total_tokens !== null), 'child model usage contributes to subagent totals');
 
   const toolErrors = db.prepare("SELECT COUNT(*) c FROM tool_results WHERE session_id LIKE 'zcode:%' AND is_error=1").get().c;
   assert.ok(toolErrors >= 1, 'error tool results indexed');
@@ -153,6 +158,49 @@ test('search finds real-model content through the full stack', () => {
   assert.equal(r.status, 0, r.stderr || r.stdout);
   const out = JSON.parse(r.stdout);
   assert.ok(out.hits.length >= 1, 'aggregate content is searchable');
+});
+
+test('twelve reasoning parts keep source order in direct and persisted detail', () => {
+  const home = makeTempDir('obelisk-zcode-reasoning-order-');
+  const src = seedSource(home);
+  const source = new DatabaseSync(src);
+  const response = source.prepare(`
+    SELECT m.* FROM message m JOIN session s ON s.id = m.session_id
+    WHERE json_extract(m.data, '$.role') = 'assistant'
+      AND json_extract(m.data, '$.semantics.uiVisibility') = 'visible'
+      AND s.parent_id IS NULL
+    LIMIT 1
+  `).get();
+  assert.ok(response, 'fixture has a first-class assistant response');
+  const insert = source.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, sequence, data) VALUES (?,?,?,?,?,?,?)');
+  for (let n = 0; n < 12; n++) {
+    insert.run(`prt_reasoning_order_${n}`, response.id, response.session_id,
+      response.time_created, response.time_updated, 100 + n,
+      JSON.stringify({ type: 'reasoning', text: `ordering-marker-${n}` }));
+  }
+  source.close();
+
+  const provider = createZcodeProvider({ rootDir: join(home, '.zcode', 'cli') });
+  const unit = provider.discover({ lastCursor: () => null }).find(item => item.meta.rawSessionId === response.session_id);
+  assert.ok(unit);
+  const records = drain(provider.parse(unit, null));
+  const db = freshDb();
+  persist(db, unit, provider.parse(unit, null));
+  const direct = assembleSessionDetail(records);
+  const persisted = assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions WHERE id = ?').get(unit.sessionId),
+    messages: db.prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, uuid').all(unit.sessionId),
+    toolCalls: db.prepare('SELECT * FROM tool_calls WHERE session_id = ?').all(unit.sessionId),
+    toolResults: db.prepare('SELECT * FROM tool_results WHERE session_id = ?').all(unit.sessionId),
+  });
+  assert.deepEqual(persisted, direct, 'the reasoning sequence survives SQLite');
+  const text = direct.messages.find(message => message.uuid === `${unit.sessionId}:${response.id}`)?._thinking;
+  assert.ok(text, 'all reasoning parts attach to their assistant response');
+  for (let n = 0; n < 11; n++) {
+    assert.ok(text.indexOf(`ordering-marker-${n}\n`) < text.indexOf(`ordering-marker-${n + 1}`),
+      `reasoning ${n} precedes ${n + 1}`);
+  }
+  db.close();
 });
 
 test('incremental append is re-parsed without duplicates; count replaced (total)', () => {
@@ -324,6 +372,137 @@ test('compaction summary is indexed as a summary record, tail ancestors inactive
     "SELECT COUNT(*) c FROM messages WHERE session_id = ? AND visibility != 'inactive'",
   ).get(summary.session_id).c;
   assert.ok(active >= 1, 'messages after the compaction tail remain active');
+  db.close();
+});
+
+test('rewinding past a compaction restores the retained prefix', () => {
+  const home = makeTempDir('obelisk-zcode-rewind-compact-');
+  const src = seedSource(home);
+  const source = new DatabaseSync(src);
+  const session = { ...source.prepare('SELECT * FROM session LIMIT 1').get() };
+  session.id = 'ses_rewind_compaction_probe';
+  session.parent_id = null;
+  session.task_type = 'interactive';
+  session.revert = JSON.stringify({
+    targetMessageID: 'msg_branch_3',
+    keptMessageIDs: ['msg_branch_1', 'msg_branch_2'],
+    branchCutAfterMessageID: 'msg_branch_5',
+  });
+  const columns = Object.keys(session);
+  source.prepare(`INSERT INTO session (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
+    .run(...columns.map(column => session[column]));
+  const insertMessage = source.prepare('INSERT INTO message (id, session_id, time_created, time_updated, sequence, data) VALUES (?,?,?,?,?,?)');
+  const insertPart = source.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, sequence, data) VALUES (?,?,?,?,?,?,?)');
+  for (let n = 1; n <= 6; n++) {
+    const id = `msg_branch_${n}`;
+    const role = n % 2 === 0 ? 'assistant' : 'user';
+    insertMessage.run(id, session.id, n, n, n, JSON.stringify({
+      role,
+      time: { created: n },
+      semantics: {
+        kind: role === 'user' ? 'user_prompt' : 'assistant_response',
+        uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible',
+      },
+    }));
+    insertPart.run(`prt_branch_${n}`, id, session.id, n, n, 0, JSON.stringify(
+      n === 4
+        ? { type: 'compaction', tail_start_id: 'msg_branch_2', auto: true }
+        : { type: 'text', text: `branch message ${n}` },
+    ));
+  }
+  source.close();
+
+  build(home);
+  const db = openIndex(home);
+  const indexed = db.prepare("SELECT id FROM sessions WHERE jsonl_path LIKE '%#z:ses_rewind_compaction_probe'").get();
+  assert.ok(indexed, 'the rewound session is indexed');
+  const rows = db.prepare('SELECT uuid, visibility FROM messages WHERE session_id = ? ORDER BY uuid').all(indexed.id);
+  assert.deepEqual(rows.map(row => [row.uuid.split(':').at(-1), row.visibility]), [
+    ['msg_branch_1', 'visible'],
+    ['msg_branch_2', 'visible'],
+    ['msg_branch_3', 'inactive'],
+    ['msg_branch_4', 'inactive'],
+    ['msg_branch_5', 'inactive'],
+    ['msg_branch_6', 'visible'],
+  ], 'only the superseded compaction branch is inactive');
+  db.close();
+});
+
+test('legacy createdMessageID rewind keeps the newly appended branch', () => {
+  const home = makeTempDir('obelisk-zcode-legacy-rewind-');
+  const src = seedSource(home);
+  const source = new DatabaseSync(src);
+  const session = { ...source.prepare('SELECT * FROM session LIMIT 1').get() };
+  session.id = 'ses_legacy_rewind_probe';
+  session.parent_id = null;
+  session.task_type = 'interactive';
+  session.revert = JSON.stringify({
+    targetMessageID: 'msg_legacy_3',
+    keptMessageIDs: ['msg_legacy_1', 'msg_legacy_2'],
+    createdMessageID: 'msg_legacy_5',
+  });
+  const columns = Object.keys(session);
+  source.prepare(`INSERT INTO session (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
+    .run(...columns.map(column => session[column]));
+  const insertMessage = source.prepare('INSERT INTO message (id, session_id, time_created, time_updated, sequence, data) VALUES (?,?,?,?,?,?)');
+  const insertPart = source.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, sequence, data) VALUES (?,?,?,?,?,?,?)');
+  for (let n = 1; n <= 6; n++) {
+    const id = `msg_legacy_${n}`;
+    const role = n % 2 === 0 ? 'assistant' : 'user';
+    insertMessage.run(id, session.id, n, n, n, JSON.stringify({
+      role,
+      time: { created: n },
+      semantics: {
+        kind: role === 'user' ? 'user_prompt' : 'assistant_response',
+        uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible',
+      },
+    }));
+    insertPart.run(`prt_legacy_${n}`, id, session.id, n, n, 0,
+      JSON.stringify({ type: 'text', text: `legacy branch message ${n}` }));
+  }
+  source.close();
+
+  build(home);
+  const db = openIndex(home);
+  const indexed = db.prepare("SELECT id FROM sessions WHERE jsonl_path LIKE '%#z:ses_legacy_rewind_probe'").get();
+  assert.ok(indexed, 'legacy rewound session is indexed');
+  const rows = db.prepare('SELECT uuid, visibility FROM messages WHERE session_id = ? ORDER BY uuid').all(indexed.id);
+  assert.deepEqual(rows.map(row => [row.uuid.split(':').at(-1), row.visibility]), [
+    ['msg_legacy_1', 'visible'],
+    ['msg_legacy_2', 'visible'],
+    ['msg_legacy_3', 'inactive'],
+    ['msg_legacy_4', 'inactive'],
+    ['msg_legacy_5', 'visible'],
+    ['msg_legacy_6', 'visible'],
+  ]);
+  db.close();
+});
+
+test('compaction preserves the source-declared message segment', () => {
+  const home = makeTempDir('obelisk-zcode-preserved-');
+  const src = seedSource(home);
+  const source = new DatabaseSync(src);
+  const marker = source.prepare("SELECT id, message_id, data FROM part WHERE json_extract(data, '$.compactBoundary') IS NOT NULL LIMIT 1").get();
+  assert.ok(marker, 'real fixture includes a compact boundary');
+  const markerData = JSON.parse(marker.data);
+  const owner = source.prepare('SELECT session_id FROM message WHERE id = ?').get(marker.message_id);
+  const before = source.prepare('SELECT id FROM message WHERE session_id = ? AND sequence IN (6, 7, 8, 9) ORDER BY sequence')
+    .all(owner.session_id).map(row => row.id);
+  assert.equal(before.length, 4, 'fixture has a preceding preservable segment and timeline marker');
+  markerData.compactBoundary.preservedSegment = {
+    headMessageId: before[1], anchorMessageId: marker.message_id, tailMessageId: before[2],
+  };
+  markerData.compactBoundary.keptMessageCount = 2;
+  source.prepare('UPDATE part SET data = ? WHERE id = ?').run(JSON.stringify(markerData), marker.id);
+  source.close();
+
+  build(home);
+  const db = openIndex(home);
+  const visibility = id => db.prepare('SELECT visibility FROM messages WHERE uuid LIKE ?').get(`%:${id}`)?.visibility;
+  assert.equal(visibility(before[0]), 'inactive', 'older summarized message remains inactive');
+  assert.equal(visibility(before[1]), 'visible', 'preserved segment head remains current evidence');
+  assert.equal(visibility(before[2]), 'visible', 'preserved segment tail remains current evidence');
+  assert.equal(visibility(before[3]), 'inactive', 'the old timeline marker is superseded');
   db.close();
 });
 

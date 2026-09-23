@@ -539,7 +539,7 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
     FROM messages m
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
     ORDER BY m.timestamp, m.uuid
   `).all(sessionId) as SessionMessageRow[];
@@ -550,7 +550,7 @@ function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   return db.prepare(`
     SELECT tc.* FROM messages m
     CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tc.session_id = ?
   `).all(sessionId, sessionId) as SessionToolCallRow[];
@@ -561,7 +561,7 @@ function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   return db.prepare(`
     SELECT tr.* FROM messages m
     CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tr.session_id = ?
   `).all(sessionId, sessionId) as SessionToolResultRow[];

@@ -44,7 +44,7 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { statSync } from 'node:fs';
-import { isAbsolute, join, normalize } from 'node:path';
+import { isAbsolute, join, normalize, sep } from 'node:path';
 
 import { normalizeObservedCwd, projectSlugFromPath, trunc, truncJson } from '../parsing.ts';
 import type { SqliteDb } from '../sqlite-types.ts';
@@ -63,7 +63,7 @@ import type {
 } from './types.ts';
 
 export const name = 'zcode';
-export const ZCODE_CANONICAL_TRANSCRIPT_MARKER = '__zcode_canonical_transcript_v2__';
+export const ZCODE_CANONICAL_TRANSCRIPT_MARKER = '__zcode_canonical_transcript_v3__';
 
 const BUSY_TIMEOUT_MS = 500;
 const require = createRequire(import.meta.url);
@@ -285,7 +285,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext, opener: ZcodeDatabase
     const normalized = normalize(dbPath);
     const touched = ctx.changedPaths.some((changed) => {
       const absolute = isAbsolute(changed) ? normalize(changed) : normalized;
-      return absolute === normalized || absolute === normalize(walPath) || normalized.startsWith(absolute + '/');
+      return absolute === normalized || absolute === normalize(walPath) || normalized.startsWith(absolute + sep);
     });
     if (!touched) return [];
   }
@@ -468,18 +468,96 @@ function mapVisibility(data: Record<string, unknown>): {
 // ---- rewind / compaction active-set (design §4.5) ----
 
 interface RevertInfo {
-  keptMessageIds: Set<string>;
+  targetMessageId: string | null;
+  keptMessageIds: string[] | null;
   branchCutAfterMessageId: string | null;
+  createdMessageId: string | null;
 }
 
 function parseRevert(revert: string | null): RevertInfo | null {
   const value = parseJson(revert);
   if (value === null) return null;
-  const kept = Array.isArray(value.keptMessageIDs) ? value.keptMessageIDs : [];
   return {
-    keptMessageIds: new Set(kept.filter((id): id is string => typeof id === 'string')),
-    branchCutAfterMessageId: typeof value.branchCutAfterMessageID === 'string' ? value.branchCutAfterMessageID : null,
+    targetMessageId: str(value.targetMessageID),
+    keptMessageIds: Array.isArray(value.keptMessageIDs)
+      ? value.keptMessageIDs.filter((id): id is string => typeof id === 'string') : null,
+    branchCutAfterMessageId: str(value.branchCutAfterMessageID),
+    createdMessageId: str(value.createdMessageID),
   };
+}
+
+function selectActiveBranch(messages: readonly MessageRow[], revert: RevertInfo | null): MessageRow[] {
+  // Mirrors ZCode's selectActiveConversationBranch, including its legacy
+  // createdMessageID path. A revert without a target is not a branch cut.
+  if (revert?.targetMessageId === null || revert === null) return [...messages];
+  const byId = new Map(messages.map(message => [message.id, message]));
+  const targetIndex = messages.findIndex(message => message.id === revert.targetMessageId);
+  const kept = revert.keptMessageIds !== null
+    ? revert.keptMessageIds.map(id => byId.get(id)).filter((message): message is MessageRow => message !== undefined)
+    : targetIndex >= 0 ? messages.slice(0, targetIndex) : [...messages];
+  if (revert.branchCutAfterMessageId !== null) {
+    const cutIndex = messages.findIndex(message => message.id === revert.branchCutAfterMessageId);
+    return cutIndex >= 0 ? [...kept, ...messages.slice(cutIndex + 1)] : kept;
+  }
+  if (revert.keptMessageIds === null && targetIndex < 0) return [...messages];
+  if (revert.createdMessageId === null) return kept;
+  const createdIndex = messages.findIndex(message => message.id === revert.createdMessageId);
+  return createdIndex >= 0 ? [...kept, ...messages.slice(createdIndex)] : kept;
+}
+
+function selectActiveMessages(
+  messages: readonly MessageRow[],
+  partsByMessage: ReadonlyMap<string, readonly PartRow[]>,
+  revert: RevertInfo | null,
+): Set<string> {
+  const parsedParts = (messageId: string) =>
+    (partsByMessage.get(messageId) ?? []).map(part => parseJson(part.data)).filter((part): part is Record<string, unknown> => part !== null);
+  const boundaryPart = (message: MessageRow) => parsedParts(message.id).find(part =>
+    part.type === 'compaction' && (Boolean(part.compactBoundary) || !part.timelineStatus));
+  const compact = (branch: MessageRow[], boundaryIndex: number): MessageRow[] => {
+    if (boundaryIndex < 0) return branch;
+    const tail = branch.slice(boundaryIndex);
+    const boundary = boundaryPart(branch[boundaryIndex]!);
+    const segment = isRecord(boundary?.compactBoundary)
+      && isRecord(boundary.compactBoundary.preservedSegment)
+      ? boundary.compactBoundary.preservedSegment : null;
+    if (segment === null) return tail;
+    const head = branch.findIndex(message => message.id === segment.headMessageId);
+    const end = branch.findIndex(message => message.id === segment.tailMessageId);
+    if (head < 0 || end < head || end >= boundaryIndex) return tail;
+    const preserved = branch.slice(head, end + 1).filter(message => {
+      const data = parseJson(message.data);
+      if (data === null || (data.role !== 'user' && data.role !== 'assistant')) return false;
+      const semantics = isRecord(data.semantics) ? data.semantics : {};
+      if (semantics.providerVisibility === 'hidden') return false;
+      if (data.role === 'assistant' && data.error) return false;
+      return !parsedParts(message.id).some(part => part.type === 'compaction');
+    });
+    return [...tail, ...preserved];
+  };
+  const lastBoundary = (branch: readonly MessageRow[]) => {
+    for (let index = branch.length - 1; index >= 0; index--) {
+      if (boundaryPart(branch[index]!)) return index;
+    }
+    return -1;
+  };
+
+  let active: MessageRow[];
+  if (revert?.branchCutAfterMessageId !== null && revert !== null) {
+    const branch = selectActiveBranch(messages, revert);
+    active = compact(branch, lastBoundary(branch));
+  } else {
+    // Older ZCode histories compact before applying the createdMessageID
+    // rewind. A kept prefix wholly before that boundary cannot revive it.
+    const boundaryIndex = lastBoundary(messages);
+    const compacted = compact([...messages], boundaryIndex);
+    const postCompactIds = new Set(messages.slice(boundaryIndex).map(message => message.id));
+    active = boundaryIndex >= 0 && revert?.keptMessageIds !== null
+      && revert !== null && !revert.keptMessageIds.some(id => postCompactIds.has(id))
+      ? compacted
+      : selectActiveBranch(compacted, revert);
+  }
+  return new Set(active.map(message => message.id));
 }
 
 // ---- parse ----
@@ -570,32 +648,9 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
       partsByMessage.set(part.message_id, list);
     }
 
-    // rewind active set
     const revert = parseRevert(session.revert);
-    const order = new Map<string, number>();
-    messages.forEach((m, i) => order.set(m.id, i));
-    const isActive = (messageId: string): boolean => {
-      if (revert === null) return true;
-      if (revert.keptMessageIds.has(messageId)) return true;
-      if (revert.branchCutAfterMessageId !== null) {
-        const cut = order.get(revert.branchCutAfterMessageId);
-        const self = order.get(messageId);
-        if (cut !== undefined && self !== undefined && self > cut) return true;
-      }
-      return false;
-    };
-
-    // compaction boundary: tail_start_id is the INCLUSIVE last-summarized id
-    const compactionParts = parts
-      .map(p => parseJson(p.data))
-      .filter((d): d is Record<string, unknown> => d !== null && d.type === 'compaction');
-    let compactTailIndex: number | null = null;
-    for (const part of compactionParts) {
-      const tailId = str(part.tail_start_id);
-      if (tailId === null) continue;
-      const idx = order.get(tailId);
-      if (idx !== undefined && (compactTailIndex === null || idx > compactTailIndex)) compactTailIndex = idx;
-    }
+    const activeIds = selectActiveMessages(messages, partsByMessage, revert);
+    const isActive = (messageId: string): boolean => activeIds.has(messageId);
 
     const startedAt = timestampOfMs(session.time_created);
     let endedAt: string | null = null;
@@ -608,11 +663,9 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
       if (data === null) continue;
       const semantics = isRecord(data.semantics) ? data.semantics : {};
       const kind = str(semantics.kind);
-      const index = order.get(message.id) ?? 0;
       const { visibility: triadVisibility, isMeta } = mapVisibility(data);
       let visibility = triadVisibility;
       if (triadVisibility === 'visible' && !isActive(message.id)) visibility = 'inactive';
-      if (triadVisibility === 'visible' && compactTailIndex !== null && index <= compactTailIndex) visibility = 'inactive';
 
       const messageTimestamp = timestampOfMs(
         isRecord(data.time) && typeof data.time.created === 'number' ? data.time.created : message.time_created,
@@ -663,7 +716,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
             visibleCount += visibility === 'visible' ? 1 : 0;
             records.push({
               kind: 'message',
-              uuid: `${sessionId}:${message.id}:think${thinkingIndex++}`,
+              uuid: `${sessionId}:${message.id}:think${String(thinkingIndex++).padStart(6, '0')}`,
               session_id: sessionId,
               type: 'assistant',
               parent_uuid: `${sessionId}:${message.id}`,
@@ -674,8 +727,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
               is_meta: isMeta,
               visibility,
               model,
-              is_sidechain: 0,
-              agent_id: null,
+              is_sidechain: isSubagent ? 1 : 0,
+              agent_id: isSubagent ? sessionId : null,
               input_tokens: null,
               output_tokens: null,
               cwd: null,
@@ -771,8 +824,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
           is_meta: isMeta,
           visibility: 'hidden',
           model,
-          is_sidechain: 0,
-          agent_id: null,
+          is_sidechain: isSubagent ? 1 : 0,
+          agent_id: isSubagent ? sessionId : null,
           input_tokens: null,
           output_tokens: null,
           cwd: null,
@@ -796,8 +849,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
         is_meta: isMeta,
         visibility,
         model,
-        is_sidechain: 0,
-        agent_id: null,
+        is_sidechain: isSubagent ? 1 : 0,
+        agent_id: isSubagent ? sessionId : null,
         input_tokens: role === 'assistant' ? totalInputTokens(data.tokens) : null,
         output_tokens: role === 'assistant' ? outputTokens(data.tokens) : null,
         cwd: role === 'assistant' && isRecord(data.path) ? str((data.path as Record<string, unknown>).cwd) : null,
