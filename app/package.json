@@ -24,7 +24,8 @@
     "test:electron:timeline": "electron-vite build && electron --no-sandbox tests/electron-session-virtualization.mjs",
     "test:electron:reader-state": "electron-vite build && electron --no-sandbox tests/electron-session-reader-state.mjs",
     "test:electron:file-refs": "electron-vite build && electron --no-sandbox tests/electron-file-references.mjs",
-    "test:electron:all": "electron-vite build && node tests/run-electron-suites.mjs"
+    "test:electron:all": "electron-vite build && node tests/run-electron-suites.mjs",
+    "verify:mac": "bash ../scripts/verify-macos-release.sh release"
   },
   "build": {
     "appId": "com.obelisk.app",
@@ -34,12 +35,13 @@
       "output": "release"
     },
     "mac": {
-      "icon": "build/icon.icns",
       "target": [
         "dmg",
         "zip"
       ],
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "identity": "-",
+      "hardenedRuntime": false
     },
     "win": {
       "target": [
