@@ -13,10 +13,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
+import { createIndexerService } from '../app/src/main/indexer-service.ts';
 import { createZcodeProvider } from '../packages/core/src/providers/zcode.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
@@ -435,6 +436,68 @@ function clearDebounce(home) {
   db.prepare("DELETE FROM index_state WHERE jsonl_path='__last_build__'").run();
   db.close();
 }
+
+test('App file watcher forwards ZCode WAL changes through changedPaths into the index', async () => {
+  const home = makeTempDir('obelisk-zcode-app-watch-');
+  const src = seedSource(home);
+  const provider = createZcodeProvider({ rootDir: join(home, '.zcode', 'cli') });
+  const builds = [];
+  const warnings = [];
+  const service = createIndexerService({
+    watchTargets: provider.watchTargets(join(home, '.zcode', 'cli')),
+    buildIndex: (args) => {
+      builds.push(args);
+      return build(home, { changedPaths: args.changedPaths });
+    },
+    writeHeartbeat: () => {},
+    watchPollMs: 30,
+    debounceMs: 0,
+    stabilityMs: 0,
+    reconcileMs: 0,
+    logger: { warn: (message) => warnings.push(message) },
+  });
+  let writer;
+  try {
+    writer = new DatabaseSync(src);
+    writer.exec('PRAGMA journal_mode=WAL');
+    service.start({ buildOnStart: false });
+    await service.runBuildNow('startup');
+    // The poller's first observation reports an appearance. Drain it before
+    // mutating the source, so only a subsequent WAL invalidation can index the rewrite.
+    for (let attempt = 0; attempt < 50 && !builds.some((args) => args.changedPaths?.includes(`${src}-wal`)); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await service.idle();
+    }
+    assert.ok(builds.some((args) => args.changedPaths?.includes(`${src}-wal`)),
+      'the pinned WAL target is observed before the rewrite');
+    await service.idle();
+    builds.length = 0;
+    clearDebounce(home);
+    const part = writer.prepare("SELECT id, data FROM part WHERE json_extract(data,'$.type')='text' LIMIT 1").get();
+    assert.ok(part, 'real fixture has a text part to rewrite');
+    const data = JSON.parse(part.data);
+    data.text = 'zcode app watcher wal needle';
+    writer.prepare('UPDATE part SET data = ? WHERE id = ?').run(JSON.stringify(data), part.id);
+    assert.ok(existsSync(`${src}-wal`), 'the WAL sidecar exists while the writer stays open');
+
+    let indexed = false;
+    for (let attempt = 0; attempt < 100 && !indexed; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      await service.idle();
+      const db = openIndex(home);
+      indexed = db.prepare("SELECT COUNT(*) c FROM messages WHERE source='zcode' AND text LIKE '%app watcher wal needle%'").get().c > 0;
+      db.close();
+    }
+    assert.ok(builds.some((args) => args.changedPaths?.includes(`${src}-wal`)),
+      'the pinned WAL target reaches the App build callback');
+    assert.ok(indexed, 'changed-path indexing projects the WAL rewrite into the shared index');
+    assert.deepEqual(warnings, [], 'the App build reports no indexing errors');
+  } finally {
+    service.stop();
+    await service.idle();
+    writer?.close();
+  }
+});
 
 test('provider-level: missing source is quiet without prior sessions, incomplete with them', () => {
   const home = makeTempDir('obelisk-zcode-missing-');
