@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -84,7 +84,7 @@ function zcodeSessions(db) {
 
 test('real-model aggregate indexes end to end: sessions, messages, tools, subagents', () => {
   const home = makeTempDir('obelisk-zcode-index-');
-  seedSource(home);
+  const sourcePath = seedSource(home);
   const result = build(home);
   assert.ok(result.complete, `inventory complete: ${JSON.stringify(result.inventoryIssues)}`);
 
@@ -106,6 +106,38 @@ test('real-model aggregate indexes end to end: sessions, messages, tools, subage
 
   const summaries = db.prepare("SELECT COUNT(*) c FROM summaries WHERE source='zcode'").get().c;
   assert.equal(summaries, 1, 'compact summary indexed');
+
+  const source = new DatabaseSync(sourcePath);
+  const priced = source.prepare("SELECT id, json_extract(data,'$.tokens.input') input, json_extract(data,'$.tokens.cache.read') cache_read FROM message WHERE json_extract(data,'$.tokens.cache.read') > 0 AND json_extract(data,'$.semantics.kind')='assistant_response' LIMIT 1").get();
+  const indexed = db.prepare("SELECT input_tokens FROM messages WHERE source='zcode' AND uuid LIKE ?").get(`%:${priced.id}`);
+  assert.equal(indexed.input_tokens, priced.input, 'cached input is already included in source tokens.input');
+  assert.ok(priced.cache_read > 0);
+  assert.ok(db.prepare("SELECT 1 FROM messages WHERE source='zcode' AND content_type='tool_use' AND text IS NULL LIMIT 1").get(), 'tool-only assistant messages keep tool_use classification');
+  assert.ok(db.prepare("SELECT 1 FROM messages WHERE source='zcode' AND content_type='unknown' AND text IS NULL LIMIT 1").get(), 'textless non-tool messages keep unknown classification');
+  const summary = db.prepare("SELECT visibility FROM summaries WHERE source='zcode' LIMIT 1").get();
+  assert.equal(summary.visibility, 'visible', 'compaction summary is available to standard readers');
+  const reasoningParts = source.prepare(`
+    SELECT p.message_id, p.data FROM part p
+    JOIN message m ON m.id = p.message_id
+    WHERE json_extract(p.data,'$.type')='reasoning'
+      AND json_extract(m.data,'$.semantics.kind')='assistant_response'
+      AND json_extract(m.data,'$.semantics.uiVisibility')='visible'
+  `).all();
+  const selected = reasoningParts.map(part => ({
+    part,
+    response: db.prepare("SELECT * FROM messages WHERE source='zcode' AND uuid LIKE ? AND visibility='visible'").get(`%:${part.message_id}`),
+  })).find(item => item.response !== undefined);
+  assert.ok(selected, 'fixture includes a current assistant response with reasoning');
+  const { part: reasoningPart, response } = selected;
+  const detail = assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions WHERE id=?').get(response.session_id),
+    messages: db.prepare('SELECT * FROM messages WHERE session_id=?').all(response.session_id),
+    toolCalls: db.prepare('SELECT * FROM tool_calls WHERE session_id=?').all(response.session_id),
+    toolResults: db.prepare('SELECT * FROM tool_results WHERE session_id=?').all(response.session_id),
+  });
+  assert.ok(detail.messages.find(message => message.uuid === response.uuid)?._thinking?.includes(JSON.parse(reasoningPart.data).text),
+    'reasoning stays on the assistant message that owns its part');
+  source.close();
 
   db.close();
 });
@@ -398,6 +430,120 @@ test('subagent classification is authoritative from task_type and parent link', 
   const types = subs.map(s => s.agent_type).sort();
   assert.ok(types.includes('zcode-general-purpose'), `agent_type observed verbatim (${types.join(',')})`);
   assert.ok(types.every(t => t === null || t.startsWith('zcode-')), 'no heuristic stripping in the adapter');
+  for (const sub of subs) {
+    const child = db.prepare('SELECT * FROM sessions WHERE id=?').get(sub.agent_id);
+    const detail = assembleSessionDetail({
+      session: child,
+      messages: db.prepare('SELECT * FROM messages WHERE session_id=?').all(sub.agent_id),
+      toolCalls: db.prepare('SELECT * FROM tool_calls WHERE session_id=?').all(sub.agent_id),
+      toolResults: db.prepare('SELECT * FROM tool_results WHERE session_id=?').all(sub.agent_id),
+    });
+    assert.ok(detail.messages.length > 0, 'a child session exposes its own conversation in session detail');
+  }
+  db.close();
+});
+
+test('parent deletion, restoration, and rewrite converge child links without child edits', () => {
+  const home = makeTempDir('obelisk-zcode-parent-link-');
+  const src = seedSource(home);
+  build(home);
+  const source = new DatabaseSync(src);
+  const child = source.prepare("SELECT id, parent_id FROM session WHERE task_type='subagent_child' LIMIT 1").get();
+  source.close();
+  const indexed = openIndex(home);
+  const childId = indexed.prepare('SELECT id FROM sessions WHERE jsonl_path LIKE ?').get(`%#z:${child.id}`).id;
+  const parentId = indexed.prepare('SELECT id FROM sessions WHERE jsonl_path LIKE ?').get(`%#z:${child.parent_id}`).id;
+  assert.ok(indexed.prepare('SELECT 1 FROM subagents WHERE agent_id=? AND session_id=?').get(childId, parentId));
+  indexed.close();
+
+  const snapshot = readSourceRows(src, child.parent_id);
+  deleteSourceSession(src, child.parent_id);
+  clearDebounce(home);
+  build(home);
+  let db = openIndex(home);
+  assert.equal(db.prepare('SELECT 1 FROM subagents WHERE agent_id=?').get(childId), undefined, 'orphan child has no dangling link');
+  assert.ok(db.prepare('SELECT 1 FROM messages WHERE session_id=?').get(childId), 'child conversation survives parent deletion');
+  db.close();
+
+  restoreSourceRows(src, child.parent_id, snapshot);
+  clearDebounce(home);
+  build(home);
+  db = openIndex(home);
+  assert.ok(db.prepare('SELECT 1 FROM subagents WHERE agent_id=? AND session_id=?').get(childId, parentId), 'byte-identical parent restore recreates child link');
+  db.close();
+
+  const writer = new DatabaseSync(src);
+  writer.prepare('UPDATE session SET title=? WHERE id=?').run('parent title changed', child.parent_id);
+  writer.close();
+  clearDebounce(home);
+  build(home);
+  db = openIndex(home);
+  assert.ok(db.prepare('SELECT 1 FROM subagents WHERE agent_id=? AND session_id=?').get(childId, parentId), 'parent-only rewrite preserves child link');
+  db.close();
+});
+
+test('retargeting a configured root symlink does not erase unchanged sessions', () => {
+  const home = makeTempDir('obelisk-zcode-symlink-');
+  const firstRoot = makeTempDir('obelisk-zcode-source-a-');
+  const secondRoot = makeTempDir('obelisk-zcode-source-b-');
+  seedSource(firstRoot);
+  seedSource(secondRoot);
+  mkdirSync(join(home, '.zcode'), { recursive: true });
+  const link = join(home, '.zcode', 'cli');
+  symlinkSync(join(firstRoot, '.zcode', 'cli'), link);
+  build(home);
+  const first = openIndex(home);
+  const ids = zcodeSessions(first).map(session => session.id);
+  assert.equal(ids.length, 17);
+  first.close();
+
+  rmSync(link);
+  symlinkSync(join(secondRoot, '.zcode', 'cli'), link);
+  clearDebounce(home);
+  build(home);
+  const second = openIndex(home);
+  assert.deepEqual(zcodeSessions(second).map(session => session.id), ids);
+  second.close();
+});
+
+test('a legacy realpath identity is replaced without tombstoning the live cursor key', () => {
+  const home = makeTempDir('obelisk-zcode-identity-upgrade-');
+  seedSource(home);
+  const provider = createZcodeProvider({ rootDir: join(home, '.zcode', 'cli') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const parsed = provider.parse(unit, null);
+  let result = parsed.next();
+  while (!result.done) result = parsed.next();
+  const cursor = result.value;
+  const legacyId = `zcode:old-realpath:${unit.sessionId.split(':').at(-1)}`;
+  const units = provider.discover({
+    lastCursor: key => key === unit.key ? cursor : null,
+    indexedSessions: () => [{ sessionId: legacyId, jsonlPath: unit.key }],
+  });
+  const replacement = units.find(candidate => candidate.key === unit.key);
+  assert.deepEqual(replacement.retractSessionIds, [unit.sessionId, legacyId]);
+  assert.equal(units.filter(candidate => candidate.key === unit.key).length, 1,
+    'the replacement must not be followed by a tombstone on the same cursor key');
+});
+
+test('raw projection supplies the full text of a long ZCode message', () => {
+  const home = makeTempDir('obelisk-zcode-fulltext-');
+  const src = seedSource(home);
+  const source = new DatabaseSync(src);
+  const part = source.prepare("SELECT id, message_id, data FROM part WHERE json_extract(data,'$.type')='text' LIMIT 1").get();
+  const data = JSON.parse(part.data);
+  data.text = `${'x'.repeat(11000)}full-text-tail`;
+  source.prepare('UPDATE part SET data=? WHERE id=?').run(JSON.stringify(data), part.id);
+  source.close();
+  build(home);
+  const db = openIndex(home);
+  const message = db.prepare("SELECT * FROM messages WHERE source='zcode' AND uuid LIKE ?").get(`%:${part.message_id}`);
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(message.session_id);
+  assert.ok(!message.text?.includes('full-text-tail'), 'indexed text is truncated');
+  const provider = createZcodeProvider({ rootDir: join(home, '.zcode', 'cli') });
+  const raw = provider.raw({ source: 'zcode', messageUuid: message.uuid, session, agentId: null });
+  assert.ok(raw.messageText.includes('full-text-tail'), 'raw messageText retains the complete body');
+  assert.ok(raw.text.includes('full-text-tail'), 'raw() keeps later pages available to the query API');
   db.close();
 });
 
@@ -460,6 +606,10 @@ test('App file watcher forwards ZCode WAL changes through changedPaths into the 
   try {
     writer = new DatabaseSync(src);
     writer.exec('PRAGMA journal_mode=WAL');
+    // Keep the WAL present before the watcher starts, so its first poll has
+    // an actual sidecar to observe on every SQLite/platform combination.
+    writer.prepare('UPDATE session SET title=title WHERE id=(SELECT id FROM session LIMIT 1)').run();
+    assert.ok(existsSync(`${src}-wal`));
     service.start({ buildOnStart: false });
     await service.runBuildNow('startup');
     // The poller's first observation reports an appearance. Drain it before
@@ -566,6 +716,7 @@ test('parse output assembles and survives a SQLite round-trip (ADR-0007 hard gat
       toolCalls: db.prepare('SELECT * FROM tool_calls WHERE session_id = ?').all(sessionId),
       toolResults: db.prepare('SELECT * FROM tool_results WHERE session_id = ?').all(sessionId),
       subagents: db.prepare('SELECT * FROM subagents WHERE session_id = ?').all(sessionId),
+      summaries: db.prepare('SELECT * FROM summaries WHERE session_id = ?').all(sessionId),
     });
     assert.deepEqual(persisted, direct, `session ${sessionId} round-trips identically`);
     compared += 1;

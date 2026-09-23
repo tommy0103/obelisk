@@ -19,11 +19,10 @@
 // (source-verified; see .obelisk/zcode-design-v2.md §2).
 //
 // Detection layers per unit:
-//   L1 — session.time_updated + revert + message/part counts and maxes
-//        (cheap, batch-queried);
+//   L1 — session.time_updated + message count (cheap, batch-queried);
 //   L2 — sha256 over the raw session/message/part rows (authoritative; a
 //        mutation that preserves every L1 field is still caught).
-// The cursor is `${time_updated}:${messageCount}:v2:${fingerprint24}` — the
+// The cursor is `${time_updated}:${messageCount}:v3:${fingerprint24}` — the
 // prefix keeps persist's index_state mtime/lines_processed convention.
 //
 // Schema generations: the transcript tables (session/message/part) have had
@@ -42,12 +41,13 @@
 //   anything else / future kinds                              → hidden + diagnostic
 
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { realpathSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { isAbsolute, join, normalize } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 
 import { normalizeObservedCwd, projectSlugFromPath, trunc, truncJson } from '../parsing.ts';
+import type { SqliteDb } from '../sqlite-types.ts';
 
 import type {
   Cursor,
@@ -63,9 +63,11 @@ import type {
 } from './types.ts';
 
 export const name = 'zcode';
-export const ZCODE_CANONICAL_TRANSCRIPT_MARKER = '__zcode_canonical_transcript_v1__';
+export const ZCODE_CANONICAL_TRANSCRIPT_MARKER = '__zcode_canonical_transcript_v2__';
 
 const BUSY_TIMEOUT_MS = 500;
+const require = createRequire(import.meta.url);
+export type ZcodeDatabaseOpener = (dbPath: string) => SqliteDb;
 
 // ---- JSON helpers ----
 
@@ -132,15 +134,25 @@ function timelineModelText(part: Record<string, unknown>, side: 'from' | 'to'): 
 
 // ---- source access ----
 
-function openSource(dbPath: string): DatabaseSync | null {
+function defaultOpenSource(dbPath: string): SqliteDb {
+  // Keep the Node-only binding out of the Electron bundle. Rollup otherwise
+  // hoists even a literal require('node:sqlite') into the App import graph.
+  const nodeSqliteSpecifier = ['node', 'sqlite'].join(':');
+  const { DatabaseSync } = require(nodeSqliteSpecifier) as {
+    DatabaseSync: new (path: string, options: { readOnly: boolean; timeout: number }) => SqliteDb;
+  };
+  return new DatabaseSync(dbPath, { readOnly: true, timeout: BUSY_TIMEOUT_MS });
+}
+
+function openSource(dbPath: string, opener: ZcodeDatabaseOpener): SqliteDb | null {
   try {
-    return new DatabaseSync(dbPath, { readOnly: true, timeout: BUSY_TIMEOUT_MS });
+    return opener(dbPath);
   } catch {
     return null;
   }
 }
 
-function sourceTables(db: DatabaseSync): Set<string> {
+function sourceTables(db: SqliteDb): Set<string> {
   try {
     return new Set(
       db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => String((r as { name: unknown }).name)),
@@ -198,11 +210,13 @@ function fingerprintSession(
   session: SessionRow,
   messages: readonly MessageRow[],
   parts: readonly PartRow[],
+  parentLive: boolean,
 ): string {
   const hash = createHash('sha256');
   hash.update(JSON.stringify([
     session.id, session.parent_id, session.task_type, session.directory, session.title,
     session.version, session.revert, session.time_archived, session.time_created, session.time_updated,
+    parentLive,
   ]));
   for (const m of messages) {
     hash.update(`\nm${JSON.stringify([m.id, m.sequence, m.time_created, m.time_updated, m.data])}`);
@@ -222,19 +236,19 @@ interface CursorState {
 }
 
 function encodeCursor(state: CursorState): string {
-  return `${state.timeUpdated}:${state.messageCount}:v2:${state.fingerprint}`;
+  return `${state.timeUpdated}:${state.messageCount}:v3:${state.fingerprint}`;
 }
 
 // Retract-only units must leave a cursor that can never equal a real session's
 // fingerprint ('tombstone' is not 24 hex chars), so a byte-identical restore of
 // a deleted session is detected as a change and re-indexed instead of being
 // suppressed by a stale cursor forever.
-const TOMBSTONE_CURSOR = '0:0:v2:tombstone';
+const TOMBSTONE_CURSOR = '0:0:v3:tombstone';
 
 function decodeCursor(cursor: Cursor): CursorState | null {
   if (cursor === null) return null;
   const parts = cursor.split(':');
-  if (parts.length !== 4 || parts[2] !== 'v2') return null;
+  if (parts.length !== 4 || parts[2] !== 'v3') return null;
   const timeUpdated = Number(parts[0]);
   const messageCount = Number(parts[1]);
   if (!Number.isFinite(timeUpdated) || !Number.isFinite(messageCount)) return null;
@@ -250,23 +264,18 @@ interface SessionUnitMeta {
 }
 
 function canonicalSessionId(dbPath: string, rawSessionId: string): string {
-  const dbi = createHash('sha256').update(realpathOrNull(dbPath) ?? dbPath).digest('hex').slice(0, 12);
+  // The session id and cursor key must use the same stable configured path.
+  // Resolving only this side lets a symlink retarget tombstone every old id
+  // while identical cursors suppress re-indexing the new ids.
+  const dbi = createHash('sha256').update(dbPath).digest('hex').slice(0, 12);
   return `zcode:${dbi}:${rawSessionId}`;
-}
-
-function realpathOrNull(path: string): string | null {
-  try {
-    return realpathSync(path);
-  } catch {
-    return null;
-  }
 }
 
 function unitKey(dbPath: string, rawSessionId: string): string {
   return `${dbPath}#z:${rawSessionId}`;
 }
 
-function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
+function discoverAt(rootDir: string, ctx: DiscoverContext, opener: ZcodeDatabaseOpener): IndexUnit[] {
   const dbPath = join(rootDir, 'db', 'db.sqlite');
   const walPath = `${dbPath}-wal`;
 
@@ -302,7 +311,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     return [];
   }
 
-  const db = openSource(dbPath);
+  const db = openSource(dbPath, opener);
   if (db === null) {
     ctx.reportIncompleteInventory?.({ path: dbPath, error: 'Session database is busy or unreadable' });
     return [];
@@ -330,20 +339,48 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
 
       const units: IndexUnit[] = [];
       const liveSessionIds = new Set<string>();
+      const liveUnitKeys = new Set<string>();
+      const indexedSessions = ctx.indexedSessions?.() ?? [];
+      const indexedByKey = new Map<string, string[]>();
+      for (const indexed of indexedSessions) {
+        const ids = indexedByKey.get(indexed.jsonlPath) ?? [];
+        ids.push(indexed.sessionId);
+        indexedByKey.set(indexed.jsonlPath, ids);
+      }
       // Raw ids of live sessions, for parent-liveness checks: a subagent child
       // whose parent row is gone indexes as an ordinary parentless session
       // (design §4.6a) instead of emitting a SubagentRecord that dangles off a
       // nonexistent session.
       const liveRawIds = new Set(sessions.map((session) => session.id));
+      const sessionById = new Map(sessions.map((session) => [session.id, session]));
+      const depths = new Map<string, number>();
+      const depth = (id: string, seen = new Set<string>()): number => {
+        if (depths.has(id)) return depths.get(id)!;
+        const parentId = sessionById.get(id)?.parent_id;
+        if (parentId === null || parentId === undefined || !sessionById.has(parentId) || seen.has(parentId)) return 0;
+        seen.add(id);
+        const value = depth(parentId, seen) + 1;
+        depths.set(id, value);
+        return value;
+      };
+      // Persisting a parent retracts its subagent link. Process parents first,
+      // then replay any unchanged children whose parent was replaced.
+      sessions.sort((a, b) => depth(a.id) - depth(b.id) || a.id.localeCompare(b.id));
+      const changedRawIds = new Set<string>();
       for (const session of sessions) {
         const sessionId = canonicalSessionId(dbPath, session.id);
         liveSessionIds.add(sessionId);
         const key = unitKey(dbPath, session.id);
+        liveUnitKeys.add(key);
+        const replacedSessionIds = (indexedByKey.get(key) ?? []).filter(id => id !== sessionId);
         const agg = messageAgg.get(session.id) ?? 0;
+        const isSubagent = session.task_type === 'subagent_child'
+          && session.parent_id !== null
+          && liveRawIds.has(session.parent_id);
         const cursor = ctx.lastCursor(key);
         const state = decodeCursor(cursor);
-        let changed = state === null;
-        if (state !== null) {
+        let changed = state === null || replacedSessionIds.length > 0;
+        if (state !== null && !changed) {
           // L1: cheap watermark/count comparison.
           const l1Match = state.timeUpdated === (session.time_updated ?? 0)
             && state.messageCount === agg;
@@ -355,24 +392,21 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
             const parts = db.prepare(
               `SELECT id, message_id, session_id, time_created, time_updated, sequence, data FROM part WHERE session_id = ? ORDER BY ${PART_ORDER}`,
             ).all(session.id) as unknown as PartRow[];
-            changed = fingerprintSession(session, messages, parts) !== state.fingerprint;
+            changed = fingerprintSession(session, messages, parts, isSubagent) !== state.fingerprint;
           } else {
             changed = true;
           }
         }
+        if (isSubagent && session.parent_id !== null && changedRawIds.has(session.parent_id)) changed = true;
         if (!changed) continue;
-        // A subagent classification is only meaningful while the parent
-        // session is live in the same database.
-        const isSubagent = session.task_type === 'subagent_child'
-          && session.parent_id !== null
-          && liveRawIds.has(session.parent_id);
+        changedRawIds.add(session.id);
         units.push({
           key,
           sessionId,
           project: projectSlugFromPath(normalizeObservedCwd(session.directory)) ?? undefined,
           isSubagent,
           agentId: isSubagent ? sessionId : undefined,
-          retractSessionIds: [sessionId],
+          retractSessionIds: [sessionId, ...replacedSessionIds],
           meta: { kind: 'zcode-session', dbPath, rawSessionId: session.id } satisfies SessionUnitMeta,
         });
       }
@@ -381,9 +415,10 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       // gone. The unit key prefix `${dbPath}#z:` cannot be confused with a
       // longer path (e.g. db.sqlite2) and only fires when the enumeration
       // above succeeded (busy/unreadable already returned early).
-      for (const indexed of ctx.indexedSessions?.() ?? []) {
+      for (const indexed of indexedSessions) {
         if (!indexed.jsonlPath.startsWith(`${dbPath}#z:`)) continue;
         if (liveSessionIds.has(indexed.sessionId)) continue;
+        if (liveUnitKeys.has(indexed.jsonlPath)) continue; // replaced by the live unit above
         units.push({
           key: indexed.jsonlPath,
           sessionId: indexed.sessionId,
@@ -456,15 +491,9 @@ const timestampOfMs = (time: number | null | undefined): string | null => (
 function totalInputTokens(tokens: unknown): number | null {
   if (!isRecord(tokens)) return null;
   const input = tokens.input;
-  const cacheRead = isRecord(tokens.cache) ? tokens.cache.read : undefined;
-  let seen = false;
-  let total = 0;
-  for (const value of [input, cacheRead]) {
-    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
-    seen = true;
-    total += value;
-  }
-  return seen ? total : null;
+  // ZCode's tokens.input already includes cache.read; adding it again
+  // overstates the same model call.
+  return typeof input === 'number' && Number.isFinite(input) ? input : null;
 }
 
 function outputTokens(tokens: unknown): number | null {
@@ -489,10 +518,10 @@ function toolResultContent(state: Record<string, unknown>): { content: string; i
   return { content: '', isError: 0 };
 }
 
-function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as SessionUnitMeta;
   if (meta.rawSessionId === '') return TOMBSTONE_CURSOR; // tombstone: retract-only
-  const db = openSource(meta.dbPath);
+  const db = openSource(meta.dbPath, opener);
   if (db === null) {
     // Never a silent empty replacement: this unit carries retractSessionIds,
     // so committing zero records would drop the session until the next
@@ -505,6 +534,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
     let session: SessionRow | undefined;
     let messages: MessageRow[];
     let parts: PartRow[];
+    let isSubagent = false;
     try {
       session = db.prepare(
         'SELECT id, parent_id, task_type, directory, title, version, revert, time_created, time_updated, time_archived FROM session WHERE id = ?',
@@ -513,6 +543,12 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
         // Vanished mid-flight (deleted between discover and parse): keep the
         // old index; the next discover emits a tombstone for it.
         throw new Error(`zcode: session vanished before parse: ${meta.rawSessionId}`);
+      }
+      isSubagent = session.task_type === 'subagent_child'
+        && session.parent_id !== null
+        && db.prepare('SELECT id FROM session WHERE id = ?').get(session.parent_id) !== undefined;
+      if (isSubagent !== (unit.isSubagent === true)) {
+        throw new Error(`zcode: parent relationship changed before parse: ${meta.rawSessionId}`);
       }
       messages = db.prepare(
         `SELECT id, session_id, time_created, time_updated, sequence, data FROM message WHERE session_id = ? ORDER BY ${MESSAGE_ORDER}`,
@@ -525,7 +561,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
     }
 
     const sessionId = unit.sessionId;
-    const fingerprint = fingerprintSession(session, messages, parts);
+    const fingerprint = fingerprintSession(session, messages, parts, isSubagent);
 
     const partsByMessage = new Map<string, PartRow[]>();
     for (const part of parts) {
@@ -604,13 +640,16 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
           timestamp: messageTimestamp,
           source: name,
           content: body,
-          visibility,
+          // The transport message is hidden in ZCode's UI, but its body is
+          // the canonical compaction summary Obelisk exposes as evidence.
+          visibility: isActive(message.id) ? 'visible' : 'inactive',
         });
         continue;
       }
 
       const messageParts = partsByMessage.get(message.id) ?? [];
       const textParts: string[] = [];
+      let hasToolCall = false;
       let thinkingIndex = 0;
       for (const part of messageParts) {
         const partData = parseJson(part.data);
@@ -635,8 +674,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
               is_meta: isMeta,
               visibility,
               model,
-              is_sidechain: unit.isSubagent === true ? 1 : 0,
-              agent_id: unit.isSubagent === true ? sessionId : null,
+              is_sidechain: 0,
+              agent_id: null,
               input_tokens: null,
               output_tokens: null,
               cwd: null,
@@ -649,6 +688,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
             const callId = str(partData.callID);
             const toolName = str(partData.tool);
             if (callId === null || toolName === null) break;
+            hasToolCall = true;
             const state = isRecord(partData.state) ? partData.state : {};
             const status = str(state.status);
             const input = state.input;
@@ -705,6 +745,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
       }
 
       const role = data.role === 'user' ? 'user' : 'assistant';
+      const fullText = textParts.join('\n');
+      const contentType = fullText.length > 0 ? 'text' : hasToolCall ? 'tool_use' : 'unknown';
       if (role === 'user') {
         const env = isRecord(data.contextSnapshot) && isRecord((data.contextSnapshot as Record<string, unknown>).envInfo)
           ? (data.contextSnapshot as Record<string, unknown>).envInfo as Record<string, unknown>
@@ -724,13 +766,13 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
           parent_uuid: parentUuid,
           timestamp: messageTimestamp,
           role,
-          text: textParts.length > 0 ? trunc(textParts.join('\n')) : null,
-          content_type: 'text',
+          text: fullText.length > 0 ? trunc(fullText) : null,
+          content_type: contentType,
           is_meta: isMeta,
           visibility: 'hidden',
           model,
-          is_sidechain: unit.isSubagent === true ? 1 : 0,
-          agent_id: unit.isSubagent === true ? sessionId : null,
+          is_sidechain: 0,
+          agent_id: null,
           input_tokens: null,
           output_tokens: null,
           cwd: null,
@@ -749,13 +791,13 @@ function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, C
         parent_uuid: parentUuid,
         timestamp: messageTimestamp,
         role,
-        text: textParts.length > 0 ? trunc(textParts.join('\n')) : null,
-        content_type: 'text',
+        text: fullText.length > 0 ? trunc(fullText) : null,
+        content_type: contentType,
         is_meta: isMeta,
         visibility,
         model,
-        is_sidechain: unit.isSubagent === true ? 1 : 0,
-        agent_id: unit.isSubagent === true ? sessionId : null,
+        is_sidechain: 0,
+        agent_id: null,
         input_tokens: role === 'assistant' ? totalInputTokens(data.tokens) : null,
         output_tokens: role === 'assistant' ? outputTokens(data.tokens) : null,
         cwd: role === 'assistant' && isRecord(data.path) ? str((data.path as Record<string, unknown>).cwd) : null,
@@ -828,11 +870,12 @@ function toolFilePath(toolName: string, input: unknown): string | null {
 
 // ---- raw projection ----
 
-function raw(input: RawLookup): RawRecord | null {
+function raw(input: RawLookup, opener: ZcodeDatabaseOpener): RawRecord | null {
   if (input.source !== name || input.messageUuid === null) return null;
   // messageUuid is `${sessionId}:${messageId}[:thinkN]`; sessionId itself is
   // `zcode:<dbi>:<rawSessionId>` — split from the right so ids containing ':'
   // survive.
+  const thinkingMatch = /:think(\d+)$/.exec(input.messageUuid);
   const withoutThink = input.messageUuid.replace(/:think\d+$/, '');
   const lastColon = withoutThink.lastIndexOf(':');
   if (lastColon === -1) return null;
@@ -843,7 +886,7 @@ function raw(input: RawLookup): RawRecord | null {
     ? String(input.session.jsonl_path).split('#z:')[0]
     : null;
   if (rawSessionId === null || dbPath === null) return null;
-  const db = openSource(dbPath);
+  const db = openSource(dbPath, opener);
   if (db === null) return null;
   try {
     const row = db.prepare('SELECT data FROM message WHERE id = ?').get(messageId) as unknown as { data: string | null } | undefined;
@@ -855,12 +898,18 @@ function raw(input: RawLookup): RawRecord | null {
       message: parseJson(row.data),
       parts: parts.map(p => parseJson(p.data)),
     };
+    const textParts = projection.parts.filter((part): part is Record<string, unknown> => part !== null);
+    const messageText = thinkingMatch === null
+      ? textParts.filter(part => part.type === 'text' && typeof part.text === 'string')
+        .map(part => part.text as string).join('\n')
+      : textParts.filter(part => part.type === 'reasoning' && typeof part.text === 'string' && part.text.length > 0)
+        .map(part => part.text as string)[Number(thinkingMatch[1])] ?? null;
     const text = JSON.stringify(projection, null, 1);
-    const truncated = trunc(text);
     return {
-      text: truncated,
+      text,
       totalLength: text.length,
-      hasMore: truncated !== text,
+      hasMore: false,
+      messageText: messageText === '' ? null : messageText,
     };
   } catch {
     return null;
@@ -874,9 +923,11 @@ function raw(input: RawLookup): RawRecord | null {
 export function createZcodeProvider({
   rootDir,
   homeDir = homedir(),
+  openDatabase = defaultOpenSource,
 }: {
   rootDir?: string;
   homeDir?: string;
+  openDatabase?: ZcodeDatabaseOpener;
 } = {}): ProviderAdapter {
   const resolvedRoot = rootDir !== undefined && rootDir.trim() !== ''
     ? (rootDir.startsWith('~/') ? join(homeDir, rootDir.slice(2)) : rootDir)
@@ -885,13 +936,13 @@ export function createZcodeProvider({
     name,
     descriptor: { id: name, name: 'ZCode', vendor: 'Z.ai', defaultRoot: resolvedRoot, color: '#3b82f6' },
     indexVersionMarker: ZCODE_CANONICAL_TRANSCRIPT_MARKER,
-    discover: (ctx: DiscoverContext) => discoverAt(resolvedRoot, ctx),
-    parse,
+    discover: (ctx: DiscoverContext) => discoverAt(resolvedRoot, ctx, openDatabase),
+    parse: (unit, cursor) => parse(unit, cursor, openDatabase),
     watchTargets: (configuredRoot: string): WatchTarget[] => [
       { kind: 'file', path: join(configuredRoot, 'db', 'db.sqlite') },
       { kind: 'file', path: join(configuredRoot, 'db', 'db.sqlite-wal') },
     ],
-    raw,
+    raw: (input) => raw(input, openDatabase),
   };
 }
 

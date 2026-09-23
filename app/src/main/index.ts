@@ -99,6 +99,11 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       readonly: true,
       fileMustExist: true,
     }),
+    openZcodeDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
   });
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;
@@ -716,7 +721,7 @@ ipcMain.handle('db:getMemories', () => {
   `).all();
 });
 
-ipcMain.handle('db:getMessageFullText', (_, uuid) => {
+ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
   if (!db) return null;
   const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
   if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
@@ -728,7 +733,7 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const paths = getRuntimePaths();
-  const raw = paths.providerRegistry.raw({
+  const lookup = {
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
@@ -736,7 +741,18 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     cursor: storedSessionCursor(db, paths.providerRegistry, session),
     subagent,
     workflowAgent,
-  });
+  };
+  // The ZCode source is SQLite, so open/read it in the existing indexer
+  // worker rather than blocking Electron's main thread on a custom root.
+  if (lookup.source === 'zcode') {
+    try {
+      const messageText = await indexerWorker?.readZcodeMessageText(lookup);
+      return messageText ?? msg.text ?? null;
+    } catch {
+      return msg.text ?? null;
+    }
+  }
+  const raw = paths.providerRegistry.raw(lookup);
   return raw?.messageText ?? msg.text ?? null;
 });
 

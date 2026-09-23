@@ -29,7 +29,9 @@ test('worker build client resolves build results from a worker thread', async ()
       queueMicrotask(() => {
         this.handlers.message({
           id: message.id,
-          result: { files: 1, reason: message.args.reason },
+          result: message.operation === 'readZcodeMessageText'
+            ? 'complete ZCode text'
+            : { files: 1, reason: message.args.reason },
         });
       });
     }
@@ -45,6 +47,9 @@ test('worker build client resolves build results from a worker thread', async ()
   assert.equal(instances.length, 1);
   assert.equal(instances[0].workerPath, '/tmp/indexer-worker.js');
   assert.deepEqual(result, { files: 1, reason: 'watch' });
+  const fullText = await client.readZcodeMessageText({ source: 'zcode', messageUuid: 'zcode:message' });
+  assert.equal(fullText, 'complete ZCode text');
+  assert.equal(instances[0].messages[1].operation, 'readZcodeMessageText');
 
   client.stop();
   assert.equal(instances[0].terminated, true);

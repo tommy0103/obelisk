@@ -8,7 +8,7 @@ import { createDeepseekProvider } from './deepseek.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createOmpProvider } from './omp.ts';
 import { createPiProvider } from './pi.ts';
-import { createZcodeProvider } from './zcode.ts';
+import { createZcodeProvider, type ZcodeDatabaseOpener } from './zcode.ts';
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 
 export type BuiltinProviderRoots = Readonly<Record<string, string | undefined>>;
@@ -18,9 +18,11 @@ export function createBuiltinProviderRegistry(
   {
     cwd,
     openCopilotChronicle,
+    openZcodeDatabase,
   }: {
     cwd?: string;
     openCopilotChronicle?: CopilotChronicleOpener;
+    openZcodeDatabase?: ZcodeDatabaseOpener;
   } = {},
 ): ProviderRegistry {
   return createProviderRegistry([
@@ -31,6 +33,6 @@ export function createBuiltinProviderRegistry(
     createKimiProvider({ rootDir: roots['kimi'] }),
     createOmpProvider({ rootDir: roots['omp'] }),
     createPiProvider({ rootDir: roots['pi'], cwd }),
-    createZcodeProvider({ rootDir: roots['zcode'] }),
+    createZcodeProvider({ rootDir: roots['zcode'], openDatabase: openZcodeDatabase }),
   ]);
 }

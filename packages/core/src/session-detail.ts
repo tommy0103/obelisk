@@ -258,10 +258,29 @@ function assembleMessages(
     if (calls?.length) assembled.tool_calls = calls;
     return assembled;
   });
+  const rawByUuid = new Map(raw.map((message) => [message.uuid, message]));
+  const attachedThinking = new Set<string>();
+  for (const message of raw) {
+    if (message.type !== 'assistant' || message.content_type !== 'thinking') continue;
+    const parent = typeof message.parent_uuid === 'string'
+      ? rawByUuid.get(message.parent_uuid)
+      : undefined;
+    // Some providers identify reasoning as a part of an assistant response.
+    // Attach it before copying the response into output: the same timestamp
+    // may sort the response before its reasoning part.
+    if (parent?.type !== 'assistant'
+      || parent.content_type === 'thinking'
+      || !message.uuid.startsWith(`${parent.uuid}:think`)) continue;
+    parent._thinking = parent._thinking
+      ? `${parent._thinking}\n\n${message.text ?? ''}`
+      : message.text ?? '';
+    attachedThinking.add(message.uuid);
+  }
 
   const output: AssembledMessage[] = [];
   for (let index = 0; index < raw.length; index++) {
     const message = raw[index];
+    if (attachedThinking.has(message.uuid)) continue;
     if (omitToolResultMessage(message)) continue;
 
     if (message.type === 'assistant' && message.content_type === 'thinking') {
@@ -394,6 +413,9 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
           timestamp: record.timestamp,
           text: record.text,
           content_type: record.content_type,
+          ...(record.content_type === 'thinking' && record.parent_uuid !== null
+            ? { parent_uuid: record.parent_uuid }
+            : {}),
           is_meta: record.is_meta,
           // Both kept per message, not per session: the working directory can change
           // mid-session, and the session id scopes which roots a file reference may resolve in.
@@ -430,7 +452,11 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
         break;
       case 'summary':
         if (canonicalVisibility(record.visibility) !== 'visible') break;
-        summaries.push(withoutKind(record));
+        summaries.push({
+          ...withoutKind(record),
+          input_tokens: record.input_tokens ?? null,
+          output_tokens: record.output_tokens ?? null,
+        });
         break;
       case 'message-turn-duration': {
         const message = messagesByUuid.get(record.uuid);

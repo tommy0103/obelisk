@@ -14,6 +14,7 @@ import {
   type ProviderRegistry,
 } from './providers/registry.ts';
 import type { CopilotChronicleOpener } from './providers/copilot.ts';
+import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 
 export type PersistedProviderSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -121,14 +122,16 @@ export function createConfiguredBuiltinProviderRuntime(
     cwd = process.cwd(),
     baseRoots = {},
     openCopilotChronicle,
+    openZcodeDatabase,
   }: {
     homeDir?: string;
     cwd?: string;
     baseRoots?: BuiltinProviderRoots;
     openCopilotChronicle?: CopilotChronicleOpener;
+    openZcodeDatabase?: ZcodeDatabaseOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, openCopilotChronicle });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, openCopilotChronicle, openZcodeDatabase });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir });
   const copilotUsesAutomaticRoots = baseRoots.copilot === undefined
     && !hasExplicitProviderRoot(persisted, 'copilot');
@@ -138,7 +141,7 @@ export function createConfiguredBuiltinProviderRuntime(
       ...roots,
       ...(copilotUsesAutomaticRoots ? { copilot: undefined } : {}),
     },
-    { cwd, openCopilotChronicle },
+    { cwd, openCopilotChronicle, openZcodeDatabase },
   );
   return {
     roots,
