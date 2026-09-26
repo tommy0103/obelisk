@@ -11,6 +11,8 @@ import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
 import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
 import { codexDbId } from '../packages/core/src/parsing.ts';
 import { namespacedSessionId as kimiSessionId } from '../packages/core/src/providers/kimi.ts';
+import { copilotSessionId } from '../packages/core/src/providers/copilot.ts';
+import { canonicalSessionId as zcodeSessionId } from '../packages/core/src/providers/zcode.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -670,10 +672,10 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
 
 test('every provider embeds the native session id verbatim in its canonical id', () => {
   // Fragment resolution in sessions() depends on this: a native id is only
-  // findable while it appears verbatim inside the canonical id. pi-family and
-  // deepseek run the native id through encodeURIComponent, identity for the
-  // uuid-shaped ids every provider emits today; a future provider with
-  // URL-unsafe native ids must not break the invariant silently.
+  // findable while it appears verbatim inside the canonical id. pi-family,
+  // deepseek, and copilot run the native id through encodeURIComponent,
+  // identity for the uuid-shaped ids every provider emits today; a future
+  // provider with URL-unsafe native ids must not break the invariant silently.
   const native = '99999999-9999-4999-8999-999999999999';
   const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
   const canonical = {
@@ -684,6 +686,8 @@ test('every provider embeds the native session id verbatim in its canonical id',
     pi: piFamilySessionId(piHeader, 'pi'),
     omp: piFamilySessionId(piHeader, 'omp'),
     deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),
+    copilot: copilotSessionId(native, '/Users/me/obelisk'),
+    zcode: zcodeSessionId('/Users/me/obelisk/db/db.sqlite', native),
   };
   for (const [source, id] of Object.entries(canonical)) {
     assert.equal(
@@ -692,6 +696,30 @@ test('every provider embeds the native session id verbatim in its canonical id',
       `${source} canonical id ${id} must embed the native id verbatim`,
     );
   }
+});
+
+test('sessions fragment expansion is capped at the newest matches', () => {
+  const db = memoryDb();
+  // The same fragment embedded in more canonical ids than the expansion cap:
+  // id resolution is not fuzzy search, so the excess must be cut newest-first
+  // rather than planner-order.
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const cutoff = [];
+  for (let i = 0; i < 12; i++) {
+    const id = piFamilySessionId({ type: 'session', id: '66666666-6666-4666-8666-666666666666', cwd: `/Users/me/p${i}` }, 'pi');
+    const ended = `2026-09-18T${String(i).padStart(2, '0')}:00:00Z`;
+    insertSession.run(id, `copy ${i}`, `-Users-me-p${i}`, `/Users/me/p${i}`, ended, ended, null, 1, 'pi');
+    cutoff.push([id, ended]);
+  }
+  const api = createQueryApi(db);
+  const rows = api.sessions({ sessionId: '66666666-6666-4666-8666-666666666666' });
+  const expected = cutoff.slice(2).reverse().map(([id]) => id);
+  assert.equal(rows.length, 10);
+  assert.deepEqual(rows.map(row => row.id), expected);
+  db.close();
 });
 
 test('query api is read-only and does not expose attune helpers', () => {

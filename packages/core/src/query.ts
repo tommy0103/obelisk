@@ -92,6 +92,12 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
 
 const BASH_EXIT_PAT = 'Exit code %';
 
+// sessions() fragment expansion is id resolution, not fuzzy search: a raw
+// native id normally resolves to exactly one session. Cap expansion at the
+// newest few matches so a pathological fragment cannot build an IN clause
+// past SQLite's bound-variable limit.
+const SESSION_REF_FRAGMENT_LIMIT = 10;
+
 type QueryVisibility = 'visible' | 'inactive' | 'hidden';
 
 function normalizedVisibility(value: unknown): QueryVisibility {
@@ -599,8 +605,8 @@ function createQueryApi(
   // sessions() is the identifier-resolution surface. Pi-family providers
   // scope session ids per project (`source:uuid:cwd-hash` in pi.ts), so the
   // raw uuid a user hands over is only a fragment of the canonical id. Exact
-  // refs pass through untouched; a non-exact ref expands to every canonical
-  // id containing it, so an ambiguous fragment returns several labeled rows
+  // refs pass through untouched; a non-exact ref expands to the canonical ids
+  // containing it, so an ambiguous fragment returns several labeled rows
   // (project_path/started_at) instead of failing the script. instr() matches
   // the ref literally, so caller-supplied SQL wildcards never gain wildcard
   // semantics of their own. Every other helper keeps exact sessionId
@@ -613,7 +619,9 @@ function createQueryApi(
       // the exact-match IN ('') it replaces.
       if (!ref) return [];
       if (db.prepare('SELECT 1 FROM sessions WHERE id=?').get(ref)) return [ref];
-      const hits = db.prepare('SELECT id FROM sessions WHERE instr(id, ?) > 0').all(ref);
+      // Newest first so the cap keeps the sessions a raw id most likely
+      // points at, not whatever the query planner happens to visit first.
+      const hits = db.prepare('SELECT id FROM sessions WHERE instr(id, ?) > 0 ORDER BY ended_at DESC LIMIT ?').all(ref, SESSION_REF_FRAGMENT_LIMIT);
       return hits.map((row: DbRow) => String(row.id));
     };
     const ids = new Set<string>();
