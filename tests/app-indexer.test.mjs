@@ -648,6 +648,7 @@ test('app indexer re-plans a Codex file reported via changedPaths and updates th
     codexDir,
     dbPath,
     DatabaseImpl: TestDatabase,
+    reason: 'reconcile',
     changedPaths: [join('2026', '06', '15', filename)],
   });
 

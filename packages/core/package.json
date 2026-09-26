@@ -15,6 +15,7 @@
     "./session-detail": "./dist/session-detail.js",
     "./providers/claude": "./dist/providers/claude.js",
     "./providers/codex": "./dist/providers/codex.js",
+    "./providers/copilot": "./dist/providers/copilot.js",
     "./providers/deepseek": "./dist/providers/deepseek.js",
     "./providers/deepseek-identity": "./dist/providers/deepseek-identity.js",
     "./providers/kimi": "./dist/providers/kimi.js",

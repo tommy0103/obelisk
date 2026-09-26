@@ -11,7 +11,12 @@ export const cliEntry = join(repoRoot, 'packages', 'cli', 'dist', 'cli', 'src', 
 export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
   const childEnv = {
     ...process.env,
-    ...(home ? { HOME: home, USERPROFILE: home } : {}),
+    ...(home ? {
+      HOME: home,
+      USERPROFILE: home,
+      APPDATA: join(home, 'AppData', 'Roaming'),
+      XDG_CONFIG_HOME: join(home, '.config'),
+    } : {}),
     ...env,
   };
   // The deepseek provider resolves `$DSH_HOME/sessions` with higher precedence

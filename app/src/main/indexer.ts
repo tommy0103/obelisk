@@ -204,6 +204,8 @@ interface BuildIndexOptions {
   DatabaseImpl?: new (dbPath: string) => any;
   LockDatabaseImpl?: new (dbPath: string) => any;
   force?: boolean;
+  reason?: string;
+  readMode?: 'normal' | 'strict';
   changedPaths?: string[];
   retrySessionIds?: string[];
   preserveDbPath?: string | null;
@@ -267,6 +269,8 @@ function buildIndex({
   DatabaseImpl = Database,
   LockDatabaseImpl = DatabaseImpl,
   force = false,
+  reason = undefined,
+  readMode = reason === 'reconcile' || reason === 'repair' ? 'strict' : 'normal',
   changedPaths = undefined,
   retrySessionIds = [],
   preserveDbPath = null,
@@ -318,14 +322,25 @@ function buildIndex({
         codex: codexDir,
         ...providerRoots,
       };
+      const openCopilotChronicle = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true });
+      const openZcodeDatabase = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots)
-          : createConfiguredBuiltinProviderRuntime(providerSettings, { baseRoots: roots }).registry);
+          ? createBuiltinProviderRegistry(roots, { openCopilotChronicle, openZcodeDatabase })
+          : createConfiguredBuiltinProviderRuntime(providerSettings, {
+            baseRoots: roots,
+            openCopilotChronicle,
+            openZcodeDatabase,
+          }).registry);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
         changedPaths,
         priorSessions,
+        readMode,
       });
       let latestSourceMtime = providerPlan.items.reduce((latest, { unit }) => {
         const providerCursor = (unit.meta as { currentCursor?: unknown } | undefined)?.currentCursor;

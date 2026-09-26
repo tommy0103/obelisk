@@ -29,6 +29,8 @@ export interface ProviderInventoryIssue extends InventoryIssue {
   readonly provider: string;
 }
 
+export type ProviderReadMode = 'normal' | 'strict';
+
 export interface ProviderIndexPlan {
   readonly items: ProviderIndexItem[];
   readonly pendingMarkers: ReadonlyMap<string, string>;
@@ -186,10 +188,12 @@ export function createProviderIndexPlan(
     force = false,
     changedPaths,
     priorSessions,
+    readMode = 'normal',
   }: {
     force?: boolean;
     changedPaths?: string[];
     priorSessions?: readonly ProviderSessionProvenance[];
+    readMode?: ProviderReadMode;
   } = {},
 ): ProviderIndexPlan {
   const items: ProviderIndexItem[] = [];
@@ -243,7 +247,15 @@ export function createProviderIndexPlan(
     for (const unit of units) {
       items.push({
         provider,
-        unit,
+        unit: readMode === 'normal'
+          ? unit
+          : {
+            ...unit,
+            meta: {
+              ...(unit.meta && typeof unit.meta === 'object' ? unit.meta : {}),
+              readMode,
+            },
+          },
         cursor: fullReindex ? null : storedProviderCursor(db, unit.key),
       });
     }

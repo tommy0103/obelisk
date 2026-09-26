@@ -6,9 +6,11 @@ import type {
   SessionPatch,
   SessionPatchCursor,
   UsageStatsOptions,
+  WindowControlAction,
 } from '../shared/ipc-types.ts';
 
 contextBridge.exposeInMainWorld('obelisk', {
+  platform: process.platform,
   getSessions: (opts?: unknown) => ipcRenderer.invoke('db:getSessions', opts),
   getSessionMessages: (id: string) => ipcRenderer.invoke('db:getSessionMessages', id),
   getSessionToolCalls: (id: string) => ipcRenderer.invoke('db:getSessionToolCalls', id),
@@ -32,6 +34,11 @@ contextBridge.exposeInMainWorld('obelisk', {
   getProjects: () => ipcRenderer.invoke('db:getProjects'),
   getStats: () => ipcRenderer.invoke('db:getStats'),
   getUsageStats: (opts?: UsageStatsOptions) => ipcRenderer.invoke('db:getUsageStats', opts),
+  onWindowState: (callback: (payload: unknown) => void) => {
+    const listener = (_: IpcRendererEvent, payload: unknown) => callback(payload);
+    ipcRenderer.on('obelisk:window-state', listener);
+    return () => ipcRenderer.removeListener('obelisk:window-state', listener);
+  },
   onIndexUpdated: (callback: (payload: unknown) => void) => {
     const listener = (_: IpcRendererEvent, payload: unknown) => callback(payload);
     ipcRenderer.on('obelisk:index-updated', listener);
@@ -42,6 +49,7 @@ contextBridge.exposeInMainWorld('obelisk', {
     ipcRenderer.on('obelisk:session-updated', listener);
     return () => ipcRenderer.removeListener('obelisk:session-updated', listener);
   },
+  windowControl: (action: WindowControlAction) => ipcRenderer.invoke('win:control', action),
   captureExport: (opts?: unknown) => ipcRenderer.invoke('capture:export', opts),
   copyImage: (opts?: unknown) => ipcRenderer.invoke('capture:copy', opts),
   recapList: () => ipcRenderer.invoke('recap:list'),

@@ -51,7 +51,13 @@ function runCliAsync(args, { home }) {
       ...args,
     ], {
       cwd: repoRoot,
-      env: { ...process.env, HOME: home, USERPROFILE: home },
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        APPDATA: join(home, 'AppData', 'Roaming'),
+        XDG_CONFIG_HOME: join(home, '.config'),
+      },
       encoding: 'utf8',
     });
     let stdout = '';
@@ -576,7 +582,15 @@ function runCoreScript(home, script, env = {}) {
     script,
   ], {
     cwd: repoRoot,
-    env: { ...process.env, HOME: home, USERPROFILE: home, OBELISK_CORE_URL: coreUrl, ...env },
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      APPDATA: join(home, 'AppData', 'Roaming'),
+      XDG_CONFIG_HOME: join(home, '.config'),
+      OBELISK_CORE_URL: coreUrl,
+      ...env,
+    },
     encoding: 'utf8',
   });
   assert.equal(run.status, 0, run.stderr);

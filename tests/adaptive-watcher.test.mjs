@@ -322,6 +322,49 @@ test('close waits for an in-flight subscribe, and no invalidation fires after cl
   assert.deepEqual(invalidations, [], 'no invalidation fires after close');
 });
 
+test('close() guards event delivery synchronously, before its promise settles', async () => {
+  // The app's quit path relies on this exact property (#187): close() must
+  // flip the guard in the same tick it is called, so a FSEvents delivery
+  // racing process teardown is a no-op even when close() itself never
+  // completes. If the guard ever moved behind an await, the bounded quit
+  // would re-open the teardown crash.
+  const root = makeTempDir('obelisk-adw-sync-guard-');
+  const invalidations = [];
+  let capturedCallback = null;
+  let resolveUnsubscribe = null;
+  const subscribe = (_root, callback) => {
+    capturedCallback = callback;
+    return Promise.resolve({
+      unsubscribe() {
+        return new Promise((resolve) => { resolveUnsubscribe = resolve; });
+      },
+    });
+  };
+  const watcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: root }],
+    hotPolling: false,
+    onInvalidate: (inv) => invalidations.push(inv),
+    subscribe,
+    logger: { warn: () => {} },
+  });
+
+  assert.ok(await waitFor(() => capturedCallback !== null), 'the tree root is subscribed');
+  const closePromise = watcher.close();
+  let settled = false;
+  void closePromise.then(() => { settled = true; });
+
+  // Delivered in the same tick as close(), with the unsubscribe still
+  // pending: the guard must already hold.
+  capturedCallback(null, [{ type: 'update', path: join(root, 'x.jsonl') }]);
+  assert.deepEqual(invalidations, [], 'an event delivered synchronously after close() is a no-op');
+  await Promise.resolve();
+  assert.equal(settled, false, 'close() is still pending — the guard did not depend on completion');
+
+  resolveUnsubscribe();
+  await closePromise;
+  assert.equal(settled, true);
+});
+
 
 test('close awaits the unsubscribe of a subscription dropped by a stream error', async () => {
   const root = makeTempDir('obelisk-adw-dropclose-');

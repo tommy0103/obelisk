@@ -1,6 +1,6 @@
 # Obelisk CLI
 
-The local Obelisk runtime used by coding agents. It indexes Claude Code, Codex,
+The local Obelisk runtime used by coding agents. It indexes Claude Code, Codex, GitHub Copilot,
 Kimi Code, and Pi transcripts into `~/.obelisk/obelisk.sqlite` and exposes the
 stable `build`, `search`, `query`, and `attune` process interface.
 

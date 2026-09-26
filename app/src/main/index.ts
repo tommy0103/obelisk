@@ -13,6 +13,7 @@ import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/in
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
+import { createDeferredQuit } from './quit-teardown.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
@@ -31,6 +32,7 @@ import type {
   SessionPatchSnapshot,
   SessionMetadata,
   SourceQueryOptions,
+  WindowControlAction,
 } from '../shared/ipc-types.ts';
 import type {
   SessionDetailAssemblyInput,
@@ -93,6 +95,15 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       claude: DEFAULT_CLAUDE_DIR,
       codex: DEFAULT_CODEX_DIR,
     },
+    openCopilotChronicle: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+    }),
+    openZcodeDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
   });
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;
@@ -334,18 +345,26 @@ async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
 }
 
 async function stopBackgroundResources({ stopWorker = false } = {}) {
-  await stopIndexerServiceAndWait();
-  if (stopWorker && indexerWorker) {
-    indexerWorker.stop();
-    indexerWorker = null;
-  }
+  // Close the ~/.obelisk watcher before the first await. close() flips its
+  // `closed` flag synchronously and every parcel event callback guards on it,
+  // so once this function yields, no teardown-time FSEvents delivery can
+  // enter user code — even when the bounded quit path (#187) cuts the
+  // remaining waits short. The service watcher's close() works the same way
+  // inside service.stop().
+  let watcherClosed: Promise<unknown> | null = null;
   if (obeliskWatcher) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
     pendingObeliskChanges.clear();
-    if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
+    if (typeof watcher.close === 'function') watcherClosed = Promise.resolve(watcher.close()).catch(() => {});
   }
+  await stopIndexerServiceAndWait();
+  if (stopWorker && indexerWorker) {
+    indexerWorker.stop();
+    indexerWorker = null;
+  }
+  if (watcherClosed) await watcherClosed;
   closeDb();
 }
 
@@ -376,14 +395,19 @@ function isSameDocumentNavigation(url: string, currentUrl: string): boolean {
 function createWindow() {
   const isDev = process.argv.includes('--dev') || !!process.env.ELECTRON_RENDERER_URL;
   const shouldOpenDevTools = process.argv.includes('--devtools');
+  const isLinux = process.platform === 'linux';
 
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 800,
     minHeight: 500,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 14, y: 10 },
+    ...(isLinux ? {
+      frame: false,
+    } : {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 14, y: 10 },
+    }),
     backgroundColor: '#0a0b14',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
@@ -392,6 +416,10 @@ function createWindow() {
       devTools: isDev || shouldOpenDevTools,
     },
   });
+
+  const pushWindowState = () => win.webContents.send('obelisk:window-state', { maximized: win.isMaximized() });
+  win.on('maximize', pushWindowState);
+  win.on('unmaximize', pushWindowState);
 
   // Prevent Electron's built-in zoom so Cmd+=/- reaches the renderer
   win.webContents.on('before-input-event', (event, input) => {
@@ -487,9 +515,15 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  void stopBackgroundResources({ stopWorker: true });
-});
+// Quit must not tear the JS environment down while a watcher is still live: a
+// @parcel/watcher callback firing during CleanupHandles throws with no JS
+// frame to catch it, and napi_throw fatals the process (#187). The stop is
+// not cached: a macOS pause (window-all-closed) can be followed by activate →
+// restart, and a later quit must stop the restarted singletons.
+app.on('before-quit', createDeferredQuit({
+  quit: () => app.quit(),
+  stop: () => stopBackgroundResources({ stopWorker: true }),
+}));
 
 app.on('window-all-closed', () => {
   void stopBackgroundResources({ stopWorker: true });
@@ -505,7 +539,7 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
     FROM messages m
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
     ORDER BY m.timestamp, m.uuid
   `).all(sessionId) as SessionMessageRow[];
@@ -516,7 +550,7 @@ function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   return db.prepare(`
     SELECT tc.* FROM messages m
     CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tc.session_id = ?
   `).all(sessionId, sessionId) as SessionToolCallRow[];
@@ -527,7 +561,7 @@ function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   return db.prepare(`
     SELECT tr.* FROM messages m
     CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
-    WHERE m.session_id = ? AND m.agent_id IS NULL
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tr.session_id = ?
   `).all(sessionId, sessionId) as SessionToolResultRow[];
@@ -687,7 +721,7 @@ ipcMain.handle('db:getMemories', () => {
   `).all();
 });
 
-ipcMain.handle('db:getMessageFullText', (_, uuid) => {
+ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
   if (!db) return null;
   const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
   if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
@@ -699,7 +733,7 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const paths = getRuntimePaths();
-  const raw = paths.providerRegistry.raw({
+  const lookup = {
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
@@ -707,7 +741,18 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     cursor: storedSessionCursor(db, paths.providerRegistry, session),
     subagent,
     workflowAgent,
-  });
+  };
+  // The ZCode source is SQLite, so open/read it in the existing indexer
+  // worker rather than blocking Electron's main thread on a custom root.
+  if (lookup.source === 'zcode') {
+    try {
+      const messageText = await indexerWorker?.readZcodeMessageText(lookup);
+      return messageText ?? msg.text ?? null;
+    } catch {
+      return msg.text ?? null;
+    }
+  }
+  const raw = paths.providerRegistry.raw(lookup);
   return raw?.messageText ?? msg.text ?? null;
 });
 
@@ -909,6 +954,17 @@ ipcMain.handle('capture:copy', async (event, { cardIdx, archetype, filename } = 
   const image = await createExportCapture(win, query);
   clipboard.writeImage(image);
   return true;
+});
+
+ipcMain.handle('win:control', (event, action: WindowControlAction) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  switch (action) {
+    case 'minimize': win.minimize(); return null;
+    case 'toggle-maximize': win.isMaximized() ? win.unmaximize() : win.maximize(); return null;
+    case 'close': win.close(); return null;
+    default: throw new Error(`win:control accepts 'minimize', 'toggle-maximize', or 'close'; received "${String(action)}"`);
+  }
 });
 
 // --- Recap files ---

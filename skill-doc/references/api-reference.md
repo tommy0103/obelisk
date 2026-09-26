@@ -67,6 +67,8 @@ All list helpers accept bounded `limit` options. Many helpers also accept
 `project`, `sessionId`, `sessions`, `after`, `before`, `branch`, and `source`
 when the underlying table can express that scope. Passing a string to many list
 helpers is treated as `sessionId`; passing a number is treated as `limit`.
+Limits must be non-negative; passing a negative limit throws a `RangeError`
+whose message names the helper and the offending value.
 
 ### Mutation Helpers
 
@@ -101,7 +103,7 @@ Full-text search across all indexed message text using FTS5.
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, `"omp"`, or `"pi"` |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, `"omp"`, `"pi"`, or `"zcode"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
 
@@ -230,7 +232,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'omp' | 'pi', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'omp' | 'pi' | 'zcode', session_count, last_session_at }]
   }
 }
 ```
@@ -249,7 +251,7 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, `"omp"`, or `"pi"`; omit for all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, `"omp"`, `"pi"`, or `"zcode"`; omit for all |
 | `opts.sessionId` | `string` | Canonical session ID; a fragment expands to every containing canonical ID |
 | `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 

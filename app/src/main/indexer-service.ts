@@ -94,7 +94,7 @@ interface IndexerServiceOptions {
 
 const TRANSCRIPT_SUFFIXES = ['.jsonl.zstd', '.jsonl', '.json'] as const;
 
-function isTranscriptPath(targetPath: string): boolean {
+function isTreeTranscriptCandidate(targetPath: string): boolean {
   return TRANSCRIPT_SUFFIXES.some((suffix) => targetPath.endsWith(suffix));
 }
 
@@ -126,6 +126,11 @@ function createIndexerService({
   const watch = watchProjects || ((onChange) => {
     const targets = watchTargets ?? [{ kind: 'tree' as const, path: projectsDir }];
     if (!targets.length) return null;
+    const exactFiles = new Set(
+      targets
+        .filter((target) => target.kind === 'file')
+        .map((target) => path.normalize(target.path)),
+    );
     return createAdaptiveWatcher({
       targets,
       subscribe,
@@ -134,9 +139,11 @@ function createIndexerService({
       retryDelayMs: watchRetryMs,
       hotPolling,
       pollIntervalMs: watchPollMs,
-      // The caller knows its transcripts; the package does not. Native events
-      // for transcripts promote the path into the hot set before delivery.
-      shouldPromote: (targetPath) => isTranscriptPath(targetPath),
+      // The caller knows its transcripts; the package does not. Promote
+      // transcript files discovered under a tree. Exact file targets already
+      // have pinned polling, even when their name has a transcript suffix.
+      shouldPromote: (targetPath) =>
+        !exactFiles.has(path.normalize(targetPath)) && isTreeTranscriptCandidate(targetPath),
       onInvalidate: (invalidation) => {
         // A rescan means anything under the root may have changed — full
         // inventory. Path invalidations filter to transcripts here, at the
@@ -146,13 +153,13 @@ function createIndexerService({
           return;
         }
         for (const changedPath of invalidation.paths) {
-          // Transcripts forward immediately. Anything else may be a directory
-          // event (a rename arrives as the bare path; the old side no longer
-          // exists) — resolve it ASYNC (no sync IO in the main process,
-          // CONTRIBUTING): existing non-directories (stray files) are dropped,
-          // directories and missing paths are forwarded for the providers to
-          // route or reconcile.
-          if (isTranscriptPath(changedPath)) {
+          // Provider-declared exact files and transcripts discovered under a
+          // tree forward immediately. Anything else may be a directory event
+          // (a rename arrives as the bare path; the old side no longer exists)
+          // — resolve it ASYNC (no sync IO in the main process, CONTRIBUTING):
+          // existing non-directories (stray files) are dropped, directories
+          // and missing paths are forwarded for providers to reconcile.
+          if (exactFiles.has(path.normalize(changedPath)) || isTreeTranscriptCandidate(changedPath)) {
             onChange(changedPath);
             continue;
           }

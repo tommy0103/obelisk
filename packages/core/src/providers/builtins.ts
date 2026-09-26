@@ -3,24 +3,36 @@
 
 import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
+import { createCopilotProvider, type CopilotChronicleOpener } from './copilot.ts';
 import { createDeepseekProvider } from './deepseek.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createOmpProvider } from './omp.ts';
 import { createPiProvider } from './pi.ts';
+import { createZcodeProvider, type ZcodeDatabaseOpener } from './zcode.ts';
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 
 export type BuiltinProviderRoots = Readonly<Record<string, string | undefined>>;
 
 export function createBuiltinProviderRegistry(
   roots: BuiltinProviderRoots = {},
-  { cwd }: { cwd?: string } = {},
+  {
+    cwd,
+    openCopilotChronicle,
+    openZcodeDatabase,
+  }: {
+    cwd?: string;
+    openCopilotChronicle?: CopilotChronicleOpener;
+    openZcodeDatabase?: ZcodeDatabaseOpener;
+  } = {},
 ): ProviderRegistry {
   return createProviderRegistry([
     createClaudeProvider({ rootDir: roots['claude'] }),
     createCodexProvider({ rootDir: roots['codex'] }),
+    createCopilotProvider({ rootDir: roots['copilot'], openChronicle: openCopilotChronicle }),
     createDeepseekProvider({ rootDir: roots['deepseek'] }),
     createKimiProvider({ rootDir: roots['kimi'] }),
     createOmpProvider({ rootDir: roots['omp'] }),
     createPiProvider({ rootDir: roots['pi'], cwd }),
+    createZcodeProvider({ rootDir: roots['zcode'], openDatabase: openZcodeDatabase }),
   ]);
 }

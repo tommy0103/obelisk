@@ -28,4 +28,8 @@ test('build:core emits an importable package with its schema resource', async ()
   const pi = await import(`${pathToFileURL(join(coreDist, 'providers', 'pi.js')).href}?test=${Date.now()}`);
   assert.equal(typeof pi.createPiProvider, 'function');
   assert.equal(pi.piProvider.descriptor.id, 'pi');
+
+  const copilot = await import(`${pathToFileURL(join(coreDist, 'providers', 'copilot.js')).href}?test=${Date.now()}`);
+  assert.equal(typeof copilot.createCopilotProvider, 'function');
+  assert.equal(copilot.copilotProvider.descriptor.id, 'copilot');
 });

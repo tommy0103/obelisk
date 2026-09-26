@@ -77,6 +77,35 @@ function searchDb() {
   return db;
 }
 
+test('list helpers reject negative limits instead of returning unbounded results', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+  const calls = [
+    ['search() limit', -1, () => api.search('memory', { limit: -1 })],
+    ['search() limit', -5, () => api.search('memory', { limit: -5 })],
+    ['subagents() limit', -1, () => api.subagents({ limit: -1 })],
+    ['workflows() limit', -1, () => api.workflows({ limit: -1 })],
+    ['fileHistory() limit', -1, () => api.fileHistory('/tmp/file.ts', { limit: -1 })],
+    ['failures() limit', -1, () => api.failures({ limit: -1 })],
+    ['sessions() limit', -1, () => api.sessions({ limit: -1 })],
+    ['sessions() limit', -1, () => api.recent(-1)],
+    ['summaries() limit', -1, () => api.summaries({ limit: -1 })],
+    ['overview() limit', -1, () => api.overview({ limit: -1 })],
+    ['overview() projectLimit', -1, () => api.overview({ projectLimit: -1 })],
+    ['overview() memoryLimit', -1, () => api.overview({ memoryLimit: -1 })],
+    ['raw() limit', -1, () => api.raw('missing', { limit: -1 })],
+    ['raw() offset', -1, () => api.raw('missing', { offset: -1 })],
+    ['memories() limit', -1, () => api.memories({ limit: -1 })],
+  ];
+
+  for (const [label, value, call] of calls) {
+    assert.throws(call, { name: 'RangeError', message: `${label} must be non-negative (got ${value})` });
+  }
+  assert.deepEqual(api.search('memory', { limit: 0 }), []);
+  assert.deepEqual(api.sessions({ limit: 0 }), []);
+  db.close();
+});
+
 test('search falls back to safe tokenization for FTS-special input instead of throwing', () => {
   const db = searchDb();
   const api = createQueryApi(db);

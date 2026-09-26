@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // DeepSeek Harness provider adapter in Core (see docs/adr/0001 and
-// docs/adr/0011 for the architecture this file implements).
+// docs/adr/0011 for the architecture this file implements, docs/adr/0014 for
+// session format multi-version support).
 //
 // Pure: discovers DeepSeek Harness session trees and parses one tree into a
 // canonical record stream. It never touches the Obelisk database.
 //
 // Source layout ($DSH_HOME/sessions, default ~/.dsh/sessions):
-//   <root>/--<normalized-cwd>--/<session-id>/session.jsonl.zstd   (default)
-//   <root>/--<normalized-cwd>--/<session-id>/session.jsonl        (compression: none)
+//   <root>/--<normalized-cwd>--/<session-id>/session[.vN].jsonl.zstd   (default)
+//   <root>/--<normalized-cwd>--/<session-id>/session[.vN].jsonl        (compression: none)
+// Format generations (ADR-0014): v0 is `session.jsonl`, N≥1 is `session.vN`;
+// an upstream write-open migrates by publishing a higher generation beside the
+// untouched source, so per session directory only the HIGHEST generation is
+// canonical. Supported versions: 0–3.
 //
 // A log is one immutable `SessionHeader` line followed by contiguous
 // `SessionEvent` lines ({type, seq, time, data}). The default artifact is a
@@ -22,10 +27,11 @@
 // ARCHITECTURE (ADR-0011). One IndexUnit is a whole ROOT SESSION TREE: a root
 // session file plus every descendant subagent file, grouped at discovery by
 // project-scoped ancestry. The cursor is a checkpoint (`mtime:count` prefix
-// for persist's index_state columns, then opaque base64url JSON): per-member
-// { agentId, headerHash, inode, count, prefixHash } plus per-member
-// lastMessageUuid (+ its own parent) and the steps with an emitted tool_use
-// anchor. Parse has two paths:
+// for persist's index_state columns, then opaque base64url JSON): ONE record
+// per member (ADR-0014 v2 shape) carrying its fast-path gates
+// { agentId, headerHash, inode, count, prefixHash } plus the optional facets
+// (parent-chain seed, emitted-anchor steps, resolved v2/v3 seed-prefix
+// length, PTC parent-callId → anchor map). Parse has two paths:
 //
 //   FAST PATH — every member satisfies strict preconditions (same member set,
 //   same identities, unchanged inodes, non-decreasing counts, and the stored
@@ -53,11 +59,19 @@
 // assistant/message, which always carries the assembled content. The vendored
 // codec (../vendor/dsh-chunk-rows.ts) remains available for raw
 // reconstruction but is not on the indexing path.
+//
+// Format v2/v3 notes (ADR-0014): the v2+ embedded assistant/message `stream`
+// is ignored exactly like packed rows. `system/message` (v3) is not indexed —
+// v0/v2 system prompts never were either. `surfaceOp` replace semantics are
+// deliberately NOT applied: Obelisk indexes the append-only log verbatim so
+// pre-compaction history stays searchable (guarded by
+// tests/dsh-context-window-plugin.test.mjs); the replacement row simply
+// appends like any other event.
 
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
+import { dirname, basename, isAbsolute, join, normalize, sep } from 'node:path';
 
 import { filePath, normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../vendor/dsh-zstd.ts';
@@ -79,9 +93,18 @@ import type {
 } from './types.ts';
 
 export const name = 'deepseek';
-const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v3__';
+const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v4__';
 
-const SESSION_FILENAMES = ['.jsonl.zstd', '.jsonl'];
+// Upstream canonical artifact basename (DSH session-format/src/filename.ts):
+// v0 is `session.jsonl`, generation N≥1 is `session.vN.jsonl`; the default
+// zstd compression appends `.zstd`. Non-canonical siblings never match:
+// `session.v0.*`, `session.lock`, `session.migration.<hex>.tmp`,
+// `<name>.<hex>.tmp`.
+export const SESSION_FILE_RE = /^session(?:\.v([1-9][0-9]*))?\.jsonl(\.zstd)?$/;
+// Format versions this adapter projects (ADR-0014); v1 is physically v0.
+// Range comparison, not a lookup Set — mirrors pi's version gate.
+const MIN_FORMAT_VERSION = 0;
+const MAX_FORMAT_VERSION = 3;
 const SUBAGENT_RESULT_RE = /started\s+subagent\s+(\S+)/;
 
 interface DshHeader {
@@ -93,6 +116,8 @@ interface DshHeader {
   origin?: unknown;
   delegationDepth?: unknown;
   seedLength?: unknown;
+  /** v2/v3: whether the log begins with an inherited prefix + end-seed marker. */
+  isSeeded?: unknown;
 }
 
 interface SessionFile {
@@ -344,18 +369,37 @@ function collectSessionFiles(sessionsDir: string, reportIssue: ((issue: { path: 
     for (const session of sessions) {
       if (!session.isDirectory()) continue;
       const sessionDir = join(projectDir, session.name);
-      for (const suffix of SESSION_FILENAMES) {
-        const path = join(sessionDir, `session${suffix}`);
-        const probe = probePath(path);
-        if (probe === 'error') {
-          // A permission/transient I/O error is NOT a deletion — record it so
-          // the inventory stays uncertified and no tombstone can fire.
-          reportIssue?.({ path, error: 'Session artifact is present but not stat-able' });
+      // One directory per session, one file per format GENERATION: an upstream
+      // write-open migrates by publishing session.v(N+1) beside the untouched
+      // source, so only the numerically highest canonical name is read (DSH
+      // session-persistence-jsonl/src/index.ts resolveGenerationInDirectory).
+      let entries;
+      try {
+        entries = readdirSync(sessionDir);
+      } catch (error) {
+        reportIssue?.(sourceInventoryIssue(sessionDir, error));
+        continue;
+      }
+      let best: { name: string; version: number; zstd: boolean } | null = null;
+      for (const entry of entries) {
+        const match = SESSION_FILE_RE.exec(entry);
+        if (match === null) continue;
+        const version = match[1] === undefined ? 0 : Number(match[1]);
+        const zstd = match[2] !== undefined;
+        if (best === null || version > best.version || (version === best.version && zstd && !best.zstd)) {
+          best = { name: entry, version, zstd };
         }
-        if (probe !== 'gone') {
-          result.push({ path, projectDir: project.name, sessionDir });
-          break;
-        }
+      }
+      if (best === null) continue;
+      const path = join(sessionDir, best.name);
+      const probe = probePath(path);
+      if (probe === 'error') {
+        // A permission/transient I/O error is NOT a deletion — record it so
+        // the inventory stays uncertified and no tombstone can fire.
+        reportIssue?.({ path, error: 'Session artifact is present but not stat-able' });
+      }
+      if (probe !== 'gone') {
+        result.push({ path, projectDir: project.name, sessionDir });
       }
     }
   }
@@ -394,7 +438,12 @@ function splitChangedPaths(sessionsDir: string, changedPaths: string[]): { files
       ? normalize(changedPath)
       : normalize(join(sessionsDir, changedPath));
     if (!rootPrefixes.some((prefix) => absolute.startsWith(prefix))) continue; // foreign provider's path
-    if (SESSION_FILENAMES.some((suffix) => absolute.endsWith(suffix))) {
+    const base = basename(absolute);
+    // Write-noise siblings (the flock lease touched on every write, migration/
+    // create staging files) route nowhere and must not escalate to a full
+    // reconcile: the final artifact's own event follows a staged rename.
+    if (base === 'session.lock' || base.endsWith('.tmp')) continue;
+    if (SESSION_FILE_RE.test(base)) {
       files.add(absolute);
     } else {
       // A project/session directory rename is reported as the directory path
@@ -488,8 +537,13 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       continue;
     }
     // Version gate (CONTRIBUTING: tolerate the unknown — skip and record,
-    // never parse a higher format as v0).
-    if (header.version !== undefined && header.version !== 0) {
+    // never parse a higher format as a known one; ADR-0014). A missing
+    // version field is legacy v0.
+    const formatVersion = header.version === undefined ? 0 : header.version;
+    if (typeof formatVersion !== 'number'
+      || !Number.isInteger(formatVersion)
+      || formatVersion < MIN_FORMAT_VERSION
+      || formatVersion > MAX_FORMAT_VERSION) {
       reportIssue({ path: file.path, error: `Unsupported session format version ${String(header.version)}` });
       unreadable.push(file);
       fileByPath.set(file.path, file);
@@ -719,7 +773,12 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
 
 // ---- cursor checkpoint ----
 
-interface MemberCheckpoint {
+/** Everything the incremental parse carries about ONE member file, as a single
+ * record (ADR-0014, revised): the fast-path preconditions, the parent-chain
+ * seed, and the emitted-anchor bookkeeping always appear and travel together.
+ * A member's state exists as a whole or not at all — deleting a member
+ * deletes one key. */
+interface MemberState {
   agentId: string | null;
   /** sha256 of the header line — identity (id, cwd, createdAt) must not change. */
   headerHash: string;
@@ -730,9 +789,35 @@ interface MemberCheckpoint {
    * cover every committed frame, not just the boundary one: an in-place edit
    * of an earlier frame with an append on top must not read as pure growth. */
   prefixHash: string;
+  /** Last message-bearing uuid emitted (parent-chain seed). */
+  lastMessageUuid?: string;
+  /** The seed's own parent: when the first message of a new window belongs to
+   * the SAME step as the seed (a step straddling the boundary), its parent is
+   * the seed's parent — linking to the seed itself would create a parent
+   * cycle once the step's anchor is re-emitted. */
+  lastMessageParentUuid?: string | null;
+  /** The "turn:step" steps that already have a tool_use anchor message
+   * (canonical or provisional). A durable tool/call lands after its step's
+   * assistant/message upstream, and an aborted step's provisional anchor may
+   * see further tool/calls in later windows — without this checkpoint both
+   * cases re-emit the anchor, downgrading model/usage or rewriting its
+   * parent/timestamp. */
+  anchorSteps?: string[];
+  /** v2/v3 subagent members: resolved inherited parent-prefix length (the
+   * session/end-seed marker's seq). Absent in v2-shape cursors written before
+   * a subagent appeared — the parse recomputes it from the member's head once. */
+  seededPrefix?: number;
+  /** parentCallId → tool_use anchor uuid for PTC dispatch sub-calls (dispatch
+   * events carry no turn/step — ADR-0014). */
+  ptcAnchors?: Record<string, string>;
 }
 
-const CURSOR_STATE_VERSION = 1;
+// Shape version 2: per-member records. v1 (six parallel path-keyed maps)
+// decodes as null → snapshot fallback self-heals — NEVER lenient-read the old
+// shape into the new one: missing optional fields would silently break parent
+// chains on the fast path. The ADR-0014 marker bump already forces a full
+// reindex, so the one-time re-parse costs nothing extra.
+const CURSOR_STATE_VERSION = 2;
 
 interface TreeCursorState {
   /** Shape version; an unrecognized/older checkpoint decodes as null and the
@@ -740,21 +825,28 @@ interface TreeCursorState {
   v: number;
   /** The session id this checkpoint belongs to — identity changes retract it. */
   sessionId: string;
-  members: Record<string, MemberCheckpoint>;
-  /** Last message-bearing uuid emitted per member path (parent-chain seed). */
-  lastMessageUuid: Record<string, string>;
-  /** The seed's own parent per member path: when the first message of a new
-   * window belongs to the SAME step as the seed (a step straddling the
-   * boundary), its parent is the seed's parent — linking to the seed itself
-   * would create a parent cycle once the step's anchor is re-emitted. */
-  lastMessageParentUuid: Record<string, string | null>;
-  /** Per member path, the "turn:step" steps that already have a tool_use
-   * anchor message (canonical or provisional). A durable tool/call lands
-   * after its step's assistant/message upstream, and an aborted step's
-   * provisional anchor may see further tool/calls in later windows — without
-   * this checkpoint both cases re-emit the anchor, downgrading model/usage or
-   * rewriting its parent/timestamp. */
-  anchorSteps: Record<string, string[]>;
+  members: Record<string, MemberState>;
+}
+
+/** Validate one checkpointed member: the required fast-path fields must be
+ * present and well-typed; optional fields are checked when present. Any
+ * deviation invalidates the whole cursor (snapshot fallback), never a
+ * half-populated member. */
+function asMemberState(value: unknown): MemberState | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.headerHash !== 'string'
+    || typeof value.inode !== 'number'
+    || typeof value.count !== 'number'
+    || typeof value.prefixHash !== 'string'
+    || (value.agentId !== null && typeof value.agentId !== 'string')) return null;
+  if (value.lastMessageUuid !== undefined && typeof value.lastMessageUuid !== 'string') return null;
+  if (value.lastMessageParentUuid !== undefined
+    && value.lastMessageParentUuid !== null
+    && typeof value.lastMessageParentUuid !== 'string') return null;
+  if (value.anchorSteps !== undefined && !Array.isArray(value.anchorSteps)) return null;
+  if (value.seededPrefix !== undefined && typeof value.seededPrefix !== 'number') return null;
+  if (value.ptcAnchors !== undefined && !isRecord(value.ptcAnchors)) return null;
+  return value as unknown as MemberState;
 }
 
 function decodeCursorState(cursor: Cursor): TreeCursorState | null {
@@ -765,15 +857,13 @@ function decodeCursorState(cursor: Cursor): TreeCursorState | null {
     const value: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
     if (!isRecord(value) || value.v !== CURSOR_STATE_VERSION) return null;
     if (typeof value.sessionId !== 'string' || !isRecord(value.members)) return null;
-    // Defensive defaults for the optional maps — never throw on a missing key.
-    return {
-      v: CURSOR_STATE_VERSION,
-      sessionId: value.sessionId,
-      members: value.members as TreeCursorState['members'],
-      lastMessageUuid: isRecord(value.lastMessageUuid) ? value.lastMessageUuid as Record<string, string> : {},
-      lastMessageParentUuid: isRecord(value.lastMessageParentUuid) ? value.lastMessageParentUuid as Record<string, string | null> : {},
-      anchorSteps: isRecord(value.anchorSteps) ? value.anchorSteps as Record<string, string[]> : {},
-    };
+    const members: Record<string, MemberState> = {};
+    for (const [path, member] of Object.entries(value.members)) {
+      const state = asMemberState(member);
+      if (state === null) return null;
+      members[path] = state;
+    }
+    return { v: CURSOR_STATE_VERSION, sessionId: value.sessionId, members };
   } catch {
     return null;
   }
@@ -886,7 +976,7 @@ function snapshotMember(path: string): MemberSnapshot | null {
 }
 
 /** Fast-path preconditions for one member against its checkpoint. */
-function memberMatchesCheckpoint(member: TreeMember, snap: MemberSnapshot, cp: MemberCheckpoint): boolean {
+function memberMatchesCheckpoint(member: TreeMember, snap: MemberSnapshot, cp: MemberState): boolean {
   return snap.headerHash === cp.headerHash
     && snap.stat.ino === cp.inode
     && snap.count >= cp.count
@@ -910,6 +1000,23 @@ function treeMatchesState(members: TreeMember[], state: TreeCursorState): boolea
 }
 
 // ---- parse: two paths over one root tree ----
+
+/** v2/v3 seeded subagents carry no header.seedLength: the inherited parent
+ * prefix ends at the LAST session/end-seed event whose data.inherited ===
+ * true, and that marker's own seq is the inherited event count (the marker
+ * itself is child-owned). null when no marker has been observed — for a live
+ * file that means the seed batch has not landed yet (the header is persisted
+ * first, the marker with the seed batch), NOT that the session is unseeded. */
+function resolveSeededPrefix(snap: MemberSnapshot): number | null {
+  let count: number | null = null;
+  for (const record of readLogRecords(memberText(snap, 0))) {
+    if (record.type === 'session/end-seed' && record.data.inherited === true && record.seq >= 0) {
+      count = record.seq;
+    }
+  }
+  return count;
+}
+
 
 function memberText(snap: MemberSnapshot, fromCount: number): string {
   if (snap.zstd) return decodeFrames(snap.zstd.buffer, snap.zstd.frames, fromCount);
@@ -987,7 +1094,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   };
   let maxMtime = 0;
   let totalCount = 0;
-  const nextState: TreeCursorState = { v: CURSOR_STATE_VERSION, sessionId, members: {}, lastMessageUuid: {}, lastMessageParentUuid: {}, anchorSteps: {} };
+  const nextState: TreeCursorState = { v: CURSOR_STATE_VERSION, sessionId, members: {} };
 
   for (const member of meta.members) {
     const snap = snaps.get(member.path);
@@ -996,13 +1103,45 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     const agentId = member.agentId;
     const isSubagent = member.isSubagent;
     const cwd = typeof header.cwd === 'string' ? header.cwd : null;
-    const fromCount = fast ? prior!.members[member.path]!.count : 0;
-    const inheritedEventCount = isSubagent
-      && typeof header.seedLength === 'number'
-      && Number.isSafeInteger(header.seedLength)
-      && header.seedLength >= 0
-      ? header.seedLength
-      : 0;
+    // The whole prior per-member record travels together (ADR-0014 v2 shape).
+    const priorMember = fast ? prior!.members[member.path] : undefined;
+    const fromCount = priorMember?.count ?? 0;
+    const formatVersion = typeof header.version === 'number' ? header.version : 0;
+    let inheritedEventCount = 0;
+    /** The observed seed cut; null means "never resolved" (unseeded, or the
+     * marker is not durable yet) — never checkpoint an unobserved value. */
+    let seededPrefixObserved: number | null = null;
+    if (isSubagent && formatVersion >= 2) {
+      if (header.isSeeded === true) {
+        // v2/v3 headers dropped seedLength: the inherited prefix ends at the
+        // session/end-seed marker, resolved once and checkpointed (ADR-0014).
+        const cached = priorMember?.seededPrefix;
+        if (typeof cached === 'number' && Number.isSafeInteger(cached) && cached >= 0) {
+          seededPrefixObserved = cached;
+        } else {
+          const resolved = resolveSeededPrefix(snap);
+          if (resolved === null) {
+            // Seeded, but the marker is not durable yet (a header-only or
+            // mid-seed file). Parsing now would leak the inherited parent
+            // prefix into the child's sidechain — and worse, checkpointing
+            // the phony cut 0 would make the leak STICKY across later windows.
+            // Fail closed for the whole tree this round (same pattern as an
+            // unreadable member snapshot); the marker lands with the seed
+            // batch, one watcher tick later.
+            return cursor;
+          }
+          seededPrefixObserved = resolved;
+        }
+        inheritedEventCount = seededPrefixObserved;
+      }
+      // isSeeded !== true: no marker will ever exist — nothing inherited.
+    } else if (isSubagent) {
+      inheritedEventCount = typeof header.seedLength === 'number'
+        && Number.isSafeInteger(header.seedLength)
+        && header.seedLength >= 0
+        ? header.seedLength
+        : 0;
+    }
     const records = readLogRecords(memberText(snap, fromCount))
       .filter(record => record.seq >= inheritedEventCount);
 
@@ -1018,8 +1157,8 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       }
     }
 
-    let lastMessageUuid: string | null = fast ? (prior!.lastMessageUuid[member.path] ?? null) : null;
-    let lastMessageParentUuid: string | null = fast ? (prior!.lastMessageParentUuid[member.path] ?? null) : null;
+    let lastMessageUuid: string | null = priorMember?.lastMessageUuid ?? null;
+    let lastMessageParentUuid: string | null = priorMember?.lastMessageParentUuid ?? null;
     // The checkpointed seed belongs to the previous window; if the first
     // message of this window is from the SAME step (a step straddling the
     // boundary), its parent is the seed's parent — linking to the seed would
@@ -1030,8 +1169,14 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
     let currentModel: string | null = null;
     let memberEndedAt: string | null = null;
     const emittedAnchors = new Set<string>();
-    const anchorSteps = new Set<string>(fast ? (prior!.anchorSteps[member.path] ?? []) : []);
+    const anchorSteps = new Set<string>(priorMember?.anchorSteps ?? []);
     const hasAnchor = (turn: unknown, step: unknown) => anchorSteps.has(`${turn}:${step}`);
+    // PTC dispatch events carry no turn/step: a sub-call anchors to its outer
+    // run_code call's tool_use anchor, resolved by the parent's callId
+    // (checkpointed across windows — ADR-0014).
+    const ptcParentAnchors = new Map<string, string>(
+      Object.entries(priorMember?.ptcAnchors ?? {}),
+    );
     let subagentDescriptor: Record<string, unknown> | null = null;
 
     const updateEndedAt = (timestamp: string | null): void => {
@@ -1056,6 +1201,18 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       // message_count on every straddle.
       if (agentId === null && record.visibility === 'visible' && record.content_type !== 'tool_use') mainMessageCount++;
       updateEndedAt(record.timestamp);
+    };
+    // A structural tool_use anchor message (provisional or minted): text-less
+    // and usage-less; tool_calls/tool_results hang off it downstream. Shared by
+    // the durable tool/call branch and the PTC dispatch fallback (ADR-0014).
+    const emitAnchorMessage = (uuid: string, timestamp: string | null): void => {
+      pushMessage({
+        kind: 'message', uuid, session_id: sessionId, type: 'assistant',
+        parent_uuid: lastMessageUuid, timestamp, role: 'assistant', text: null,
+        content_type: 'tool_use', is_meta: 0, visibility: 'visible', model: currentModel,
+        is_sidechain: isSubagent ? 1 : 0, agent_id: agentId,
+        input_tokens: null, output_tokens: null, cwd, skill: null, source: 'deepseek',
+      });
     };
 
     for (const record of records) {
@@ -1157,6 +1314,8 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           const toolName = typeof data.name === 'string' ? data.name : 'tool';
           const args = parseToolArguments(data.arguments);
           const anchor = toolUseUuid(dbId, data.turn, data.step);
+          // Any call (typically run_code) may parent PTC dispatch sub-calls.
+          ptcParentAnchors.set(nativeCallId, anchor);
           // The anchor message must exist even when this step's assistant/message
           // has no tool-call part (or never landed): tool_calls and tool_results
           // are filtered by message_uuid downstream, and the ADR-0008 nonce
@@ -1164,13 +1323,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           if (!emittedAnchors.has(anchor) && !stepsWithCanonicalAnchor.has(`${data.turn}:${data.step}`) && !hasAnchor(data.turn, data.step)) {
             emittedAnchors.add(anchor);
             anchorSteps.add(`${data.turn}:${data.step}`);
-            pushMessage({
-              kind: 'message', uuid: anchor, session_id: sessionId, type: 'assistant',
-              parent_uuid: lastMessageUuid, timestamp, role: 'assistant', text: null,
-              content_type: 'tool_use', is_meta: 0, visibility: 'visible', model: currentModel,
-              is_sidechain: isSubagent ? 1 : 0, agent_id: agentId,
-              input_tokens: null, output_tokens: null, cwd, skill: null, source: 'deepseek',
-            });
+            emitAnchorMessage(anchor, timestamp);
           }
           recordsOut.push({
             kind: 'tool_call', id: callId(dbId, nativeCallId),
@@ -1185,6 +1338,14 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           const source = isRecord(message.source) ? message.source : {};
           if (typeof source.callId !== 'string') break;
           const toolId = callId(dbId, source.callId);
+          // A settled call can never gain new PTC dispatches — upstream settles
+          // every sub-call before the outer result lands — so prune its anchor
+          // mapping (and any nested sub-call ids under it): the checkpointed
+          // map holds only in-flight calls, not every call the log ever saw.
+          ptcParentAnchors.delete(source.callId);
+          for (const key of [...ptcParentAnchors.keys()]) {
+            if (key.startsWith(`${source.callId}:`)) ptcParentAnchors.delete(key);
+          }
           const content = toolResultContent(message.content);
           recordsOut.push({
             kind: 'tool_result', tool_use_id: toolId,
@@ -1198,6 +1359,52 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           if (match !== null && match[1]) {
             subagentPart(canonicalDeepseekTreeSessionId(match[1], meta.scope)).parent_tool_use_id = toolId;
           }
+          break;
+        }
+        // PTC/code-mode inner calls never get tool/call or tool/result events —
+        // the settle event is their only durable record, projecting as one
+        // tool_call + one tool_result anchored to the outer run_code call
+        // (ADR-0014). Both spellings: tool/code-dispatch (v0–v2),
+        // tool/ptc-dispatch (v3). *-dispatch-start carries only timing.
+        case 'tool/ptc-dispatch':
+        case 'tool/code-dispatch': {
+          const data = record.data;
+          const subCallId = typeof data.subCallId === 'string' && data.subCallId.length > 0 ? data.subCallId : null;
+          const parentCallId = typeof data.parentCallId === 'string' && data.parentCallId.length > 0 ? data.parentCallId : null;
+          if (subCallId === null || parentCallId === null) break;
+          let anchor = ptcParentAnchors.get(parentCallId);
+          if (anchor === undefined) {
+            // The outer tool/call predates this cursor window (or the parent
+            // is itself a nested sub-call): mint a deterministic anchor so the
+            // sub-call group still has a message to hang on. Minted once —
+            // the checkpointed map keeps later windows from re-emitting it.
+            anchor = `${dbId}:ptc:${encodeURIComponent(parentCallId)}`;
+            ptcParentAnchors.set(parentCallId, anchor);
+            if (!emittedAnchors.has(anchor)) {
+              emittedAnchors.add(anchor);
+              emitAnchorMessage(anchor, timestamp);
+            }
+          }
+          // A nested run_code's own dispatches resolve through this sub-call.
+          ptcParentAnchors.set(subCallId, anchor);
+          const toolName = typeof data.name === 'string' ? data.name : 'tool';
+          // Unlike tool/call, dispatch arguments are already-parsed JSON.
+          const args = data.arguments;
+          const subToolId = callId(dbId, subCallId);
+          recordsOut.push({
+            kind: 'tool_call', id: subToolId,
+            message_uuid: anchor, session_id: sessionId,
+            name: toolName, presentation: toolName === 'skill' ? 'skill' : 'default',
+            input_json: truncJson(args) ?? '{}', file_path: dshToolFilePath(toolName, isRecord(args) ? args : null),
+          });
+          recordsOut.push({
+            kind: 'tool_result', tool_use_id: subToolId,
+            message_uuid: anchor, session_id: sessionId,
+            content: trunc(toolResultContent(data.content)), file_path: null,
+            // `error` was only added upstream on 2026-09-12; older settle
+            // events carry `isError` alone.
+            is_error: data.isError === true || data.error !== undefined ? 1 : 0,
+          });
           break;
         }
         default:
@@ -1225,18 +1432,23 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
       part.duration_ms = startedMs !== null && endedMs !== null ? Math.max(0, endedMs - startedMs) : null;
       // total_tokens is derived at query time from the sidechain messages (ADR-0010).
     }
-    if (lastMessageUuid !== null) {
-      nextState.lastMessageUuid[member.path] = lastMessageUuid;
-      nextState.lastMessageParentUuid[member.path] = lastMessageParentUuid;
-    }
-    if (anchorSteps.size > 0) nextState.anchorSteps[member.path] = [...anchorSteps];
-    nextState.members[member.path] = {
+    // One member = one record: every checkpointed facet of this member is
+    // written or omitted together (ADR-0014 v2 shape).
+    const memberState: MemberState = {
       agentId: member.agentId,
       headerHash: snap.headerHash,
       inode: snap.stat.ino,
       count: snap.count,
       prefixHash: snap.prefixHash,
     };
+    if (lastMessageUuid !== null) {
+      memberState.lastMessageUuid = lastMessageUuid;
+      memberState.lastMessageParentUuid = lastMessageParentUuid;
+    }
+    if (anchorSteps.size > 0) memberState.anchorSteps = [...anchorSteps];
+    if (seededPrefixObserved !== null) memberState.seededPrefix = seededPrefixObserved;
+    if (ptcParentAnchors.size > 0) memberState.ptcAnchors = Object.fromEntries(ptcParentAnchors);
+    nextState.members[member.path] = memberState;
     maxMtime = Math.max(maxMtime, snap.stat.mtimeMs);
     totalCount += snap.count;
   }

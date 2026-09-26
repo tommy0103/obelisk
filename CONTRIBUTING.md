@@ -111,6 +111,14 @@ interactions, or the full Electron suites.
 
 ## Provider adapters
 
+- **Before requesting review, pass the adapter-review skill in a clean session.**
+  Run [`maintainer-skills/adapter-review/SKILL.md`](maintainer-skills/adapter-review/SKILL.md)
+  from a fresh agent session — not the session that wrote the code — and resolve
+  every blocking finding first. The authoring session shares the implementation's
+  assumptions; the skill encodes the failure patterns this repo's adapter reviews
+  keep hitting (identity/key asymmetry, destructive tombstones, migration
+  convergence, fixture authenticity), and it only works when the reviewer is not
+  the author.
 - **Read all provider implementations in
   [`packages/core/src/providers/`](packages/core/src/providers/) before writing a
   new adapter.**

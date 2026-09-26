@@ -78,6 +78,19 @@ test('--query surfaces a throw as { error, stack } and exits 1', () => {
   assert.equal(typeof payload.stack, 'string');
 });
 
+test('--query rejects a negative helper limit instead of returning unbounded results', () => {
+  const home = tempHome();
+  const scriptPath = join(home, 'negative-limit.mjs');
+  writeFileSync(scriptPath, 'return sessions({ limit: -1 });');
+
+  const result = runRuntime(['--query', scriptPath], { home });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.error, 'sessions() limit must be non-negative (got -1)');
+  assert.equal(typeof payload.stack, 'string');
+});
+
 test('--attune surfaces a throw as { error, stack } and exits 1', () => {
   const home = tempHome();
   // Attune requires an initialized index; bring one up so the script's own

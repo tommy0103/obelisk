@@ -113,25 +113,46 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
-function readLines(filePath: string, callback: (line: string, terminated: boolean) => boolean | void): void {
+interface ReadLinesOptions {
+  start?: number;
+  onBytesRead?: (bytes: number) => void;
+}
+
+function readLines(
+  filePath: string,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+  { start = 0, onBytesRead }: ReadLinesOptions = {},
+): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
-  let remainder = '';
+  let remainder = Buffer.alloc(0);
   let bytesRead;
+  let position = start;
   try {
-    while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
-      const lines = buf.toString('utf8', 0, bytesRead).split('\n');
-      lines[0] = remainder + lines[0];
-      remainder = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line && callback(line, true) === false) return;
+    while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      onBytesRead?.(bytesRead);
+      const chunkStart = position;
+      position += bytesRead;
+      const chunk = buf.subarray(0, bytesRead);
+      const combinedStart = chunkStart - remainder.length;
+      const data = remainder.length === 0 ? chunk : Buffer.concat([remainder, chunk]);
+      let lineStart = 0;
+      while (true) {
+        const newline = data.indexOf(0x0a, lineStart);
+        if (newline < 0) break;
+        const line = data.toString('utf8', lineStart, newline);
+        lineStart = newline + 1;
+        if (line && callback(line, true, combinedStart + lineStart) === false) return;
       }
+      // `buf` is reused by the next readSync; retain an owned copy so a line
+      // spanning chunks is never overwritten before it is completed.
+      remainder = Buffer.from(data.subarray(lineStart));
     }
     // `terminated: false` — the final chunk had no trailing newline, so this
     // tail may still be growing (or may simply be an unterminated last line;
     // the caller cannot tell, and must decide what that means).
-    if (remainder) callback(remainder, false);
+    if (remainder.length > 0) callback(remainder.toString('utf8'), false);
   } finally {
     closeSync(fd);
   }

@@ -21,6 +21,7 @@ import {
   readPersistedProviderSettings,
 } from './provider-settings.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
+import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import { createQueryApi, createAttuneApi } from './query.ts';
 import type { SqliteDb } from './sqlite-types.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
@@ -69,7 +70,9 @@ function reportIncompleteInventory(build: unknown): void {
 
 function refreshQueryIndex(): ProviderRegistry {
   const settings = readPersistedProviderSettings();
-  const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings).registry;
+  const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings, {
+    openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+  }).registry;
   if (!settings.ok) {
     const schema = ensureReadableSchema();
     if (!schema.ready) {
@@ -78,7 +81,11 @@ function refreshQueryIndex(): ProviderRegistry {
     process.stderr.write(`Warning: ${settings.error}; index refresh skipped\n`);
     return providerRegistry;
   }
-  reportIncompleteInventory(buildIndex({ providerRegistry }));
+  // The pre-query refresh is a full-inventory pass, and for a CLI-only user
+  // it is their reconciliation: there is no watcher to reconcile against.
+  // It therefore verifies prefixes (strict) instead of trusting cooperative
+  // append checkpoints (RFC #172).
+  reportIncompleteInventory(buildIndex({ providerRegistry, readMode: 'strict' }));
   return providerRegistry;
 }
 
@@ -315,7 +322,15 @@ export function resolveInvokingSessionIdWithWait(
   providerRegistry: ProviderRegistry,
   {
     openRead = openReadDb,
-    build = () => buildIndex({ ignoreRecentBuild: true, ignoreDaemonOwnership: true, providerRegistry }),
+    build = () => buildIndex({
+      ignoreRecentBuild: true,
+      ignoreDaemonOwnership: true,
+      providerRegistry,
+      // This freshness build is also a full-inventory pass and the CLI-only
+      // user's reconciliation; verify prefixes rather than trusting
+      // cooperative checkpoints (RFC #172).
+      readMode: 'strict',
+    }),
     pollIntervalMs = INVOCATION_POLL_INTERVAL_MS,
     pollCapMs = INVOCATION_POLL_CAP_MS,
     resolveOpts,

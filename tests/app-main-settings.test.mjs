@@ -10,6 +10,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
@@ -190,6 +191,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
       windows.push(this);
     }
     loadFile(filePath) { this.loadedFile = filePath; }
+    on() {}
     loadURL(url) { this.loadedURL = url; return Promise.resolve(); }
     close() {}
     static getAllWindows() { return windows; }
@@ -244,6 +246,8 @@ test('malformed settings keep the desktop recovery window available', async () =
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
   const originalProfile = process.env.USERPROFILE;
+  const originalAppData = process.env.APPDATA;
+  const originalXdgConfig = process.env.XDG_CONFIG_HOME;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -254,6 +258,9 @@ test('main process watches every root declared by the built-in provider registry
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
   process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+  process.env.APPDATA = join(home, 'AppData', 'Roaming');
+  process.env.XDG_CONFIG_HOME = join(home, '.config');
+  const [stableCopilotRoot, insidersCopilotRoot] = defaultCopilotUserDataRoots();
 
   const serviceOptions = [];
   const workerCalls = [];
@@ -272,6 +279,7 @@ test('main process watches every root declared by the built-in provider registry
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -319,11 +327,19 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(codexDir, 'sessions') },
       { kind: 'tree', path: join(codexDir, 'archived_sessions') },
       { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+      { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+      { kind: 'tree', path: join(stableCopilotRoot, 'workspaceStorage') },
+      { kind: 'file', path: join(insidersCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+      { kind: 'file', path: join(insidersCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+      { kind: 'tree', path: join(insidersCopilotRoot, 'workspaceStorage') },
       { kind: 'tree', path: join(home, '.dsh', 'sessions') },
       { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite-wal') },
     ]);
     assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
@@ -332,6 +348,8 @@ test('main process watches every root declared by the built-in provider registry
     restore();
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
+    restoreEnvVar('APPDATA', originalAppData);
+    restoreEnvVar('XDG_CONFIG_HOME', originalXdgConfig);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -365,6 +383,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() { notifications += 1; } };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() {
@@ -484,6 +503,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -575,6 +595,18 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   `).run('claude-undated-message', 'claude-session', 'assistant', 'assistant', 'ok', 7, 0, 'claude');
   setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
     .run('pi:session', 'pi');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('zcode:session', 'zcode', '/tmp/zcode/db/db.sqlite#z:session');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('zcode:full-text', 'zcode:session', 'assistant', 'assistant', 'truncated text', 'zcode');
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
+    .run('zcode:child', 'zcode');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,visibility,source,agent_id) VALUES (?,?,?,?,?,?,?,?)')
+    .run('zcode:child:message', 'zcode:child', 'assistant', 'assistant', 'child response', 'visible', 'zcode', 'zcode:child');
+  setup.prepare('INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json) VALUES (?,?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'Read', '{}');
+  setup.prepare('INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content) VALUES (?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'read result');
   setup.prepare(`
     INSERT INTO summaries (
       id, session_id, timestamp, source, content, visibility, input_tokens, output_tokens
@@ -642,6 +674,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -664,7 +697,17 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
-    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+    [INDEXER_WORKER_URL, { namedExports: {
+      createWorkerBuildIndex: () => ({
+        buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
+        readZcodeMessageText: async lookup => {
+          assert.equal(lookup.source, 'zcode');
+          assert.equal(lookup.messageUuid, 'zcode:full-text');
+          return 'complete ZCode text from worker';
+        },
+        stop() {},
+      }),
+    } }],
   ]);
 
   try {
@@ -683,6 +726,12 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session').map(row => row.tool_use_id),
       ['pi-visible-main-call'],
     );
+    assert.deepEqual(ipcHandlers.get('db:getSessionMessages')(null, 'zcode:child').map(row => row.uuid),
+      ['zcode:child:message'], 'first-class child detail includes its self-agent message');
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolCalls')(null, 'zcode:child').map(row => row.id),
+      ['zcode:child:call']);
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolResults')(null, 'zcode:child').map(row => row.tool_use_id),
+      ['zcode:child:call']);
     assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
     assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
     assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
@@ -701,7 +750,9 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     const patch = ipcHandlers.get('db:getSessionPatch')(null, 'pi:session', {});
     assert.equal(patch.changes.messages[0].tool_calls[0].result.content, 'main result');
     assert.equal(JSON.stringify(patch).includes('agent result'), false);
-    assert.equal(ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'zcode:full-text'),
+      'complete ZCode text from worker');
 
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
     assert.equal(claudeOnly.totalTokens, 72);
@@ -768,6 +819,7 @@ test('main process migrates an existing app database before source-filtered IPC 
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -840,6 +892,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -916,6 +969,7 @@ test('closing the last macOS window releases background resources until activati
       windows.push(this);
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return windows; }
@@ -1056,6 +1110,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
       };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return [new FakeBrowserWindow()]; }
@@ -1235,6 +1290,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1343,6 +1399,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1441,6 +1498,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1554,6 +1612,7 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
       windows.push(this);
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return windows; }
@@ -1604,6 +1663,97 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
   } finally {
     restore();
     mock.timers.reset();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the win:control IPC applies only whitelisted window actions to the sender window', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-window-control-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+  const windowCalls = [];
+  const windows = [];
+  let maximized = false;
+
+  class FakeDatabase {
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {},
+      };
+      windows.push(this);
+    }
+    on() {}
+    loadFile() {}
+    loadURL() {}
+    close() { windowCalls.push('close'); }
+    minimize() { windowCalls.push('minimize'); }
+    maximize() { windowCalls.push('maximize'); maximized = true; }
+    unmaximize() { windowCalls.push('unmaximize'); maximized = false; }
+    isMaximized() { return maximized; }
+    static getAllWindows() { return windows; }
+    static fromWebContents() { return windows[0] ?? null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+
+    const handler = ipcHandlers.get('win:control');
+    assert.equal(typeof handler, 'function', 'the main process registers one win:control handler');
+
+    // The window always comes from the sender; a renderer-supplied argument is ignored.
+    assert.equal(handler({ sender: {} }, 'minimize', 'window-from-the-renderer'), null);
+    assert.deepEqual(windowCalls, ['minimize']);
+
+    assert.equal(handler({ sender: {} }, 'toggle-maximize'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize'], 'an unmaximized window maximizes');
+    assert.equal(handler({ sender: {} }, 'toggle-maximize'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize'], 'a maximized window restores');
+
+    assert.equal(handler({ sender: {} }, 'close'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize', 'close'], 'close stays win.close()');
+
+    assert.throws(
+      () => handler({ sender: {} }, 'explode'),
+      /win:control accepts 'minimize', 'toggle-maximize', or 'close'/,
+    );
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize', 'close'], 'an unknown action changes nothing');
+  } finally {
+    restore();
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });

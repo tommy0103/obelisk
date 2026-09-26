@@ -44,5 +44,9 @@ copy:
    inline the local types).
 4. Update the vendored-at commit + last-touch hashes in this README and in
    both module headers.
-5. Run `node --test tests/deepseek-parse.test.mjs` — the multi-frame zstd and
-   chunk-row tests cover the vendored paths.
+5. Run `node --test tests/deepseek-tree.test.mjs tests/deepseek-identity.test.mjs`
+   — the multi-frame zstd and chunk-row tests cover the vendored paths.
+
+Note: the container and chunk-row formats are unchanged across session format
+v0–v3 (ADR-0014); the vendored decoders needed no update for multi-version
+support.

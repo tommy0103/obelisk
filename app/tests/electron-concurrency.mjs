@@ -5,7 +5,7 @@
 // Electron-ABI better-sqlite3 that the app uses in production.
 import { app } from 'electron';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { copyFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -148,6 +148,27 @@ async function run() {
   assert(boundedMs < 1000, `persistent contention returned within budget (${boundedMs}ms)`);
   persistentHolder.stdin.write('release\n');
   await Promise.all([waitForSuccess(persistentHolder), waitForSuccess(boundedBuild)]);
+
+  console.log('--- Test 5: ZCode source opens through the Electron SQLite binding ---');
+  const zcodeRoot = join(home, '.zcode', 'cli');
+  mkdirSync(join(zcodeRoot, 'db'), { recursive: true });
+  copyFileSync(new URL('../../tests/fixtures/zcode/zcode-real-aggregate.sqlite', import.meta.url),
+    join(zcodeRoot, 'db', 'db.sqlite'));
+  const zcodeIndexPath = join(home, 'zcode-index.sqlite');
+  const zcodeResult = buildIndex({
+    force: true,
+    claudeDir: join(home, '.missing-claude'),
+    codexDir: join(home, '.missing-codex'),
+    projectsDir: join(home, '.missing-claude', 'projects'),
+    providerRoots: { zcode: zcodeRoot },
+    dbPath: zcodeIndexPath,
+    DatabaseImpl: Database,
+  });
+  const zcodeIndex = new Database(zcodeIndexPath, { readonly: true });
+  const zcodeSessions = zcodeIndex.prepare("SELECT COUNT(*) c FROM sessions WHERE source='zcode'").get().c;
+  assert(zcodeResult.complete === true, 'the Electron ZCode inventory is complete');
+  assert(zcodeSessions === 17, `the Electron binding indexes all 17 ZCode sessions, got ${zcodeSessions}`);
+  zcodeIndex.close();
 
   rmSync(home, { recursive: true, force: true });
   console.log('---');

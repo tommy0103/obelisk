@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 3,
+  "sessions": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "cwd": "__PROJECT_ALPHA__",
+      "repository": null,
+      "host_type": "vscode",
+      "branch": "fixture-main",
+      "summary": "Sanitized shared session",
+      "agent_name": null,
+      "agent_description": null,
+      "created_at": "2026-09-16T08:00:00.000Z",
+      "updated_at": "2026-09-16T08:02:02.000Z"
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "cwd": "__PROJECT_BETA__",
+      "repository": null,
+      "host_type": "vscode",
+      "branch": null,
+      "summary": "Sanitized Chronicle-only session",
+      "agent_name": null,
+      "agent_description": null,
+      "created_at": "2026-09-16T07:00:00.000Z",
+      "updated_at": "2026-09-16T07:01:00.000Z"
+    }
+  ],
+  "turns": [
+    {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "turn_index": 0,
+      "user_message": "Sanitized fixture request",
+      "assistant_response": "Truncated Chronicle answer",
+      "timestamp": "2026-09-16T08:00:01.000Z"
+    },
+    {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "turn_index": 0,
+      "user_message": "Sanitized Chronicle-only request",
+      "assistant_response": "Sanitized Chronicle-only answer",
+      "timestamp": "2026-09-16T07:00:01.000Z"
+    }
+  ]
+}
