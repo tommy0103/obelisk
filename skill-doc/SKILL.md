@@ -296,7 +296,7 @@ All list helpers accept a bounded `limit`. Many also accept:
 filters or return fields.
 
 - `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, the invoking session id (`current.session_id`) when the invocation nonce resolved, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
-- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded. The invoking session row carries `is_invoking: true`.
+- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern. `sessionId`/`sessions` also accept a fragment such as a raw provider uuid, returning at most the 10 newest containing sessions. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded. The invoking session row carries `is_invoking: true`.
 - `recent(n?)` -- shorthand for recent sessions.
 - `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, visibility, session_title, project }`; inactive rows require `includeInactive: true`, hidden rows are never returned, and `source` is the summary kind rather than the transcript provider.
 - `subagents(opts?)` -- subagent metadata plus `messageCount`.
