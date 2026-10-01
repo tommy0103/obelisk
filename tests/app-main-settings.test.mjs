@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
@@ -1882,5 +1882,254 @@ test('the win:control IPC applies only whitelisted window actions to the sender 
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+// Loads the app main module against a throwaway home so a test can drive the real
+// settings IPC handlers. Mirrors loadMainForWindowFlags, but returns the captured
+// handlers and the temp home instead of the opened windows.
+async function loadMainForSettings({ settingsText } = {}) {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-settings-${Date.now()}-${Math.random()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  if (settingsText !== undefined) {
+    writeFileSync(join(home, '.obelisk', 'settings.json'), settingsText);
+  }
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+
+  class FakeDatabase {
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {},
+        setWindowOpenHandler() {},
+        getURL() { return ''; },
+        setZoomLevel() {},
+        openDevTools() {},
+        send() {},
+      };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        app: {
+          whenReady: () => Promise.resolve(),
+          on() {},
+          quit() {},
+          getVersion: () => '9.8.7-test',
+        },
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  const cleanup = () => {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  };
+
+  try {
+    await importMain();
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+  return { ipcHandlers, home, cleanup };
+}
+
+function corruptSettingsBackups(home) {
+  return readdirSync(join(home, '.obelisk')).filter(name => name.startsWith('settings.json.corrupt-'));
+}
+
+// A settings file the shared reader rejects cannot be read back, so overwriting it is the
+// only practical way to recover — the app has to keep working. What must not happen is the
+// previous content vanishing silently, so it is moved aside and the user is told where it
+// went. The notice has to come back on the save itself: the editor path does not reload
+// settings afterwards, so a notice only on settings:get would never be seen.
+test('saving over a corrupt settings file preserves it aside and reports where', async () => {
+  // Unparseable: a Windows path written with single backslashes, the shape a hand edit
+  // produces. JSON.stringify always escapes them, so only manual edits look like this.
+  // One backslash built from its char code: a literal backslash is easy to lose to
+  // editor/tool escaping, and a fixture that silently stays valid would make this test
+  // pass for the wrong reason. The assertion below pins it as unparseable.
+  const backslash = String.fromCharCode(92);
+  const corruptText = [
+    '{',
+    '  "providerRoots": {',
+    `    "claude": "C:${backslash}Users${backslash}probe${backslash}.claude"`,
+    '  },',
+    '  "editorScheme": "cursor"',
+    '}',
+  ].join('\n');
+  assert.throws(() => JSON.parse(corruptText), 'the fixture must be unparseable');
+
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: corruptText });
+  try {
+    const saveResult = await ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed');
+
+    const backups = corruptSettingsBackups(home);
+    assert.equal(backups.length, 1, 'the unparseable file was moved aside exactly once');
+    assert.equal(
+      readFileSync(join(home, '.obelisk', backups[0]), 'utf8'),
+      corruptText,
+      'the preserved copy is byte-identical to the file the user had',
+    );
+
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(saved, { editorScheme: 'zed' }, 'the save itself behaves exactly as before');
+
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.match(settings.settingsRecovery, /could not be read/);
+    assert.ok(
+      settings.settingsRecovery.includes(backups[0]),
+      'the notice names the path the previous file was preserved at',
+    );
+    assert.equal(
+      saveResult.settingsRecovery,
+      settings.settingsRecovery,
+      'the save response carries the notice, so a save that does not reload settings still shows it',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('saving over a valid settings file keeps every other setting and reports no recovery', async () => {
+  const validText = JSON.stringify({
+    providerRoots: { pi: '/custom/pi' },
+    editorScheme: 'cursor',
+    autoRefresh: true,
+  });
+
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: validText });
+  try {
+    await ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed');
+
+    assert.deepEqual(corruptSettingsBackups(home), [], 'a parseable file is never moved aside');
+
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.equal(saved.editorScheme, 'zed');
+    assert.deepEqual(saved.providerRoots, { pi: '/custom/pi' }, 'unrelated settings survive');
+    assert.equal(saved.autoRefresh, true);
+
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.equal(settings.settingsRecovery, null, 'no recovery notice when nothing was preserved');
+  } finally {
+    cleanup();
+  }
+});
+
+// The reader rejects more than malformed syntax, and every file it rejects is rebuilt from {}
+// by the save below. A structural rejection that parses is therefore the same #42 loss, and
+// must be preserved for the same reason: this fixture's recapDir would otherwise be gone,
+// with no backup and no notice.
+test('saving over settings the reader rejects for its structure preserves it too', async () => {
+  const structuralText = JSON.stringify({
+    providerRoots: [],
+    recapDir: '/valuable/recaps',
+    editorScheme: 'cursor',
+  });
+  assert.doesNotThrow(() => JSON.parse(structuralText), 'the fixture is valid JSON');
+
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: structuralText });
+  try {
+    const saveResult = await ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed');
+
+    const backups = corruptSettingsBackups(home);
+    assert.equal(backups.length, 1, 'the rejected file was moved aside');
+    assert.equal(
+      readFileSync(join(home, '.obelisk', backups[0]), 'utf8'),
+      structuralText,
+      'the recap directory the user configured is still recoverable from the backup',
+    );
+    assert.match(saveResult.settingsRecovery, /could not be read/);
+    assert.ok(saveResult.settingsRecovery.includes(backups[0]));
+  } finally {
+    cleanup();
+  }
+});
+
+// The refusal has to hold at the entry point the renderer actually calls, not only inside
+// the preservation helper: it is this handler that has to stop before savePersistedSettings
+// replaces the file. Reaching that through the real entry point needs a real filesystem
+// fault -- node:test cannot mock a builtin module, and the main module exports nothing to
+// inject through -- so the settings directory is made read-only instead.
+//
+// That needs POSIX directory permissions. On Windows chmod on a directory does not stop a
+// rename inside it (measured, not assumed), so this is skipped there;
+// tests/settings-preservation.test.mjs covers the same behaviour on every platform.
+test('a save is refused and the file left alone when the rejected file cannot be preserved', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const corruptText = '{ not json';
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: corruptText });
+  const obeliskDir = join(home, '.obelisk');
+  const settingsPath = join(obeliskDir, 'settings.json');
+  chmodSync(obeliskDir, 0o555);
+  try {
+    // Probe the exact syscall the fix depends on, rather than assuming the mode took: a
+    // privileged user, or a filesystem that ignores the mode, would otherwise leave the
+    // test asserting against a fault that was never injected.
+    const probeSource = join(home, 'write-probe');
+    writeFileSync(probeSource, '');
+    try {
+      renameSync(probeSource, join(obeliskDir, 'write-probe'));
+      rmSync(join(obeliskDir, 'write-probe'), { force: true });
+      t.skip('a mode-0555 directory does not block a rename here');
+      return;
+    } catch {}
+
+    await assert.rejects(
+      () => ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed'),
+      /could not back up/,
+      'the save must not proceed without a preserved copy',
+    );
+    assert.equal(
+      readFileSync(settingsPath, 'utf8'),
+      corruptText,
+      'the only copy of the user bytes is still where it was',
+    );
+    assert.deepEqual(
+      corruptSettingsBackups(home),
+      [],
+      'nothing was moved aside, so nothing was replaced either',
+    );
+  } finally {
+    chmodSync(obeliskDir, 0o755);
+    cleanup();
   }
 });

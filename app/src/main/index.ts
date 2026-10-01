@@ -27,6 +27,7 @@ import {
   setPersistedSetting,
   type ProviderSourceIssue,
 } from './provider-settings.ts';
+import { preserveRejectedSettings } from './settings-preservation.ts';
 import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
@@ -78,6 +79,11 @@ let indexerService;
 let indexerWorker;
 let latestSourceIssues: ProviderSourceIssue[] = [];
 let latestSettingsError: string | null = null;
+// A recovery notice is deliberately kept apart from latestSettingsError: that variable
+// also gates the indexer (startIndexerService, migrations, rebuildIndex all treat a
+// non-null value as "settings unusable"). Once a corrupt file has been moved aside the
+// settings ARE usable again, so the notice must not block those paths.
+let latestSettingsRecovery: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
 
@@ -1071,13 +1077,26 @@ ipcMain.handle('settings:get', () => {
     lastIndexed,
     status: connected ? 'ok' : 'error',
     statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
+    settingsRecovery: latestSettingsRecovery,
   };
 });
 
 ipcMain.handle('settings:set', async (_, key, value) => {
   const persisted = loadPersistedSettings();
+  // Preserve a file the shared reader rejected before the write below replaces it. Runs
+  // before the save, and re-reads the file itself rather than trusting latestSettingsError,
+  // so a stale flag from an earlier read cannot skip or repeat it. Throwing here is the
+  // point: with no preserved copy the overwrite is the silent #42 loss.
+  const backupPath = await preserveRejectedSettings(SETTINGS_PATH, {
+    rename: (from, to) => fs.promises.rename(from, to),
+    copyFile: (from, to) => fs.promises.copyFile(from, to),
+  });
   const providerRootChanged = setPersistedSetting(persisted, key, value);
   savePersistedSettings(persisted);
+  if (backupPath !== null) {
+    latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
+    console.warn(latestSettingsRecovery);
+  }
 
   if (key === 'autoRefresh') {
     if (value === false && indexerService) {
@@ -1102,7 +1121,10 @@ ipcMain.handle('settings:set', async (_, key, value) => {
     }
     notifyIndexUpdated({ inventoryIssues: [] });
   }
-  return true;
+  // The save is what moves a rejected file aside, so the notice is returned here as well as
+  // from settings:get: the paths that save without reloading settings (editor, recap
+  // directory, auto-refresh) would otherwise never see it.
+  return { settingsRecovery: latestSettingsRecovery };
 });
 
 ipcMain.handle('settings:browseFolder', async (event) => {
