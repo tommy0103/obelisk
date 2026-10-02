@@ -217,6 +217,12 @@ ran this query (see "Your Own Session In Results"); it is omitted otherwise.
 timestamp. It is not the parent chain. Use `context(uuid)` or `trace(uuid)` for
 causal/parent-chain context.
 
+When many hits are plausible but response space is tight, make the first pass
+`search(topic, { projectPath, limit: 30, snippetTokens: 16, contextLimit: 0 })`.
+Inspect UUIDs and matched excerpts, then expand only useful hits with
+`context(uuid)` or `raw(uuid)`. The snippet is navigation, not full evidence;
+keep normal full-text/context results when the question already needs them.
+
 Use `message.content_type` to keep evidence boundaries intact:
 `text` is user/assistant visible language, `thinking` is trace/debug material,
 `tool_use` marks a tool-call message whose details live in `tool_calls`, and

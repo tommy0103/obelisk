@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
@@ -516,6 +516,58 @@ test('codex parse() persists a session-index-only metadata refresh without repla
   assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
   assert.equal(cursorState(second.ret).indexedTitle, 'After');
 });
+
+function assertVerifiedMetadataRefresh(parseSource, readMode = 'normal') {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'unchanged source' } },
+  ]);
+  const first = drain(parseSource({
+    key: path, sessionId: '',
+    meta: { indexedTitle: 'Before', indexedUpdatedAt: '2026-06-10T11:00:00Z' },
+  }, null));
+  const refreshedUnit = {
+    key: path, sessionId: '',
+    meta: { readMode, indexedTitle: 'After', indexedUpdatedAt: '2026-06-10T12:00:00Z' },
+  };
+  const metrics = createCodexParseMetrics();
+  const second = drain(parseSource(refreshedUnit, first.ret, metrics));
+
+  assert.deepEqual(second.values.map(record => record.kind), ['session'], 'metadata changes emit only the session aggregate');
+  assert.equal(second.values[0].title, 'After');
+  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(second.values[0].message_count, first.values.find(record => record.kind === 'session').message_count);
+  assert.equal(cursorState(second.ret).indexedTitle, 'After');
+  assert.equal(cursorState(second.ret).indexedUpdatedAt, '2026-06-10T12:00:00Z');
+  assert.equal(metrics.plan, 'verified-append', 'unsupported identities and strict mode still verify the prefix');
+  assert.equal(metrics.sourceBytesRead, statSync(path).size, 'the prefix is fingerprinted once');
+  assert.equal(metrics.jsonLinesParsed, 0, 'an unchanged rollout is not replayed');
+  assert.equal(metrics.suffixBytesRead, 0);
+
+  const third = drain(parseSource(refreshedUnit, second.ret));
+  assert.deepEqual(third.values, [], 'the refreshed metadata does not emit again');
+  assert.equal(third.ret, second.ret, 'the refreshed checkpoint converges');
+}
+
+test('codex strict reconcile persists a session-index-only metadata refresh without replay', () => {
+  assertVerifiedMetadataRefresh(parse, 'strict');
+});
+
+for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
+  test(`codex metadata refresh with ${identityName} file identity persists without replay`, async t => {
+    const unsupportedStat = (...args) => {
+      const result = statSync(...args);
+      result.ino = inode;
+      return result;
+    };
+    const fsMock = t.mock.module('node:fs', {
+      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+    });
+    t.after(() => fsMock.restore());
+    const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?metadata-${identityName}-identity`);
+    assertVerifiedMetadataRefresh(parseWithoutIdentity);
+  });
+}
 
 test('codex provider discovers, watches, and reads archived sessions', () => {
   const root = makeTempDir('obelisk-codex-archive-');
