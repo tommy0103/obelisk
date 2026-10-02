@@ -92,12 +92,6 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
 
 const BASH_EXIT_PAT = 'Exit code %';
 
-// sessions() fragment expansion is id resolution, not fuzzy search: a raw
-// native id normally resolves to exactly one session. Cap expansion at the
-// newest few matches so a pathological fragment cannot build an IN clause
-// past SQLite's bound-variable limit.
-const SESSION_REF_FRAGMENT_LIMIT = 10;
-
 type QueryVisibility = 'visible' | 'inactive' | 'hidden';
 
 function normalizedVisibility(value: unknown): QueryVisibility {
@@ -602,46 +596,23 @@ function createQueryApi(
     });
   };
 
-  // sessions() is the identifier-resolution surface. Pi-family providers
-  // scope session ids per project (`source:uuid:cwd-hash` in pi.ts), so the
-  // raw uuid a user hands over is only a fragment of the canonical id. Exact
-  // refs pass through untouched; a non-exact ref expands to the canonical ids
-  // containing it, so an ambiguous fragment returns several labeled rows
-  // (project_path/started_at) instead of failing the script. instr() matches
-  // the ref literally, so caller-supplied SQL wildcards never gain wildcard
-  // semantics of their own. Every other helper keeps exact sessionId
-  // matching: resolve through sessions() first.
-  const expandSessionRefs = (opts: QueryOptions): QueryOptions => {
-    if (!opts.sessionId && !opts.sessions?.length) return opts;
-    const expand = (ref: string): string[] => {
-      // instr() treats every character literally, which also makes an empty
-      // ref match everything; an empty entry must stay an empty result like
-      // the exact-match IN ('') it replaces.
-      if (!ref) return [];
-      if (db.prepare('SELECT 1 FROM sessions WHERE id=?').get(ref)) return [ref];
-      // Newest first so the cap keeps the sessions a raw id most likely
-      // points at, not whatever the query planner happens to visit first.
-      const hits = db.prepare('SELECT id FROM sessions WHERE instr(id, ?) > 0 ORDER BY ended_at DESC LIMIT ?').all(ref, SESSION_REF_FRAGMENT_LIMIT);
-      return hits.map((row: DbRow) => String(row.id));
-    };
-    const ids = new Set<string>();
-    if (opts.sessionId) expand(opts.sessionId).forEach((id) => ids.add(id));
-    (opts.sessions ?? []).forEach((ref) => expand(ref).forEach((id) => ids.add(id)));
-    // No expansion hit: keep the original refs so the query returns the same
-    // empty result an unknown exact id always produced.
-    if (!ids.size) return opts;
-    const next: QueryOptions = { ...opts, sessions: [...ids] };
-    delete next.sessionId;
-    return next;
-  };
-
   const sessions = (optsOrN?: QueryOptions | number | string) => {
-    const opts = expandSessionRefs(normalizeOpts(optsOrN, 'sessionId'));
-    const { limit = 50 } = opts;
+    const opts = normalizeOpts(optsOrN, 'sessionId');
+    const { limit = 50, sessionId, sessions: sessionIds, ...filters } = opts;
     assertNonNegativeLimit(limit, 'sessions() limit');
-    const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const { where, params } = buildWhere(filters, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const refs = [...(sessionId ? [sessionId] : []), ...(sessionIds ?? [])];
+    // Resolve within the requested scope, retaining exact-ID precedence globally.
+    const resolvedWhere = refs.length ? `${where} AND s.id IN (
+      WITH refs(id) AS (VALUES ${refs.map(() => '(?)').join(',')})
+      SELECT id FROM refs UNION ALL
+      SELECT hit.id FROM refs JOIN sessions hit ON hit.id IN (
+        SELECT s.id FROM sessions s WHERE ${where} AND instr(s.id, refs.id) > 0
+        ORDER BY s.ended_at DESC LIMIT 10)
+      WHERE refs.id <> '' AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = refs.id))` : where;
+    if (refs.length) params.push(...refs, ...params);
     params.push(limit);
-    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params)
+    return db.prepare(`SELECT * FROM sessions s WHERE ${resolvedWhere} ORDER BY ended_at DESC LIMIT ?`).all(...params)
       .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
   };
 

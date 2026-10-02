@@ -33,7 +33,7 @@ unless scoped evidence is insufficient and `query_plan` says why.
 
 Session references resolve through `sessions()`: a raw provider uuid (pi-family
 canonical ids are `source:uuid:project-scope`, so the uuid is only a fragment)
-resolves to the containing sessions, capped at the 10 newest matches — a raw
+resolves to the containing sessions, capped at the 10 newest matches within the requested filters — a raw
 uuid normally resolves to exactly one session. All other helpers match
 `sessionId` exactly; feed them the canonical `id` from the `sessions()` row,
 never the raw uuid.

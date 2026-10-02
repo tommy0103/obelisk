@@ -1077,3 +1077,30 @@ test('subagents() never overrides a provider-stored total_tokens', () => {
   assert.equal(api.context('cx-m1').subagent.total_tokens, 20);
   db.close();
 });
+
+test('sessions applies scope before each reference cap and unions both ID inputs', () => {
+  const db = memoryDb();
+  const insert = db.prepare('INSERT INTO sessions(id, project, source, git_branch, started_at, ended_at) VALUES(?,?,?,?,?,?)');
+  for (const ref of ['raw-a', 'raw-b']) {
+    for (let i = 0; i < 12; i++) {
+      const timestamp = `2026-09-18T${String(i).padStart(2, '0')}:00:00Z`;
+      insert.run(`pi:${ref}:p${i}`, `p${i}`, i === 0 ? 'omp' : 'pi', i === 0 ? 'target' : 'main', timestamp, timestamp);
+    }
+  }
+  insert.run('raw-exact', 'exact', 'claude', 'main', '2026', '2026');
+  insert.run('pi:raw-exact:shadow', 'exact', 'pi', 'main', '2026', '2026');
+  const api = createQueryApi(db);
+  for (const filter of [{ project: 'p0' }, { source: 'omp' }, { branch: 'target' }, { before: '2026-09-18T01:00:00Z' }]) {
+    assert.deepEqual(api.sessions({ sessionId: 'raw-a', ...filter }).map(row => row.id), ['pi:raw-a:p0']);
+    assert.deepEqual(api.sessions({ sessions: ['raw-a'], ...filter }).map(row => row.id), ['pi:raw-a:p0']);
+  }
+  const rows = api.sessions({ sessionId: 'raw-a', sessions: ['raw-b', 'raw-a', ''], limit: 100 });
+  assert.equal(rows.length, 20);
+  for (const ref of ['raw-a', 'raw-b']) {
+    assert.deepEqual(rows.filter(row => row.id.includes(ref)).map(row => row.id),
+      Array.from({ length: 10 }, (_, i) => `pi:${ref}:p${11 - i}`));
+  }
+  assert.deepEqual(api.sessions('raw-exact').map(row => row.id), ['raw-exact']);
+  assert.deepEqual(api.sessions({ sessionId: 'raw-exact', source: 'pi' }), []);
+  db.close();
+});

@@ -258,7 +258,8 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 Returns `Array<session_row>`.
 Only `sessions()` resolves fragments; every other helper matches `sessionId`
 exactly. Fragments match literally, so `%` and `_` in them are not SQL
-wildcards, and expand to at most the 10 newest containing sessions; entries
+wildcards, and expand to at most the 10 newest containing sessions within the
+requested project/source/time/branch filters; entries
 from `sessionId` and `sessions` union. A raw native id normally resolves to
 exactly one session; several rows mean the id is not unique (for example a
 copied session file), so narrow with `project` or `source`.
