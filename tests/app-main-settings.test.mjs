@@ -250,6 +250,7 @@ test('main process watches every root declared by the built-in provider registry
   const originalAppData = process.env.APPDATA;
   const originalXdgConfig = process.env.XDG_CONFIG_HOME;
   const originalHermesHome = process.env.HERMES_HOME;
+  const originalCodexHostData = process.env.CODEXHOST_DATA_DIR;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -263,6 +264,7 @@ test('main process watches every root declared by the built-in provider registry
   process.env.APPDATA = join(home, 'AppData', 'Roaming');
   process.env.XDG_CONFIG_HOME = join(home, '.config');
   process.env.HERMES_HOME = join(home, '.hermes');
+  process.env.CODEXHOST_DATA_DIR = join(home, '.codexhost');
   const [stableCopilotRoot, insidersCopilotRoot] = defaultCopilotUserDataRoots();
 
   const serviceOptions = [];
@@ -330,6 +332,8 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(codexDir, 'sessions') },
       { kind: 'tree', path: join(codexDir, 'archived_sessions') },
       { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.codexhost', 'antigravity-history') },
+      { kind: 'tree', path: join(home, '.codexhost', 'mapping-store', 'threads') },
       { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
       { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
       { kind: 'tree', path: join(stableCopilotRoot, 'workspaceStorage') },
@@ -357,6 +361,7 @@ test('main process watches every root declared by the built-in provider registry
     restoreEnvVar('APPDATA', originalAppData);
     restoreEnvVar('XDG_CONFIG_HOME', originalXdgConfig);
     restoreEnvVar('HERMES_HOME', originalHermesHome);
+    restoreEnvVar('CODEXHOST_DATA_DIR', originalCodexHostData);
     rmSync(home, { recursive: true, force: true });
   }
 });
