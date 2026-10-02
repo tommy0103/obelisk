@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
 import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
 import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
 import { codexDbId } from '../packages/core/src/parsing.ts';
@@ -596,6 +597,10 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawKimi = '33333333-3333-4333-8444-555555555553';
   const rawCodex = '44444444-4444-4333-8444-555555555554';
   const rawDeepseek = '55555555-5555-4333-8444-555555555555';
+  // Shape-compatible lookup fixtures, not end-to-end provider ingestion fixtures.
+  const rawClaude = '8f39c2a1-7b45-4d83-a029-61e47f903bc2';
+  const rawCopilot = '6b8a4d92-0f13-4c67-95ea-2d7419b03f86';
+  const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
   // Canonical ids in each provider's own shape: pi/omp/deepseek namespace by
   // project, kimi/codex prefix the native id, claude keeps the bare uuid.
   const piHeader = (cwd) => ({ type: 'session', id: rawPi, cwd });
@@ -605,6 +610,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalKimi = kimiSessionId(rawKimi);
   const canonicalCodex = codexDbId(rawCodex);
   const canonicalDeepseek = canonicalDeepseekTreeSessionId(rawDeepseek, deepseekProjectScope('/Users/me/ds'));
+  const canonicalCopilot = copilotSessionId(rawCopilot, '/Users/me/copilot');
+  const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -615,6 +622,9 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalKimi, 'Kimi session', '-Users-me-kimi', '/Users/me/kimi', '2026-09-18T07:00:00Z', '2026-09-18T08:00:00Z', null, 4, 'kimi');
   insertSession.run(canonicalCodex, 'Codex session', '-Users-me-codex', '/Users/me/codex', '2026-09-18T06:00:00Z', '2026-09-18T07:00:00Z', null, 5, 'codex');
   insertSession.run(canonicalDeepseek, 'Deepseek session', '-Users-me-ds', '/Users/me/ds', '2026-09-18T05:00:00Z', '2026-09-18T06:00:00Z', null, 6, 'deepseek');
+  insertSession.run(rawClaude, 'Claude session', '-Users-me-claude', '/Users/me/claude', '2026-09-18T04:00:00Z', '2026-09-18T05:00:00Z', null, 1, 'claude');
+  insertSession.run(canonicalCopilot, 'Copilot session', '-Users-me-copilot', '/Users/me/copilot', '2026-09-18T03:00:00Z', '2026-09-18T04:00:00Z', null, 1, 'copilot');
+  insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -626,11 +636,21 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   `).run(canonicalPiA);
   const api = createQueryApi(db);
 
-  // Each provider's native id resolves through that provider's own id shape.
-  assert.deepEqual(api.sessions({ sessionId: rawOmp }).map(row => row.id), [canonicalOmp]);
-  assert.deepEqual(api.sessions({ sessionId: rawKimi }).map(row => row.id), [canonicalKimi]);
-  assert.deepEqual(api.sessions({ sessionId: rawCodex }).map(row => row.id), [canonicalCodex]);
-  assert.deepEqual(api.sessions({ sessionId: rawDeepseek }).map(row => row.id), [canonicalDeepseek]);
+  // Every registered provider has an exercised native-ID lookup case.
+  const lookups = {
+    claude: [rawClaude, [rawClaude]],
+    codex: [rawCodex, [canonicalCodex]],
+    copilot: [rawCopilot, [canonicalCopilot]],
+    deepseek: [rawDeepseek, [canonicalDeepseek]],
+    kimi: [rawKimi, [canonicalKimi]],
+    omp: [rawOmp, [canonicalOmp]],
+    pi: [rawPi, [canonicalPiB, canonicalPiA]],
+    zcode: [rawZcode, [canonicalZcode]],
+  };
+  assert.deepEqual(Object.keys(lookups).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());
+  for (const [source, [native, expected]] of Object.entries(lookups)) {
+    assert.deepEqual(api.sessions({ sessionId: native }).map(row => row.id), expected, `${source} native-ID lookup`);
+  }
 
   // The same uuid scoped to two projects returns every containing row, each
   // labeled with project_path/started_at; other filters narrow as usual.
@@ -689,6 +709,7 @@ test('every provider embeds the native session id verbatim in its canonical id',
     copilot: copilotSessionId(native, '/Users/me/obelisk'),
     zcode: zcodeSessionId('/Users/me/obelisk/db/db.sqlite', native),
   };
+  assert.deepEqual(Object.keys(canonical).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());
   for (const [source, id] of Object.entries(canonical)) {
     assert.equal(
       typeof id === 'string' && id.includes(native),
