@@ -38,6 +38,8 @@ const channels = [
 let failures = 0;
 let firstSessionListRead = true;
 let nextPatchDelayMs = 0;
+let scrollingContentUuid = null;
+let scrollingContentText = null;
 let stressGlobalCatalogue = false;
 let currentSessionTitle = 'Virtualized timeline integration';
 const ipcReads = {
@@ -147,6 +149,7 @@ async function waitFor(webContents, expression, message, timeoutMs = 8000) {
     if (await webContents.executeJavaScript(`Boolean(${expression})`, true)) return;
     await delay(40);
   }
+  console.error('TIMELINE TIMEOUT', message, JSON.stringify({ ipcReads, scrollingContentUuid, storedText: messages.find(row => row.uuid === scrollingContentUuid)?.text, renderer: await webContents.executeJavaScript(`({ scrollTop: document.querySelector('.detail-wrap')?.scrollTop, rows: [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')].map(row => ({ uuid: row.dataset.uuid, text: row.textContent.slice(0, 80) })) })`) }));
   throw new Error(`Timed out waiting for ${message}`);
 }
 
@@ -250,7 +253,8 @@ async function startRendererTrace(win, { captureScreenshots = false } = {}) {
     if (method === 'Tracing.dataCollected') traceEvents.push(...(params.value || []));
     if (method === 'Tracing.tracingComplete') completeTrace();
   };
-  win.webContents.debugger.attach('1.3');
+  const ownsDebugger = !win.webContents.debugger.isAttached();
+  if (ownsDebugger) win.webContents.debugger.attach('1.3');
   win.webContents.debugger.on('message', onMessage);
   await win.webContents.debugger.sendCommand('Tracing.start', {
     categories: [
@@ -267,7 +271,7 @@ async function startRendererTrace(win, { captureScreenshots = false } = {}) {
     await win.webContents.debugger.sendCommand('Tracing.end');
     await traceComplete;
     win.webContents.debugger.removeListener('message', onMessage);
-    win.webContents.debugger.detach();
+    if (ownsDebugger) win.webContents.debugger.detach();
     return traceEvents;
   };
 }
@@ -462,7 +466,7 @@ function rendererTaskMetrics(traceEvents, startMark, endMark) {
       ))
       .sort((a, b) => (b.dur || 0) - (a.dur || 0))
       .slice(0, 8)
-      .map(event => ({ name: event.name, durationMs: (event.dur || 0) / 1000 }))
+      .map(event => ({ name: event.name, durationMs: (event.dur || 0) / 1000, args: event.args }))
     : [];
   return {
     tasks: taskDurations.length,
@@ -479,6 +483,29 @@ function rendererTaskMetrics(traceEvents, startMark, endMark) {
       .map(event => (event.dur || 0) / 1000)),
     slowestChildren,
   };
+}
+
+// A stationary commit must start after navigation, focus highlighting and
+// virtual-row measurement have settled, rather than a fixed host-side delay.
+async function waitForStationaryLayout(win) {
+  await win.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+    const deadline = setTimeout(() => reject(new Error('Timeline did not settle before stationary trace')), 8000);
+    let previous = null;
+    let stableSince = performance.now();
+    function sample(now) {
+      const wrap = document.querySelector('.detail-wrap');
+      const geometry = JSON.stringify([wrap?.scrollTop, wrap?.scrollHeight,
+        ...[...document.querySelectorAll('.virtual-timeline-row')].map(row => {
+          const rect = row.getBoundingClientRect();
+          return [row.dataset.index, rect.top, rect.height];
+        })]);
+      if (geometry !== previous || document.querySelector('.is-focused, .flap-slot.flipping')) stableSince = now;
+      previous = geometry;
+      if (now - stableSince >= 500) { clearTimeout(deadline); resolve(true); }
+      else requestAnimationFrame(sample);
+    }
+    requestAnimationFrame(sample);
+  })`, true);
 }
 
 async function traceStationaryAppend(win, index, expectedTotal, runIndex) {
@@ -539,7 +566,22 @@ function registerHandlers() {
   });
   ipcMain.handle('db:getSessionSubagents', () => { ipcReads.subagents++; return []; });
   ipcMain.handle('db:getSessionWorkflows', () => { ipcReads.workflows++; return []; });
-  ipcMain.handle('db:getSessionSummaries', () => { ipcReads.summaries++; return []; });
+  ipcMain.handle('db:getSessionSummaries', (event, id) => {
+    if (id === 'content-gesture-probe') {
+      setTimeout(() => replaceMessageText({ webContents: event.sender }, scrollingContentUuid, scrollingContentText), 200);
+      return [];
+    }
+    if (id === 'scroll-gesture-probe') {
+      // Start the live append only after the renderer has begun its gesture.
+      setTimeout(() => appendMessage({ webContents: event.sender }, scrollingAppendIndex), 250);
+      return [];
+    }
+    if (id === 'cold-open-layout-probe') {
+      event.sender.send('obelisk:session-updated', { sessionId });
+      return [];
+    }
+    ipcReads.summaries++; return [];
+  });
   ipcMain.handle('db:getMessageFullText', (_event, uuid) => uuid === focusMessageUuid ? fullTextSentinel : null);
   ipcMain.handle('db:getMemories', () => { globalReads.memories++; return []; });
   ipcMain.handle('db:getProjects', () => {
@@ -593,6 +635,8 @@ async function run() {
       preload: join(appRoot, 'out', 'preload', 'index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // This hidden fixture exercises foreground animation/frame behavior.
+      backgroundThrottling: false,
     },
   });
 
@@ -604,6 +648,11 @@ async function run() {
     `document.body.textContent.includes('Virtualized timeline integration')`,
     'the session list before cold open',
   );
+  // This suite asserts the full-motion flap transition; do not inherit a CI
+  // host's accessibility setting. Keep the emulation session through traces.
+  win.webContents.debugger.attach('1.3');
+  await win.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+  assert(!await win.webContents.executeJavaScript(`matchMedia('(prefers-reduced-motion: reduce)').matches`), 'the animation fixture runs with explicit full-motion preference');
   await win.webContents.executeJavaScript(`(() => {
     const probe = {
       maxOverlaps: 0,
@@ -645,22 +694,31 @@ async function run() {
       requestAnimationFrame(sample);
     }
     requestAnimationFrame(sample);
+    // Fire after the snapshot commits but while cold layout is still hidden.
+    // A fixed timer can fire before this lazily loaded view mounts on CI.
+    const coldObserver = new MutationObserver(() => {
+      const timeline = document.querySelector('.virtual-timeline');
+      if (!timeline || document.querySelector('.flap-number')?.getAttribute('aria-label') !== '${messageCount}') return;
+      coldObserver.disconnect();
+      window.__coldUpdateVisibility = getComputedStyle(timeline).visibility;
+      void window.obelisk.getSessionSummaries('cold-open-layout-probe');
+    });
+    coldObserver.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-label'] });
     window.location.hash = ${JSON.stringify(`/sessions/${sessionId}`)};
   })()`, true);
-  const coldOpenUpdateTimer = setTimeout(() => {
-    win.webContents.send('obelisk:session-updated', { sessionId });
-  }, 10);
   await waitFor(
     win.webContents,
     `document.querySelector('.flap-number')?.getAttribute('aria-label') === '${messageCount}'`,
     'the cold-start session snapshot',
   );
-  clearTimeout(coldOpenUpdateTimer);
   for (let attempt = 0; attempt < 100 && ipcReads.patches === 0; attempt++) {
     await delay(10);
   }
   const coldOpenPatchReads = ipcReads.patches;
-  await delay(250);
+  await waitFor(win.webContents, `(() => {
+    const timeline = document.querySelector('.virtual-timeline');
+    return timeline && getComputedStyle(timeline).visibility === 'visible' && !document.querySelector('.first-open-loading');
+  })()`, 'cold-open layout recovery');
   const coldOpenVisibility = await win.webContents.executeJavaScript(`(() => {
     const header = document.querySelector('.session-header');
     const timeline = document.querySelector('.virtual-timeline');
@@ -672,10 +730,12 @@ async function run() {
       visibleRows: [...document.querySelectorAll('.virtual-timeline-row')]
         .filter(row => getComputedStyle(row).visibility !== 'hidden').length,
       patchReads: ${coldOpenPatchReads},
+      notificationVisibility: window.__coldUpdateVisibility,
     };
   })()`, true);
   const coldOpenRecovered = coldOpenVisibility.total === messageCount
     && coldOpenVisibility.patchReads > 0
+    && coldOpenVisibility.notificationVisibility === 'hidden'
     && !coldOpenVisibility.loading
     && coldOpenVisibility.headerVisibility === 'visible'
     && coldOpenVisibility.timelineVisibility === 'visible'
@@ -976,6 +1036,7 @@ async function run() {
       },
     };
   })()`, true);
+  await waitForStationaryLayout(win);
   const stationaryAnchorBefore = await win.webContents.executeJavaScript(`(() => {
     const wrap = document.querySelector('.detail-wrap');
     const wrapRect = wrap.getBoundingClientRect();
@@ -1052,7 +1113,6 @@ async function run() {
     requestAnimationFrame(sample);
   })()`, true);
   currentSessionTitle = 'Live metadata title';
-  setTimeout(() => appendMessage(win, scrollingAppendIndex), 250);
   const scrollProbe = await win.webContents.executeJavaScript(`new Promise(resolve => {
     const wrap = document.querySelector('.detail-wrap');
     const totalBeforeGesture = Number(document.querySelector('.flap-number')?.getAttribute('aria-label'));
@@ -1060,6 +1120,16 @@ async function run() {
     let programmaticScrolls = 0;
     let postScrollEndWrites = 0;
     let phase = 'scrolling';
+    // Capture the short animation inside the renderer instead of racing it
+    // with a later IPC poll on a loaded CI host.
+    window.__postScrollFlapObserved = false;
+    const flapObserver = new MutationObserver(() => {
+      if (phase === 'settled' && document.querySelector('.flap-slot.flipping')) {
+        window.__postScrollFlapObserved = true;
+        flapObserver.disconnect();
+      }
+    });
+    flapObserver.observe(document.querySelector('.flap-number'), { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
     const blockAutomaticScrollEnd = event => event.stopImmediatePropagation();
     wrap.addEventListener('scrollend', blockAutomaticScrollEnd, true);
     wrap.scrollTo = (...args) => {
@@ -1074,6 +1144,7 @@ async function run() {
     let maxResidualMotion = 0;
     let residualExample = null;
     wrap.dispatchEvent(new WheelEvent('wheel', { deltaY: -70, bubbles: true }));
+    void window.obelisk.getSessionSummaries('scroll-gesture-probe');
     function sampleGeometry(now) {
       const wrapRect = wrap.getBoundingClientRect();
       const scrollTop = wrap.scrollTop;
@@ -1103,6 +1174,9 @@ async function run() {
     function frame(now) {
       gaps.push(now - previous);
       previous = now;
+      // Model a continuing physical gesture with wheel packets, rather than
+      // relying on a single packet's 450ms watchdog surviving CI frame gaps.
+      if (now - startedAt < 1200) wrap.dispatchEvent(new WheelEvent('wheel', { deltaY: -70, bubbles: true }));
       if (now - startedAt >= 400) wrap.scrollTop -= 70;
       sampleGeometry(now);
       if (now - startedAt < 1200) requestAnimationFrame(frame);
@@ -1143,6 +1217,8 @@ async function run() {
     }
     requestAnimationFrame(frame);
   })`, true);
+  assert(scrollProbe.totalBeforeGesture === messageCount + stationaryAppendRuns, 'the live append starts after the renderer gesture begins');
+  console.log(`SCROLL GESTURE: ${JSON.stringify(scrollProbe)}`);
   await waitFor(
     win.webContents,
     `document.querySelector('.flap-number')?.getAttribute('aria-label') === '${messageCount + stationaryAppendRuns + 1}'`,
@@ -1150,7 +1226,7 @@ async function run() {
   );
   await waitFor(
     win.webContents,
-    `document.querySelector('.flap-slot.flipping')`,
+    `window.__postScrollFlapObserved === true`,
     'post-scrollend flap animation',
   );
   await waitFor(
@@ -1248,7 +1324,8 @@ async function run() {
       restore: () => { window.marked.parse = original; },
     };
   })()`, true);
-  setTimeout(() => replaceMessageText(win, scrollProbe.anchor.uuid, updatedReaderText), 200);
+  scrollingContentUuid = scrollProbe.anchor.uuid;
+  scrollingContentText = updatedReaderText;
   const existingUpdateProbe = await win.webContents.executeJavaScript(`new Promise(resolve => {
     const wrap = document.querySelector('.detail-wrap');
     const targetUuid = ${JSON.stringify(scrollProbe.anchor.uuid)};
@@ -1266,8 +1343,10 @@ async function run() {
       return originalScrollTo(...args);
     };
     wrap.dispatchEvent(new WheelEvent('wheel', { deltaY: -40, bubbles: true }));
+    void window.obelisk.getSessionSummaries('content-gesture-probe');
     const startedAt = performance.now();
     function frame(now) {
+      if (now - startedAt < 700) wrap.dispatchEvent(new WheelEvent('wheel', { deltaY: -40, bubbles: true }));
       if (now - startedAt >= 250 && steps < 3) {
         wrap.scrollTop -= 40;
         steps++;
@@ -1330,6 +1409,7 @@ async function run() {
     `document.querySelector('[data-uuid=${JSON.stringify(scrollProbe.anchor.uuid)}]')?.textContent.includes(${JSON.stringify(updatedReaderText.slice(0, 40))})`,
     'visible message content update',
   );
+  await waitForStationaryLayout(win);
   const updatedReaderState = await win.webContents.executeJavaScript(`(() => {
     const wrap = document.querySelector('.detail-wrap');
     const anchorElement = document.querySelector(

@@ -3,6 +3,7 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import UpdatePanel from '../components/UpdatePanel.vue';
 
 defineOptions({ name: 'Settings' });
 
@@ -315,6 +316,10 @@ function fmtRelative(iso) {
           <div class="form-control version-text">
             Obelisk {{ version }}
           </div>
+        </div>
+        <div class="form-row">
+          <div class="form-label">Updates</div>
+          <div class="form-control"><UpdatePanel /></div>
         </div>
         <div class="form-row">
           <div class="form-label">Reset</div>

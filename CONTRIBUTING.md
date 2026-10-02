@@ -71,6 +71,35 @@ the test you added.
 
 ---
 
+## Node and Electron runtimes
+
+Use **Node 22** for repository verification, matching the current CI workflows.
+The CLI's supported runtime floor is **22.13.0**, as declared in
+`packages/cli/package.json`. This host Node runs npm, builds, typechecking, lint,
+and `npm test`.
+
+The desktop app runs on **Electron's embedded Node**; Electron 43 uses Node 24.
+Installing Node 22 on the build host does not make the app run on Node 22. See
+[ADR-0005](docs/adr/0005-app-electron-vite-ts-esm.md) for the architectural
+distinction and the historical Electron 33 / Node 20 context.
+
+Install both dependency sets with `npm ci` and `npm --prefix app ci`, then run
+the repository Node checks. Before running Electron suites, rebuild native
+modules for Electron:
+
+```bash
+cd app
+npx --no-install electron-builder install-app-deps
+npm run test:electron:all
+```
+
+If returning to host-Node tests that load native modules, restore host-Node
+dependencies first; an Electron ABI build is not interchangeable with a
+host-Node build. For packaging, electron-builder performs the Electron rebuild.
+When changing Electron or native dependencies, verify the actual packaged
+executable's `process.versions` and load its bundled native modules, rather than
+inferring the app runtime from the CI `node-version` setting.
+
 ## Renderer / Electron UI changes
 
 Proving the new element renders correctly is one third of the job. You also owe
@@ -89,7 +118,7 @@ interactions, or the full Electron suites.
   skips scroll compensation for already-measured rows when
   `scrollDirection === 'backward'`, so drift can be zero at rest and large while
   scrolling up. Test both.
-- Run `npm run test:electron:all` (all five suites), not only the suite you
+- Run `npm run test:electron:all` (all six suites), not only the suite you
   added.
 - **Do not add `loading="lazy"` to virtualized rows.** Rows already mount near
   the viewport; lazy only defers decode into the scroll itself.

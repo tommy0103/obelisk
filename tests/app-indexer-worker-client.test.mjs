@@ -31,7 +31,9 @@ test('worker build client resolves build results from a worker thread', async ()
           id: message.id,
           result: message.operation === 'readZcodeMessageText'
             ? 'complete ZCode text'
-            : { files: 1, reason: message.args.reason },
+            : message.operation === 'readHermesMessageText'
+              ? 'complete Hermes text'
+              : { files: 1, reason: message.args.reason },
         });
       });
     }
@@ -50,6 +52,9 @@ test('worker build client resolves build results from a worker thread', async ()
   const fullText = await client.readZcodeMessageText({ source: 'zcode', messageUuid: 'zcode:message' });
   assert.equal(fullText, 'complete ZCode text');
   assert.equal(instances[0].messages[1].operation, 'readZcodeMessageText');
+  const hermesText = await client.readHermesMessageText({ source: 'hermes', messageUuid: 'hermes:message' });
+  assert.equal(hermesText, 'complete Hermes text');
+  assert.equal(instances[0].messages[2].operation, 'readHermesMessageText');
 
   client.stop();
   assert.equal(instances[0].terminated, true);

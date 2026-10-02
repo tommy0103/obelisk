@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { hermesSessionId } from '../packages/core/src/providers/hermes.ts';
 import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
 import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
 import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
@@ -119,6 +120,50 @@ test('search falls back to safe tokenization for FTS-special input instead of th
   const rows = api.search('needle-reply', { limit: 5 });
 
   assert.deepEqual(rows.map(r => r.message.uuid), ['msg-text']);
+  db.close();
+});
+
+test('search broadens only an empty query when the OR fallback is explicitly enabled', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+
+  assert.deepEqual(api.search('needle absent', { limit: 10 }), []);
+  assert.deepEqual(
+    api.search('needle absent', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+  );
+  assert.deepEqual(
+    new Set(api.search('needle absent', { fallback: 'or', includeInactive: true, limit: 10 }).map(row => row.message.uuid)),
+    new Set(['msg-text', 'msg-inactive']),
+    'the relaxed retry preserves visibility filtering',
+  );
+  assert.deepEqual(
+    api.search('needle reply', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+    'a non-empty primary result is not broadened',
+  );
+  db.close();
+});
+
+test('OR fallback retains scope, source, time, cwd and limit filters', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+  const opts = { fallback: 'or', limit: 10 };
+  for (const scope of [
+    { sessionId: 'missing-session' }, { project: 'missing-project' },
+    { source: 'codex' }, { cwd: '/other/project' },
+    { after: '2026-06-11T00:00:00Z' }, { before: '2026-06-09T00:00:00Z' },
+  ]) {
+    assert.deepEqual(api.search('needle absent', { ...opts, ...scope }), [], JSON.stringify(scope));
+  }
+  const scoped = { ...opts, sessionId: 'sid-search', project: 'quiet-zero',
+    source: 'claude', cwd: '/tmp/quiet-zero',
+    after: '2026-06-10T10:00:00Z', before: '2026-06-10T10:03:00Z' };
+  assert.deepEqual(api.search('needle absent', scoped).map(r => r.message.uuid), ['msg-text']);
+  assert.equal(api.search('needle absent', { ...scoped, includeMeta: true }).length, 2);
+  assert.equal(api.search('needle absent', { ...scoped, includeMeta: true, limit: 1 }).length, 1);
+  assert.deepEqual(api.search('needle absent', { ...scoped, limit: 0 }), []);
+  assert.deepEqual(api.search('---', opts), []);
   db.close();
 });
 
@@ -601,6 +646,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawClaude = '8f39c2a1-7b45-4d83-a029-61e47f903bc2';
   const rawCopilot = '6b8a4d92-0f13-4c67-95ea-2d7419b03f86';
   const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
+  const rawHermes = '20260101_120000_aaaaaa';
   // Canonical ids in each provider's own shape: pi/omp/deepseek namespace by
   // project, kimi/codex prefix the native id, claude keeps the bare uuid.
   const piHeader = (cwd) => ({ type: 'session', id: rawPi, cwd });
@@ -612,6 +658,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalDeepseek = canonicalDeepseekTreeSessionId(rawDeepseek, deepseekProjectScope('/Users/me/ds'));
   const canonicalCopilot = copilotSessionId(rawCopilot, '/Users/me/copilot');
   const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
+  const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -625,6 +672,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(rawClaude, 'Claude session', '-Users-me-claude', '/Users/me/claude', '2026-09-18T04:00:00Z', '2026-09-18T05:00:00Z', null, 1, 'claude');
   insertSession.run(canonicalCopilot, 'Copilot session', '-Users-me-copilot', '/Users/me/copilot', '2026-09-18T03:00:00Z', '2026-09-18T04:00:00Z', null, 1, 'copilot');
   insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
+  insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -642,6 +690,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
     codex: [rawCodex, [canonicalCodex]],
     copilot: [rawCopilot, [canonicalCopilot]],
     deepseek: [rawDeepseek, [canonicalDeepseek]],
+    hermes: [rawHermes, [canonicalHermes]],
     kimi: [rawKimi, [canonicalKimi]],
     omp: [rawOmp, [canonicalOmp]],
     pi: [rawPi, [canonicalPiB, canonicalPiA]],
@@ -693,14 +742,15 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
 test('every provider embeds the native session id verbatim in its canonical id', () => {
   // Fragment resolution in sessions() depends on this: a native id is only
   // findable while it appears verbatim inside the canonical id. pi-family,
-  // deepseek, and copilot run the native id through encodeURIComponent,
-  // identity for the uuid-shaped ids every provider emits today; a future
-  // provider with URL-unsafe native ids must not break the invariant silently.
+  // deepseek, copilot, and hermes encode native ids with encodeURIComponent,
+  // which preserves this UUID-shaped fixture and Hermes's timestamp-shaped
+  // lookup fixture above. URL-unsafe native ids need explicit coverage.
   const native = '99999999-9999-4999-8999-999999999999';
   const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
   const canonical = {
     // claude has no namespacing step: the canonical id is the native uuid.
     claude: native,
+    hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
     codex: codexDbId(native),
     kimi: kimiSessionId(native),
     pi: piFamilySessionId(piHeader, 'pi'),

@@ -106,3 +106,84 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     mock.reset();
   }
 });
+
+// A profile can appear after watcher startup. The tree carries Hermes's exact database names,
+// so its files reach the indexer without a synchronous enumeration on Electron's main thread.
+test('Hermes profile stores reach the indexer through the declared tree file names', async () => {
+  let captured = null;
+  const ctx = mock.module(WATCHER_URL, {
+    namedExports: {
+      createAdaptiveWatcher: (opts) => {
+        captured = opts;
+        return { stop() {}, ready: Promise.resolve() };
+      },
+    },
+  });
+  try {
+    const { createHermesProvider } = await import('../packages/core/src/providers/hermes.ts');
+    const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?watcher-hermes=${Date.now()}`);
+    const home = mkdtempSync(join(tmpdir(), 'obelisk-hermes-wf-'));
+    const profileStore = join(home, 'profiles', 'coder', 'state.db');
+    mkdirSync(join(home, 'profiles', 'coder'), { recursive: true });
+    writeFileSync(profileStore, 'sqlite fixture');
+    writeFileSync(`${profileStore}-wal`, '');
+
+    const provider = createHermesProvider({
+      rootDir: home,
+      openStore: () => { throw new Error('the watcher filter must not open a store'); },
+    });
+    const targets = provider.watchTargets(home);
+    assert.deepEqual(targets.find(target => target.kind === 'tree'), {
+      kind: 'tree', path: join(home, 'profiles'), fileNames: ['state.db', 'state.db-wal'],
+    });
+    assert.equal(targets.some(target => target.kind === 'file' && target.path === profileStore), false);
+
+    const timers = manualTimers();
+    const builds = [];
+    const service = createIndexerService({
+      buildIndex: async (args) => builds.push(args),
+      watchTargets: targets,
+      writeHeartbeat: () => {},
+      timers,
+      stabilityMs: 0,
+    });
+    service.start({ buildOnStart: false });
+
+    // The tree forwards both SQLite files and promotes them to the bounded hot poller.
+    captured.onInvalidate({ type: 'paths', paths: [`${profileStore}-wal`] });
+    timers.flush();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      builds.at(-1).changedPaths,
+      [`${profileStore}-wal`],
+      'a profile store update reaches the indexer',
+    );
+    assert.equal(captured.shouldPromote(profileStore), true);
+    assert.equal(captured.shouldPromote(`${profileStore}-wal`), true);
+    assert.equal(captured.shouldPromote(`${profileStore}-shm`), false);
+
+    // A profile created later is covered without rebuilding the target list.
+    const lateStore = join(home, 'profiles', 'late', 'state.db');
+    mkdirSync(join(home, 'profiles', 'late'), { recursive: true });
+    writeFileSync(lateStore, 'sqlite fixture');
+    captured.onInvalidate({ type: 'paths', paths: [lateStore] });
+    timers.flush();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      builds.flatMap((build) => build.changedPaths ?? []).includes(lateStore),
+      true,
+      'a newly created profile database reaches the indexer immediately',
+    );
+    const stray = join(home, 'profiles', 'late', 'other.db');
+    writeFileSync(stray, 'not a provider store');
+    assert.equal(captured.shouldPromote(stray), false, 'other databases stay out of the hot overlay');
+    captured.onInvalidate({ type: 'paths', paths: [stray] });
+    await new Promise((resolve) => setImmediate(resolve));
+    timers.flush();
+    assert.equal(builds.flatMap(build => build.changedPaths ?? []).includes(stray), false);
+    service.stop();
+  } finally {
+    ctx.restore();
+    mock.reset();
+  }
+});

@@ -11,6 +11,7 @@ import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type { SqliteDb, SqliteRow, SqliteStatement } from './sqlite-types.ts';
+import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
 
 type DbRow = SqliteRow;
 
@@ -29,6 +30,7 @@ interface QueryOptions extends Record<string, any> {
   source?: string;
   includeMeta?: boolean;
   includeInactive?: boolean;
+  fallback?: 'or';
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
@@ -261,12 +263,12 @@ function assertEnglishMemoryText(value: unknown, label: string): void {
   }
 }
 
-function buildSafeFtsQuery(text: unknown): string {
+function buildSafeFtsQuery(text: unknown, separator = ' '): string {
   const tokens = String(text || '').match(/[\p{Letter}\p{Number}]+/gu) || [];
   return tokens
     .slice(0, 12)
     .map(token => `"${token}"`)
-    .join(' ');
+    .join(separator);
 }
 
 function createQueryApi(
@@ -274,6 +276,7 @@ function createQueryApi(
   {
     providerRegistry = createBuiltinProviderRegistry({}, {
       openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+      openHermesStore: openHermesStoreWithNodeSqlite,
     }),
     invokingSessionId = null,
   }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
@@ -303,6 +306,7 @@ function createQueryApi(
       source,
       includeMeta = false,
       includeInactive = false,
+      fallback,
     } = opts;
     assertNonNegativeLimit(limit, 'search() limit');
     let where = 'WHERE mf.text MATCH ?';
@@ -333,6 +337,10 @@ function createQueryApi(
     } catch {
       const safe = buildSafeFtsQuery(text);
       rows = safe ? runMatch(safe) : [];
+    }
+    if (rows.length === 0 && fallback === 'or') {
+      const broad = buildSafeFtsQuery(text, ' OR ');
+      rows = broad ? runMatch(broad) : [];
     }
     const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
     const contextWhere = `
@@ -533,7 +541,7 @@ function createQueryApi(
        LEFT JOIN sessions s ON s.id=tc.session_id
        LEFT JOIN messages m ON m.uuid=tc.message_uuid
        WHERE ${where}
-       ORDER BY m.timestamp
+       ORDER BY m.timestamp, m.uuid, tc.rowid
        LIMIT ?`
     ).all(...params).map((r: DbRow) => ({
       toolCall: { id: r.id, message_uuid: r.message_uuid, name: r.name, input_json: r.input_json },

@@ -93,7 +93,7 @@ test('default watcher reports deep new files in freshly created directories', as
     assert.ok(hit.changedPaths.every((p) => p.startsWith(root) || p.startsWith(realRoot)),
       'changed paths are absolute paths under the watched root');
   } finally {
-    service.stop();
+    await service.stop();
     await service.idle();
   }
 });
@@ -146,7 +146,7 @@ test('default watcher filters non-transcript files', async () => {
       .some((b) => (b.changedPaths ?? []).some((p) => p.endsWith('noise.txt')));
     assert.equal(sawNoiseLate, false, 'a .txt write never schedules a build, even at CI event latency');
   } finally {
-    service.stop();
+    await service.stop();
     await service.idle();
   }
 });
@@ -194,7 +194,7 @@ test('a subscription that errors is re-attached by the watch retry loop', async 
     timers.flush();
     assert.ok(await waitFor(() => subscriptions.length === 2), 'the retry loop re-attaches the root');
   } finally {
-    service.stop();
+    await service.stop();
   }
 });
 
@@ -224,7 +224,7 @@ test('silently missed watcher events are reconciled by a periodic full-inventory
     assert.deepEqual(calls, [{ reason: 'reconcile', changedPaths: undefined }],
       'the reconcile build is a full-inventory build, not a changed-paths build');
   } finally {
-    service.stop();
+    await service.stop();
   }
 });
 
@@ -276,7 +276,7 @@ test('build watchHints are promoted into the hot set and polled for later append
     }
     assert.ok(appended, 'the append — possibly invisible to the tree backend — is detected by polling');
   } finally {
-    service.stop();
+    await service.stop();
     await service.idle();
   }
 });
@@ -345,7 +345,7 @@ test('an evicted hot file is re-seeded by a later reconcile hint', async () => {
     }
     assert.ok(reseeded, 'a reconcile hint re-seeds the evicted file into the hot set');
   } finally {
-    service.stop();
+    await service.stop();
     await service.idle();
   }
 });

@@ -15,6 +15,7 @@ const suites = [
   'electron-session-virtualization.mjs',
   'electron-session-reader-state.mjs',
   'electron-file-references.mjs',
+  'electron-updates.mjs',
 ]
 
 const failed = []

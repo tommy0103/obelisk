@@ -25,6 +25,10 @@ import { formatProjectLabel } from './utils.js';
 import { buildSidebarProjects } from './sidebar-projects.mjs';
 import { resolveGlobalShortcut } from './keyboard-shortcuts.mjs';
 import { sourceLabel } from './source-catalog.mjs';
+import UpdateNotice from './components/UpdateNotice.vue';
+import UpdateNotes from './components/UpdateNotes.vue';
+import { connectUpdates } from './updates.js';
+let disconnectUpdates = null;
 
 const router = useRouter();
 const route = useRoute();
@@ -184,6 +188,7 @@ function handleToggleSearchMsgs() {
 }
 
 function handleGlobalKeydown(event) {
+  if (document.querySelector('dialog[open]')) return;
   const tagName = event.target?.tagName;
   const command = resolveGlobalShortcut(event, {
     isTextInput: tagName === 'INPUT' || tagName === 'TEXTAREA' || event.target?.isContentEditable,
@@ -210,12 +215,14 @@ function handleGlobalKeydown(event) {
 }
 
 onMounted(() => {
+  disconnectUpdates = connectUpdates();
   window.addEventListener('keydown', handleGlobalKeydown);
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates = window.obelisk?.onIndexUpdated?.(() => loadSourceDots()) ?? null;
   stopWindowState = window.obelisk?.onWindowState?.((s) => { maximized.value = !!s?.maximized; }) ?? null;
 });
 onUnmounted(() => {
+  disconnectUpdates?.();
   window.removeEventListener('keydown', handleGlobalKeydown);
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates?.();
@@ -268,6 +275,7 @@ provide('recapGenerateOpen', recapGenerateOpen);
 </script>
 
 <template>
+  <UpdateNotes />
   <router-view v-if="isExportRoute" />
   <div class="app" v-else>
     <div class="titlebar" :class="{ mac: platform === 'darwin', 'has-controls': platform === 'linux' }" @dblclick="onTitlebarDbClick">
@@ -474,6 +482,7 @@ provide('recapGenerateOpen', recapGenerateOpen);
           </div>
         </div>
 
+        <UpdateNotice />
         <div class="sidebar-section sidebar-bottom">
           <button
             class="sidebar-item"

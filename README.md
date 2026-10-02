@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Kimi Code, OMP, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
+Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Hermes Agent, Kimi Code, OMP, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
 
 </div>
 
@@ -25,7 +25,7 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 **App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
 
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code Stable and Insiders user-data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
+Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code Stable and Insiders user-data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Hermes Agent sessions from `~/.hermes/state.db` (or `$HERMES_HOME/state.db`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
 
 ## Multi-provider support
 
@@ -50,12 +50,13 @@ ZCode stores its transcripts in one SQLite database (`~/.zcode/cli/db/db.sqlite`
 | OMP | Branch, leaf, and compaction state attests inactive history |
 | ZCode | Rewind retention and compaction attest inactive history |
 | Kimi Code | Undo/clear can attest supersession; preservation is a follow-up |
+| Hermes Agent | Superseded history is not split: compaction-archived and rewound rows are both stored as `inactive` |
 | Claude Code | The source does not attest rewind or current-leaf state |
 | Codex | Sessions have no branching semantics |
 
-Because Pi and OMP explicit session IDs are project-local, Obelisk combines each provider's header ID with a deterministic hash of the normalized header `cwd`; this keeps identities stable across file moves while allowing two projects to use the same custom ID. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
+Because Pi and OMP explicit session IDs are project-local, Obelisk combines each provider's header ID with a deterministic hash of the normalized header `cwd`; this keeps identities stable across file moves while allowing two projects to use the same custom ID. Hermes Agent sessions are scoped by the store they were read from as well as the profile name, so a copied or migrated `state.db` cannot collide with the original. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
 
-For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite` plus its WAL sidecar. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
+For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.hermes/state.db` with `~/.hermes/profiles`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite` plus its WAL sidecar. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
 
 Pi chooses its session directory in this order: `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in settings, then the default under `~/.pi/agent/sessions`. Obelisk automatically follows absolute or `~`-prefixed environment/global settings and the project setting for Obelisk's launch cwd; a relative project setting is resolved against that cwd. CLI-only roots, relative environment/global settings, and project settings from another launch cwd cannot be inferred safely, so select the resolved directory in Obelisk **Settings** instead of letting Obelisk guess.
 
@@ -170,10 +171,44 @@ Prebuilt releases are currently available for macOS from
 [Releases](https://github.com/tommy0103/obelisk/releases). The source app can be
 run locally on macOS, Windows, and Linux.
 
+### Release the macOS app
+
+The **Release macOS App** workflow builds signed and notarized DMG/ZIP packages
+for Apple Silicon (`arm64`) and Intel (`x64`). It runs the repository checks and
+all five Electron suites, then verifies signatures, notarization tickets and
+packaged native modules in the apps extracted from both distribution formats.
+All four packages are uploaded to a GitHub Release draft once both builds pass.
+
+The build host uses Node 22; the app runs on Electron 43's embedded Node 24.
+Artifact verification reports the embedded Electron, Node and ABI versions.
+See [the runtime explanation](docs/adr/0005-app-electron-vite-ts-esm.md) and
+[development verification guidance](CONTRIBUTING.md#node-and-electron-runtimes).
+
+Configure these repository Actions secrets:
+
+| Secret | Value |
+| --- | --- |
+| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12`, including its private key |
+| `MAC_CSC_KEY_PASSWORD` | The `.p12` export password |
+| `APPLE_ID` | Apple Account email with access to the signing team |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
+| `APPLE_TEAM_ID` | The signing team's 10-character Team ID |
+
+Update `app/package.json` and `app/package-lock.json` to the same version,
+merge the release changes, then push a matching tag such as `v0.2.4`.
+The workflow rejects a tag that differs from the app version. To retry an
+existing tag, use **Actions → Release macOS App → Run workflow** and enter the
+tag. Retries replace assets in the draft; published releases require a new tag.
+The first signed release needs a new version tag containing this workflow and
+the tracked icon assets; the existing `v0.2.3` tag predates those assets.
+Review the draft's notes and downloads before publishing it. This workflow
+releases the desktop app; CLI npm and Windows/Linux publishing are separate.
+
 ### Run locally
 
-Install [Node.js 22](https://nodejs.org/) and npm, then run the app from its own
-package directory:
+Install [Node.js 22](https://nodejs.org/) (22.13.0 or newer) and npm for the
+build tools, then run the app from its own package directory. The app itself
+uses Electron's bundled Node 24, including during `npm run dev`:
 
 ```bash
 git clone https://github.com/tommy0103/obelisk.git
@@ -206,7 +241,7 @@ run `npm ci` again.
 
 | Layer | Source | What's captured |
 |-------|--------|----------------|
-| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Copilot Chronicle plus workspace `transcripts/*.jsonl`; Kimi session directories; Pi recursive `*.jsonl`; DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]`; ZCode `session` rows in `~/.zcode/cli/db/db.sqlite` | Title, project, timestamps, git branch, source |
+| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Copilot Chronicle plus workspace `transcripts/*.jsonl`; Hermes `state.db`; Kimi session directories; Pi recursive `*.jsonl`; DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]`; ZCode `session` rows in `~/.zcode/cli/db/db.sqlite` | Title, project, timestamps, git branch, source |
 | **Messages** | user + assistant turns | Full text, model, token usage, parent chain |
 | **Tool calls** | every tool invocation | Tool name, input, file paths |
 | **Subagents** | Claude `subagents/agent-<id>.jsonl`; Codex child threads; DeepSeek Harness child sessions (folded into the root session); ZCode `task_type='subagent_child'` sessions | Agent type, description, full conversation |
@@ -307,8 +342,9 @@ means the daemon owns writes, so CLI invocations remain read-only; a separate SQ
 writer lease prevents cross-process writes from overlapping. The
 `__app_last_successful_build__` marker records index freshness, not ownership.
 
-The CLI has zero runtime npm dependencies and uses Node 22's built-in
-`node:sqlite` with FTS5. The formal skill contains instructions and references,
+The CLI has zero runtime npm dependencies, requires Node >=22.13.0, and uses
+built-in `node:sqlite` with FTS5. The desktop app uses Electron's embedded Node
+24 and `better-sqlite3`. The formal skill contains instructions and references,
 not a second executable runtime.
 
 20K lines of scattered JSONL → something the agent can search() and sql() against in milliseconds.

@@ -14,6 +14,8 @@ import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
 import { createDeferredQuit } from './quit-teardown.ts';
+import { createUpdateLifecycle } from './update-lifecycle.ts';
+import { createUpdateService } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
@@ -220,6 +222,7 @@ function openDb(
 }
 
 function runAppDbWrite(work: () => void): boolean {
+  updateLifecycle.assertWritable();
   if (!db) return false;
   const lease = acquireAppWriterLease(getRuntimePaths().dbPath, 250);
   if (!lease) {
@@ -284,6 +287,7 @@ function appendWhere(sql, params, clause) {
 }
 
 function startIndexerService({ buildOnStart = false } = {}) {
+  if (updateLifecycle.isBlocked()) return null;
   if (indexerService) return indexerService;
   const paths = getRuntimePaths();
   if (latestSettingsError !== null) return null;
@@ -324,12 +328,13 @@ function startIndexerService({ buildOnStart = false } = {}) {
   return service;
 }
 
-function startBackgroundResources({ runStartupBuild = false } = {}) {
+function startBackgroundResources({ runStartupBuild = false, watchSources = true } = {}) {
+  if (updateLifecycle.isBlocked()) return;
   if (!indexerWorker) indexerWorker = createWorkerBuildIndex();
   const paths = getRuntimePaths();
   if (latestSettingsError === null) migrateLegacyDbIfNeeded(paths);
   openDb(paths.dbPath);
-  if (!indexerService && latestSettingsError === null) {
+  if (watchSources && !indexerService && latestSettingsError === null) {
     const service = startIndexerService({ buildOnStart: false });
     if (runStartupBuild) service?.runBuildNow('startup');
   }
@@ -339,12 +344,20 @@ function startBackgroundResources({ runStartupBuild = false } = {}) {
 async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
   const service = indexerService;
   if (!service) return;
-  service.stop();
-  if (waitForIdle && typeof service.idle === 'function') await service.idle();
+  const closed = service.stop();
+  const results = await Promise.allSettled([closed, waitForIdle && typeof service.idle === 'function' ? service.idle() : undefined]);
   if (indexerService === service) indexerService = null;
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
-async function stopBackgroundResources({ stopWorker = false } = {}) {
+let resourcesStop: Promise<void> | null = null;
+async function stopBackgroundResources(options: { stopWorker?: boolean } = {}) {
+  if (resourcesStop) return resourcesStop;
+  resourcesStop = stopBackgroundResourcesNow(options);
+  try { await resourcesStop; } finally { resourcesStop = null; }
+}
+async function stopBackgroundResourcesNow({ stopWorker = false } = {}) {
   // Close the ~/.obelisk watcher before the first await. close() flips its
   // `closed` flag synchronously and every parcel event callback guards on it,
   // so once this function yields, no teardown-time FSEvents delivery can
@@ -357,15 +370,22 @@ async function stopBackgroundResources({ stopWorker = false } = {}) {
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
     pendingObeliskChanges.clear();
-    if (typeof watcher.close === 'function') watcherClosed = Promise.resolve(watcher.close()).catch(() => {});
+    if (typeof watcher.close === 'function') {
+      watcherClosed = Promise.resolve(watcher.close());
+      // Attach immediately so a rejection during service.idle() is observed.
+      void watcherClosed.catch(() => {});
+    }
   }
-  await stopIndexerServiceAndWait();
+  const results = await Promise.allSettled([stopIndexerServiceAndWait(), watcherClosed]);
   if (stopWorker && indexerWorker) {
-    indexerWorker.stop();
-    indexerWorker = null;
+    const worker = indexerWorker;
+    const termination = await Promise.allSettled([Promise.resolve(worker.stop())]);
+    results.push(...termination);
+    if (indexerWorker === worker) indexerWorker = null;
   }
-  if (watcherClosed) await watcherClosed;
   closeDb();
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
 function safeProtocol(url: string): string {
@@ -503,9 +523,34 @@ function onObeliskChange(filePath) {
   }
 }
 
+let appQuitRequested = false;
+const updateLifecycle = createUpdateLifecycle({
+  stop: () => stopBackgroundResources({ stopWorker: true }),
+  resume: () => { if (!appQuitRequested) startBackgroundResources({ watchSources: loadPersistedSettings().autoRefresh !== false }); },
+});
+const updater = createUpdateService({
+  enabled: app.isPackaged === true && process.platform === 'darwin',
+  version: app.getVersion(),
+  createBackend: async receive => {
+    const { createMacUpdateBackend } = await import('./update-backends.ts');
+    return createMacUpdateBackend(receive);
+  },
+  prepare: updateLifecycle.prepare,
+  recover: updateLifecycle.recover,
+  publish: state => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send('obelisk:update-state', state);
+    }
+  },
+});
+ipcMain.handle('updates:getState', () => updater.getState());
+ipcMain.handle('updates:check', () => updater.check());
+ipcMain.handle('updates:install', () => updater.install());
+
 app.whenReady().then(() => {
   startBackgroundResources({ runStartupBuild: true });
   createWindow();
+  void updater.check();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -520,13 +565,19 @@ app.whenReady().then(() => {
 // frame to catch it, and napi_throw fatals the process (#187). The stop is
 // not cached: a macOS pause (window-all-closed) can be followed by activate →
 // restart, and a later quit must stop the restarted singletons.
-app.on('before-quit', createDeferredQuit({
+const deferOrdinaryQuit = createDeferredQuit({
   quit: () => app.quit(),
   stop: () => stopBackgroundResources({ stopWorker: true }),
-}));
+});
+app.on('before-quit', event => {
+  appQuitRequested = true;
+  if (updateLifecycle.isPrepared()) return;
+  updater.stop();
+  deferOrdinaryQuit(event);
+});
 
 app.on('window-all-closed', () => {
-  void stopBackgroundResources({ stopWorker: true });
+  if (!updateLifecycle.isBlocked()) void stopBackgroundResources({ stopWorker: true }).catch(error => console.warn('Obelisk cleanup failed:', error));
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -547,12 +598,16 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
 
 function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   if (!db) return [];
+  // Insertion order is the provider's source order, and the assembled session detail keeps a
+  // message's calls the way they arrive here: `tool_calls` carries a `(session_id, name)` index, so
+  // an explicit order is what stops the planner from returning them sorted by tool name (ADR-0007).
   return db.prepare(`
     SELECT tc.* FROM messages m
     CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
     WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
       AND COALESCE(m.visibility, 'visible') = 'visible'
       AND tc.session_id = ?
+    ORDER BY tc.rowid
   `).all(sessionId, sessionId) as SessionToolCallRow[];
 }
 
@@ -693,10 +748,12 @@ ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
 
 ipcMain.handle('db:getSubagentToolCalls', (_, agentId) => {
   if (!db) return [];
+  // Same as querySessionToolCalls: insertion order, not the `(session_id, name)` index order.
   return db.prepare(`
     SELECT tc.* FROM tool_calls tc
     JOIN messages m ON m.uuid = tc.message_uuid
     WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY tc.rowid
   `).all(agentId);
 });
 
@@ -742,11 +799,12 @@ ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
     subagent,
     workflowAgent,
   };
-  // The ZCode source is SQLite, so open/read it in the existing indexer
-  // worker rather than blocking Electron's main thread on a custom root.
-  if (lookup.source === 'zcode') {
+  // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
+  if (lookup.source === 'zcode' || lookup.source === 'hermes') {
     try {
-      const messageText = await indexerWorker?.readZcodeMessageText(lookup);
+      const messageText = lookup.source === 'zcode'
+        ? await indexerWorker?.readZcodeMessageText(lookup)
+        : await indexerWorker?.readHermesMessageText(lookup);
       return messageText ?? msg.text ?? null;
     } catch {
       return msg.text ?? null;
@@ -1067,7 +1125,7 @@ ipcMain.handle('settings:get', () => {
   };
 });
 
-ipcMain.handle('settings:set', async (_, key, value) => {
+ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(async () => {
   const persisted = loadPersistedSettings();
   const providerRootChanged = setPersistedSetting(persisted, key, value);
   savePersistedSettings(persisted);
@@ -1096,7 +1154,7 @@ ipcMain.handle('settings:set', async (_, key, value) => {
     notifyIndexUpdated({ inventoryIssues: [] });
   }
   return true;
-});
+}));
 
 ipcMain.handle('settings:browseFolder', async (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -1113,7 +1171,7 @@ ipcMain.handle('settings:revealPath', (_, p) => {
   if (fs.existsSync(p)) shell.showItemInFolder(p);
 });
 
-ipcMain.handle('settings:rebuildIndex', async () => {
+ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () => {
   if (!indexerWorker) return null;
   const persisted = loadPersistedSettings();
   if (latestSettingsError !== null) throw new Error(latestSettingsError);
@@ -1203,4 +1261,4 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       }
     }
   }
-});
+}));

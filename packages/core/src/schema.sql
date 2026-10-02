@@ -74,6 +74,8 @@ CREATE INDEX IF NOT EXISTS idx_tc_message ON tool_calls(message_uuid);
 CREATE INDEX IF NOT EXISTS idx_tc_file ON tool_calls(file_path);
 CREATE INDEX IF NOT EXISTS idx_tr_session ON tool_results(session_id);
 CREATE INDEX IF NOT EXISTS idx_tr_message ON tool_results(message_uuid);
+CREATE INDEX IF NOT EXISTS idx_tr_failure_session ON tool_results(session_id)
+  WHERE is_error = 1 OR content LIKE 'Exit code %';
 CREATE INDEX IF NOT EXISTS idx_sa_session ON subagents(session_id);
 CREATE INDEX IF NOT EXISTS idx_wf_session ON workflows(session_id);
 CREATE INDEX IF NOT EXISTS idx_wa_run ON workflow_agents(run_id);

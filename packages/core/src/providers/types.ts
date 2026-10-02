@@ -306,6 +306,8 @@ export interface RawRecord {
 export interface WatchTarget {
   readonly kind: 'tree' | 'file';
   readonly path: string;
+  /** Exact descendant basenames that the app should forward from this tree, beyond JSON transcripts. */
+  readonly fileNames?: readonly string[];
 }
 
 /** Complete adapter interface used by every indexing and presentation caller. */

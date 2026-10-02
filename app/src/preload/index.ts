@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import type { UpdateState } from '../shared/update-types.ts';
 import type {
   SessionPatch,
   SessionPatchCursor,
@@ -11,6 +12,14 @@ import type {
 
 contextBridge.exposeInMainWorld('obelisk', {
   platform: process.platform,
+  getUpdateState: (): Promise<UpdateState> => ipcRenderer.invoke('updates:getState'),
+  checkForUpdates: (): Promise<UpdateState> => ipcRenderer.invoke('updates:check'),
+  installUpdate: (): Promise<void> => ipcRenderer.invoke('updates:install'),
+  onUpdateState: (callback: (state: UpdateState) => void) => {
+    const listener = (_: IpcRendererEvent, state: UpdateState) => callback(state);
+    ipcRenderer.on('obelisk:update-state', listener);
+    return () => ipcRenderer.removeListener('obelisk:update-state', listener);
+  },
   getSessions: (opts?: unknown) => ipcRenderer.invoke('db:getSessions', opts),
   getSessionMessages: (id: string) => ipcRenderer.invoke('db:getSessionMessages', id),
   getSessionToolCalls: (id: string) => ipcRenderer.invoke('db:getSessionToolCalls', id),
