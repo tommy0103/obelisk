@@ -103,7 +103,7 @@ Full-text search across all indexed message text using FTS5.
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, `"omp"`, `"pi"`, or `"zcode"` |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"omp"`, `"pi"`, or `"zcode"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
 | `opts.fallback` | `'or'` | On zero hits only, retry safe tokens joined by OR |
@@ -256,11 +256,18 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, `"omp"`, `"pi"`, or `"zcode"`; omit for all |
-| `opts.sessionId` | `string` | Exact session ID |
-| `opts.sessions` | `string[]` | Restrict to session IDs |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"omp"`, `"pi"`, or `"zcode"`; omit for all |
+| `opts.sessionId` | `string` | Canonical session ID; a non-exact ref resolves as a literal fragment, capped at the 10 newest matches |
+| `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 
 Returns `Array<session_row>`.
+Only `sessions()` resolves fragments; every other helper matches `sessionId`
+exactly. Fragments match literally, so `%` and `_` in them are not SQL
+wildcards, and expand to at most the 10 newest containing sessions within the
+requested project/source/time/branch filters; entries
+from `sessionId` and `sessions` union. A raw native id normally resolves to
+exactly one session; several rows mean the id is not unique (for example a
+copied session file), so narrow with `project` or `source`.
 `message_count` describes the visible canonical transcript; inactive and hidden
 records do not increase it. The invoking session row carries
 `is_invoking: true` (see Invocation Identity); other rows omit the field.

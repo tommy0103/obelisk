@@ -7,6 +7,14 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { hermesSessionId } from '../packages/core/src/providers/hermes.ts';
+import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
+import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
+import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
+import { codexDbId } from '../packages/core/src/parsing.ts';
+import { namespacedSessionId as kimiSessionId } from '../packages/core/src/providers/kimi.ts';
+import { copilotSessionId } from '../packages/core/src/providers/copilot.ts';
+import { canonicalSessionId as zcodeSessionId } from '../packages/core/src/providers/zcode.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -627,6 +635,164 @@ test('overview returns a compact current-project map with bounded sessions', () 
   db.close();
 });
 
+test('sessions resolves raw provider native ids to canonical ids', () => {
+  const db = memoryDb();
+  const rawPi = '11111111-2222-4333-8444-555555555551';
+  const rawOmp = '22222222-2222-4333-8444-555555555552';
+  const rawKimi = '33333333-3333-4333-8444-555555555553';
+  const rawCodex = '44444444-4444-4333-8444-555555555554';
+  const rawDeepseek = '55555555-5555-4333-8444-555555555555';
+  // Shape-compatible lookup fixtures, not end-to-end provider ingestion fixtures.
+  const rawClaude = '8f39c2a1-7b45-4d83-a029-61e47f903bc2';
+  const rawCopilot = '6b8a4d92-0f13-4c67-95ea-2d7419b03f86';
+  const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
+  const rawHermes = '20260101_120000_aaaaaa';
+  // Canonical ids in each provider's own shape: pi/omp/deepseek namespace by
+  // project, kimi/codex prefix the native id, claude keeps the bare uuid.
+  const piHeader = (cwd) => ({ type: 'session', id: rawPi, cwd });
+  const canonicalPiA = piFamilySessionId(piHeader('/Users/me/a'), 'pi');
+  const canonicalPiB = piFamilySessionId(piHeader('/Users/me/b'), 'pi');
+  const canonicalOmp = piFamilySessionId({ type: 'session', id: rawOmp, cwd: '/Users/me/omp' }, 'omp');
+  const canonicalKimi = kimiSessionId(rawKimi);
+  const canonicalCodex = codexDbId(rawCodex);
+  const canonicalDeepseek = canonicalDeepseekTreeSessionId(rawDeepseek, deepseekProjectScope('/Users/me/ds'));
+  const canonicalCopilot = copilotSessionId(rawCopilot, '/Users/me/copilot');
+  const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
+  const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertSession.run(canonicalPiA, 'Pi session in project A', '-Users-me-a', '/Users/me/a', '2026-09-18T10:00:00Z', '2026-09-18T11:00:00Z', null, 7, 'pi');
+  insertSession.run(canonicalPiB, 'Same raw uuid in project B', '-Users-me-b', '/Users/me/b', '2026-09-18T09:00:00Z', '2026-09-18T12:00:00Z', null, 3, 'pi');
+  insertSession.run(canonicalOmp, 'Omp session', '-Users-me-omp', '/Users/me/omp', '2026-09-18T08:00:00Z', '2026-09-18T09:00:00Z', null, 2, 'omp');
+  insertSession.run(canonicalKimi, 'Kimi session', '-Users-me-kimi', '/Users/me/kimi', '2026-09-18T07:00:00Z', '2026-09-18T08:00:00Z', null, 4, 'kimi');
+  insertSession.run(canonicalCodex, 'Codex session', '-Users-me-codex', '/Users/me/codex', '2026-09-18T06:00:00Z', '2026-09-18T07:00:00Z', null, 5, 'codex');
+  insertSession.run(canonicalDeepseek, 'Deepseek session', '-Users-me-ds', '/Users/me/ds', '2026-09-18T05:00:00Z', '2026-09-18T06:00:00Z', null, 6, 'deepseek');
+  insertSession.run(rawClaude, 'Claude session', '-Users-me-claude', '/Users/me/claude', '2026-09-18T04:00:00Z', '2026-09-18T05:00:00Z', null, 1, 'claude');
+  insertSession.run(canonicalCopilot, 'Copilot session', '-Users-me-copilot', '/Users/me/copilot', '2026-09-18T03:00:00Z', '2026-09-18T04:00:00Z', null, 1, 'copilot');
+  insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
+  insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
+    VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
+  `);
+  insertMessage.run('mu-1', canonicalPiA, '2026-09-18T10:01:00Z');
+  db.prepare(`
+    INSERT INTO summaries (id, session_id, timestamp, source, content, visibility)
+    VALUES ('sum-1', ?, '2026-09-18T10:02:00Z', 'summary', 'summary text', 'visible')
+  `).run(canonicalPiA);
+  const api = createQueryApi(db);
+
+  // Every registered provider has an exercised native-ID lookup case.
+  const lookups = {
+    claude: [rawClaude, [rawClaude]],
+    codex: [rawCodex, [canonicalCodex]],
+    copilot: [rawCopilot, [canonicalCopilot]],
+    deepseek: [rawDeepseek, [canonicalDeepseek]],
+    hermes: [rawHermes, [canonicalHermes]],
+    kimi: [rawKimi, [canonicalKimi]],
+    omp: [rawOmp, [canonicalOmp]],
+    pi: [rawPi, [canonicalPiB, canonicalPiA]],
+    zcode: [rawZcode, [canonicalZcode]],
+  };
+  assert.deepEqual(Object.keys(lookups).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());
+  for (const [source, [native, expected]] of Object.entries(lookups)) {
+    assert.deepEqual(api.sessions({ sessionId: native }).map(row => row.id), expected, `${source} native-ID lookup`);
+  }
+
+  // The same uuid scoped to two projects returns every containing row, each
+  // labeled with project_path/started_at; other filters narrow as usual.
+  assert.deepEqual(
+    api.sessions({ sessionId: rawPi }).map(row => [row.id, row.project_path]),
+    [[canonicalPiB, '/Users/me/b'], [canonicalPiA, '/Users/me/a']],
+  );
+  assert.deepEqual(
+    api.sessions({ sessionId: rawPi, project: '-Users-me-a' }).map(row => row.id),
+    [canonicalPiA],
+  );
+
+  // Exact canonical ids keep today's behavior, in all input forms.
+  assert.equal(api.sessions({ sessionId: canonicalPiA }).length, 1);
+  assert.equal(api.sessions({ sessionId: 'sid-1' })[0].id, 'sid-1');
+  assert.deepEqual(api.sessions('sid-2').map(row => row.id), ['sid-2']);
+  assert.deepEqual(
+    api.sessions({ sessions: [rawKimi, 'sid-3', rawCodex] })
+      .map(row => row.id).sort(),
+    [canonicalKimi, 'sid-3', canonicalCodex].sort(),
+  );
+
+  // Unknown refs and SQL wildcards stay literal: no error, no fuzzy misses.
+  assert.deepEqual(api.sessions({ sessionId: 'ffffffff-0000-4000-8000-000000000000' }), []);
+  assert.deepEqual(api.sessions({ sessionId: 'sid-1%' }), []);
+  assert.deepEqual(api.sessions({ sessionId: 'sid_1' }), []);
+  // An empty array entry matches nothing, exactly as IN ('') always did.
+  assert.deepEqual(api.sessions({ sessions: ['', 'sid-1'] }).map(row => row.id), ['sid-1']);
+  assert.deepEqual(api.sessions({ sessions: [''] }), []);
+
+  // Other helpers keep exact matching; resolution is sessions()-only.
+  assert.equal(api.thread(rawPi).length, 0);
+  assert.equal(api.thread(canonicalPiA).length, 1);
+  assert.equal(api.summaries({ sessionId: canonicalPiA }).length, 1);
+  assert.deepEqual(api.summaries({ sessionId: rawPi }), []);
+
+  db.close();
+});
+
+test('every provider embeds the native session id verbatim in its canonical id', () => {
+  // Fragment resolution in sessions() depends on this: a native id is only
+  // findable while it appears verbatim inside the canonical id. pi-family,
+  // deepseek, copilot, and hermes encode native ids with encodeURIComponent,
+  // which preserves this UUID-shaped fixture and Hermes's timestamp-shaped
+  // lookup fixture above. URL-unsafe native ids need explicit coverage.
+  const native = '99999999-9999-4999-8999-999999999999';
+  const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
+  const canonical = {
+    // claude has no namespacing step: the canonical id is the native uuid.
+    claude: native,
+    hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
+    codex: codexDbId(native),
+    kimi: kimiSessionId(native),
+    pi: piFamilySessionId(piHeader, 'pi'),
+    omp: piFamilySessionId(piHeader, 'omp'),
+    deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),
+    copilot: copilotSessionId(native, '/Users/me/obelisk'),
+    zcode: zcodeSessionId('/Users/me/obelisk/db/db.sqlite', native),
+  };
+  assert.deepEqual(Object.keys(canonical).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());
+  for (const [source, id] of Object.entries(canonical)) {
+    assert.equal(
+      typeof id === 'string' && id.includes(native),
+      true,
+      `${source} canonical id ${id} must embed the native id verbatim`,
+    );
+  }
+});
+
+test('sessions fragment expansion is capped at the newest matches', () => {
+  const db = memoryDb();
+  // The same fragment embedded in more canonical ids than the expansion cap:
+  // id resolution is not fuzzy search, so the excess must be cut newest-first
+  // rather than planner-order.
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const cutoff = [];
+  for (let i = 0; i < 12; i++) {
+    const id = piFamilySessionId({ type: 'session', id: '66666666-6666-4666-8666-666666666666', cwd: `/Users/me/p${i}` }, 'pi');
+    const ended = `2026-09-18T${String(i).padStart(2, '0')}:00:00Z`;
+    insertSession.run(id, `copy ${i}`, `-Users-me-p${i}`, `/Users/me/p${i}`, ended, ended, null, 1, 'pi');
+    cutoff.push([id, ended]);
+  }
+  const api = createQueryApi(db);
+  const rows = api.sessions({ sessionId: '66666666-6666-4666-8666-666666666666' });
+  const expected = cutoff.slice(2).reverse().map(([id]) => id);
+  assert.equal(rows.length, 10);
+  assert.deepEqual(rows.map(row => row.id), expected);
+  db.close();
+});
+
 test('query api is read-only and does not expose attune helpers', () => {
   const db = memoryDb();
   const api = createQueryApi(db);
@@ -980,5 +1146,32 @@ test('subagents() never overrides a provider-stored total_tokens', () => {
   const api = createQueryApi(db);
   assert.equal(api.subagents()[0].total_tokens, 20);
   assert.equal(api.context('cx-m1').subagent.total_tokens, 20);
+  db.close();
+});
+
+test('sessions applies scope before each reference cap and unions both ID inputs', () => {
+  const db = memoryDb();
+  const insert = db.prepare('INSERT INTO sessions(id, project, source, git_branch, started_at, ended_at) VALUES(?,?,?,?,?,?)');
+  for (const ref of ['raw-a', 'raw-b']) {
+    for (let i = 0; i < 12; i++) {
+      const timestamp = `2026-09-18T${String(i).padStart(2, '0')}:00:00Z`;
+      insert.run(`pi:${ref}:p${i}`, `p${i}`, i === 0 ? 'omp' : 'pi', i === 0 ? 'target' : 'main', timestamp, timestamp);
+    }
+  }
+  insert.run('raw-exact', 'exact', 'claude', 'main', '2026', '2026');
+  insert.run('pi:raw-exact:shadow', 'exact', 'pi', 'main', '2026', '2026');
+  const api = createQueryApi(db);
+  for (const filter of [{ project: 'p0' }, { source: 'omp' }, { branch: 'target' }, { before: '2026-09-18T01:00:00Z' }]) {
+    assert.deepEqual(api.sessions({ sessionId: 'raw-a', ...filter }).map(row => row.id), ['pi:raw-a:p0']);
+    assert.deepEqual(api.sessions({ sessions: ['raw-a'], ...filter }).map(row => row.id), ['pi:raw-a:p0']);
+  }
+  const rows = api.sessions({ sessionId: 'raw-a', sessions: ['raw-b', 'raw-a', ''], limit: 100 });
+  assert.equal(rows.length, 20);
+  for (const ref of ['raw-a', 'raw-b']) {
+    assert.deepEqual(rows.filter(row => row.id.includes(ref)).map(row => row.id),
+      Array.from({ length: 10 }, (_, i) => `pi:${ref}:p${11 - i}`));
+  }
+  assert.deepEqual(api.sessions('raw-exact').map(row => row.id), ['raw-exact']);
+  assert.deepEqual(api.sessions({ sessionId: 'raw-exact', source: 'pi' }), []);
   db.close();
 });
