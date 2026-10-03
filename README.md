@@ -25,13 +25,23 @@ The agent writes JS queries, runs them locally, and answers in plain language.
 
 **App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
 
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code Stable and Insiders user-data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Hermes Agent sessions from `~/.hermes/state.db` (or `$HERMES_HOME/state.db`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
+Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code `User` data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Hermes Agent sessions from `~/.hermes/state.db` (or `$HERMES_HOME/state.db`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
 
 ## Multi-provider support
 
 Obelisk indexes every provider into the same SQLite schema instead of keeping separate databases. Rows carry a `source` value, and non-Claude IDs are provider-prefixed so they cannot collide.
 
 Codex root threads become normal Obelisk sessions. Codex child threads are attached through the same `subagents` table when parent-thread metadata is available. Codex does not emit Claude-style workflow metadata, so workflow tables may be empty for Codex-only history.
+
+GitHub Copilot / VS Code Chat sessions combine two local sources under the VS
+Code `User` directory: the Chronicle SQLite history at
+`globalStorage/github.copilot-chat/session-store.db` and workspace JSONL logs at
+`workspaceStorage/<workspace>/GitHub.copilot-chat/transcripts/*.jsonl`.
+Obelisk reads both sources without modifying them. Supported transcripts supply
+the messages, reasoning, and tool activity; Chronicle supplies summaries and
+metadata, with message fallback when a supported transcript is unavailable.
+Sessions present in only one source are also indexed. Use `source: 'copilot'`
+to scope queries to this history.
 
 Kimi session directories become one Obelisk session each. Main and child-agent
 `wire.jsonl` streams are projected into the same messages, tools, summaries and
@@ -62,11 +72,24 @@ Pi chooses its session directory in this order: `--session-dir`, `PI_CODING_AGEN
 
 OMP uses `~/.omp/agent/sessions` by default. Select another absolute session directory in Obelisk **Settings** when OMP is configured with a custom root.
 
-GitHub Copilot defaults to automatic discovery of both VS Code Stable and VS
-Code Insiders `User` data roots. Selecting a Copilot folder in **Settings** pins
-the provider to exactly that one `User` root; it does not re-enable discovery of
-the other edition. Remote, WSL, Codespaces, and arbitrary `--user-data-dir`
-locations are not discovered automatically.
+The Copilot provider supports automatic discovery of both VS Code Stable and
+VS Code Insiders `User` data roots from the CLI. The desktop app currently
+indexes only Stable by default: it passes the Stable root to its indexing
+worker as an explicit root, which disables the provider's automatic two-root
+discovery. To index Insiders in the desktop app, select its `User` directory
+in **Settings**. Selecting a Copilot folder pins the desktop provider to that
+one root, so it will not index Stable and Insiders together. Remote, WSL,
+Codespaces, and arbitrary `--user-data-dir` locations are not discovered
+automatically.
+
+The default Stable roots are `%APPDATA%/Code/User` on Windows,
+`~/Library/Application Support/Code/User` on macOS, and
+`$XDG_CONFIG_HOME/Code/User` on Linux (`~/.config/Code/User` when
+`XDG_CONFIG_HOME` is unset). Insiders uses `Code - Insiders`
+in place of `Code`. For a custom location, select its `User` directory, rather
+than the database file or a workspace's `transcripts` directory. Live refresh
+watches the Chronicle database, its `-wal` sidecar, and the `workspaceStorage`
+tree.
 
 ## Skill: agent-first retrieval
 
@@ -237,7 +260,7 @@ npm ci
 npm run dev
 ```
 
-`electron-vite` starts the renderer dev server and launches Electron. On first run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available registered-provider transcripts, and then watches them for changes. The default sources include `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite`; use **Settings** to point the app at different directories. On Windows, Obelisk also checks common WSL distributions for the Claude Code directory.
+`electron-vite` starts the renderer dev server and launches Electron. On first run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available registered-provider transcripts, and then watches them for changes. The default sources include `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, GitHub Copilot history in the VS Code Stable `User` root, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite`; use **Settings** to select the Insiders `User` root or other custom directories. On Windows, Obelisk also checks common WSL distributions for the Claude Code directory.
 
 ### Debug the app
 
@@ -280,6 +303,7 @@ packages/core/                # @obelisk/core npm workspace (TypeScript + ESM)
 │   │   ├── types.ts          # Provider + TranscriptRecord contract
 │   │   ├── claude.ts         # Claude Code adapter (line-incremental)
 │   │   ├── codex.ts          # Codex adapter (full-reparse)
+│   │   ├── copilot.ts        # VS Code Chat adapter (Chronicle + transcripts)
 │   │   ├── kimi.ts           # Kimi Code adapter (session projection)
 │   │   ├── zcode.ts          # ZCode adapter (read-only SQLite full-reparse)
 │   │   └── pi.ts             # Pi adapter (tree-aware full-reparse)
