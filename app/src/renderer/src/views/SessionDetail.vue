@@ -288,7 +288,7 @@ async function fetchSessionSnapshot(sessionId, { force = false } = {}) {
   const messageSnapshot = force ? null : getCachedSessionDetail(sessionId);
   if (messageSnapshot) return messageSnapshot;
   const cached = state.sessions.find(session => session.id === sessionId);
-  if (cached && (force || !cached.messages || cached.messages.length === 0)) {
+  if (!cached || force || !cached.messages || cached.messages.length === 0) {
     return loadSessionDetail(sessionId);
   }
   return cached;

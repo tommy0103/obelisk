@@ -26,7 +26,7 @@ test('Activity requests usage across all indexed providers', () => {
   assert.doesNotMatch(source, /monthBlocks\s*=\s*ref\(/);
 });
 
-test('preload forwards usage source options to the main process', async () => {
+test('preload forwards usage and catalogue source options to the main process', async () => {
   const calls = [];
   let api;
   const electron = mock.module(esmResolve('electron'), {
@@ -51,6 +51,14 @@ test('preload forwards usage source options to the main process', async () => {
     await import(`${preloadUrl.href}?activity-usage=${Date.now()}`);
     await api.getUsageStats({ source: 'all' });
     assert.deepEqual(calls.at(-1), ['db:getUsageStats', { source: 'all' }]);
+    await api.getProjects({ source: 'all' });
+    assert.deepEqual(calls.at(-1), ['db:getProjects', { source: 'all' }]);
+    await api.getStats({ source: 'all' });
+    assert.deepEqual(calls.at(-1), ['db:getStats', { source: 'all' }]);
+    await api.getSessions({ source: 'all', limit: null });
+    assert.deepEqual(calls.at(-1), ['db:getSessions', { source: 'all', limit: null }]);
+    await api.getSessions({ source: 'all', sessionId: 'older', limit: 1 });
+    assert.deepEqual(calls.at(-1), ['db:getSessions', { source: 'all', sessionId: 'older', limit: 1 }]);
   } finally {
     electron.restore();
     mock.reset();

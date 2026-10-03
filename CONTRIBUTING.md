@@ -118,7 +118,7 @@ interactions, or the full Electron suites.
   skips scroll compensation for already-measured rows when
   `scrollDirection === 'backward'`, so drift can be zero at rest and large while
   scrolling up. Test both.
-- Run `npm run test:electron:all` (all six suites), not only the suite you
+- Run `npm run test:electron:all` (all suites), not only the suite you
   added.
 - **Do not add `loading="lazy"` to virtualized rows.** Rows already mount near
   the viewport; lazy only defers decode into the scroll itself.

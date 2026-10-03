@@ -33,6 +33,7 @@ import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
   SessionMetadata,
+  SessionsQueryOptions,
   SourceQueryOptions,
   WindowControlAction,
 } from '../shared/ipc-types.ts';
@@ -691,9 +692,9 @@ function querySessionMetadata(sessionId: string): SessionMetadata | null {
   ) || null;
 }
 
-ipcMain.handle('db:getSessions', (_, opts = {}) => {
+ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
   if (!db) return [];
-  const { project, limit = 200 } = opts;
+  const { project, sessionId, limit = 200 } = opts;
   let sql = `SELECT ${SESSION_METADATA_COLUMNS} FROM sessions`;
   const params: unknown[] = [];
   const sourceFilter = sourceWhereClause(opts);
@@ -702,8 +703,12 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
     params.push(...sourceFilter.params);
   }
   if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
-  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`;
-  params.push(limit);
+  if (sessionId !== undefined) { sql = appendWhere(sql, params, `id = ?`); params.push(sessionId); }
+  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC`;
+  if (limit !== null) {
+    sql += ' LIMIT ?';
+    params.push(limit);
+  }
   return db.prepare(sql).all(...params);
 });
 
