@@ -1,7 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
 
@@ -92,7 +92,6 @@ export function resolveProviderRoots(
 export function readPersistedProviderSettings(
   settingsPath = join(homedir(), '.obelisk', 'settings.json'),
 ): ProviderSettingsReadResult {
-  if (!existsSync(settingsPath)) return { ok: true, settings: {} };
   try {
     const parsed = JSON.parse(readFileSync(settingsPath, 'utf8')) as unknown;
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -108,6 +107,11 @@ export function readPersistedProviderSettings(
     }
     return { ok: true, settings: parsed as PersistedProviderSettings };
   } catch (error) {
+    // existsSync also returns false for denied/uninspectable paths. Only an
+    // actual missing-file read can safely select the no-settings defaults.
+    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+      return { ok: true, settings: {} };
+    }
     return {
       ok: false,
       settings: {},
