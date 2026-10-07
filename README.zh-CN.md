@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-你的 Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Hermes Agent、Kimi Code、OMP、Pi、ZCode 历史会话——agent 能查，你能看。
+你的 Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Hermes Agent、Kimi Code、OMP、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
 
 [English](README.md) · **中文**
 
@@ -17,14 +17,14 @@
 
 <br />
 
-Obelisk 把本地各种 coding agent 的历史会话统一索引进一个 SQLite 数据库，服务两边：
+Obelisk 把本地各种 coding agent 的历史会话统一索引进一个 SQLite 数据库，使得两种上游都可以使用：
 
-- **Agent**：`obelisk` CLI 加一个 agent skill，让 coding agent 学会查自己的历史——它现场写 JS 查询，本地执行，用人话回答。
-- **你**：一个 Electron 桌面应用，翻会话、管记忆、看 token 用量、收每周回顾卡片。
+- **Agent**：提供 `obelisk` CLI 和相应的 agent skill，让 coding agent 学会查自己的历史——它现场写 JS 查询，本地执行，然后组织语言回答你。
+- **你**：提供一个 Electron 桌面应用，你可以翻会话、管记忆、看 token 用量、收每周回顾卡片。
 
-两边读的是同一个 `~/.obelisk/obelisk.sqlite`，后台监听各 provider 的目录自动更新。
+读的是同一个 `~/.obelisk/obelisk.sqlite`，后台监听各 provider 的目录自动更新。
 
-2 万行散落的 JSONL，变成 agent 用 `search()` 和 `sql()` 毫秒级查询的索引。
+让 2 万行散落的 JSONL，变成 agent 用 `search()` 和 `sql()` 毫秒级查询的索引。
 
 ## 在 agent 里用
 
@@ -44,7 +44,7 @@ Obelisk 把本地各种 coding agent 的历史会话统一索引进一个 SQLite
 
 #### 让 agent 装（推荐）
 
-最省事的办法：把下面这段话原样发给一个有 shell 权限的 coding agent
+最快速的办法：把下面这段话原样发给一个有 shell 权限的 coding agent
 （Claude Code、Codex 之类）。注意是发给 agent，不是贴进终端：
 
 ```text
@@ -53,8 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/tommy0103/obelisk/main/SKILL.md
 ```
 
 agent 会先问你、再动手：装好并验证 CLI 之后，再问你要把正式的 `/obelisk`
-skill 装在当前项目还是全局。这份引导只负责一次性安装，本身不是查询用的
-skill。
+skill 装在当前项目还是全局。
 
 #### 手动装
 
@@ -106,11 +105,11 @@ agent 针对 SQLite 索引写一段 JS 查询
 ### Recap
 
 `/obelisk recap` 是可选功能：把一段时间的会话做成可分享的周报/月报卡片。
-只有明确说要 recap 时才会加载对应文档——入口是
+只有明确说要 recap 时才会加载对应文档。入口是
 [skill-doc/references/recap/overview.md](skill-doc/references/recap/overview.md)，
 之后一张一张卡片往下走。
 
-## 用桌面应用看
+## 桌面应用
 
 <div align="center">
   <img src=".github/assets/app-screenshot.png" alt="Obelisk 应用" width="720">
@@ -137,7 +136,7 @@ npm run dev
 调试、打包、发布这些维护者向的内容在
 [CONTRIBUTING.md](CONTRIBUTING.md#desktop-app-development-and-release) 里。
 
-注意：桌面应用开着的时候，索引写入由它独占，这时 CLI 是只读的。
+请注意：桌面应用开着的时候，索引写入由它独占，这时 CLI 是只读的。
 
 ## 索引内容
 
