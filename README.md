@@ -29,6 +29,9 @@ serves it to two audiences:
 Both read the same `~/.obelisk/obelisk.sqlite`, kept fresh by watching every
 configured provider directory.
 
+20K lines of scattered JSONL → something your agent can `search()` and `sql()`
+against in milliseconds.
+
 ## Use it from your agent
 
 <div align="center">
@@ -63,7 +66,8 @@ the query skill itself.
 
 #### Install manually
 
-Obelisk requires Node.js 22.13 or newer. Install the platform-neutral CLI:
+Obelisk requires Node.js 22.13 or newer. Install the platform-neutral CLI
+(zero runtime npm dependencies — it uses Node's built-in SQLite):
 
 ```bash
 npm install --global @obelisk-apps/cli
@@ -147,6 +151,9 @@ npm run dev
 Debugging, packaging, and the release workflow are maintainer docs; they live
 in [CONTRIBUTING.md](CONTRIBUTING.md#desktop-app-development-and-release).
 
+Note: while the desktop app is running it owns index writes, so CLI invocations
+stay read-only.
+
 ## What gets indexed
 
 Every provider projects into the same shared layers; a few layers exist only
@@ -203,15 +210,6 @@ Adapter internals (identity hashing, supersession replay, per-provider root
 discovery) are documented in
 [retrieval semantics](skill-doc/references/retrieval-semantics.md) and the
 [ADRs](docs/adr/).
-
-## Implementation notes
-
-- The index rebuilds incrementally — only new or modified transcript files are re-parsed.
-- The CLI has zero runtime npm dependencies and uses built-in `node:sqlite` with FTS5 (Node ≥ 22.13).
-- When the desktop app is running it owns index writes (single-writer lease); CLI invocations stay read-only.
-- The app runs on Electron's embedded Node 24 with `better-sqlite3`, and shares `packages/core` with the CLI.
-
-20K lines of scattered JSONL → something the agent can `search()` and `sql()` against in milliseconds.
 
 ## Contributing
 

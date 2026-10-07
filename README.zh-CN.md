@@ -27,6 +27,8 @@ Obelisk 把你本地的 coding-agent 历史索引进一个 SQLite 数据库，�
 两者读同一个 `~/.obelisk/obelisk.sqlite`，并通过监听所有已配置的 provider
 目录保持更新。
 
+2 万行散落的 JSONL → agent 可以用 `search()` 和 `sql()` 以毫秒级查询的东西。
+
 ## 在 agent 中使用
 
 <div align="center">
@@ -59,7 +61,8 @@ agent 会先询问再改动你的机器，安装并验证 CLI，然后问你是�
 
 #### 手动安装
 
-Obelisk 需要 Node.js 22.13 或更新版本。安装平台无关的 CLI：
+Obelisk 需要 Node.js 22.13 或更新版本。安装平台无关的 CLI（没有运行时 npm
+依赖——使用 Node 内置的 SQLite）：
 
 ```bash
 npm install --global @obelisk-apps/cli
@@ -139,6 +142,8 @@ npm run dev
 调试、打包和发布流程属于维护者文档，见
 [CONTRIBUTING.md](CONTRIBUTING.md#desktop-app-development-and-release)。
 
+注意：桌面应用运行时持有索引的写入权，此时 CLI 调用保持只读。
+
 ## 索引了什么
 
 每个 provider 都投影到同一组共享层级；少数层级只在来源工具有对应概念时存在：
@@ -192,15 +197,6 @@ FTS5 全文搜索覆盖所有层级。各 provider 的读取位置见
 
 适配器内部实现（identity 哈希、取代重放、各 provider 的目录发现）记录在
 [检索语义](skill-doc/references/retrieval-semantics.md)和 [ADR](docs/adr/) 中。
-
-## 实现要点
-
-- 索引增量重建——只有新增或修改过的 transcript 文件会被重新解析。
-- CLI 没有运行时 npm 依赖，使用内置的 `node:sqlite` 和 FTS5（Node ≥ 22.13）。
-- 桌面应用运行时持有索引的写入权（单写入者租约）；此时 CLI 调用保持只读。
-- 应用运行在 Electron 内置的 Node 24 上，使用 `better-sqlite3`，与 CLI 共享 `packages/core`。
-
-2 万行散落的 JSONL → agent 可以用 `search()` 和 `sql()` 以毫秒级查询的东西。
 
 ## 参与贡献
 
