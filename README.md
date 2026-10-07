@@ -45,7 +45,7 @@ configured provider directory.
 
 ### Install
 
-#### Let your agent install it (recommended)
+#### Install with your agent (recommended)
 
 The shortest path is to give the bootstrap guide directly to a coding agent
 with shell access. Paste this as a prompt into Claude Code, Codex, or another
@@ -113,14 +113,11 @@ sessions — a synthesis cache, not a replacement for raw evidence.
 
 ### Recap
 
-The optional `/obelisk recap` flow is loaded only for explicit `/obelisk recap` intent.
-It starts at `skill-doc/references/recap/overview.md` and proceeds card-by-card:
-
-- `skill-doc/references/recap/pattern1-cover.md` + `skill-doc/references/recap/writing1-cover.md`
-- `skill-doc/references/recap/pattern2-thinking.md` + `skill-doc/references/recap/writing2-thinking.md`
-- `skill-doc/references/recap/pattern3-vibe.md` + `skill-doc/references/recap/writing3-vibe.md`
-- `skill-doc/references/recap/pattern4-workflow.md` + `skill-doc/references/recap/writing4-workflow.md`
-- `skill-doc/references/recap/pattern5-closing.md` + `skill-doc/references/recap/writing5-closing.md`
+The optional `/obelisk recap` flow turns a period of sessions into shareable
+weekly/monthly recap cards. It loads its references only for explicit recap
+intent, starting at
+[skill-doc/references/recap/overview.md](skill-doc/references/recap/overview.md)
+and proceeding card by card.
 
 ## Browse it in the app
 

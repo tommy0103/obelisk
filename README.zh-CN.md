@@ -106,14 +106,10 @@ Agent 针对 SQLite 索引编写 JS 查询
 
 ### Recap
 
-可选的 `/obelisk recap` 流程只会在显式的 `/obelisk recap` 意图下加载。它从
-`skill-doc/references/recap/overview.md` 开始，逐张卡片进行：
-
-- `skill-doc/references/recap/pattern1-cover.md` + `skill-doc/references/recap/writing1-cover.md`
-- `skill-doc/references/recap/pattern2-thinking.md` + `skill-doc/references/recap/writing2-thinking.md`
-- `skill-doc/references/recap/pattern3-vibe.md` + `skill-doc/references/recap/writing3-vibe.md`
-- `skill-doc/references/recap/pattern4-workflow.md` + `skill-doc/references/recap/writing4-workflow.md`
-- `skill-doc/references/recap/pattern5-closing.md` + `skill-doc/references/recap/writing5-closing.md`
+可选的 `/obelisk recap` 流程会把一段时间的会话变成可分享的每周/每月回顾卡片。
+它只在显式的 recap 意图下加载参考文件：从
+[skill-doc/references/recap/overview.md](skill-doc/references/recap/overview.md)
+开始，逐张卡片进行。
 
 ## 在应用中浏览
 
