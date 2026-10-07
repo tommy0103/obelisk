@@ -149,17 +149,21 @@ in [CONTRIBUTING.md](CONTRIBUTING.md#desktop-app-development-and-release).
 
 ## What gets indexed
 
-| Layer | Source | What's captured |
-|-------|--------|----------------|
-| **Sessions** | Claude `<project>/<sessionId>.jsonl`; Codex `sessions/YYYY/MM/DD/*.jsonl` and `archived_sessions/*.jsonl`; Copilot Chronicle plus workspace `transcripts/*.jsonl`; Hermes `state.db`; Kimi session directories; Pi recursive `*.jsonl`; DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]`; ZCode `session` rows in `~/.zcode/cli/db/db.sqlite` | Title, project, timestamps, git branch, source |
-| **Messages** | user + assistant turns | Full text, model, token usage, parent chain |
-| **Tool calls** | every tool invocation | Tool name, input, file paths |
-| **Subagents** | Claude `subagents/agent-<id>.jsonl`; Codex child threads; DeepSeek Harness child sessions (folded into the root session); ZCode `task_type='subagent_child'` sessions | Agent type, description, full conversation |
-| **Workflows** | Claude `workflows/wf_<runId>.json` | Script, result, agent count |
-| **Workflow agents** | Claude `subagents/workflows/wf_<runId>/` | Per-agent transcripts |
-| **Memories** | registered markdown files | Conclusions linked to source sessions |
+Every provider projects into the same shared layers; a few layers exist only
+where the source tool has the concept:
 
-Full-text search via FTS5 covers all layers.
+| Layer | What's captured | Availability |
+|-------|-----------------|--------------|
+| **Sessions** | Title, project, timestamps, git branch, source | all providers |
+| **Messages** | Full text, model, token usage, parent chain | all providers |
+| **Tool calls** | Tool name, input, file paths | all providers |
+| **Subagents** | Agent type, description, full conversation | Claude Code, Codex, DeepSeek Harness, Hermes Agent, Kimi Code, ZCode |
+| **Summaries** | Session summaries emitted by the provider | Kimi Code |
+| **Workflows** | Workflow script, result, and per-agent transcripts | Claude Code |
+| **Memories** | Conclusions linked to source sessions | registered markdown files |
+
+Full-text search via FTS5 covers all layers. Per-provider source locations are
+listed under [Provider coverage](#provider-coverage).
 
 ## Provider coverage
 

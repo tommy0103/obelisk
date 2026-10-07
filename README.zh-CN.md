@@ -141,17 +141,20 @@ npm run dev
 
 ## 索引了什么
 
-| 层级 | 来源 | 捕获内容 |
-|-------|--------|----------------|
-| **Sessions** | Claude `<project>/<sessionId>.jsonl`；Codex `sessions/YYYY/MM/DD/*.jsonl` 和 `archived_sessions/*.jsonl`；Copilot Chronicle 加 workspace `transcripts/*.jsonl`；Hermes `state.db`；Kimi 会话目录；Pi 递归 `*.jsonl`；DeepSeek Harness `<project>/<sessionId>/session.jsonl[.zstd]`；ZCode `~/.zcode/cli/db/db.sqlite` 里的 `session` 行 | 标题、项目、时间戳、git 分支、来源 |
-| **Messages** | user + assistant 轮次 | 完整文本、模型、token 用量、父链 |
-| **Tool calls** | 每次 tool 调用 | 工具名、输入、文件路径 |
-| **Subagents** | Claude `subagents/agent-<id>.jsonl`；Codex 子线程；DeepSeek Harness 子会话（折叠进根会话）；ZCode `task_type='subagent_child'` 会话 | agent 类型、描述、完整对话 |
-| **Workflows** | Claude `workflows/wf_<runId>.json` | 脚本、结果、agent 数量 |
-| **Workflow agents** | Claude `subagents/workflows/wf_<runId>/` | 每个 agent 的 transcript |
-| **Memories** | 已注册的 markdown 文件 | 关联到来源会话的结论 |
+每个 provider 都投影到同一组共享层级；少数层级只在来源工具有对应概念时存在：
 
-FTS5 全文搜索覆盖所有层级。
+| 层级 | 捕获内容 | 覆盖范围 |
+|-------|--------|---------|
+| **Sessions** | 标题、项目、时间戳、git 分支、来源 | 所有 provider |
+| **Messages** | 完整文本、模型、token 用量、父链 | 所有 provider |
+| **Tool calls** | 工具名、输入、文件路径 | 所有 provider |
+| **Subagents** | agent 类型、描述、完整对话 | Claude Code、Codex、DeepSeek Harness、Hermes Agent、Kimi Code、ZCode |
+| **Summaries** | provider 产生的会话摘要 | Kimi Code |
+| **Workflows** | workflow 脚本、结果和每个 agent 的 transcript | Claude Code |
+| **Memories** | 关联到来源会话的结论 | 注册的 markdown 文件 |
+
+FTS5 全文搜索覆盖所有层级。各 provider 的读取位置见
+[Provider 覆盖情况](#provider-覆盖情况)。
 
 ## Provider 覆盖情况
 
