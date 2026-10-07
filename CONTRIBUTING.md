@@ -283,6 +283,85 @@ severe stalls; they do not certify that every displayed frame arrives within
 50ms on a shared runner. A controlled-performance-machine requirement is not
 part of the repository's CI infrastructure.
 
+## Desktop app development and release
+
+### Run and debug the app locally
+
+`electron-vite` starts the renderer dev server and launches Electron. On first
+run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available
+registered-provider transcripts, and then watches them for changes. Use
+**Settings** to select provider directories beyond the defaults. On Windows,
+Obelisk also checks common WSL distributions for the Claude Code directory.
+
+- Renderer changes use Vite hot module replacement. Open Electron DevTools with
+  `Cmd+Option+I` on macOS or `Ctrl+Shift+I` on Windows/Linux.
+- Main-process and preload logs appear in the terminal running `npm run dev`;
+  their source changes are rebuilt by electron-vite.
+- To attach a Node debugger to the Electron main process, start it with
+  `npm run dev -- --inspect=5858`, then attach your debugger to port `5858`.
+- The development app reads and updates the real `~/.obelisk` index. Back it up
+  before testing destructive rebuilds. For an isolated run, launch with a
+  disposable home directory (`HOME=/tmp/obelisk-dev npm run dev` on
+  macOS/Linux, or set a temporary `USERPROFILE` first on Windows), then select
+  fixture source directories in **Settings**.
+
+`better-sqlite3` provides prebuilt binaries for common platforms. If `npm ci`
+falls back to compiling it locally, install the platform's C/C++ build tools and
+run `npm ci` again.
+
+### Release the desktop app
+
+The **Release Desktop App** workflow builds Developer ID signed/notarized
+DMG and ZIP packages for macOS Apple Silicon (`arm64`) and Intel (`x64`), plus
+`Obelisk-<version>-linux-amd64.deb` for Linux Intel/AMD 64-bit systems. It runs
+repository checks and all six Electron suites, verifies the packaged native
+resources, and installs the Debian package on Ubuntu 22.04 and 24.04. All
+packages and update feeds are uploaded to one GitHub Release draft after the
+required build and acceptance jobs pass.
+
+The app checks and downloads updates in the background. Settings → About
+supports manual checks and retry; the sidebar notice offers View changes,
+Later, and Update & restart. macOS uses Sparkle, falling back to
+`electron-updater` only if the native bridge cannot initialize. Linux `.deb`
+installations use `DebUpdater`; replacing the system installation requests
+administrator authorization through Polkit. Cancelling leaves the staged
+update retryable. Existing 0.2.2 installations require one manual upgrade to
+this updater-enabled release. Linux arm64, AppImage and Windows update channels
+are not enabled by this workflow.
+
+The build host uses Node 22; the app runs on Electron 43's embedded Node 24.
+Artifact verification reports the embedded Electron, Node and ABI versions.
+See [the runtime explanation](docs/adr/0005-app-electron-vite-ts-esm.md) and
+[the runtime requirements above](#node-and-electron-runtimes).
+
+Configure these repository Actions secrets:
+
+| Secret | Value |
+| --- | --- |
+| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12`, including its private key |
+| `MAC_CSC_KEY_PASSWORD` | The `.p12` export password |
+| `APPLE_ID` | Apple Account email with access to the signing team |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
+| `APPLE_TEAM_ID` | The signing team's 10-character Team ID |
+| `SPARKLE_ED_PRIVATE_KEY` | Exported Sparkle EdDSA private key matching the app's trusted public key |
+
+The `SPARKLE_ED_PUBLIC_KEY` Actions variable must match
+`app/build/sparkle-public-key.txt`. Linux Debian builds need no Apple credentials.
+
+Update `app/package.json` and `app/package-lock.json` to the same version,
+merge the release changes, then push a matching tag such as `v0.2.4`.
+To retry an existing tag, select that tag as the ref in **Actions → Release
+Desktop App → Run workflow**; the optional tag input checks that selection.
+The workflow rejects version mismatches and never overwrites a published
+release. Review the draft's notes and downloads before publishing it.
+
+Use `verify_only=true` on a branch to build and verify all platforms without
+creating a tag or Release. **Build and verify Debian App** also runs directly
+on relevant PRs or by manual dispatch, leaving its verified `.deb` as an Actions
+artifact. Its two-version acceptance uses the actual package, shipped UI,
+`DebUpdater`, and real dpkg installation, with a test substitute for the
+administrator-authorization dialog. CLI npm publication remains independent.
+
 ---
 
 ## Verification contract

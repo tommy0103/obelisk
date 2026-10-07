@@ -11,95 +11,31 @@
 
 Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Hermes Agent, Kimi Code, OMP, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
 
+**English** · [中文](README.zh-CN.md)
+
 </div>
 
 <br />
 
-## Two sides of the same index
+Obelisk indexes your local coding-agent history into one SQLite database and
+serves it to two audiences:
 
-Obelisk has two sides that share one SQLite index:
+- **Agents** — the `obelisk` CLI plus an agent skill that teaches coding agents
+  to search their own session history. The agent writes JS queries, runs them
+  locally, and answers in plain language.
+- **Humans** — an Electron desktop app to browse sessions, manage memories,
+  view usage stats, and see weekly recap cards.
 
-**Agent side** — the `obelisk` CLI owns the local runtime, while a separate
-agent skill teaches coding agents how to search and query their session history.
-The agent writes JS queries, runs them locally, and answers in plain language.
+Both read the same `~/.obelisk/obelisk.sqlite`, kept fresh by watching every
+configured provider directory.
 
-**App side** — an Electron desktop app for humans to browse sessions, manage memories, view usage stats, and see weekly recap cards.
-
-Both read from the same `~/.obelisk/obelisk.sqlite` database. The indexer reads Claude Code transcripts from `~/.claude/projects`, Codex transcripts from `~/.codex/sessions` and `~/.codex/archived_sessions`, GitHub Copilot Chronicle and workspace transcripts from VS Code `User` data roots, DeepSeek Harness sessions from `~/.dsh/sessions` (or `$DSH_HOME/sessions`), Hermes Agent sessions from `~/.hermes/state.db` (or `$HERMES_HOME/state.db`), Kimi Code sessions from `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`), OMP sessions from `~/.omp/agent/sessions`, Pi sessions from `~/.pi/agent/sessions`, and ZCode sessions from `~/.zcode/cli/db/db.sqlite`.
-
-## Multi-provider support
-
-Obelisk indexes every provider into the same SQLite schema instead of keeping separate databases. Rows carry a `source` value, and non-Claude IDs are provider-prefixed so they cannot collide.
-
-Codex root threads become normal Obelisk sessions. Codex child threads are attached through the same `subagents` table when parent-thread metadata is available. Codex does not emit Claude-style workflow metadata, so workflow tables may be empty for Codex-only history.
-
-GitHub Copilot / VS Code Chat sessions combine two local sources under the VS
-Code `User` directory: the Chronicle SQLite history at
-`globalStorage/github.copilot-chat/session-store.db` and workspace JSONL logs at
-`workspaceStorage/<workspace>/GitHub.copilot-chat/transcripts/*.jsonl`.
-Obelisk reads both sources without modifying them. Supported transcripts supply
-the messages, reasoning, and tool activity; Chronicle supplies summaries and
-metadata, with message fallback when a supported transcript is unavailable.
-Sessions present in only one source are also indexed. Use `source: 'copilot'`
-to scope queries to this history.
-
-Kimi session directories become one Obelisk session each. Main and child-agent
-`wire.jsonl` streams are projected into the same messages, tools, summaries and
-subagents tables. Undo/clear is handled as a full session replay, so retracted
-wire records do not remain in the index.
-
-OMP's Pi-compatible JSONL v3 sessions use a dedicated adapter and `source='omp'` identity. The adapter consumes OMP's mutable title prelude as session metadata while preserving the underlying tree, messages, tools, usage, visibility, and raw evidence semantics. OMP and Pi roots are independent, so both histories can be indexed at the same time.
-
-Pi JSONL v1-v3 sessions are projected through the same provider contract. Pi's tree, branch summaries, compactions, durable leaf, retained checkpoint tail, custom messages, bash records, tool calls, token usage, and raw JSONL evidence stay inside the adapter; no Pi-specific database or renderer branch is needed. Active visibility follows Pi's own context rules: a retained tail replaces pre-compaction ancestors even when those physical entries still exist and bounds any later legacy compaction, while a legacy-only chain retains ancestors beginning at `firstKeptEntryId`. Missing parents form orphan branch roots, matching Pi's recovery behavior. Pi entries that the source explicitly superseded are stored as `inactive`: the app and normal agent queries omit them, while supported query helpers can include them with `includeInactive: true`. Display-suppressed or transport-only records remain `hidden` and are never returned by those helpers.
-
-ZCode stores its transcripts in one SQLite database (`~/.zcode/cli/db/db.sqlite`, WAL mode). Obelisk opens it read-only and indexes each session row as one Obelisk session; messages, tool calls, reasoning, compaction summaries, and subagent sessions flow into the shared tables. Rewind and compaction attest supersession the same way Pi branch state does: messages outside the retained range are stored as `inactive` and are only returned when you ask for `includeInactive: true`. Session identity combines the database path with the raw session ID, so a database recreated at the same path retracts stale snapshots instead of mixing histories; moving the database to a different root leaves the old sessions in place until a forced rebuild. ZCode's legacy script-workflow metadata is not indexed yet; workflow child sessions appear as ordinary sessions.
-
-| Provider | Superseded-history support |
-| --- | --- |
-| Pi | Branch, leaf, and compaction state attests inactive history |
-| OMP | Branch, leaf, and compaction state attests inactive history |
-| ZCode | Rewind retention and compaction attest inactive history |
-| Kimi Code | Undo/clear can attest supersession; preservation is a follow-up |
-| Hermes Agent | Superseded history is not split: compaction-archived and rewound rows are both stored as `inactive` |
-| Claude Code | The source does not attest rewind or current-leaf state |
-| Codex | Sessions have no branching semantics |
-
-Because Pi and OMP explicit session IDs are project-local, Obelisk combines each provider's header ID with a deterministic hash of the normalized header `cwd`; this keeps identities stable across file moves while allowing two projects to use the same custom ID. Hermes Agent sessions are scoped by the store they were read from as well as the profile name, so a copied or migrated `state.db` cannot collide with the original. Replacement and deletion replay is provenance-aware, so stale session snapshots are retracted atomically; compaction and branch-summary model usage is included in usage totals.
-
-For live app refresh, Obelisk watches the roots declared by every registered provider, including `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.hermes/state.db` with `~/.hermes/profiles`, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite` plus its WAL sidecar. Codex's `session_index.jsonl` is used as lightweight title/update metadata during indexing, not as the message transcript source.
-
-Pi chooses its session directory in this order: `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in settings, then the default under `~/.pi/agent/sessions`. Obelisk automatically follows absolute or `~`-prefixed environment/global settings and the project setting for Obelisk's launch cwd; a relative project setting is resolved against that cwd. CLI-only roots, relative environment/global settings, and project settings from another launch cwd cannot be inferred safely, so select the resolved directory in Obelisk **Settings** instead of letting Obelisk guess.
-
-OMP uses `~/.omp/agent/sessions` by default. Select another absolute session directory in Obelisk **Settings** when OMP is configured with a custom root.
-
-The Copilot provider supports automatic discovery of both VS Code Stable and
-VS Code Insiders `User` data roots from the CLI. The desktop app currently
-indexes only Stable by default: it passes the Stable root to its indexing
-worker as an explicit root, which disables the provider's automatic two-root
-discovery. To index Insiders in the desktop app, select its `User` directory
-in **Settings**. Selecting a Copilot folder pins the desktop provider to that
-one root, so it will not index Stable and Insiders together. Remote, WSL,
-Codespaces, and arbitrary `--user-data-dir` locations are not discovered
-automatically.
-
-The default Stable roots are `%APPDATA%/Code/User` on Windows,
-`~/Library/Application Support/Code/User` on macOS, and
-`$XDG_CONFIG_HOME/Code/User` on Linux (`~/.config/Code/User` when
-`XDG_CONFIG_HOME` is unset). Insiders uses `Code - Insiders`
-in place of `Code`. For a custom location, select its `User` directory, rather
-than the database file or a workspace's `transcripts` directory. Live refresh
-watches the Chronicle database, its `-wal` sidecar, and the `workspaceStorage`
-tree.
-
-## Skill: agent-first retrieval
+## Use it from your agent
 
 <div align="center">
-  <img src=".github/assets/demo.png" alt="Obelisk App" width="720">
+  <img src=".github/assets/demo.png" alt="Obelisk skill demo" width="720">
 </div>
 
-You can use obelisk like:
-
-```
+```text
 /obelisk 上次 auth bug 最后到底改了哪些文件，为什么这么改
 /obelisk 这个文件最近在哪些 sessions 里被反复修改
 /obelisk 找出最近失败的 tool calls，它们分别发生在哪些任务里
@@ -147,19 +83,13 @@ obelisk install
 ```
 
 `obelisk install` delegates to the standard skills installer for
-`tommy0103/obelisk-skill`.
-
-Then in any Claude Code session:
-
-```
-/obelisk <your question>
-```
-
-First run builds the index (~5 seconds for 100 sessions). After that it rebuilds incrementally.
+`tommy0103/obelisk-skill`. Then in any agent session: `/obelisk <your question>`.
+First run builds the index (~5 seconds for 100 sessions); after that it
+rebuilds incrementally.
 
 ### How it works
 
-```
+```text
 You ask a question
   ↓
 Agent writes a JS query against the SQLite index
@@ -169,19 +99,33 @@ Runs it via obelisk --query <script>
 Reads the JSON result, answers in natural language
 ```
 
-Core API: `search()`, `context()`, `sql()`, plus structured helpers (`sessions`, `memories`, `summaries`, `workflows`, `failures`, `fileHistory`, etc).
+Core API: `search()`, `context()`, `sql()`, plus structured helpers (`sessions`,
+`memories`, `summaries`, `workflows`, `failures`, `fileHistory`, etc).
+Signatures, options, and query patterns live in the
+[API reference](skill-doc/references/api-reference.md).
 
 ### Memory layer
 
-When a retrieval produces a conclusion worth keeping, the agent proposes a markdown memory file. After user approval, it registers the file with `obelisk --attune <script>`. Memories are recalled via `memories()` in future sessions — a synthesis cache, not a replacement for raw evidence.
+When a retrieval produces a conclusion worth keeping, the agent proposes a
+markdown memory file. After your approval, it registers the file with
+`obelisk --attune <script>`. Memories are recalled via `memories()` in future
+sessions — a synthesis cache, not a replacement for raw evidence.
 
-## App: A surface for humans
+### Recap
 
-A companion desktop app for browsing the same index maintained by the CLI or
-the app daemon.
+The optional `/obelisk recap` flow is loaded only for explicit `/obelisk recap` intent.
+It starts at `skill-doc/references/recap/overview.md` and proceeds card-by-card:
+
+- `skill-doc/references/recap/pattern1-cover.md` + `skill-doc/references/recap/writing1-cover.md`
+- `skill-doc/references/recap/pattern2-thinking.md` + `skill-doc/references/recap/writing2-thinking.md`
+- `skill-doc/references/recap/pattern3-vibe.md` + `skill-doc/references/recap/writing3-vibe.md`
+- `skill-doc/references/recap/pattern4-workflow.md` + `skill-doc/references/recap/writing4-workflow.md`
+- `skill-doc/references/recap/pattern5-closing.md` + `skill-doc/references/recap/writing5-closing.md`
+
+## Browse it in the app
 
 <div align="center">
-  <img src=".github/assets/app-screenshot.png" alt="Obelisk App" width="720">
+  <img src=".github/assets/app-screenshot.png" alt="Obelisk app" width="720">
 </div>
 
 - **Sessions** — browse all sessions with search, project filtering, readable tool calls (diffs, terminal output, file viewers)
@@ -191,67 +135,10 @@ the app daemon.
 - **Settings** — data source configuration, auto-refresh, rebuild index
 
 Prebuilt releases are available for macOS and Linux amd64 from
-[Releases](https://github.com/tommy0103/obelisk/releases). The source app can be
-run locally on macOS, Windows, and Linux.
-
-### Release the desktop app
-
-The **Release Desktop App** workflow builds Developer ID signed/notarized
-DMG and ZIP packages for macOS Apple Silicon (`arm64`) and Intel (`x64`), plus
-`Obelisk-<version>-linux-amd64.deb` for Linux Intel/AMD 64-bit systems. It runs
-repository checks and all six Electron suites, verifies the packaged native
-resources, and installs the Debian package on Ubuntu 22.04 and 24.04. All
-packages and update feeds are uploaded to one GitHub Release draft after the
-required build and acceptance jobs pass.
-
-The app checks and downloads updates in the background. Settings → About
-supports manual checks and retry; the sidebar notice offers View changes,
-Later, and Update & restart. macOS uses Sparkle, falling back to
-`electron-updater` only if the native bridge cannot initialize. Linux `.deb`
-installations use `DebUpdater`; replacing the system installation requests
-administrator authorization through Polkit. Cancelling leaves the staged
-update retryable. Existing 0.2.2 installations require one manual upgrade to
-this updater-enabled release. Linux arm64, AppImage and Windows update channels
-are not enabled by this workflow.
-
-The build host uses Node 22; the app runs on Electron 43's embedded Node 24.
-Artifact verification reports the embedded Electron, Node and ABI versions.
-See [the runtime explanation](docs/adr/0005-app-electron-vite-ts-esm.md) and
-[development verification guidance](CONTRIBUTING.md#node-and-electron-runtimes).
-
-Configure these repository Actions secrets:
-
-| Secret | Value |
-| --- | --- |
-| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12`, including its private key |
-| `MAC_CSC_KEY_PASSWORD` | The `.p12` export password |
-| `APPLE_ID` | Apple Account email with access to the signing team |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
-| `APPLE_TEAM_ID` | The signing team's 10-character Team ID |
-| `SPARKLE_ED_PRIVATE_KEY` | Exported Sparkle EdDSA private key matching the app's trusted public key |
-
-The `SPARKLE_ED_PUBLIC_KEY` Actions variable must match
-`app/build/sparkle-public-key.txt`. Linux Debian builds need no Apple credentials.
-
-Update `app/package.json` and `app/package-lock.json` to the same version,
-merge the release changes, then push a matching tag such as `v0.2.4`.
-To retry an existing tag, select that tag as the ref in **Actions → Release
-Desktop App → Run workflow**; the optional tag input checks that selection.
-The workflow rejects version mismatches and never overwrites a published
-release. Review the draft's notes and downloads before publishing it.
-
-Use `verify_only=true` on a branch to build and verify all platforms without
-creating a tag or Release. **Build and verify Debian App** also runs directly
-on relevant PRs or by manual dispatch, leaving its verified `.deb` as an Actions
-artifact. Its two-version acceptance uses the actual package, shipped UI,
-`DebUpdater`, and real dpkg installation, with a test substitute for the
-administrator-authorization dialog. CLI npm publication remains independent.
-
-### Run locally
-
-Install [Node.js 22](https://nodejs.org/) (22.13.0 or newer) and npm for the
-build tools, then run the app from its own package directory. The app itself
-uses Electron's bundled Node 24, including during `npm run dev`:
+[Releases](https://github.com/tommy0103/obelisk/releases), with in-app updates
+(Sparkle on macOS, `DebUpdater` on Debian installations). On macOS, Windows,
+and Linux you can also run the app from source — Node.js 22.13+ for the build
+tools; the app itself runs on Electron's embedded Node:
 
 ```bash
 git clone https://github.com/tommy0103/obelisk.git
@@ -260,25 +147,8 @@ npm ci
 npm run dev
 ```
 
-`electron-vite` starts the renderer dev server and launches Electron. On first run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available registered-provider transcripts, and then watches them for changes. The default sources include `~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`, GitHub Copilot history in the VS Code Stable `User` root, `~/.kimi-code/sessions`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`, and `~/.zcode/cli/db/db.sqlite`; use **Settings** to select the Insiders `User` root or other custom directories. On Windows, Obelisk also checks common WSL distributions for the Claude Code directory.
-
-### Debug the app
-
-- Renderer changes use Vite hot module replacement. Open Electron DevTools with
-  `Cmd+Option+I` on macOS or `Ctrl+Shift+I` on Windows/Linux.
-- Main-process and preload logs appear in the terminal running `npm run dev`;
-  their source changes are rebuilt by electron-vite.
-- To attach a Node debugger to the Electron main process, start it with
-  `npm run dev -- --inspect=5858`, then attach your debugger to port `5858`.
-- The development app reads and updates the real `~/.obelisk` index. Back it up
-  before testing destructive rebuilds. For an isolated run, launch with a
-  disposable home directory (`HOME=/tmp/obelisk-dev npm run dev` on
-  macOS/Linux, or set a temporary `USERPROFILE` first on Windows), then select
-  fixture source directories in **Settings**.
-
-`better-sqlite3` provides prebuilt binaries for common platforms. If `npm ci`
-falls back to compiling it locally, install the platform's C/C++ build tools and
-run `npm ci` again.
+Debugging, packaging, and the release workflow are maintainer docs; they live
+in [CONTRIBUTING.md](CONTRIBUTING.md#desktop-app-development-and-release).
 
 ## What gets indexed
 
@@ -294,112 +164,59 @@ run `npm ci` again.
 
 Full-text search via FTS5 covers all layers.
 
-## Structure
+## Provider coverage
 
-```
-packages/core/                # @obelisk/core npm workspace (TypeScript + ESM)
-├── src/
-│   ├── providers/
-│   │   ├── types.ts          # Provider + TranscriptRecord contract
-│   │   ├── claude.ts         # Claude Code adapter (line-incremental)
-│   │   ├── codex.ts          # Codex adapter (full-reparse)
-│   │   ├── copilot.ts        # VS Code Chat adapter (Chronicle + transcripts)
-│   │   ├── kimi.ts           # Kimi Code adapter (session projection)
-│   │   ├── zcode.ts          # ZCode adapter (read-only SQLite full-reparse)
-│   │   └── pi.ts             # Pi adapter (tree-aware full-reparse)
-│   ├── session-detail.ts     # Provider-independent transcript projection
-│   ├── persist.ts            # Binding-agnostic record writer (upsert/merge)
-│   ├── tx.ts                 # Write transaction + connection config
-│   ├── write-coordinator.ts  # Bounded retry policy
-│   ├── writer-lease.ts       # Cross-process single-writer lease (SQLite lock DB)
-│   ├── core.ts               # buildIndex / searchText / executeQuery / executeAttune
-│   ├── indexer.ts            # Skill orchestration (discover → persist → finalize)
-│   ├── parsing.ts            # Pure helpers (node:sqlite-free, app-consumable)
-│   ├── db.ts                 # node:sqlite lifecycle + migrations
-│   ├── query.ts              # Query/attune sandbox API (helpers)
-│   └── schema.sql            # SQLite schema (single source of truth)
-├── package.json
-└── dist/                     # Generated package JS, declarations, and schema
+Every provider indexes into the same schema; rows carry a `source` value and
+non-Claude IDs are provider-prefixed so they cannot collide.
 
-packages/cli/                 # @obelisk-apps/cli npm workspace
-├── src/obelisk.ts            # CLI shell + skill installer delegation
-├── scripts/build.mjs         # Compiles CLI + readable Core into one package
-├── package.json
-└── dist/                     # Generated platform-neutral npm payload
+| Provider | Default source |
+| --- | --- |
+| Claude Code | `~/.claude/projects` |
+| Codex | `~/.codex/sessions`, `~/.codex/archived_sessions` |
+| GitHub Copilot | VS Code `User` data roots (Chronicle store + workspace transcripts) |
+| DeepSeek Harness | `~/.dsh/sessions` (or `$DSH_HOME/sessions`) |
+| Hermes Agent | `~/.hermes/state.db` (or `$HERMES_HOME/state.db`) |
+| Kimi Code | `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`) |
+| OMP | `~/.omp/agent/sessions` |
+| Pi | `~/.pi/agent/sessions` |
+| ZCode | `~/.zcode/cli/db/db.sqlite` |
 
-skill-doc/                    # Source for the docs-only obelisk agent skill
-├── SKILL.md                  # Query and memory workflow
-└── references/               # Progressive-disclosure API/schema/pattern docs
-    └── recap/                # Per-card recap retrieval + writing references
+Where a provider attests superseded history, Obelisk preserves it as inactive
+rows that normal queries omit; supported query helpers can opt in with
+`includeInactive: true`.
 
-app/                          # Electron desktop app (electron-vite + Vue)
-├── src/main/                 # TypeScript main process (consumes shared core)
-├── src/preload/              # CJS preload (sandbox)
-├── src/renderer/             # Vue renderer
-└── electron.vite.config.ts
+| Provider | Superseded-history support |
+| --- | --- |
+| Pi | Branch, leaf, and compaction state attests inactive history |
+| OMP | Branch, leaf, and compaction state attests inactive history |
+| ZCode | Rewind retention and compaction attest inactive history |
+| Kimi Code | Undo/clear can attest supersession; preservation is a follow-up |
+| Hermes Agent | Superseded history is not split: compaction-archived and rewound rows are both stored as `inactive` |
+| Claude Code | The source does not attest rewind or current-leaf state |
+| Codex | Sessions have no branching semantics |
 
-packaging/                    # Skill publish infrastructure
-├── build-skill.mjs           # Builds the docs-only skill artifact
-├── skill-package.json
-├── skill-README.md
-├── skill-LICENSE             # MIT (relicensed for the skill artifact)
-└── publish-skill.sh
+Non-default locations — a Pi `--session-dir`, an OMP custom root, the VS Code
+Insiders `User` directory — can be selected in the app's **Settings**.
 
-SKILL.md                      # Remote one-time CLI + skill bootstrap guide
-install.sh                    # POSIX CLI-only installer
-CONTEXT.md                    # Project glossary
-docs/adr/                     # Architecture decision records (0001–0013)
-```
+Adapter internals (identity hashing, supersession replay, per-provider root
+discovery) are documented in
+[retrieval semantics](skill-doc/references/retrieval-semantics.md) and the
+[ADRs](docs/adr/).
 
-The optional `/obelisk recap` flow is loaded only for explicit `/obelisk recap` intent.
-It starts at `skill-doc/references/recap/overview.md` and proceeds card-by-card:
+## Implementation notes
 
-- `skill-doc/references/recap/pattern1-cover.md` + `skill-doc/references/recap/writing1-cover.md`
-- `skill-doc/references/recap/pattern2-thinking.md` + `skill-doc/references/recap/writing2-thinking.md`
-- `skill-doc/references/recap/pattern3-vibe.md` + `skill-doc/references/recap/writing3-vibe.md`
-- `skill-doc/references/recap/pattern4-workflow.md` + `skill-doc/references/recap/writing4-workflow.md`
-- `skill-doc/references/recap/pattern5-closing.md` + `skill-doc/references/recap/writing5-closing.md`
+- The index rebuilds incrementally — only new or modified transcript files are re-parsed.
+- The CLI has zero runtime npm dependencies and uses built-in `node:sqlite` with FTS5 (Node ≥ 22.13).
+- When the desktop app is running it owns index writes (single-writer lease); CLI invocations stay read-only.
+- The app runs on Electron's embedded Node 24 with `better-sqlite3`, and shares `packages/core` with the CLI.
 
-### Generated build outputs
-
-- `packages/core/dist/` is produced by `npm run build:core`. It is the compiled
-  internal `@obelisk/core` workspace: JavaScript, type declarations, and
-  `schema.sql`.
-- `packages/cli/dist/` is produced by `npm run build:cli`. It is the publishable
-  `@obelisk-apps/cli` payload: the thin command shell, readable compiled Core,
-  and `schema.sql`.
-- `dist/obelisk-skill/` is produced by `npm run build:skill`. It is the
-  docs-only skill artifact: `SKILL.md`, references, and skill package metadata.
-- Skill publishing stages that artifact at `skills/obelisk/` in the
-  `obelisk-skill` repository; only `README.md` and `LICENSE` remain at the
-  repository root for `npx skills` discovery.
-
-Both directories are generated and should not be edited by hand. The Electron
-app imports `packages/core/src/` directly so electron-vite can bundle Core.
-
-## Implementation Notes
-
-The index rebuilds incrementally — only new or modified JSONL files are re-parsed.
-When the optional app is running, it is the active indexer: it watches Claude
-project files and builds in a worker thread. A fresh `__app_heartbeat__` alone
-means the daemon owns writes, so CLI invocations remain read-only; a separate SQLite
-writer lease prevents cross-process writes from overlapping. The
-`__app_last_successful_build__` marker records index freshness, not ownership.
-
-The CLI has zero runtime npm dependencies, requires Node >=22.13.0, and uses
-built-in `node:sqlite` with FTS5. The desktop app uses Electron's embedded Node
-24 and `better-sqlite3`. The formal skill contains instructions and references,
-not a second executable runtime.
-
-20K lines of scattered JSONL → something the agent can search() and sql() against in milliseconds.
+20K lines of scattered JSONL → something the agent can `search()` and `sql()` against in milliseconds.
 
 ## Contributing
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening
 a PR — it is short, and it is written from what actually blocked past PRs rather
-than from generic style rules.
-
-The parts worth knowing up front:
+than from generic style rules. The parts worth knowing up front:
 
 - **Run every claim in your PR description end to end.** The most common reason a
   PR stalls here is a capability that is advertised but unreachable — including
@@ -411,22 +228,6 @@ The parts worth knowing up front:
   deny-by-default.
 - **Re-run verification after merging main.** A merge voids every result above
   it, including your own noted limitations.
-
-`CONTRIBUTING.md` also carries hard constraints per area — renderer/Electron,
-provider adapters, schema migrations, main process, and indexing/daemon
-ownership. The PR template mirrors them as per-area checklists.
-
----
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=tommy0103%2Fobelisk&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=tommy0103/obelisk&type=date&theme=dark&legend=top-left&sealed_token=zGsTpxirzDypxpaSUQ4aiPpCQFVFbII1Xl68UlRRpVdaTr6NoPY_cEvprnA9kMMdmXnERYZn3uXo20PkKEiuoGQ8d-qD3nPDanawRUrZuFYnNPytlC2iTw" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=tommy0103/obelisk&type=date&legend=top-left&sealed_token=zGsTpxirzDypxpaSUQ4aiPpCQFVFbII1Xl68UlRRpVdaTr6NoPY_cEvprnA9kMMdmXnERYZn3uXo20PkKEiuoGQ8d-qD3nPDanawRUrZuFYnNPytlC2iTw" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=tommy0103/obelisk&type=date&legend=top-left&sealed_token=zGsTpxirzDypxpaSUQ4aiPpCQFVFbII1Xl68UlRRpVdaTr6NoPY_cEvprnA9kMMdmXnERYZn3uXo20PkKEiuoGQ8d-qD3nPDanawRUrZuFYnNPytlC2iTw" />
- </picture>
-</a>
 
 ## License
 
