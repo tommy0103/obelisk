@@ -80,11 +80,27 @@ export async function assembleRelease({ directory, version, tag, notes, reposito
   await writeFile(path.join(directory, 'latest-mac.yml'), JSON.stringify({ version, files,
     path: legacy.url, sha512: legacy.sha512, releaseDate: date.toISOString(), releaseNotes: notes }, null, 2)+'\n');
 }
+export async function assembleDebianRelease({ directory, version, notes }) {
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error('Invalid Debian release version');
+  const info = JSON.parse(await readFile(path.join(directory, 'debian-amd64.json'), 'utf8'));
+  const file = `Obelisk-${version}-linux-amd64.deb`;
+  if (info.file !== file || info.version !== version || info.arch !== 'x64') throw new Error('Mismatched Debian artifact metadata');
+  const bytes = await readFile(path.join(directory, file));
+  const sha512 = createHash('sha512').update(bytes).digest('base64');
+  if (sha512 !== info.sha512 || bytes.length !== info.size) throw new Error('Debian artifact changed after verification');
+  await writeFile(path.join(directory, 'latest-linux.yml'), JSON.stringify({ version,
+    files: [{ url: file, sha512, size: bytes.length }], path: file, sha512,
+    releaseDate: new Date().toISOString(), releaseNotes: notes }, null, 2)+'\n');
+}
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [mode, directory] = process.argv.slice(2);
   if (mode === 'sign') await signArchive({ directory, version: process.env.APP_VERSION, arch: process.env.MAC_ARCH,
     tool: process.env.SPARKLE_SIGN_TOOL, privateKeyFile: process.env.SPARKLE_KEY_FILE, minimumSystemVersion: process.env.MIN_MAC_OS });
-  else if (mode === 'assemble') await assembleRelease({ directory, version: process.env.APP_VERSION,
-    tag: process.env.RELEASE_TAG, notes: await readFile(process.env.RELEASE_NOTES_FILE, 'utf8') });
+  else if (mode === 'assemble') {
+    const options = { directory, version: process.env.APP_VERSION, tag: process.env.RELEASE_TAG,
+      notes: await readFile(process.env.RELEASE_NOTES_FILE, 'utf8') };
+    await assembleRelease(options);
+    if (process.env.INCLUDE_DEBIAN === 'true') await assembleDebianRelease(options);
+  }
   else throw new Error('Expected sign or assemble');
 }

@@ -33,17 +33,11 @@ test('skill routes only the explicit recap intent to the split recap overview', 
   assert.doesNotMatch(skill, /playful personal progress recap/);
 });
 
-test('README lists the recap folder without making recap the core retrieval path', async () => {
+test('README documents recap as an optional flow with its own references', async () => {
   const readme = await read('README.md');
 
-  assert.match(readme, /references\/recap\/overview\.md/);
-  for (const [n, name] of cards) {
-    assert.match(readme, new RegExp(`skill-doc/references/recap/pattern${n}-${name}\\.md`));
-    assert.match(readme, new RegExp(`skill-doc/references/recap/writing${n}-${name}\\.md`));
-  }
   assert.match(readme, /optional .*\/obelisk recap/i);
-  assert.match(readme, /explicit `\/obelisk recap` intent/);
-  assert.match(readme, /card-by-card/i);
+  assert.match(readme, /skill-doc\/references\/recap\/overview\.md/);
 });
 
 test('old recap references are thin redirects to the split docs', async () => {

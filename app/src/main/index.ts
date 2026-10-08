@@ -22,6 +22,8 @@ import { storedSessionCursor } from '../../../packages/core/src/provider-indexin
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
+  getCopilotEditions,
+  hasExplicitProviderRoot,
   readPersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
@@ -33,6 +35,7 @@ import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
   SessionMetadata,
+  SessionsQueryOptions,
   SourceQueryOptions,
   WindowControlAction,
 } from '../shared/ipc-types.ts';
@@ -102,6 +105,11 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       fileMustExist: true,
     }),
     openZcodeDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
+    openKiroDatabase: sourcePath => new Database(sourcePath, {
       readonly: true,
       fileMustExist: true,
       timeout: 500,
@@ -528,12 +536,17 @@ const updateLifecycle = createUpdateLifecycle({
   stop: () => stopBackgroundResources({ stopWorker: true }),
   resume: () => { if (!appQuitRequested) startBackgroundResources({ watchSources: loadPersistedSettings().autoRefresh !== false }); },
 });
+// Only the shipped amd64 Debian target has a verified Linux update channel.
+// AppImage/source builds and other architectures must not consume its feed.
+const isDebInstall = app.isPackaged && process.platform === 'linux' && process.arch === 'x64' &&
+  await fs.promises.readFile(path.join(process.resourcesPath, 'package-type'), 'utf8')
+    .then(value => value.trim() === 'deb', () => false);
 const updater = createUpdateService({
-  enabled: app.isPackaged === true && process.platform === 'darwin',
+  enabled: app.isPackaged === true && (process.platform === 'darwin' || isDebInstall),
   version: app.getVersion(),
   createBackend: async receive => {
-    const { createMacUpdateBackend } = await import('./update-backends.ts');
-    return createMacUpdateBackend(receive);
+    const { createMacUpdateBackend, createDebUpdateBackend } = await import('./update-backends.ts');
+    return process.platform === 'darwin' ? createMacUpdateBackend(receive) : createDebUpdateBackend(receive);
   },
   prepare: updateLifecycle.prepare,
   recover: updateLifecycle.recover,
@@ -686,9 +699,9 @@ function querySessionMetadata(sessionId: string): SessionMetadata | null {
   ) || null;
 }
 
-ipcMain.handle('db:getSessions', (_, opts = {}) => {
+ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
   if (!db) return [];
-  const { project, limit = 200 } = opts;
+  const { project, sessionId, limit = 200 } = opts;
   let sql = `SELECT ${SESSION_METADATA_COLUMNS} FROM sessions`;
   const params: unknown[] = [];
   const sourceFilter = sourceWhereClause(opts);
@@ -697,8 +710,12 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
     params.push(...sourceFilter.params);
   }
   if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
-  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`;
-  params.push(limit);
+  if (sessionId !== undefined) { sql = appendWhere(sql, params, `id = ?`); params.push(sessionId); }
+  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC`;
+  if (limit !== null) {
+    sql += ' LIMIT ?';
+    params.push(limit);
+  }
   return db.prepare(sql).all(...params);
 });
 
@@ -800,11 +817,13 @@ ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
     workflowAgent,
   };
   // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
-  if (lookup.source === 'zcode' || lookup.source === 'hermes') {
+  if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro') {
     try {
       const messageText = lookup.source === 'zcode'
         ? await indexerWorker?.readZcodeMessageText(lookup)
-        : await indexerWorker?.readHermesMessageText(lookup);
+        : lookup.source === 'kiro'
+          ? await indexerWorker?.readKiroMessageText({ ...lookup, rootDir: paths.providerRoots.kiro })
+          : await indexerWorker?.readHermesMessageText(lookup);
       return messageText ?? msg.text ?? null;
     } catch {
       return msg.text ?? null;
@@ -1069,9 +1088,11 @@ function savePersistedSettings(settings) {
   }
 }
 
-ipcMain.handle('settings:get', () => {
+ipcMain.handle('settings:get', async () => {
   const persisted = loadPersistedSettings();
   const paths = getRuntimePaths(persisted);
+  const copilotEditions = getCopilotEditions(persisted);
+  const copilotCustomRoot = hasExplicitProviderRoot(persisted, 'copilot');
   const { providerRoots, providerRegistry, claudeDir, codexDir, dbPath: dbFile } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
@@ -1095,12 +1116,36 @@ ipcMain.handle('settings:get', () => {
       memoryCount = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
     } catch {}
   }
+  const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
+  const sourcePaths = new Set([
+    ...providerRegistry.catalog().map((provider) => providerRoots[provider.id] ?? provider.defaultRoot),
+    ...(!copilotCustomRoot ? selectedCopilotEditions.map((edition) => edition.path) : []),
+  ]);
+  const existingPaths = new Set((await Promise.all([...sourcePaths].map(async (sourcePath) => {
+    try {
+      await fs.promises.access(sourcePath);
+      return sourcePath;
+    } catch {
+      return null;
+    }
+  }))).filter((sourcePath): sourcePath is string => sourcePath !== null));
+  const copilotCatalogRoot = selectedCopilotEditions.find((edition) => existingPaths.has(edition.path))
+    ?? selectedCopilotEditions[0];
   const sources = buildSourceCatalog({
     registry: providerRegistry,
-    roots: providerRoots,
+    roots: copilotCustomRoot ? providerRoots : {
+      ...providerRoots,
+      copilot: copilotCatalogRoot?.path ?? '',
+    },
     stats: sourceStats,
     sourceIssues: latestSourceIssues,
-    pathExists: fs.existsSync,
+    pathExists: (sourcePath) => existingPaths.has(sourcePath),
+  }).map((source) => {
+    if (source.id !== 'copilot' || copilotCustomRoot) return source;
+    if (selectedCopilotEditions.length === 0) {
+      return { ...source, exists: false, status: 'warn', statusText: 'No folders selected' };
+    }
+    return source;
   });
   const sessionCount = sources.reduce((sum, source) => sum + source.sessionCount, 0);
   const lastIndexed = sources.map((source) => source.lastIndexed).filter(Boolean).sort().at(-1) || '';
@@ -1110,6 +1155,8 @@ ipcMain.handle('settings:get', () => {
   return {
     version: app.getVersion(),
     providerRoots,
+    copilotEditions,
+    copilotCustomRoot,
     claudeDir,
     codexDir,
     dbPath: dbFile,

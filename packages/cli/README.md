@@ -1,7 +1,7 @@
 # Obelisk CLI
 
 The local Obelisk runtime used by coding agents. It indexes Claude Code, Codex, GitHub Copilot,
-Kimi Code, and Pi transcripts into `~/.obelisk/obelisk.sqlite` and exposes the
+Kimi Code, Kiro, and Pi transcripts into `~/.obelisk/obelisk.sqlite` and exposes the
 stable `build`, `search`, `query`, and `attune` process interface.
 
 Requires **Node.js >=22.13.0** on the host. The CLI uses built-in `node:sqlite`;

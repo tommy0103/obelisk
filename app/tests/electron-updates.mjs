@@ -4,6 +4,7 @@
 // Exercise update IPC, actual renderer interactions and reader-anchor stability.
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSessionPatch } from '../src/shared/session-patch.mjs';
@@ -178,7 +179,7 @@ async function run() {
   await delay(50);
   assert(openedLinks[0] === 'https://github.com/tommy0103/obelisk/releases/tag/v0.2.4', 'only a user-initiated HTTPS release link reaches the browser boundary');
   await delay(120);
-  await win.webContents.capturePage().then(image => image.toPNG()).then(bytes => import('node:fs/promises').then(fs => fs.writeFile('/private/tmp/obelisk-update-notes.png', bytes)));
+  await win.webContents.capturePage().then(image => image.toPNG()).then(bytes => import('node:fs/promises').then(fs => fs.writeFile(join(tmpdir(), 'obelisk-update-notes.png'), bytes)));
   win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
   win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
   await waitFor(win.webContents, `!document.querySelector('.update-dialog')?.open`, 'closed release notes');
@@ -186,7 +187,7 @@ async function run() {
   setUpdate(win, { phase: 'ready', progress: 100 });
   await waitFor(win.webContents, `document.querySelector('.update-notice .primary')`, 'ready action');
   await delay(120);
-  await win.webContents.capturePage().then(image => image.toPNG()).then(bytes => import('node:fs/promises').then(fs => fs.writeFile('/private/tmp/obelisk-update-ready.png', bytes)));
+  await win.webContents.capturePage().then(image => image.toPNG()).then(bytes => import('node:fs/promises').then(fs => fs.writeFile(join(tmpdir(), 'obelisk-update-ready.png'), bytes)));
   await evaluate(`document.querySelector('.update-notice .subtle').click()`);
   await waitFor(win.webContents, `!document.querySelector('.update-notice')`, 'Later dismissal');
   assert(installCalls === 0, 'Later keeps the app running without installing');

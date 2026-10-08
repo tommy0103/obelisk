@@ -1,7 +1,7 @@
 ---
 name: obelisk
 description: >
-  Search and query past Claude Code, Codex, Kimi Code, OMP, and Pi session history.
+  Search and query past Claude Code, Codex, Kimi Code, Kiro, OMP, and Pi session history.
   Reactive: when the user asks "how did I fix X", "what did we do last time", "find the session where", "上次怎么修的", "之前的session", "历史记录".
   Proactive: when the user references past work you lack context for, when you're about to modify a file with complex edit history, when the user says "继续之前的" or "continue where we left off", or when understanding prior decisions would improve your current response.
   Memory: when the user says "记住这个", "remember this", "写入记忆", "save this conclusion", or when you determine a retrieval result contains a conclusion worth persisting.
@@ -14,7 +14,7 @@ allowed-tools:
 # obelisk
 
 Search and query local Claude Code, Codex, DeepSeek Harness, GitHub Copilot,
-Kimi Code, OMP, Pi, and ZCode session history.
+Kimi Code, Kiro, OMP, Pi, and ZCode session history.
 Obelisk indexes sessions, messages, tool calls, tool results, summaries,
 subagents, workflows, workflow agents, parent chains, and raw JSONL lines into
 SQLite + FTS5.
@@ -22,7 +22,7 @@ SQLite + FTS5.
 Obelisk has several transcript sources. Treat all of them as ordinary sessions by
 default: Claude rows use `source='claude'`, Codex rows use `source='codex'`,
 DeepSeek Harness rows use `source='deepseek'`, GitHub Copilot rows use
-`source='copilot'`, Kimi Code rows use `source='kimi'`, OMP rows use
+`source='copilot'`, Kimi Code rows use `source='kimi'`, Kiro rows use `source='kiro'`, OMP rows use
 `source='omp'`, Pi rows use `source='pi'`, and ZCode rows use `source='zcode'`.
 Use `source` only when provenance matters or the user asks to scope to one
 provider.

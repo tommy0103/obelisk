@@ -2,15 +2,17 @@
 
 The implementation for [#209](https://github.com/tommy0103/obelisk/issues/209)
 follows [ADR-0015](adr/0015-desktop-sparkle-and-electron-updater.md). The initial
-scope is macOS arm64 and x64, with stable desktop releases hosted on GitHub.
+scope was macOS arm64 and x64. The Debian extension below adds Linux amd64
+`.deb` installs, with stable desktop releases hosted on GitHub.
 The CLI retains its independent npm lifecycle. No version tag or release is
 created as part of implementation verification.
 
 ## App behavior
 
-Packaged macOS apps automatically check and download without forcing a restart.
-Development builds and the initial Windows/Linux delivery disable updates.
-Sparkle schedules hourly checks; the fallback checks at startup and every
+Packaged macOS and Linux amd64 `.deb` apps automatically check and download
+without forcing a restart. Development builds, Windows, AppImage and other Linux
+architectures disable updates. Sparkle schedules hourly checks; electron-updater
+backends check at startup and every
 30 minutes. A manual check lives in Settings → About, alongside status, progress,
 last check time and retry errors. The sidebar notice offers View changes, Later,
 and Update & restart. Later keeps the validated download and its About action.
@@ -153,3 +155,27 @@ Existing app versions need one manual installation of the first updater-enabled
 version. DMG-mounted or read-only apps should be installed into a writable
 Applications location before updating. No public release is needed for the
 verification-only workflow or the local harness.
+
+## Linux Debian release extension
+
+The desktop release workflow also builds `Obelisk-<version>-linux-amd64.deb`
+on Ubuntu 22.04 and installs/verifies it on Ubuntu 22.04 and 24.04 before draft
+upload. The package declares its Electron runtime libraries and Polkit helper.
+`latest-linux.yml` contains the verified Debian archive's SHA512, size, version,
+and the same release notes as the macOS feeds.
+
+Only packaged x64 applications carrying `resources/package-type=deb` enable
+`DebUpdater`. They reuse background check/download, release notes, Later,
+Update & restart, downgrade rejection and the cleanup/recovery lifecycle.
+The system requests administrator authorization to replace `/opt/Obelisk`;
+cancellation retains the staged update and reopens background resources for retry.
+Existing 0.2.2 Linux installations need one manual upgrade to this version.
+
+`app/tests/packaged-deb-updates.mjs` makes two disposable versions from the
+actual Debian installer, redirects only their feed and test-home bootstrap,
+and drives the shipped UI/preload/main. It verifies non-newer-release rejection,
+SHA512 mismatch and retry, authorization cancellation, actual dpkg installation
+through CI sudo, relaunch, and preserved memory/recap data. The authorization
+helper is a test-only substitute for the desktop authentication dialog; the
+DebUpdater installer command and system package manager are real. AppImage,
+Linux arm64 and Windows automatic updates remain outside this delivery.

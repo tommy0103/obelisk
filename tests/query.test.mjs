@@ -13,6 +13,7 @@ import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
 import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
 import { codexDbId } from '../packages/core/src/parsing.ts';
 import { namespacedSessionId as kimiSessionId } from '../packages/core/src/providers/kimi.ts';
+import { kiroSessionId } from '../packages/core/src/providers/kiro.ts';
 import { copilotSessionId } from '../packages/core/src/providers/copilot.ts';
 import { canonicalSessionId as zcodeSessionId } from '../packages/core/src/providers/zcode.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
@@ -647,7 +648,9 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawCopilot = '6b8a4d92-0f13-4c67-95ea-2d7419b03f86';
   const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
   const rawHermes = '20260101_120000_aaaaaa';
-  // Canonical ids in each provider's own shape: pi/omp/deepseek namespace by
+  const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
+  const rawKiro = kiroHeader.id;
+  // Canonical ids in each provider's own shape: pi/omp/deepseek/kiro namespace by
   // project, kimi/codex prefix the native id, claude keeps the bare uuid.
   const piHeader = (cwd) => ({ type: 'session', id: rawPi, cwd });
   const canonicalPiA = piFamilySessionId(piHeader('/Users/me/a'), 'pi');
@@ -659,6 +662,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalCopilot = copilotSessionId(rawCopilot, '/Users/me/copilot');
   const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
   const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
+  const canonicalKiro = kiroSessionId(rawKiro, kiroHeader.workspacePaths[0]);
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -673,6 +677,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalCopilot, 'Copilot session', '-Users-me-copilot', '/Users/me/copilot', '2026-09-18T03:00:00Z', '2026-09-18T04:00:00Z', null, 1, 'copilot');
   insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
   insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
+  insertSession.run(canonicalKiro, kiroHeader.title, '-workspace-demo', kiroHeader.workspacePaths[0], kiroHeader.createdAt, kiroHeader.lastModifiedAt, null, 1, 'kiro');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -692,6 +697,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
     deepseek: [rawDeepseek, [canonicalDeepseek]],
     hermes: [rawHermes, [canonicalHermes]],
     kimi: [rawKimi, [canonicalKimi]],
+    kiro: [rawKiro, [canonicalKiro]],
     omp: [rawOmp, [canonicalOmp]],
     pi: [rawPi, [canonicalPiB, canonicalPiA]],
     zcode: [rawZcode, [canonicalZcode]],
@@ -742,7 +748,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
 test('every provider embeds the native session id verbatim in its canonical id', () => {
   // Fragment resolution in sessions() depends on this: a native id is only
   // findable while it appears verbatim inside the canonical id. pi-family,
-  // deepseek, copilot, and hermes encode native ids with encodeURIComponent,
+  // deepseek, copilot, hermes, and kiro encode native ids with encodeURIComponent,
   // which preserves this UUID-shaped fixture and Hermes's timestamp-shaped
   // lookup fixture above. URL-unsafe native ids need explicit coverage.
   const native = '99999999-9999-4999-8999-999999999999';
@@ -753,6 +759,7 @@ test('every provider embeds the native session id verbatim in its canonical id',
     hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
     codex: codexDbId(native),
     kimi: kimiSessionId(native),
+    kiro: kiroSessionId(native, '/Users/me/obelisk'),
     pi: piFamilySessionId(piHeader, 'pi'),
     omp: piFamilySessionId(piHeader, 'omp'),
     deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),

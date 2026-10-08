@@ -7,7 +7,7 @@ import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { generateKeyPairSync, sign, createHash } from 'node:crypto';
-import { assembleRelease, verifyArchive, validateKeyPair } from '../app/scripts/update-release.mjs';
+import { assembleRelease, assembleDebianRelease, verifyArchive, validateKeyPair } from '../app/scripts/update-release.mjs';
 
 async function artifacts(t) {
   const directory = await mkdtemp(path.join(tmpdir(), 'obelisk-update-feed-')); t.after(() => rm(directory, { recursive: true, force: true }));
@@ -65,4 +65,25 @@ test('Sparkle keys use the official 32-byte seed format and must match the baked
   assert.doesNotThrow(() => validateKeyPair(pub, secret));
   assert.throws(() => validateKeyPair(pub, Buffer.alloc(64).toString('base64')), /private key format/);
   assert.throws(() => validateKeyPair(pub, Buffer.alloc(32).toString('base64')), /do not match/);
+});
+
+test('Debian update metadata carries the verified amd64 installer and the same release notes', async t => {
+  const options = await artifacts(t);
+  const file = 'Obelisk-0.2.4-linux-amd64.deb';
+  const bytes = Buffer.from('immutable Debian archive fixture');
+  const metadata = { file, version: options.version, arch: 'x64', size: bytes.length,
+    sha512: createHash('sha512').update(bytes).digest('base64') };
+  await writeFile(path.join(options.directory, file), bytes);
+  const manifestPath = path.join(options.directory, 'debian-amd64.json');
+  await writeFile(manifestPath, JSON.stringify(metadata));
+  await assembleDebianRelease(options);
+  const feed = JSON.parse(await readFile(path.join(options.directory, 'latest-linux.yml'), 'utf8'));
+  assert.equal(feed.version, options.version);
+  assert.equal(feed.releaseNotes, options.notes);
+  assert.deepEqual(feed.files, [{ url: file, size: bytes.length, sha512: metadata.sha512 }]);
+  await writeFile(manifestPath, JSON.stringify({ ...metadata, arch: 'arm64' }));
+  await assert.rejects(assembleDebianRelease(options), /Mismatched Debian/);
+  await writeFile(manifestPath, JSON.stringify(metadata));
+  await writeFile(path.join(options.directory, file), 'tampered Debian archive');
+  await assert.rejects(assembleDebianRelease(options), /changed after verification/);
 });

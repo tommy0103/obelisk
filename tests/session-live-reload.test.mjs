@@ -112,6 +112,7 @@ test('a skipped live patch does not advance the visible patch baseline', async t
     { uuid: 'message-1', type: 'user', timestamp: '2026-07-14T00:00:01Z', text: 'one' },
   ];
   let patchCalls = 0;
+  const patchCursorTypes = [];
   let releaseFirstPatch;
   let firstPatchStarted;
   const firstPatchGate = new Promise(resolve => { releaseFirstPatch = resolve; });
@@ -125,7 +126,9 @@ test('a skipped live patch does not advance the visible patch baseline', async t
       getSessionSubagents: async () => [],
       getSessionWorkflows: async () => [],
       getSessionSummaries: async () => [],
-      getSessionPatch: async (_id, cursor) => {
+      getSessionPatch: async (_id, encodedCursor) => {
+        patchCursorTypes.push(typeof encodedCursor);
+        const cursor = typeof encodedCursor === 'string' ? JSON.parse(encodedCursor) : encodedCursor;
         const snapshotAtCall = { messages: assembleSessionDetail({
           messages: rows,
           toolCalls: [],
@@ -175,6 +178,7 @@ test('a skipped live patch does not advance the visible patch baseline', async t
   releaseFirstPatch();
   await Promise.all([first, second]);
 
+  assert.deepEqual(patchCursorTypes, ['string', 'string'], 'the bridge receives primitives instead of the full fingerprint objects');
   assert.deepEqual(commits, [{
     messages: ['message-1', 'message-2', 'message-3'],
     changedIds: ['message-2', 'message-3'],

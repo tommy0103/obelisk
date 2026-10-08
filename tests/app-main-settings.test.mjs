@@ -10,6 +10,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { defaultKiroDatabasePath } from '../packages/core/src/providers/kiro.ts';
 import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -145,6 +146,7 @@ function defaultIndexerWorkerClient() {
     createWorkerBuildIndex: () => ({
       buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
       readHermesMessageText: async () => null,
+      readKiroMessageText: async () => null,
       stop() {},
     }),
   };
@@ -267,13 +269,20 @@ test('main process watches every root declared by the built-in provider registry
 
   const serviceOptions = [];
   const workerCalls = [];
+  const ipcHandlers = new Map();
 
   class FakeDatabase {
     pragma() {}
     exec() {}
     close() {}
-    prepare() {
-      return { get: () => null, all: () => [], run: () => ({}) };
+    prepare(sql) {
+      return {
+        get: () => null,
+        all: () => sql.includes("GROUP BY COALESCE(source")
+          ? [{ source: 'copilot', session_count: 2, last_indexed: '2026-10-08' }]
+          : [],
+        run: () => ({}),
+      };
     }
   }
 
@@ -290,7 +299,10 @@ test('main process watches every root declared by the built-in provider registry
   }
 
   const restore = registerMocks([
-    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
     [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
@@ -342,6 +354,9 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(home, '.hermes', 'profiles'), fileNames: ['state.db', 'state.db-wal'] },
       { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.kiro', 'sessions') },
+      { kind: 'file', path: defaultKiroDatabasePath({ homeDir: home }) },
+      { kind: 'file', path: `${defaultKiroDatabasePath({ homeDir: home })}-wal` },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
       { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
@@ -350,6 +365,21 @@ test('main process watches every root declared by the built-in provider registry
     assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
     assert.deepEqual(workerCalls[0].providerSettings, {});
+    mkdirSync(insidersCopilotRoot, { recursive: true });
+    const defaultSettings = await ipcHandlers.get('settings:get')();
+    assert.deepEqual(defaultSettings.copilotEditions.map((edition) => edition.enabled), [true, true]);
+    const copilotSource = defaultSettings.sources.find((source) => source.id === 'copilot');
+    assert.equal(copilotSource.exists, true);
+    assert.equal(copilotSource.sessionCount, 2);
+    assert.equal(copilotSource.status, 'ok', 'Insiders-only indexed history is connected without a warning');
+    assert.equal(copilotSource.statusText, 'Connected');
+    await ipcHandlers.get('settings:set')(null, 'copilotEditions.stable', false);
+    assert.deepEqual((await ipcHandlers.get('settings:get')()).copilotEditions.map((edition) => edition.enabled), [false, true]);
+    assert.equal(serviceOptions.length, 2);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(stableCopilotRoot)), false);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(insidersCopilotRoot)), true);
+    await serviceOptions[1].buildIndex({ reason: 'settings-transfer' });
+    assert.deepEqual(workerCalls[1].providerSettings.copilotEditions, { stable: false });
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -618,6 +648,10 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     .run('hermes:session', 'hermes', '/tmp/hermes/state.db#session:source');
   setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
     .run('hermes:full-text', 'hermes:session', 'assistant', 'assistant', 'truncated Hermes text', 'hermes');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('kiro:session', 'kiro', '/workspace/kiro/sessions/cli/example.jsonl');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('kiro:full-text', 'kiro:session', 'assistant', 'assistant', 'truncated Kiro text', 'kiro');
   setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
     .run('zcode:child', 'zcode');
   setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,visibility,source,agent_id) VALUES (?,?,?,?,?,?,?,?)')
@@ -729,6 +763,12 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
           assert.equal(lookup.messageUuid, 'hermes:full-text');
           return 'complete Hermes text from worker';
         },
+        readKiroMessageText: async lookup => {
+          assert.equal(lookup.source, 'kiro');
+          assert.equal(lookup.messageUuid, 'kiro:full-text');
+          assert.equal(lookup.rootDir, join(home, '.kiro'));
+          return 'complete Kiro text from worker';
+        },
         stop() {},
       }),
     } }],
@@ -779,6 +819,8 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       'complete ZCode text from worker');
     assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'hermes:full-text'),
       'complete Hermes text from worker');
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'kiro:full-text'),
+      'complete Kiro text from worker');
 
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
     assert.equal(claudeOnly.totalTokens, 72);
@@ -890,6 +932,74 @@ test('session IPC keeps a message tool calls in insertion order', async () => {
       ['browser_snapshot', 'browser_console'],
       'which is the order the assembled session detail carries',
     );
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('session catalogue includes older sessions beyond 1000 across providers and resolves exact IDs', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-catalogue-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const setup = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  const insert = setup.prepare('INSERT INTO sessions (id, title, project, source, started_at) VALUES (?, ?, ?, ?, ?)');
+  setup.exec('BEGIN');
+  for (let i = 0; i < 1105; i++) {
+    insert.run(`catalogue-${i}`, `Session ${i}`, i < 5 ? 'older-only' : 'active',
+      i % 2 ? 'codex' : 'claude', new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString());
+  }
+  setup.exec('COMMIT');
+  setup.close();
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      app: captureAppHandlers(appHandlers), BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+  try {
+    await importMain();
+    const sessions = opts => ipcHandlers.get('db:getSessions')(null, opts);
+    const catalogue = sessions({ source: 'all', limit: null });
+    assert.equal(catalogue.length, 1105);
+    assert.equal(catalogue[0].id, 'catalogue-1104');
+    assert.equal(catalogue.at(-1).id, 'catalogue-0');
+    assert.equal(sessions({ source: 'all' }).length, 200, 'default bounded callers remain bounded');
+    assert.equal(sessions({ source: 'all', limit: 0 }).length, 0);
+    assert.equal(sessions({ source: 'codex', limit: null }).length, 552);
+    assert.equal(sessions({ source: 'all', project: 'older-only', limit: null }).length, 5);
+    assert.deepEqual(sessions({ source: 'all', sessionId: 'catalogue-1', limit: 1 }).map(s => s.id), ['catalogue-1']);
+    assert.equal(sessions({ source: 'claude', sessionId: 'catalogue-1' }).length, 0);
+    assert.equal(sessions({ source: 'all', sessionId: 'missing' }).length, 0);
+    assert.equal(ipcHandlers.get('db:getStats')(null, { source: 'all' }).sessions, 1105);
+    const projects = ipcHandlers.get('db:getProjects')(null, { source: 'all' });
+    assert.equal(projects.find(p => p.project === 'older-only').session_count, 5);
+    assert.equal(projects.reduce((sum, p) => sum + p.session_count, 0), 1105);
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);

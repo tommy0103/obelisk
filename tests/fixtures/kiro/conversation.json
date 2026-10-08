@@ -1,0 +1,133 @@
+{
+  "key": "/workspace/demo",
+  "conversation_id": "id-46",
+  "value": {
+    "conversation_id": "id-46",
+    "history": [
+      {
+        "user": {
+          "content": {
+            "Prompt": {
+              "prompt": "Example content"
+            }
+          },
+          "timestamp": "2026-01-01T12:00:00.000Z"
+        },
+        "assistant": {
+          "ToolUse": {
+            "message_id": "id-47",
+            "content": "Example content",
+            "tool_uses": [
+              {
+                "id": "id-48",
+                "name": "example_tool",
+                "args": {
+                  "operations": [
+                    {
+                      "mode": "Example content",
+                      "path": "Example content"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "request_metadata": {
+          "stream_end_timestamp_ms": 1767268800000,
+          "model_id": "example-model",
+          "uncached_input_tokens": null,
+          "output_tokens": null,
+          "cache_read_input_tokens": null,
+          "cache_write_input_tokens": null
+        }
+      },
+      {
+        "user": {
+          "content": {
+            "ToolUseResults": {
+              "tool_use_results": [
+                {
+                  "tool_use_id": "id-48",
+                  "content": [
+                    {
+                      "Text": "Example content"
+                    }
+                  ],
+                  "status": "Success"
+                }
+              ]
+            }
+          },
+          "timestamp": null
+        },
+        "assistant": {
+          "ToolUse": {
+            "message_id": "id-49",
+            "content": "Example content",
+            "tool_uses": [
+              {
+                "id": "id-50",
+                "name": "example_tool",
+                "args": {
+                  "command": "Example content",
+                  "path": "Example content",
+                  "file_text": "Example content"
+                }
+              }
+            ]
+          }
+        },
+        "request_metadata": {
+          "stream_end_timestamp_ms": 1767268800000,
+          "model_id": "example-model",
+          "uncached_input_tokens": null,
+          "output_tokens": null,
+          "cache_read_input_tokens": null,
+          "cache_write_input_tokens": null
+        }
+      },
+      {
+        "user": {
+          "content": {
+            "CancelledToolUses": {
+              "prompt": "Example content",
+              "tool_use_results": [
+                {
+                  "tool_use_id": "id-50",
+                  "content": [
+                    {
+                      "Text": "Example content"
+                    }
+                  ],
+                  "status": "Error"
+                }
+              ]
+            }
+          },
+          "timestamp": "2026-01-01T12:00:00.000Z"
+        },
+        "assistant": {
+          "Response": {
+            "message_id": "id-51",
+            "content": "Example content"
+          }
+        },
+        "request_metadata": {
+          "stream_end_timestamp_ms": 1767268800000,
+          "model_id": "example-model",
+          "uncached_input_tokens": null,
+          "output_tokens": null,
+          "cache_read_input_tokens": null,
+          "cache_write_input_tokens": null
+        }
+      }
+    ],
+    "next_message": null,
+    "model_info": {
+      "model_id": "example-model"
+    }
+  },
+  "created_at": 1767268800000,
+  "updated_at": 1767268860000
+}

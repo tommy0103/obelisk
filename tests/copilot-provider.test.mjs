@@ -497,6 +497,67 @@ test('complete union inventory retracts only sessions missing from both sources'
   }
 });
 
+for (const source of ['transcript', 'chronicle']) {
+  test(`deleted ${source} sessions under a root containing # are retracted without touching excluded roots`, () => {
+    const base = makeTempDir('obelisk-copilot-hash-root-');
+    const root = join(base, 'Code#User');
+    const project = join(base, 'project');
+    const db = new DatabaseSync(':memory:');
+    db.exec(SCHEMA);
+    let chronicle;
+    try {
+      const transcriptPath = source === 'transcript'
+        ? writeWorkspaceTranscript(root, 'workspace', project, TRANSCRIPT_ONLY_ID)
+        : null;
+      if (source === 'chronicle') chronicle = createChronicle(root, project, project);
+      const provider = createCopilotProvider({ userDataRoots: [root], openChronicle });
+      const rawId = source === 'transcript' ? TRANSCRIPT_ONLY_ID : CHRONICLE_ONLY_ID;
+      const unit = discover(provider).find((candidate) => candidate.meta.rawSessionId === rawId);
+      assert.ok(unit);
+      persist(db, unit, provider.parse(unit, null));
+      const indexed = db.prepare('SELECT id AS sessionId, jsonl_path AS jsonlPath FROM sessions').all();
+      assert.equal(indexed.length, 1);
+      if (transcriptPath !== null) rmSync(transcriptPath);
+      else {
+        chronicle.db.prepare('DELETE FROM turns WHERE session_id = ?').run(rawId);
+        chronicle.db.prepare('DELETE FROM sessions WHERE id = ?').run(rawId);
+      }
+      indexed.push({ sessionId: 'copilot:excluded', jsonlPath: join(base, 'excluded#User', 'old.jsonl') });
+      const issues = [];
+      const changes = discover(provider, { indexed, issues });
+      assert.deepEqual(issues, []);
+      const tombstone = changes.find((candidate) => candidate.sessionId === unit.sessionId);
+      assert.ok(tombstone, 'a complete inventory retracts the deleted session even when its root contains #');
+      assert.equal(changes.some((candidate) => candidate.retractSessionIds?.includes('copilot:excluded')), false);
+      persist(db, tombstone, provider.parse(tombstone, null));
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 0);
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, 0);
+    } finally {
+      chronicle?.db.close();
+      db.close();
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+}
+
+test('an unavailable root containing # preserves its last-good sessions', () => {
+  const base = makeTempDir('obelisk-copilot-unavailable-hash-root-');
+  const root = join(base, 'Code#User');
+  try {
+    const provider = createCopilotProvider({ userDataRoots: [root], openChronicle });
+    const issues = [];
+    const changes = discover(provider, {
+      indexed: [{ sessionId: 'copilot:preserved', jsonlPath: join(root, 'workspaceStorage', 'old.jsonl') }],
+      issues,
+    });
+    assert.deepEqual(changes, []);
+    assert.equal(issues.length, 1);
+    assert.match(issues[0].error, /root is unavailable/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test('an unreadable Chronicle marks inventory incomplete and withholds deletion', () => {
   const base = makeTempDir('obelisk-copilot-incomplete-');
   const root = join(base, 'Code', 'User');

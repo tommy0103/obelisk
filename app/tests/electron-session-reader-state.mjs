@@ -146,34 +146,53 @@ async function navigate(win, sessionId, query = '') {
 }
 
 async function scrollState(win, fraction = null) {
-  return win.webContents.executeJavaScript(`(async () => {
+  return win.webContents.executeJavaScript(`new Promise((resolve, reject) => {
     const wrap = document.querySelector('.detail-wrap');
     ${fraction === null ? '' : `wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) * ${fraction};`}
-    await new Promise(resolve => setTimeout(resolve, 500));
-    const wrapRect = wrap.getBoundingClientRect();
-    const anchorRow = [...document.querySelectorAll('.virtual-timeline-row')]
-      .find(row => row.getBoundingClientRect().bottom > wrapRect.top);
-    const anchorRect = anchorRow?.getBoundingClientRect();
-    return {
-      current: Number(document.querySelector('.msg-nav-current')?.textContent),
-      total: Number(document.querySelector('.flap-number')?.getAttribute('aria-label')),
-      scrollTop: wrap.scrollTop,
-      anchorUuid: anchorRow?.querySelector('[data-message-uuid]')?.dataset.messageUuid || null,
-      anchorOffset: anchorRect ? anchorRect.top - wrapRect.top : null,
-    };
-  })()`, true);
+    let previous = null;
+    let stableSince = performance.now();
+    const deadline = setTimeout(() => reject(new Error('Reader geometry did not settle')), 8000);
+    function sample(now) {
+      try {
+        const wrapRect = wrap.getBoundingClientRect();
+        const visibleRows = [...document.querySelectorAll('.virtual-timeline-row')]
+          .map(row => ({ row, rect: row.getBoundingClientRect() }))
+          .filter(({ rect }) => rect.bottom > wrapRect.top && rect.top < wrapRect.bottom)
+          .sort((left, right) => left.rect.top - right.rect.top);
+        const anchor = visibleRows[0];
+        const state = {
+          current: Number(document.querySelector('.msg-nav-current')?.textContent),
+          total: Number(document.querySelector('.flap-number')?.getAttribute('aria-label')),
+          scrollTop: wrap.scrollTop,
+          anchorUuid: anchor?.row.querySelector('[data-message-uuid]')?.dataset.messageUuid || null,
+          anchorOffset: anchor ? anchor.rect.top - wrapRect.top : null,
+        };
+        const geometry = JSON.stringify([state, wrap.scrollHeight,
+          ...visibleRows.map(({ row, rect }) => [row.dataset.index, rect.top, rect.height])]);
+        const ready = !document.querySelector('.first-open-loading, .session-header.is-preparing');
+        if (!ready || !state.anchorUuid || geometry !== previous) stableSince = now;
+        previous = geometry;
+        if (ready && state.anchorUuid && now - stableSince >= 150) {
+          clearTimeout(deadline);
+          resolve(state);
+        } else requestAnimationFrame(sample);
+      } catch (error) { clearTimeout(deadline); reject(error); }
+    }
+    requestAnimationFrame(sample);
+  })`, true);
 }
 
 async function run() {
   registerHandlers();
   const win = new BrowserWindow({
-    show: false,
+    show: true,
     width: 1200,
     height: 800,
     webPreferences: {
       preload: join(appRoot, 'out', 'preload', 'index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
 

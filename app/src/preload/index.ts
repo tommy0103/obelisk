@@ -6,6 +6,8 @@ import type { UpdateState } from '../shared/update-types.ts';
 import type {
   SessionPatch,
   SessionPatchCursor,
+  SessionsQueryOptions,
+  SourceQueryOptions,
   UsageStatsOptions,
   WindowControlAction,
 } from '../shared/ipc-types.ts';
@@ -20,12 +22,12 @@ contextBridge.exposeInMainWorld('obelisk', {
     ipcRenderer.on('obelisk:update-state', listener);
     return () => ipcRenderer.removeListener('obelisk:update-state', listener);
   },
-  getSessions: (opts?: unknown) => ipcRenderer.invoke('db:getSessions', opts),
+  getSessions: (opts?: SessionsQueryOptions) => ipcRenderer.invoke('db:getSessions', opts),
   getSessionMessages: (id: string) => ipcRenderer.invoke('db:getSessionMessages', id),
   getSessionToolCalls: (id: string) => ipcRenderer.invoke('db:getSessionToolCalls', id),
   getSessionToolResults: (id: string) => ipcRenderer.invoke('db:getSessionToolResults', id),
-  getSessionPatch: (id: string, cursor: SessionPatchCursor): Promise<SessionPatch | null> => (
-    ipcRenderer.invoke('db:getSessionPatch', id, cursor)
+  getSessionPatch: async (id: string, cursor: SessionPatchCursor | string): Promise<SessionPatch | null> => (
+    ipcRenderer.invoke('db:getSessionPatch', id, typeof cursor === 'string' ? JSON.parse(cursor) : cursor)
   ),
   getSessionSubagents: (id: string) => ipcRenderer.invoke('db:getSessionSubagents', id),
   getSessionWorkflows: (id: string) => ipcRenderer.invoke('db:getSessionWorkflows', id),
@@ -40,8 +42,8 @@ contextBridge.exposeInMainWorld('obelisk', {
     ipcRenderer.invoke('file-ref:open', ref),
   archiveMemory: (id: string, reason?: string) => ipcRenderer.invoke('db:archiveMemory', id, reason),
   restoreMemory: (id: string) => ipcRenderer.invoke('db:restoreMemory', id),
-  getProjects: () => ipcRenderer.invoke('db:getProjects'),
-  getStats: () => ipcRenderer.invoke('db:getStats'),
+  getProjects: (opts?: SourceQueryOptions) => ipcRenderer.invoke('db:getProjects', opts),
+  getStats: (opts?: SourceQueryOptions) => ipcRenderer.invoke('db:getStats', opts),
   getUsageStats: (opts?: UsageStatsOptions) => ipcRenderer.invoke('db:getUsageStats', opts),
   onWindowState: (callback: (payload: unknown) => void) => {
     const listener = (_: IpcRendererEvent, payload: unknown) => callback(payload);

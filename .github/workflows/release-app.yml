@@ -1,4 +1,4 @@
-name: Release macOS App
+name: Release Desktop App
 
 on:
   push:
@@ -283,8 +283,14 @@ jobs:
             app/release/builder-mac-${{ matrix.arch }}.yml
           if-no-files-found: error
 
+  build-deb:
+    needs: prepare
+    uses: ./.github/workflows/build-deb.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
   validate-feeds:
-    needs: [prepare, build]
+    needs: [prepare, build, build-deb]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -299,9 +305,14 @@ jobs:
           pattern: mac-*
           merge-multiple: true
           path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: release
       - name: Verify both signed feeds and the combined fallback manifest
         env:
           APP_VERSION: ${{ needs.prepare.outputs.version }}
+          INCLUDE_DEBIAN: 'true'
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
@@ -311,7 +322,7 @@ jobs:
 
   release:
     if: ${{ !inputs.verify_only }}
-    needs: [prepare, verify, build, validate-feeds]
+    needs: [prepare, verify, build, build-deb, validate-feeds]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -329,12 +340,18 @@ jobs:
           merge-multiple: true
           path: release
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: release
+
       - name: Assemble update feeds and upload verified assets to a release draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           APP_VERSION: ${{ needs.prepare.outputs.version }}
+          INCLUDE_DEBIAN: 'true'
         run: |
           set -euo pipefail
           # Only reuse a draft. Never overwrite an already published release.
@@ -352,7 +369,7 @@ jobs:
           export RELEASE_NOTES_FILE="$RUNNER_TEMP/obelisk-release-notes.md"
           gh release view "$RELEASE_TAG" --json body --jq .body > "$RELEASE_NOTES_FILE"
           node app/scripts/update-release.mjs assemble release
-          assets=(release/*.dmg release/*.zip release/appcast-*.xml release/latest-mac.yml)
+          assets=(release/*.dmg release/*.zip release/*.deb release/linux-amd64.sha256 release/appcast-*.xml release/latest-mac.yml release/latest-linux.yml)
           shopt -s nullglob
           assets+=(release/*.blockmap)
           gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber

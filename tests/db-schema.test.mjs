@@ -320,7 +320,7 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
-  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'omp' \| 'pi'/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'kiro' \| 'omp' \| 'pi'/);
   assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
@@ -340,7 +340,7 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, Kiro, OMP, and Pi/);
   assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
   assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
   assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);

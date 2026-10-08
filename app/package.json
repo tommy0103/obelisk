@@ -1,6 +1,6 @@
 {
   "name": "obelisk",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Memory management for Obelisk \u2014 let Claude Code search its own memory",
   "homepage": "https://github.com/tommy0103/obelisk",
   "author": {
@@ -64,7 +64,21 @@
       "maintainer": "Obelisk contributors <tommy0103@users.noreply.github.com>"
     },
     "deb": {
-      "compression": "bzip2"
+      "compression": "xz",
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "libgbm1",
+        "libasound2 (>= 1.0.17) | libasound2t64",
+        "pkexec | policykit-1"
+      ]
     },
     "files": [
       "out/**",

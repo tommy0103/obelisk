@@ -44,7 +44,15 @@ export async function createMacUpdateBackend(receive: (event: UpdateEvent) => vo
     log(`Sparkle initialization failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   log('Using electron-updater because the Sparkle bridge could not initialize');
-  const { autoUpdater } = electronUpdater;
+  return createElectronUpdateBackend(receive, electronUpdater.autoUpdater);
+}
+
+export function createDebUpdateBackend(receive: (event: UpdateEvent) => void): UpdateBackend {
+  return createElectronUpdateBackend(receive, new electronUpdater.DebUpdater());
+}
+
+function createElectronUpdateBackend(receive: (event: UpdateEvent) => void,
+  autoUpdater: typeof electronUpdater.autoUpdater): UpdateBackend {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.allowPrerelease = false;
@@ -62,6 +70,13 @@ export async function createMacUpdateBackend(receive: (event: UpdateEvent) => vo
     ['error', error => receive({ type: 'error', message: error.message || String(error) })],
   ];
   for (const [name, listener] of listeners) autoUpdater.on(name, listener);
-  return { kind: 'electron-updater', check: () => autoUpdater.checkForUpdates(), install: () => autoUpdater.quitAndInstall(false, true),
+  return { kind: 'electron-updater', check: async () => {
+    const result = await autoUpdater.checkForUpdates();
+    // Auto-download failures emit 'error' AND reject this separate promise.
+    // The event already publishes the real cause; consume the rejection so
+    // retries do not leave an unhandled background exception.
+    void result?.downloadPromise?.catch(() => {});
+    return result;
+  }, install: () => autoUpdater.quitAndInstall(false, true),
     stop: () => { for (const [name, listener] of listeners) autoUpdater.removeListener(name, listener); } };
 }

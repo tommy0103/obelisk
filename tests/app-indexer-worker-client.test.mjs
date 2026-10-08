@@ -33,7 +33,9 @@ test('worker build client resolves build results from a worker thread', async ()
             ? 'complete ZCode text'
             : message.operation === 'readHermesMessageText'
               ? 'complete Hermes text'
-              : { files: 1, reason: message.args.reason },
+              : message.operation === 'readKiroMessageText'
+                ? 'complete Kiro text'
+                : { files: 1, reason: message.args.reason },
         });
       });
     }
@@ -55,6 +57,11 @@ test('worker build client resolves build results from a worker thread', async ()
   const hermesText = await client.readHermesMessageText({ source: 'hermes', messageUuid: 'hermes:message' });
   assert.equal(hermesText, 'complete Hermes text');
   assert.equal(instances[0].messages[2].operation, 'readHermesMessageText');
+
+  const kiroText = await client.readKiroMessageText({ source: 'kiro', messageUuid: 'kiro:message', rootDir: '/workspace/kiro' });
+  assert.equal(kiroText, 'complete Kiro text');
+  assert.equal(instances[0].messages[3].operation, 'readKiroMessageText');
+  assert.equal(instances[0].messages[3].args.rootDir, '/workspace/kiro');
 
   client.stop();
   assert.equal(instances[0].terminated, true);

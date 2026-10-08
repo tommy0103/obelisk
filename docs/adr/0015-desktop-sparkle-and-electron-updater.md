@@ -3,16 +3,21 @@
 **Status.** Accepted on 2026-10-01; runtime and release integration are implemented for issue [#209](https://github.com/tommy0103/obelisk/issues/209).
 
 **Context.** Obelisk has an Electron desktop app, separate CLI releases, and a
-macOS release workflow that builds signed and notarized arm64 and x64 packages
-into a GitHub Release draft. Existing app installations cannot discover or
+desktop release workflow that builds signed and notarized macOS arm64 and x64 packages
+and a Linux amd64 Debian installer into a GitHub Release draft. Existing app installations cannot discover or
 install updates. The contributor selected Sparkle plus `electron-updater`,
 following [Lody's desktop updater](https://github.com/LodyAI/Lody/blob/c687e45ae6a59e27b5cc7431889c08b3231e9446/apps/electron/src/main/services/app-updater-service.ts).
 
 **Decision.** Packaged macOS apps use Sparkle through
 `electron-sparkle-updater`. If the native bridge cannot load or initialize at
-startup, select `electron-updater` for that process. Windows and Linux will use
-`electron-updater` when their release pipelines are added; the initial delivery
-covers macOS arm64 and x64. Keep one updater service in the main process and one
+startup, select `electron-updater` for that process. Linux amd64 `.deb`
+installations use `electron-updater`'s `DebUpdater`, with
+`latest-linux.yml` checking download integrity through SHA512 over GitHub
+HTTPS. Installation requests administrator authorization through the system's
+Polkit helper. It uses the same cleanup/retry lifecycle and renderer controls.
+Only packaged x64 installs identified as `deb` enable this channel; AppImage,
+other Linux architectures, Windows, and development builds remain disabled
+until their feeds and packaged installation paths pass acceptance. Keep one updater service in the main process and one
 typed state/command interface through the existing sandboxed preload.
 
 Backend selection happens before a check or download. An invalid feed, failed
@@ -51,8 +56,11 @@ setup for users.
 
 **Verification.** In addition to repository and Electron suites, exercise real
 two-version upgrades for both native macOS architectures, the initialized
-fallback backend, and signature rejection. Confirm the replacement app's
-version and architecture and the preservation of the user's existing data.
+fallback backend, and signature rejection. For Debian packages, verify apt
+installation and real two-version upgrades,
+including download-integrity rejection and administrator-authorization failure
+followed by retry. Confirm the replacement app's version and architecture and
+the preservation of the user's existing data.
 Source tests and successful packaging alone do not prove installation works.
 Existing installations require one manual installation of an updater-enabled
 version. Implementation and acceptance details live in the
