@@ -606,11 +606,21 @@ function createQueryApi(
 
   const sessions = (optsOrN?: QueryOptions | number | string) => {
     const opts = normalizeOpts(optsOrN, 'sessionId');
-    const { limit = 50 } = opts;
+    const { limit = 50, sessionId, sessions: sessionIds, ...filters } = opts;
     assertNonNegativeLimit(limit, 'sessions() limit');
-    const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const { where, params } = buildWhere(filters, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const refs = [...(sessionId ? [sessionId] : []), ...(sessionIds ?? [])];
+    // Resolve within the requested scope, retaining exact-ID precedence globally.
+    const resolvedWhere = refs.length ? `${where} AND s.id IN (
+      WITH refs(id) AS (VALUES ${refs.map(() => '(?)').join(',')})
+      SELECT id FROM refs UNION ALL
+      SELECT hit.id FROM refs JOIN sessions hit ON hit.id IN (
+        SELECT s.id FROM sessions s WHERE ${where} AND instr(s.id, refs.id) > 0
+        ORDER BY s.ended_at DESC LIMIT 10)
+      WHERE refs.id <> '' AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = refs.id))` : where;
+    if (refs.length) params.push(...refs, ...params);
     params.push(limit);
-    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params)
+    return db.prepare(`SELECT * FROM sessions s WHERE ${resolvedWhere} ORDER BY ended_at DESC LIMIT ?`).all(...params)
       .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
   };
 
