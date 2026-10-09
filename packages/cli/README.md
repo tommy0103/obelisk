@@ -4,6 +4,11 @@ The local Obelisk runtime used by coding agents. It indexes Claude Code, Codex, 
 Kimi Code, Kiro, and Pi transcripts into `~/.obelisk/obelisk.sqlite` and exposes the
 stable `build`, `search`, `query`, and `attune` process interface.
 
+CLI 0.3.0 adds bounded `messages` retrieval. The default query surface is
+`overview`, `sessions`, `search`, `messages`, `memories`, `summaries`, and `sql`.
+Specialized helpers and older script globals remain callable; see the
+[authoritative query contract](../../skill-doc/references/api-reference.md).
+
 Requires **Node.js >=22.13.0** on the host. The CLI uses built-in `node:sqlite`;
 the desktop app separately runs on Electron's embedded Node 24 and uses
 `better-sqlite3`. See the

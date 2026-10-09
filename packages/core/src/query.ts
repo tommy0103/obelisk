@@ -36,6 +36,24 @@ interface QueryOptions extends Record<string, any> {
   memoryLimit?: number;
 }
 
+interface MessageQueryOptions {
+  uuid?: string;
+  around?: string;
+  sessionId?: string;
+  relation?: 'timeline' | 'parents';
+  beforeCount?: number;
+  afterCount?: number;
+  after?: string;
+  before?: string;
+  limit?: number;
+  cursor?: { timestamp: string | null; uuid: string };
+  agentId?: string | null;
+  contentTypes?: string[];
+  includeMeta?: boolean;
+  includeInactive?: boolean;
+  includeSession?: boolean;
+}
+
 interface ColumnAliases {
   sessionId: string;
   project: string;
@@ -435,6 +453,128 @@ function createQueryApi(
     });
   };
 
+  const messages = (input: MessageQueryOptions | string) => {
+    const opts = typeof input === 'string' ? { uuid: input } : input;
+    if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError('messages() requires uuid, around, or sessionId');
+    }
+    const allowed = new Set(['uuid', 'around', 'sessionId', 'relation', 'beforeCount', 'afterCount',
+      'after', 'before', 'limit', 'cursor', 'agentId', 'contentTypes', 'includeMeta', 'includeInactive', 'includeSession']);
+    for (const key of Object.keys(opts)) {
+      if (!allowed.has(key)) throw new TypeError(`messages() does not support option ${key}`);
+    }
+    const locators = ['uuid', 'around', 'sessionId'].filter(key => key in opts);
+    if (locators.length !== 1) throw new TypeError('messages() requires exactly one of uuid, around, or sessionId');
+    const mode = locators[0];
+    const locator = opts[mode as 'uuid' | 'around' | 'sessionId'];
+    if (typeof locator !== 'string' || !locator.trim()) throw new TypeError(`messages() ${mode} must be a non-empty string`);
+    for (const key of ['includeMeta', 'includeInactive', 'includeSession'] as const) {
+      if (opts[key] !== undefined && typeof opts[key] !== 'boolean') throw new TypeError(`messages() ${key} must be boolean`);
+    }
+    const rangeKeys = ['after', 'before', 'limit', 'cursor', 'agentId'];
+    const windowKeys = ['relation', 'beforeCount', 'afterCount'];
+    for (const key of [...(mode !== 'sessionId' ? rangeKeys : []), ...(mode !== 'around' ? windowKeys : [])]) {
+      if (key in opts) throw new TypeError(`messages() ${key} is not supported with ${mode}`);
+    }
+    const boundedCount = (value: number | undefined, fallback: number, key: string) => {
+      const count = value === undefined ? fallback : value;
+      if (!Number.isSafeInteger(count) || count < 0 || count > 500) throw new RangeError(`messages() ${key} must be an integer from 0 to 500`);
+      return count;
+    };
+    const relation = opts.relation === undefined ? 'timeline' : opts.relation;
+    if (relation !== 'timeline' && relation !== 'parents') throw new TypeError('messages() relation must be timeline or parents');
+    const beforeCount = mode === 'around' ? boundedCount(opts.beforeCount, 3, 'beforeCount') : 0;
+    const afterCount = mode === 'around' ? boundedCount(opts.afterCount, relation === 'parents' ? 0 : 3, 'afterCount') : 0;
+    if (relation === 'parents' && afterCount !== 0) throw new RangeError('messages() parents relation requires afterCount: 0');
+    if (beforeCount + afterCount + 1 > 500) throw new RangeError('messages() window must contain at most 500 messages including the anchor');
+    const limit = mode === 'sessionId' ? boundedCount(opts.limit, 20, 'limit') : 0;
+    if (opts.contentTypes !== undefined && (!Array.isArray(opts.contentTypes) || !opts.contentTypes.length
+      || opts.contentTypes.some(value => typeof value !== 'string' || !value.trim()))) {
+      throw new TypeError('messages() contentTypes must be a non-empty array of strings');
+    }
+    for (const key of ['after', 'before'] as const) {
+      if (opts[key] !== undefined && (typeof opts[key] !== 'string' || !opts[key].trim())) throw new TypeError(`messages() ${key} must be a non-empty timestamp string`);
+    }
+    if (opts.agentId !== undefined && opts.agentId !== null && typeof opts.agentId !== 'string') throw new TypeError('messages() agentId must be a string or null');
+    const cursor = opts.cursor;
+    if (cursor !== undefined && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)
+      || typeof cursor.uuid !== 'string' || !cursor.uuid.trim() || (cursor.timestamp !== null && typeof cursor.timestamp !== 'string'))) {
+      throw new TypeError('messages() cursor requires timestamp (string or null) and uuid');
+    }
+    const predicate = `${visibilitySql('m', opts.includeInactive === true)}${opts.includeMeta === true ? '' : ' AND COALESCE(m.is_meta,0)=0'}${opts.contentTypes ? ` AND m.content_type IN (${opts.contentTypes.map(() => '?').join(',')})` : ''}`;
+    const filterParams = opts.contentTypes ?? [];
+    const sessionFor = (id: unknown) => opts.includeSession === true
+      ? db.prepare('SELECT * FROM sessions WHERE id=?').get(id) ?? null : null;
+    if (mode === 'sessionId') {
+      const clauses = ['m.session_id=?', predicate];
+      const params: any[] = [locator, ...filterParams];
+      if (opts.agentId !== undefined) { clauses.push('m.agent_id IS ?'); params.push(opts.agentId); }
+      if (opts.after !== undefined) { clauses.push('m.timestamp > ?'); params.push(opts.after); }
+      if (opts.before !== undefined) { clauses.push('m.timestamp < ?'); params.push(opts.before); }
+      if (cursor) {
+        clauses.push("(COALESCE(m.timestamp,'') > ? OR (COALESCE(m.timestamp,'')=? AND m.uuid > ?))");
+        params.push(cursor.timestamp ?? '', cursor.timestamp ?? '', cursor.uuid);
+      }
+      const rows = db.prepare(`SELECT m.* FROM messages m WHERE ${clauses.join(' AND ')} ORDER BY COALESCE(m.timestamp,''),m.uuid LIMIT ?`).all(...params, limit + 1);
+      const hasMore = rows.length > limit;
+      const selected = rows.slice(0, limit).map(withVisibility);
+      const last = selected[selected.length - 1];
+      return { anchor: null, messages: selected, session: sessionFor(locator), hasMore,
+        nextCursor: hasMore && last ? { timestamp: last.timestamp as string | null, uuid: last.uuid as string } : null };
+    }
+    // An explicit anchor is selected by visibility, independently of neighbor content/meta filters.
+    const row = db.prepare(`SELECT * FROM messages WHERE uuid=? AND ${visibilitySql('messages', opts.includeInactive === true)}`).get(locator);
+    if (!isQueryableMessage(row, opts.includeInactive === true)) return null;
+    const anchor = withVisibility(row);
+    let preceding: DbRow[] = [];
+    let following: DbRow[] = [];
+    let hasMore = false;
+    if (mode === 'around' && relation === 'parents' && beforeCount > 0) {
+      // Traverse only structure until N+1 qualifying ancestors; load body fields at the final join.
+      // Hidden/inactive bridge rows are traversable, but never projected unless eligible.
+      const ancestors = db.prepare(`WITH RECURSIVE path(uuid,parent_uuid,depth,n,eligible,visited,cycle) AS (
+        SELECT uuid,parent_uuid,0,0,0,json_array(uuid),0 FROM messages WHERE uuid=?
+        UNION ALL
+        SELECT m.uuid,m.parent_uuid,p.depth+1,p.n+CASE WHEN ${predicate} THEN 1 ELSE 0 END,
+          CASE WHEN ${predicate} THEN 1 ELSE 0 END,json_insert(p.visited,'$[#]',m.uuid),
+          EXISTS(SELECT 1 FROM json_each(p.visited) WHERE value=m.uuid)
+        FROM path p JOIN messages m ON m.uuid=p.parent_uuid
+        WHERE p.n < ? AND p.depth < 10000 AND p.cycle=0
+      ) SELECT m.*,p.depth AS __depth,p.cycle AS __cycle,p.n AS __n,
+        (p.parent_uuid IS NOT NULL) AS __continues
+        FROM path p LEFT JOIN messages m ON m.uuid=p.uuid AND p.eligible=1 AND p.cycle=0
+        WHERE p.depth>0 AND (p.eligible=1 OR p.cycle=1 OR p.depth=10000) ORDER BY p.depth`)
+        .all(locator, ...filterParams, ...filterParams, beforeCount + 1);
+      if (ancestors.some(value => value.__cycle === 1)) throw new Error('messages() found a cyclic parent path');
+      if (ancestors.some(value => value.__depth === 10000 && value.__continues === 1 && Number(value.__n) < beforeCount + 1)) {
+        throw new Error('messages() parent traversal exceeded 10000 records');
+      }
+      const eligible = ancestors.filter(value => value.uuid !== null);
+      hasMore = eligible.length > beforeCount;
+      preceding = eligible.slice(0, beforeCount).reverse().map(value => {
+        const { __depth, __cycle, __n, __continues, ...message } = value;
+        return withVisibility(message);
+      });
+    } else if (mode === 'around' && relation === 'timeline') {
+      const neighbors = (count: number, direction: 'before' | 'after') => {
+        if (count === 0) return [];
+        const comparison = direction === 'before' ? '<' : '>';
+        const order = direction === 'before' ? 'DESC' : 'ASC';
+        const rows = db.prepare(`SELECT m.* FROM messages m WHERE m.session_id=? AND m.agent_id IS ? AND ${predicate}
+          AND (COALESCE(m.timestamp,'') ${comparison} ? OR (COALESCE(m.timestamp,'')=? AND m.uuid ${comparison} ?))
+          ORDER BY COALESCE(m.timestamp,'') ${order},m.uuid ${order} LIMIT ?`)
+          .all(row.session_id, row.agent_id, ...filterParams, row.timestamp ?? '', row.timestamp ?? '', row.uuid, count + 1);
+        hasMore = hasMore || rows.length > count;
+        const selected = rows.slice(0, count).map(withVisibility);
+        return direction === 'before' ? selected.reverse() : selected;
+      };
+      preceding = neighbors(beforeCount, 'before');
+      following = neighbors(afterCount, 'after');
+    }
+    return { anchor, messages: [...preceding, anchor, ...following], session: sessionFor(row.session_id), hasMore, nextCursor: null };
+  };
+
+  // Compatibility helpers retain their full-chain/full-session behavior.
   const context = (uuid: string, opts: QueryOptions = {}) => {
     const includeInactive = opts.includeInactive === true;
     const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
@@ -888,7 +1028,7 @@ function createQueryApi(
     `).all(...params);
   };
 
-  return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
+  return { sql: q, search, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
 function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {
@@ -983,3 +1123,4 @@ function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (w
 }
 
 export { createQueryApi, createAttuneApi };
+export type { MessageQueryOptions };

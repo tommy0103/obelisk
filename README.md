@@ -103,8 +103,9 @@ Runs it via obelisk --query <script>
 Reads the JSON result, answers in natural language
 ```
 
-Core API: `search()`, `context()`, `sql()`, plus structured helpers (`sessions`,
-`memories`, `summaries`, `workflows`, `failures`, `fileHistory`, etc).
+Default query surface (CLI 0.3.0+): `overview()`, `sessions()`, `search()`,
+`messages()`, `memories()`, `summaries()`, and `sql()`.
+Specialized helpers and legacy script globals remain available.
 Signatures, options, and query patterns live in the
 [API reference](skill-doc/references/api-reference.md).
 

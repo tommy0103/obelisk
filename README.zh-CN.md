@@ -92,9 +92,10 @@ agent 针对 SQLite 索引写一段 JS 查询
 读 JSON 结果，用人话回答
 ```
 
-核心 API 是 `search()`、`context()`、`sql()`，外加一组结构化辅助方法
-（`sessions`、`memories`、`summaries`、`workflows`、`failures`、`fileHistory`
-等）。签名、参数和查询范例都在 [API 参考](skill-doc/references/api-reference.md)里。
+默认查询接口（CLI 0.3.0+）为 `overview()`、`sessions()`、`search()`、
+`messages()`、`memories()`、`summaries()` 和 `sql()`。
+专题 helper 和旧脚本接口仍可使用。
+签名、参数和查询范例都在 [API 参考](skill-doc/references/api-reference.md)里。
 
 ### 记忆层
 
