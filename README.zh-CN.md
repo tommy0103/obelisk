@@ -64,13 +64,19 @@ npm install --global @obelisk-apps/cli
 obelisk --version
 ```
 
-macOS、Linux、WSL 也可以用一键脚本，效果相同：
+CLI 0.3.1+ 会自动安装 agent skill，无需交互：`npm install --global` 安装到
+用户全局，普通 `npm install` 安装到调用 npm 的项目。设置
+`OBELISK_SKIP_SKILL_INSTALL=1` 可以只装 CLI。skill 安装失败不影响 CLI；可用
+`obelisk install --global --yes`（全局）或 `npx --no-install obelisk install --yes`（项目）重试。
+加上 npm 的 `--foreground-scripts` 可以查看安装输出。
+
+macOS、Linux、WSL 也可以用只安装 CLI 的一键脚本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tommy0103/obelisk/main/install.sh | sh
 ```
 
-然后装 skill：
+只装了 CLI，或想另选 skill 的安装范围时：
 
 ```bash
 obelisk install

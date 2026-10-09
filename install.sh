@@ -19,7 +19,7 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 echo "Installing ${PACKAGE}..."
-npm install --global "$PACKAGE"
+OBELISK_SKIP_SKILL_INSTALL=1 npm install --global "$PACKAGE"
 
 if ! command -v obelisk >/dev/null 2>&1; then
   echo 'The CLI was installed, but `obelisk` is not on PATH.' >&2
