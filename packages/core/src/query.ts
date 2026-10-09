@@ -541,7 +541,7 @@ function createQueryApi(
         FROM path p JOIN messages m ON m.uuid=p.parent_uuid
         WHERE p.n < ? AND p.depth < 10000 AND p.cycle=0
       ) SELECT m.*,p.depth AS __depth,p.cycle AS __cycle,p.n AS __n,
-        (p.parent_uuid IS NOT NULL) AS __continues
+        EXISTS(SELECT 1 FROM messages parent WHERE parent.uuid=p.parent_uuid) AS __continues
         FROM path p LEFT JOIN messages m ON m.uuid=p.uuid AND p.eligible=1 AND p.cycle=0
         WHERE p.depth>0 AND (p.eligible=1 OR p.cycle=1 OR p.depth=10000) ORDER BY p.depth`)
         .all(locator, ...filterParams, ...filterParams, beforeCount + 1);

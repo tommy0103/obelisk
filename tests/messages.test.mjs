@@ -169,6 +169,25 @@ test('messages() reports hidden parent cycles without returning partial evidence
   assert.throws(() => api.messages({ around: 'cycle-target', relation: 'parents' }), /cyclic parent path/);
 });
 
+test('messages() terminates at missing parents at the 10000-record traversal boundary', t => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  db.exec(schema);
+  db.exec('BEGIN');
+  const insert = db.prepare("INSERT INTO messages(uuid,session_id,parent_uuid,visibility) VALUES (?,'probe',?,?)");
+  for (let i = 0; i < 10000; i++) insert.run(`bridge-${i}`, i ? `bridge-${i - 1}` : null, i === 9999 ? 'visible' : 'hidden');
+  insert.run('target', 'bridge-9999', 'visible');
+  db.exec('COMMIT');
+  const api = createQueryApi(db);
+  for (const parent of [null, 'missing']) {
+    db.prepare("UPDATE messages SET parent_uuid=? WHERE uuid='bridge-0'").run(parent);
+    const result = api.messages({ around: 'target', relation: 'parents', beforeCount: 3 });
+    assert.deepEqual(ids(result.messages), ['bridge-9999', 'target']);
+    assert.equal(result.hasMore, false);
+    assert.equal(result.nextCursor, null);
+  }
+});
+
 test('messages() fails explicitly on excessive filtered traversal without returning partial evidence', t => {
   const db = new DatabaseSync(':memory:');
   t.after(() => db.close());
