@@ -35,7 +35,7 @@ jobs:
         run: npm test
       - run: npm run build:cli
       - name: Verify CLI package and runtime contract
-        run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs tests/codex-index.test.mjs
+        run: node --experimental-test-module-mocks --test tests/cli-package.test.mjs tests/cli-skill-install.test.mjs tests/runtime-cli-envelope.test.mjs tests/runtime.test.mjs tests/codex-index.test.mjs
 
       - name: Verify DSH plugin package
         run: |

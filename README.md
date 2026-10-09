@@ -74,13 +74,21 @@ npm install --global @obelisk-apps/cli
 obelisk --version
 ```
 
-On macOS, Linux, or WSL, the CLI-only installer is equivalent:
+CLI 0.3.1+ also installs the agent skill automatically, without prompts:
+`npm install --global` installs it globally, while ordinary `npm install`
+installs it in the invoking project. Set `OBELISK_SKIP_SKILL_INSTALL=1` to
+install only the CLI. If skill setup fails, the CLI remains usable; retry with
+`obelisk install --global --yes` (global) or
+`npx --no-install obelisk install --yes` (project).
+Use npm's `--foreground-scripts` to see setup output.
+
+On macOS, Linux, or WSL, the CLI-only installer is also available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tommy0103/obelisk/main/install.sh | sh
 ```
 
-Then install the agent skill:
+After a CLI-only install, or to choose a different skill scope:
 
 ```bash
 obelisk install
