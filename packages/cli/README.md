@@ -21,6 +21,19 @@ obelisk install
 obelisk --query /tmp/query.mjs
 ```
 
+### Unreadable provider settings
+
+Only a missing `~/.obelisk/settings.json` (`ENOENT` when read) selects default
+provider roots. Access-denied, I/O and invalid-path failures are reported as
+unavailable settings, not as an absent configuration. A force build then fails
+without publishing a snapshot. Existing indexed queries remain available with
+an explicit refresh-skipped warning, but invocation-nonce recovery cannot write
+or index default source roots while the settings are unknown. Correct the
+reported settings read failure, then retry; no permission or configuration is
+changed automatically.
+
+### Agent skill
+
 `obelisk install` installs the separate docs-only agent skill from
 `tommy0103/obelisk-skill`. The CLI itself remains daemon-free: each command
 refreshes the local index when write ownership is available, then exits.
