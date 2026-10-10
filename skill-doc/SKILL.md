@@ -97,6 +97,12 @@ The default retrieval surface is:
 Specialized and legacy helpers remain callable; read their API contracts when
 needed. Check uncertain option names and row fields before relying on them.
 
+When many hits are plausible but response space is tight, make the first pass
+`search(topic, { projectPath, limit: 30, snippetTokens: 16, contextLimit: 0 })`.
+Inspect UUIDs and matched excerpts, then expand only useful hits with
+`context(uuid)` or `raw(uuid)`. The snippet is navigation, not full evidence;
+keep normal full-text/context results when the question already needs them.
+
 ## Load references by task
 
 Load only the references needed for the current task. Each reference owns its

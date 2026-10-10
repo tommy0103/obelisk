@@ -23,6 +23,7 @@ interface QueryOptions extends Record<string, any> {
   sessionId?: string;
   sessions?: string[];
   project?: string;
+  projectPath?: string;
   after?: string;
   before?: string;
   cwd?: string;
@@ -34,6 +35,8 @@ interface QueryOptions extends Record<string, any> {
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
+  contextLimit?: number;
+  snippetTokens?: number;
 }
 
 interface MessageQueryOptions {
@@ -318,27 +321,40 @@ function createQueryApi(
       limit = 20,
       sessionId,
       project,
+      projectPath,
       after,
       before,
       cwd,
       source,
       includeMeta = false,
       includeInactive = false,
+      contextLimit = 6,
+      snippetTokens,
       fallback,
     } = opts;
     assertNonNegativeLimit(limit, 'search() limit');
+    if (!Number.isInteger(contextLimit) || contextLimit < 0 || contextLimit > 6) {
+      throw new RangeError('search() contextLimit must be an integer from 0 to 6');
+    }
+    if (snippetTokens !== undefined && (!Number.isInteger(snippetTokens) || snippetTokens < 1 || snippetTokens > 64)) {
+      throw new RangeError('search() snippetTokens must be an integer from 1 to 64');
+    }
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
+    if (projectPath) { where += ' AND s.project_path=?'; filterParams.push(projectPath); }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
     if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
     if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
     where += ` AND ${visibilitySql('m', includeInactive)}`;
+    const hitText = snippetTokens === undefined ? 'm.text' : `snippet(messages_fts, 2, '', '', '…', ${snippetTokens})`;
     const stmt = db.prepare(`
-      SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
+      SELECT m.uuid,m.session_id,${hitText} AS text,
+             ${snippetTokens === undefined ? 'NULL' : 'length(m.text)'} AS text_length,
+             m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
              COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source,
@@ -419,8 +435,9 @@ function createQueryApi(
       };
       const indexedTimestamp = typeof r.timestamp === 'string'
         && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.timestamp);
-      const ctx = (indexedTimestamp ? indexedContext : scanContext)
+      const ctx = contextLimit === 0 ? [] : (indexedTimestamp ? indexedContext : scanContext)
         .all(contextParams)
+        .slice(0, contextLimit)
         .map(withVisibility)
         .sort((a: DbRow, b: DbRow) => {
           if (a.timestamp === b.timestamp) return 0;
@@ -437,6 +454,7 @@ function createQueryApi(
         message: {
           uuid: r.uuid,
           text: r.text,
+          ...(snippetTokens === undefined ? {} : { textLength: r.text_length, isSnippet: true }),
           content_type: r.content_type,
           is_meta: r.is_meta || 0,
           role: r.role,

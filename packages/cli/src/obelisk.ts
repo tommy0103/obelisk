@@ -66,11 +66,35 @@ async function main() {
       // layer can identify the invoking session; it is not part of the FTS text.
       let nonce: string | undefined;
       const textParts: string[] = [];
+      const searchOpts: Record<string, unknown> = {};
+      const valueFlags: Record<string, string> = {
+        '--limit': 'limit', '--context-limit': 'contextLimit', '--snippet-tokens': 'snippetTokens',
+        '--project-path': 'projectPath', '--session-id': 'sessionId',
+        '--after': 'after', '--before': 'before', '--source': 'source',
+      };
       const rest = args.slice(1);
       for (let i = 0; i < rest.length; i++) {
-        if (rest[i] === '--nonce' && rest[i + 1]) { nonce = rest[i + 1]; i++; } else { textParts.push(rest[i]); }
+        const arg = rest[i];
+        if (arg === '--') {
+          textParts.push(...rest.slice(i + 1));
+          break;
+        }
+        // Preserve the positional text argument, even when it names a flag.
+        if (i === 0) { textParts.push(arg); continue; }
+        if (arg === '--nonce' || Object.hasOwn(valueFlags, arg)) {
+          const value = rest[++i];
+          if (!value) throw new Error(`${arg} requires a value`);
+          if (arg === '--nonce') nonce = value;
+          else if (['--limit', '--context-limit', '--snippet-tokens'].includes(arg)) {
+            const parsed = Number(value);
+            if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${arg} requires a non-negative integer`);
+            searchOpts[valueFlags[arg]] = parsed;
+          } else searchOpts[valueFlags[arg]] = value;
+        } else if (arg.startsWith('--')) throw new Error(`Unknown --search option: ${arg}`);
+        else textParts.push(arg);
       }
-      emit(searchText(textParts.join(' '), undefined, { invocationNonce: nonce }));
+      if (!textParts.length) throw new Error('--search requires text');
+      emit(searchText(textParts.join(' '), searchOpts, { invocationNonce: nonce }));
     } catch (error) { fail(error); }
     return;
   }
@@ -113,7 +137,7 @@ async function main() {
     }
     return;
   }
-  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text" [--nonce <token>]\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
+  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text" [--limit N] [--project-path PATH] [--session-id ID] [--snippet-tokens N] [--context-limit 0..6] [--after ISO] [--before ISO] [--source ID] [--nonce TOKEN] [-- literal text...]\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
   process.exitCode = 1;
 }
 
