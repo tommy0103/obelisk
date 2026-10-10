@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1.0.0",
+  "dataModelVersion": 1,
+  "id": "00000000-0000-4000-8000-000000000001",
+  "title": "Example session",
+  "agentMode": "vibe",
+  "workspacePaths": [
+    "/workspace/demo"
+  ],
+  "rootPaths": [
+    "/workspace/demo"
+  ],
+  "createdAt": "2026-01-01T14:34:51.431000Z",
+  "lastModifiedAt": "2026-01-01T14:41:20.101000Z",
+  "modelId": "example-model",
+  "status": "idle"
+}

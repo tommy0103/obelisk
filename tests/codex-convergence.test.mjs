@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Canonical hard gate: a full Codex snapshot must assemble identically before
-// and after persistence, and prefix + cooperative append must converge to the
+// and after persistence, and prefix + normal append must converge to the
 // same SQLite projection as parsing the final source from scratch.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { persist } from '../packages/core/src/persist.ts';
@@ -90,6 +90,16 @@ function writeJsonl(path, lines) {
   writeFileSync(path, `${lines.map(line => JSON.stringify(line)).join('\n')}\n`);
 }
 
+function assertNormalAppendReads(metrics, sourceStat, suffixBytes) {
+  const usableIdentity = Number.isSafeInteger(sourceStat.dev) && sourceStat.dev > 0
+    && Number.isSafeInteger(sourceStat.ino) && sourceStat.ino > 0;
+  const expectedPlan = usableIdentity ? 'cooperative-append' : 'verified-append';
+  assert.equal(metrics.plan, expectedPlan, `normal append read plan (dev=${sourceStat.dev}, ino=${sourceStat.ino})`);
+  assert.equal(metrics.suffixBytesRead, suffixBytes * 2, 'pre-scan and emit each read the suffix once');
+  assert.equal(metrics.sourceBytesRead, suffixBytes * 2 + (usableIdentity ? 0 : sourceStat.size),
+    'unsupported identity adds exactly one complete fingerprint pass to the two suffix reads');
+}
+
 const REAL_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url);
 const REAL_PREFIX_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized-prefix.jsonl', import.meta.url);
 
@@ -126,9 +136,9 @@ test('real sanitized Codex output round-trips through SQLite', () => {
 // original string always maps to the same placeholder, a different string to
 // a different one), so the duplicate-pair structure survives sanitization.
 // Regenerate with scripts/sanitize-codex-fixture.mjs. Line 60 splits no
-// duplicate pair, so the incremental pass must take the cooperative fast
-// path — not merely "some plan" — and read only the appended suffix.
-test('real sanitized Codex prefix plus append takes the cooperative fast path and converges', () => {
+// duplicate pair, so a usable file identity must engage cooperative append.
+// Unsupported identities must verify the prefix instead of selecting snapshot.
+test('real sanitized Codex prefix plus append selects the identity-gated read plan and converges', () => {
   const fullPath = join(makeTempDir('obelisk-codex-real-full-'), 'rollout.jsonl');
   copyFileSync(REAL_FIXTURE, fullPath);
   const dbFull = freshDb();
@@ -145,9 +155,7 @@ test('real sanitized Codex prefix plus append takes the cooperative fast path an
   const metrics = createCodexParseMetrics();
   persist(dbSplit, { key: path, sessionId: '', meta: { source: 'codex', guardian: false } }, parse({ key: path, sessionId: '', meta: { source: 'codex', guardian: false } }, cursor, metrics));
 
-  assert.equal(metrics.plan, 'cooperative-append', 'a real-shaped append must engage the fast path, not silently degrade to snapshot');
-  assert.equal(metrics.suffixBytesRead, suffixBytes * 2, 'pre-scan and emit each read the suffix once');
-  assert.ok(metrics.sourceBytesRead <= suffixBytes * 2, 'cooperative source reads only the two suffix passes');
+  assertNormalAppendReads(metrics, statSync(path), suffixBytes);
   assert.equal(metrics.jsonLinesParsed, suffixLines.length * 2, 'only suffix records are parsed in pre-scan and emit');
   assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFull));
   dbFull.close();
@@ -245,7 +253,7 @@ test('Codex child rewritten as guardian retracts only its persisted contribution
   db.close();
 });
 
-test('Codex prefix snapshot plus cooperative append converges SQLite projection', () => {
+test('Codex prefix snapshot plus identity-gated append converges SQLite projection', () => {
   const finalPath = join(makeTempDir('obelisk-codex-final-'), 'rollout.jsonl');
   writeJsonl(finalPath, [...prefixLines(), ...suffixLines()]);
   const dbFinal = freshDb();
@@ -261,12 +269,48 @@ test('Codex prefix snapshot plus cooperative append converges SQLite projection'
 
   const metrics = createCodexParseMetrics();
   persist(dbSplit, unit(path), parse(unit(path), cursor, metrics));
-  assert.equal(metrics.plan, 'cooperative-append');
-  assert.equal(metrics.suffixBytesRead, suffixBytes * 2, 'pre-scan and emit each read the suffix once');
-  assert.ok(metrics.sourceBytesRead <= suffixBytes * 2, 'cooperative source reads only the two suffix passes');
+  assertNormalAppendReads(metrics, statSync(path), suffixBytes);
   assert.equal(metrics.jsonLinesParsed, suffixLines().length * 2, 'only suffix records are parsed in pre-scan and emit');
   assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFinal));
 
   dbFinal.close();
   dbSplit.close();
 });
+
+// Cooperative resume requires a positive, safely representable source identity.
+// Exercise the fallback deterministically, including on POSIX test machines.
+for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
+  test(`Codex append with ${identityName} file identity verifies the prefix and converges`, async t => {
+    const unsupportedStat = (...args) => {
+      const result = statSync(...args);
+      result.ino = inode;
+      return result;
+    };
+    const fsMock = t.mock.module('node:fs', {
+      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+    });
+    t.after(() => fsMock.restore());
+    const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?${identityName}-identity`);
+    const finalPath = join(makeTempDir('obelisk-codex-identity-final-'), 'rollout.jsonl');
+    copyFileSync(REAL_FIXTURE, finalPath);
+    const dbFinal = freshDb();
+    t.after(() => dbFinal.close());
+    const finalUnit = { key: finalPath, sessionId: '', meta: { source: 'codex', guardian: false } };
+    persist(dbFinal, finalUnit, parse(finalUnit, null));
+
+    const path = join(makeTempDir('obelisk-codex-identity-split-'), 'rollout.jsonl');
+    copyFileSync(REAL_PREFIX_FIXTURE, path);
+    const dbSplit = freshDb();
+    t.after(() => dbSplit.close());
+    const sourceUnit = { key: path, sessionId: '', meta: { source: 'codex', guardian: false } };
+    const cursor = persist(dbSplit, sourceUnit, parseWithoutIdentity(sourceUnit, null));
+    const lines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
+    const suffix = `${lines.join('\n')}\n`;
+    appendFileSync(path, suffix);
+    const metrics = createCodexParseMetrics();
+    persist(dbSplit, sourceUnit, parseWithoutIdentity(sourceUnit, cursor, metrics));
+    assertNormalAppendReads(metrics, unsupportedStat(path), Buffer.byteLength(suffix));
+    assert.equal(metrics.jsonLinesParsed, lines.length * 2, 'verified append parses only the suffix');
+    assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFinal));
+  });
+}

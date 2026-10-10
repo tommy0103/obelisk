@@ -59,7 +59,7 @@ test('registers the plugin-owned Obelisk skill as a runtime contribution', () =>
   assert.equal(loaded.provider, '@obelisk/dsh-obelisk-plugin')
   assert.equal(loaded.source, 'runtime')
   assert.deepEqual(loaded.invocation, { modelInvocable: true, userInvocable: true })
-  assert.match(loaded.description, /Search and query past Claude Code, Codex, Kimi Code, and Pi session history/)
+  assert.match(loaded.description, /Search and query past Claude Code, Codex, Kimi Code, Kiro, and Pi session history/)
   assert.equal(loaded.content, bodyOf(pluginSkill))
   assert.equal(loaded.resourceBase.kind, 'directory')
   assert.equal(resolve(loaded.resourceBase.path), pluginSkillRoot)

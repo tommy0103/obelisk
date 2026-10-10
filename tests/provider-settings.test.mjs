@@ -4,10 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, normalize } from 'node:path';
 
 import {
   createConfiguredBuiltinProviderRuntime,
+  getCopilotEditions,
   readPersistedProviderSettings,
 } from '../packages/core/src/provider-settings.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
@@ -82,6 +83,20 @@ test('removing a generic provider root restores its descriptor default', () => {
 
   assert.equal(setPersistedSetting(persisted, 'providerRoots.gamma', null), true);
   assert.deepEqual(resolveProviderRoots(registry, persisted), { gamma: '/default/gamma' });
+});
+
+test('Copilot editions default to both on and preserve legacy custom roots until restored', () => {
+  const persisted = { copilotDir: '/legacy/copilot' };
+  assert.deepEqual(getCopilotEditions(persisted).map((edition) => edition.enabled), [true, true]);
+  assert.equal(setPersistedSetting(persisted, 'copilotEditions.stable', false), true);
+  assert.deepEqual(getCopilotEditions(persisted).map((edition) => edition.enabled), [false, true]);
+  assert.equal(createConfiguredBuiltinProviderRuntime(persisted).roots.copilot, normalize('/legacy/copilot'));
+  assert.equal(setPersistedSetting(persisted, 'providerRoots.copilot', null), true);
+  assert.equal(persisted.copilotDir, undefined);
+  assert.equal(createConfiguredBuiltinProviderRuntime(persisted).roots.copilot, getCopilotEditions(persisted)[1].path);
+  assert.equal(setPersistedSetting(persisted, 'copilotEditions.stable', true), true);
+  assert.equal(persisted.copilotEditions, undefined);
+  assert.deepEqual(getCopilotEditions(persisted).map((edition) => edition.enabled), [true, true]);
 });
 
 test('source catalog surfaces exact provider issues without hiding indexed sessions', () => {
