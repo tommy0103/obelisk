@@ -10,6 +10,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { defaultKiroDatabasePath } from '../packages/core/src/providers/kiro.ts';
 import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -23,6 +24,7 @@ class SqliteCompatDatabase {
   pragma(statement) { this.db.exec(`PRAGMA ${statement}`); }
   exec(sql) { return this.db.exec(sql); }
   close() { return this.db.close(); }
+  function(name, options, callback) { this.db.function(name, options, callback); }
   prepare(sql) {
     const stmt = this.db.prepare(sql);
     return {
@@ -87,7 +89,7 @@ async function importMain() {
 // 'dialog', 'nativeImage', 'shell') must be present, even if unused by a test.
 function electronNamespace({ app, BrowserWindow, ipcMain }) {
   return {
-    app: app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} },
+    app: { isPackaged: false, getVersion: () => '0.2.3', ...(app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} }) },
     BrowserWindow,
     ipcMain: ipcMain ?? { handle() {} },
     clipboard: {},
@@ -145,6 +147,7 @@ function defaultIndexerWorkerClient() {
     createWorkerBuildIndex: () => ({
       buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
       readHermesMessageText: async () => null,
+      readKiroMessageText: async () => null,
       stop() {},
     }),
   };
@@ -167,6 +170,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const windows = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -269,13 +273,21 @@ test('main process watches every root declared by the built-in provider registry
 
   const serviceOptions = [];
   const workerCalls = [];
+  const ipcHandlers = new Map();
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
-    prepare() {
-      return { get: () => null, all: () => [], run: () => ({}) };
+    prepare(sql) {
+      return {
+        get: () => null,
+        all: () => sql.includes("GROUP BY COALESCE(source")
+          ? [{ source: 'copilot', session_count: 2, last_indexed: '2026-10-08' }]
+          : [],
+        run: () => ({}),
+      };
     }
   }
 
@@ -292,7 +304,10 @@ test('main process watches every root declared by the built-in provider registry
   }
 
   const restore = registerMocks([
-    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
     [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
@@ -346,6 +361,9 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(home, '.hermes', 'profiles'), fileNames: ['state.db', 'state.db-wal'] },
       { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.kiro', 'sessions') },
+      { kind: 'file', path: defaultKiroDatabasePath({ homeDir: home }) },
+      { kind: 'file', path: `${defaultKiroDatabasePath({ homeDir: home })}-wal` },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
       { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
@@ -354,6 +372,21 @@ test('main process watches every root declared by the built-in provider registry
     assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
     assert.deepEqual(workerCalls[0].providerSettings, {});
+    mkdirSync(insidersCopilotRoot, { recursive: true });
+    const defaultSettings = await ipcHandlers.get('settings:get')();
+    assert.deepEqual(defaultSettings.copilotEditions.map((edition) => edition.enabled), [true, true]);
+    const copilotSource = defaultSettings.sources.find((source) => source.id === 'copilot');
+    assert.equal(copilotSource.exists, true);
+    assert.equal(copilotSource.sessionCount, 2);
+    assert.equal(copilotSource.status, 'ok', 'Insiders-only indexed history is connected without a warning');
+    assert.equal(copilotSource.statusText, 'Connected');
+    await ipcHandlers.get('settings:set')(null, 'copilotEditions.stable', false);
+    assert.deepEqual((await ipcHandlers.get('settings:get')()).copilotEditions.map((edition) => edition.enabled), [false, true]);
+    assert.equal(serviceOptions.length, 2);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(stableCopilotRoot)), false);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(insidersCopilotRoot)), true);
+    await serviceOptions[1].buildIndex({ reason: 'settings-transfer' });
+    assert.deepEqual(workerCalls[1].providerSettings.copilotEditions, { stable: false });
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -383,6 +416,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
   const sent = [];
 
   class FakeDatabase {
+    function() {}
     constructor() { databaseOpens += 1; }
     pragma() {}
     exec() {}
@@ -492,6 +526,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
   const queries = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -623,6 +658,10 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
     .run('hermes:session', 'hermes', '/tmp/hermes/state.db#session:source');
   setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
     .run('hermes:full-text', 'hermes:session', 'assistant', 'assistant', 'truncated Hermes text', 'hermes');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('kiro:session', 'kiro', '/workspace/kiro/sessions/cli/example.jsonl');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('kiro:full-text', 'kiro:session', 'assistant', 'assistant', 'truncated Kiro text', 'kiro');
   setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
     .run('zcode:child', 'zcode');
   setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,visibility,source,agent_id) VALUES (?,?,?,?,?,?,?,?)')
@@ -734,6 +773,12 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
           assert.equal(lookup.messageUuid, 'hermes:full-text');
           return 'complete Hermes text from worker';
         },
+        readKiroMessageText: async lookup => {
+          assert.equal(lookup.source, 'kiro');
+          assert.equal(lookup.messageUuid, 'kiro:full-text');
+          assert.equal(lookup.rootDir, join(home, '.kiro'));
+          return 'complete Kiro text from worker';
+        },
         stop() {},
       }),
     } }],
@@ -784,6 +829,8 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       'complete ZCode text from worker');
     assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'hermes:full-text'),
       'complete Hermes text from worker');
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'kiro:full-text'),
+      'complete Kiro text from worker');
 
     const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
     assert.equal(claudeOnly.totalTokens, 72);
@@ -904,6 +951,109 @@ test('session IPC keeps a message tool calls in insertion order', async () => {
   }
 });
 
+test('session catalogue includes older sessions beyond 1000 across providers and resolves exact IDs', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-catalogue-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const setup = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  const insert = setup.prepare('INSERT INTO sessions (id, title, project, source, started_at) VALUES (?, ?, ?, ?, ?)');
+  setup.exec('BEGIN');
+  for (let i = 0; i < 1105; i++) {
+    insert.run(`catalogue-${i}`, `Session ${i}`, i < 5 ? 'older-only' : 'active',
+      i % 2 ? 'codex' : 'claude', new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString());
+  }
+  setup.exec('COMMIT');
+  setup.exec("UPDATE sessions SET started_at = '2026-01-01T00:00:00.000Z' WHERE CAST(SUBSTR(id, 11) AS INTEGER) < 10");
+  setup.exec("UPDATE sessions SET git_branch = 'old-release' WHERE id = 'catalogue-1'");
+  setup.close();
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      app: captureAppHandlers(appHandlers), BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+  try {
+    await importMain();
+    const sessions = opts => ipcHandlers.get('db:getSessions')(null, opts);
+    const catalogue = sessions({ source: 'all', limit: null });
+    assert.equal(catalogue.length, 1105);
+    assert.equal(catalogue[0].id, 'catalogue-1104');
+    assert.equal(catalogue.at(-1).id, 'catalogue-0');
+    assert.equal(sessions({ source: 'all' }).length, 200, 'default bounded callers remain bounded');
+    assert.equal(sessions({ source: 'all', limit: 0 }).length, 0);
+    assert.equal(sessions({ source: 'codex', limit: null }).length, 552);
+    assert.equal(sessions({ source: 'all', project: 'older-only', limit: null }).length, 5);
+    assert.deepEqual(sessions({ source: 'all', sessionId: 'catalogue-1', limit: 1 }).map(s => s.id), ['catalogue-1']);
+    assert.equal(sessions({ source: 'claude', sessionId: 'catalogue-1' }).length, 0);
+    assert.equal(sessions({ source: 'all', sessionId: 'missing' }).length, 0);
+    assert.equal(ipcHandlers.get('db:getStats')(null, { source: 'all' }).sessions, 1105);
+    const projects = ipcHandlers.get('db:getProjects')(null, { source: 'all' });
+    assert.equal(projects.find(p => p.project === 'older-only').session_count, 5);
+    assert.equal(projects.reduce((sum, p) => sum + p.session_count, 0), 1105);
+    const page = opts => ipcHandlers.get('db:getSessionCatalogue')(null, { source: 'all', ...opts });
+    assert.equal(page({ limit: 1000 }).rows.length, 100, 'untrusted IPC cannot request an unbounded page');
+    assert.equal(page({ offset: 1000, limit: 100 }).rows[0].id, 'catalogue-104');
+    assert.equal(page({ offset: 1100 }).rows.at(-1).id, 'catalogue-0');
+    assert.deepEqual(page({ query: 'session 1', project: 'older-only', descending: false }).rows.map(s => s.id), ['catalogue-1']);
+    assert.equal(page({ source: 'codex', project: 'older-only' }).total, 2);
+    assert.deepEqual(page({ query: 'old-release' }).rows.map(s => s.id), ['catalogue-1']);
+    const lastPage = page({ offset: 1100, limit: 5 }).rows.map(s => s.id);
+    const previousPage = page({ offset: 1095, limit: 5 }).rows.map(s => s.id);
+    assert.equal(new Set([...previousPage, ...lastPage]).size, 10, 'tied timestamps across pages have no duplicates');
+    assert.equal(previousPage.at(-1), 'catalogue-5');
+    assert.equal(lastPage[0], 'catalogue-4');
+    assert.deepEqual([...lastPage].slice(-2), ['catalogue-1', 'catalogue-0']);
+    assert.deepEqual(page({ offset: 1105, limit: 5, descending: false }).rows, []);
+    assert.deepEqual(page({ offset: 0, limit: 2, descending: false }).rows.map(s => s.id), ['catalogue-0', 'catalogue-1']);
+    const activity = ipcHandlers.get('db:getActivitySessions')(null, { from: '2026-01-01', to: '2026-01-02' });
+    assert.ok(activity.total >= 2);
+    assert.equal(activity.rows.length, Math.min(200, activity.total));
+    const update = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+    try {
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('École', 'catalogue-0');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('ÜBER', 'catalogue-2');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Συνάντηση', 'catalogue-4');
+      update.prepare('UPDATE sessions SET project = ?, git_branch = ? WHERE id = ?').run('ÉQUIPE', 'DÉVELOP', 'catalogue-3');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('100%_literal\\path', 'catalogue-6');
+    } finally { update.close(); }
+    for (const [query, id] of [['école', 'catalogue-0'], ['über', 'catalogue-2'], ['συνάντηση', 'catalogue-4'], ['équipe', 'catalogue-3'], ['dévelop', 'catalogue-3'], ['%_literal\\path', 'catalogue-6']]) {
+      assert.deepEqual(page({ query }).rows.map(row => row.id), [id],
+        'database catalogue search preserves Unicode case-insensitive literal matching');
+      assert.equal(page({ query }).total, 1, 'search counts use the same matching semantics');
+    }
+    assert.equal(page({ query: 'session_' }).total, 0, 'underscore is literal, not a wildcard');
+
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('main process migrates an existing app database before source-filtered IPC queries', async () => {
   const originalHome = process.env.HOME;
   const originalProfile = process.env.USERPROFILE;
@@ -986,6 +1136,12 @@ test('main process migrates an existing app database before source-filtered IPC 
       memories: 0,
       memoriesArchived: 0,
     });
+    const migrated = new DatabaseSync(dbPath);
+    assert.ok(migrated.prepare('PRAGMA index_list(sessions)').all().some(index => index.name === 'idx_sessions_catalogue_order'));
+    assert.ok(migrated.prepare(`EXPLAIN QUERY PLAN SELECT id FROM sessions
+      ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 100`).all()
+      .some(step => step.detail.includes('idx_sessions_catalogue_order')));
+    migrated.close();
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -1085,6 +1241,7 @@ test('closing the last macOS window releases background resources until activati
   let quitCalled = false;
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() { serviceEvents.push('db-close'); }
@@ -1216,6 +1373,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
   let publishRebuild = false;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
       openedDbPaths.push(dbPath);
@@ -1399,6 +1557,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   const serviceEvents = [];
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.dbPath = dbPath;
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
@@ -1513,6 +1672,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   let buildIndexCalls = 0;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1612,6 +1772,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
   let finishRebuild;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1725,6 +1886,7 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
   const sent = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -1814,6 +1976,7 @@ test('the win:control IPC applies only whitelisted window actions to the sender 
   let maximized = false;
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}

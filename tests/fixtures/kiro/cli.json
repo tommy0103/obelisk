@@ -1,0 +1,36 @@
+{
+  "session_id": "id-1",
+  "cwd": "/workspace/demo",
+  "created_at": "2026-01-01T12:00:00.000Z",
+  "updated_at": "2026-01-01T12:00:00.000Z",
+  "title": "Example content",
+  "session_created_reason": "subagent",
+  "session_state": {
+    "version": "v1",
+    "conversation_metadata": {
+      "user_turn_metadatas": [
+        {
+          "message_ids": [
+            "id-2",
+            "id-3",
+            "id-4",
+            "id-7",
+            "id-8",
+            "id-21"
+          ],
+          "end_timestamp": "2026-01-01T12:00:00.000Z",
+          "input_token_count": 0,
+          "output_token_count": 0,
+          "cache_read_input_token_count": 0,
+          "cache_write_input_token_count": 0,
+          "model": "example-model"
+        }
+      ]
+    },
+    "rts_model_state": {
+      "model_info": {
+        "model_id": "example-model"
+      }
+    }
+  }
+}

@@ -5,6 +5,33 @@ export interface SourceQueryOptions {
   source?: string;
 }
 
+export interface SessionsQueryOptions extends SourceQueryOptions {
+  project?: string;
+  sessionId?: string;
+  /** null requests the complete metadata catalogue; omitted defaults to 200. */
+  limit?: number | null;
+}
+
+export interface SessionCatalogueOptions extends SourceQueryOptions {
+  project?: string;
+  query?: string;
+  quiet?: boolean;
+  descending?: boolean;
+  offset?: number;
+  limit?: number;
+}
+
+export interface SessionCataloguePage {
+  rows: SessionMetadata[];
+  total: number;
+}
+
+export interface ActivitySessionsOptions {
+  from: string;
+  to: string;
+  offset?: number;
+}
+
 export type UsageStatsOptions = SourceQueryOptions;
 
 export type SessionPatchTable =

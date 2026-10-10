@@ -48,6 +48,8 @@ export interface IndexUnit {
 export interface IndexedSession {
   sessionId: string;
   jsonlPath: string;
+  /** Persisted source cursor, independent of a full-reindex cursor reset. */
+  cursor?: Cursor;
 }
 
 /** One source location that prevented a provider from certifying its inventory. */

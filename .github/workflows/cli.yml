@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   package:
     name: Node 22 / ${{ matrix.os }}
@@ -54,7 +57,7 @@ jobs:
           node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/adaptive-watcher.test.mjs tests/core-watch-hints.test.mjs tests/claude-parse.test.mjs tests/codex-parse.test.mjs tests/codex-discover.test.mjs tests/codex-convergence.test.mjs tests/copilot-provider.test.mjs tests/hermes-provider.test.mjs tests/kimi-parse.test.mjs tests/kimi-manifest.test.mjs tests/app-kimi-index.test.mjs tests/app-indexer.test.mjs tests/app-indexer-watcher.test.mjs tests/app-indexer-service.test.mjs tests/app-main-settings.test.mjs tests/app-indexer-watcher-filter.test.mjs tests/deepseek-tree.test.mjs tests/app-zcode-index.test.mjs tests/index-finalize.test.mjs
 
       - name: Verify query sandbox read-only contract
-        run: node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/query.test.mjs
+        run: node --experimental-strip-types --experimental-sqlite --experimental-test-module-mocks --test tests/query.test.mjs tests/messages.test.mjs tests/contract-helper-shapes.test.mjs
 
       - name: Verify tool input rendering and Codex patch round-trip
         run: node --experimental-test-module-mocks --test tests/app-tool-renderer.test.mjs tests/app-codex-patch-pipeline.test.mjs
@@ -62,3 +65,81 @@ jobs:
       - name: Verify POSIX bootstrap installer
         if: runner.os != 'Windows'
         run: node --test tests/cli-bootstrap-install.test.mjs
+
+  desktop:
+    name: Electron desktop regressions
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            output: mac-arm64
+          - arch: x64
+            runner: macos-15-intel
+            output: mac
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            app/package-lock.json
+      - run: npm ci
+      - run: npm --prefix app ci
+      - run: npm run build:core
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Rebuild native modules for Electron
+        working-directory: app
+        run: npx --no-install electron-builder install-app-deps
+      - id: electron-regressions
+        run: npm --prefix app run test:electron:all
+
+      - name: Compare baseline timeline after a regression failure
+        if: ${{ !cancelled() && steps.electron-regressions.outcome == 'failure' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BASE_SHA" ]]; then exit 0; fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          work=$(mktemp -d "$RUNNER_TEMP/obelisk-baseline.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          git archive "$BASE_SHA" | tar -x -C "$work"
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$work/node_modules"
+          ln -s "$GITHUB_WORKSPACE/app/node_modules" "$work/app/node_modules"
+          cp -R packages/core/dist "$work/packages/core/dist"
+          cp app/tests/electron-session-virtualization.mjs "$work/app/tests/electron-session-virtualization.mjs"
+          cd "$work/app"
+          npx --no-install electron-vite build
+          echo "Baseline product: $BASE_SHA; current fixture and identical Electron runtime"
+          if npx --no-install electron --no-sandbox tests/electron-session-virtualization.mjs; then
+            echo 'Baseline timeline passed; investigate the feature regression.'
+          else
+            echo 'Baseline timeline failed too; retain the failed feature gate and compare diagnostics.'
+          fi
+
+      - name: Package native updater and run two-version acceptance
+        # Keep acceptance evidence when an unrelated renderer regression fails.
+        # The failed regression still fails the job and blocks publication.
+        if: ${{ !cancelled() && (success() || steps.electron-regressions.outcome == 'failure') }}
+        env:
+          MAC_ARCH: ${{ matrix.arch }}
+          MAC_OUTPUT: ${{ matrix.output }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d "$RUNNER_TEMP/obelisk-sparkle-tools.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --location --silent --show-error \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
+            -o "$work/sparkle.tar.xz"
+          printf '%s  %s\n' ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9 "$work/sparkle.tar.xz" | shasum -a 256 -c -
+          tar -xJf "$work/sparkle.tar.xz" -C "$work"
+          npm --prefix app run pack -- --mac --"$MAC_ARCH" -c.mac.identity=null --publish never
+          node app/tests/packaged-updates.mjs sparkle "$MAC_ARCH" "app/release/$MAC_OUTPUT/Obelisk.app" "$work/bin/sign_update"
+          node app/tests/packaged-updates.mjs fallback "$MAC_ARCH" "app/release/$MAC_OUTPUT/Obelisk.app" "$work/bin/sign_update"

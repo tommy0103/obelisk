@@ -13,6 +13,7 @@ const focusUuid = 'a-message-180';
 const expandedTextSentinel = 'RESTORED FULL TEXT SENTINEL';
 const channels = [
   'db:getSessions',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -99,7 +100,12 @@ async function waitFor(webContents, expression, message, timeoutMs = 8_000) {
 }
 
 function registerHandlers() {
-  ipcMain.handle('db:getSessions', () => [summary(sessionA), summary(sessionB)]);
+  ipcMain.handle('db:getSessions', (_event, opts = {}) => opts.sessionId
+    ? [summary(opts.sessionId)] : [summary(sessionA), summary(sessionB)]);
+  ipcMain.handle('db:getSessionCatalogue', (_event, opts) => ({
+    rows: opts.quiet ? [] : [summary(sessionA), summary(sessionB)].slice(opts.offset, opts.offset + opts.limit),
+    total: opts.quiet ? 0 : 2,
+  }));
   ipcMain.handle('db:getSessionMessages', (_event, sessionId) => fixtures[sessionId]?.messages || []);
   ipcMain.handle('db:getSessionToolCalls', (_event, sessionId) => fixtures[sessionId]?.toolCalls || []);
   ipcMain.handle('db:getSessionToolResults', (_event, sessionId) => fixtures[sessionId]?.toolResults || []);
@@ -127,8 +133,8 @@ function registerHandlers() {
     return messageUuid === 'a-message-2' ? `${expandedTextSentinel} complete message` : null;
   });
   ipcMain.handle('db:getMemories', () => []);
-  ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', count: 2 }]);
-  ipcMain.handle('db:getStats', () => ({}));
+  ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', session_count: 2 }]);
+  ipcMain.handle('db:getStats', () => ({ sessions: 2 }));
   ipcMain.handle('settings:get', () => ({}));
 }
 
@@ -143,37 +149,64 @@ async function navigate(win, sessionId, query = '') {
     `${sessionId} timeline`,
   );
   await delay(650);
+  const routeMetadata = await win.webContents.executeJavaScript(`({
+    breadcrumb: document.querySelector('#breadcrumb')?.textContent,
+    title: document.title,
+  })`, true);
+  assert(routeMetadata.breadcrumb?.includes(fixtures[sessionId].title),
+    `${sessionId} navigation restores its breadcrumb title`);
+  assert(routeMetadata.title.includes(fixtures[sessionId].title),
+    `${sessionId} navigation restores its window title`);
 }
 
 async function scrollState(win, fraction = null) {
-  return win.webContents.executeJavaScript(`(async () => {
+  return win.webContents.executeJavaScript(`new Promise((resolve, reject) => {
     const wrap = document.querySelector('.detail-wrap');
     ${fraction === null ? '' : `wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) * ${fraction};`}
-    await new Promise(resolve => setTimeout(resolve, 500));
-    const wrapRect = wrap.getBoundingClientRect();
-    const anchorRow = [...document.querySelectorAll('.virtual-timeline-row')]
-      .find(row => row.getBoundingClientRect().bottom > wrapRect.top);
-    const anchorRect = anchorRow?.getBoundingClientRect();
-    return {
-      current: Number(document.querySelector('.msg-nav-current')?.textContent),
-      total: Number(document.querySelector('.flap-number')?.getAttribute('aria-label')),
-      scrollTop: wrap.scrollTop,
-      anchorUuid: anchorRow?.querySelector('[data-message-uuid]')?.dataset.messageUuid || null,
-      anchorOffset: anchorRect ? anchorRect.top - wrapRect.top : null,
-    };
-  })()`, true);
+    let previous = null;
+    let stableSince = performance.now();
+    const deadline = setTimeout(() => reject(new Error('Reader geometry did not settle')), 8000);
+    function sample(now) {
+      try {
+        const wrapRect = wrap.getBoundingClientRect();
+        const visibleRows = [...document.querySelectorAll('.virtual-timeline-row')]
+          .map(row => ({ row, rect: row.getBoundingClientRect() }))
+          .filter(({ rect }) => rect.bottom > wrapRect.top && rect.top < wrapRect.bottom)
+          .sort((left, right) => left.rect.top - right.rect.top);
+        const anchor = visibleRows[0];
+        const state = {
+          current: Number(document.querySelector('.msg-nav-current')?.textContent),
+          total: Number(document.querySelector('.flap-number')?.getAttribute('aria-label')),
+          scrollTop: wrap.scrollTop,
+          anchorUuid: anchor?.row.querySelector('[data-message-uuid]')?.dataset.messageUuid || null,
+          anchorOffset: anchor ? anchor.rect.top - wrapRect.top : null,
+        };
+        const geometry = JSON.stringify([state, wrap.scrollHeight,
+          ...visibleRows.map(({ row, rect }) => [row.dataset.index, rect.top, rect.height])]);
+        const ready = !document.querySelector('.first-open-loading, .session-header.is-preparing');
+        if (!ready || !state.anchorUuid || geometry !== previous) stableSince = now;
+        previous = geometry;
+        if (ready && state.anchorUuid && now - stableSince >= 150) {
+          clearTimeout(deadline);
+          resolve(state);
+        } else requestAnimationFrame(sample);
+      } catch (error) { clearTimeout(deadline); reject(error); }
+    }
+    requestAnimationFrame(sample);
+  })`, true);
 }
 
 async function run() {
   registerHandlers();
   const win = new BrowserWindow({
-    show: false,
+    show: true,
     width: 1200,
     height: 800,
     webPreferences: {
       preload: join(appRoot, 'out', 'preload', 'index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
 
@@ -181,6 +214,10 @@ async function run() {
   await waitFor(win.webContents, `document.body.textContent.includes('Reader state A')`, 'session list');
 
   await navigate(win, sessionA);
+  await navigate(win, sessionB);
+  await navigate(win, sessionA);
+  await waitFor(win.webContents, `document.querySelector('[data-uuid="a-message-2"] .truncated-btn')`,
+    'session A truncated message is mounted');
   await win.webContents.executeJavaScript(
     `document.querySelector('[data-view-key="tool:a-tool-call"] .toolcall-toggle')?.click()`,
     true,

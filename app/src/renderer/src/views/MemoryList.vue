@@ -83,7 +83,7 @@ function summaryHTML(m) {
 function sourceSessionTitle(m) {
   if (!m.session_id) return '';
   const s = state.sessions.find(x => x.id === m.session_id);
-  return s?.title || m.session_id.slice(0, 8);
+  return s?.title || m.session_title || m.session_id.slice(0, 8);
 }
 
 function openSourceSession(m) {

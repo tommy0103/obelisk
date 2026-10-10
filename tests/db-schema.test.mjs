@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { extractContentType, extractMessageIsMeta } from '../packages/core/src/db.ts';
 import { migrateCoreSchemaColumns } from '../packages/core/src/schema-migrations.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 
 async function readExecutableSchema() {
   return readFile(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -125,6 +126,72 @@ test('tool results schema indexes live session patch lookups', async () => {
   } finally {
     db.close();
   }
+});
+
+test('tool results schema limits failure scans to failure rows', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    const plan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tr.*
+      FROM tool_results tr
+      LEFT JOIN messages rm ON rm.uuid=tr.message_uuid
+      LEFT JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      LEFT JOIN messages cm ON cm.uuid=tc.message_uuid
+      LEFT JOIN sessions s ON s.id=tr.session_id
+      WHERE (tr.is_error = 1 OR tr.content LIKE 'Exit code %')
+        AND COALESCE(rm.visibility,'visible')='visible'
+        AND COALESCE(cm.visibility,'visible')='visible'
+        AND COALESCE(s.source, 'claude') = ?
+      ORDER BY rm.timestamp DESC
+      LIMIT ?
+    `).all('codex', 50);
+
+    assert.ok(
+      plan.some(row => /USING INDEX idx_tr_failure_session/.test(String(row.detail))),
+      `expected partial failure index, got: ${plan.map(row => row.detail).join('; ')}`,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('failure index preserves NULL-source compatibility and visibility in the production helper', async () => {
+  const schema = await readExecutableSchema();
+  const outputs = [];
+  for (const indexed of [false, true]) {
+    const db = new DatabaseSync(':memory:');
+    try {
+      db.exec(schema);
+      if (!indexed) db.exec('DROP INDEX idx_tr_failure_session');
+      db.exec(`
+        INSERT INTO sessions (id, source) VALUES ('legacy', NULL), ('codex', 'codex');
+        INSERT INTO messages (uuid, session_id, timestamp, visibility) VALUES
+          ('visible', 'legacy', '2026-09-01T00:00:00.000Z', 'visible'),
+          ('inactive', 'legacy', '2026-09-02T00:00:00.000Z', 'inactive'),
+          ('hidden', 'legacy', '2026-09-03T00:00:00.000Z', 'hidden');
+        INSERT INTO tool_results (tool_use_id, session_id, message_uuid, content, is_error) VALUES
+          ('null-source', 'legacy', 'visible', 'failed', 1),
+          ('missing-session', 'absent', NULL, 'Exit code 1', 0),
+          ('codex-error', 'codex', NULL, 'failed', 1),
+          ('inactive-error', 'legacy', 'inactive', 'failed', 1),
+          ('hidden-error', 'legacy', 'hidden', 'failed', 1),
+          ('success', 'legacy', 'visible', 'ok', 0);
+      `);
+      const api = createQueryApi(db);
+      const ids = opts => api.failures(opts).map(row => row.result.tool_use_id);
+      assert.deepEqual(ids({ source: 'claude' }), ['null-source', 'missing-session']);
+      assert.deepEqual(ids({ source: 'codex' }), ['codex-error']);
+      assert.deepEqual(ids({ source: 'claude', includeInactive: true }),
+        ['inactive-error', 'null-source', 'missing-session']);
+      assert.deepEqual(ids({ source: 'claude', sessionId: 'legacy', limit: 1 }), ['null-source']);
+      outputs.push(api.failures({ source: 'claude', includeInactive: true }));
+    } finally {
+      db.close();
+    }
+  }
+  assert.deepEqual(outputs[1], outputs[0], 'adding the index must not change returned evidence');
 });
 
 test('session detail queries use the visible main timeline index', async () => {
@@ -253,7 +320,7 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
-  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'omp' \| 'pi'/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'kiro' \| 'omp' \| 'pi'/);
   assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
@@ -273,15 +340,27 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
-  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
-  assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
-  assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);
-  assert.match(skill, /Reference Map/);
-  assert.match(skill, /references\/schema\.md.*raw SQL/i);
-  assert.match(skill, /references\/api-reference\.md.*helper/i);
-  assert.match(skill, /references\/query-patterns\.md.*synthesis/i);
-  assert.match(skill, /references\/pitfalls\.md.*error/i);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, Kiro, OMP, and Pi/);
+  const routes = [
+    ['references/schema.md', /raw SQL/i],
+    ['references/api-reference.md', /helper/i],
+    ['references/query-patterns.md', /synthesis/i],
+    ['references/retrieval-semantics.md', /correlation/i],
+    ['references/pitfalls.md', /error/i],
+  ];
+  for (const [path, trigger] of routes) {
+    const route = skill.split('\n').find(line => line.startsWith('|')
+      && line.includes(`](${path})`) && trigger.test(line.split('|')[1]));
+    assert.ok(route, `${path} must have a task-specific disclosure trigger`);
+    await readFile(new URL(`../skill-doc/${path}`, import.meta.url), 'utf8');
+  }
+
+  // Details belong to the references reached by these routes, not the entry.
+  const api = await readApiReference();
+  const semantics = await readFile(new URL('../skill-doc/references/retrieval-semantics.md', import.meta.url), 'utf8');
+  assert.match(api, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(semantics, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(semantics, /build the candidate session set from X first.*Y only inside that\s+set/s);
 });
 
 test('extractContentType maps Claude content blocks to the message evidence type', () => {

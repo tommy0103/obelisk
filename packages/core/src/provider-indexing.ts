@@ -170,14 +170,16 @@ export function storedSessionCursor(
 
 export function readProviderSessionProvenance(db: SqliteDb): ProviderSessionProvenance[] {
   return db.prepare(`
-    SELECT id, jsonl_path, COALESCE(source, 'claude') AS source
-    FROM sessions
-    WHERE jsonl_path IS NOT NULL
-      AND jsonl_path != ''
+    SELECT s.id, s.jsonl_path, COALESCE(s.source, 'claude') AS source, i.cursor
+    FROM sessions s
+    LEFT JOIN index_state i ON i.jsonl_path = s.jsonl_path
+    WHERE s.jsonl_path IS NOT NULL
+      AND s.jsonl_path != ''
   `).all().map((row) => ({
     source: String(row.source),
     sessionId: String(row.id),
     jsonlPath: String(row.jsonl_path),
+    cursor: typeof row.cursor === 'string' ? row.cursor : null,
   }));
 }
 
@@ -205,7 +207,7 @@ export function createProviderIndexPlan(
   for (const provider of registry.list()) {
     const indexedSessions = provenance
       .filter((session) => session.source === provider.name)
-      .map(({ sessionId, jsonlPath }) => ({ sessionId, jsonlPath }));
+      .map(({ sessionId, jsonlPath, cursor }) => ({ sessionId, jsonlPath, cursor }));
     const marker = provider.indexVersionMarker;
     const markerMissing = marker !== undefined && !db.prepare(
       'SELECT jsonl_path FROM index_state WHERE jsonl_path = ?',

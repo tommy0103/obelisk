@@ -34,6 +34,17 @@ function cursorState(cursor) {
   return JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
 }
 
+function touchWithChangedCtime(path, before) {
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 20; attempt++) {
+    Atomics.wait(wait, 0, 0, 10);
+    utimesSync(path, before.atime, before.mtime);
+    const touched = statSync(path);
+    if (touched.ctimeMs !== before.ctimeMs) return touched;
+  }
+  assert.fail('the touch must change ctime for this test');
+}
+
 const META = { id: '019e8951-3e7d-7343-a3e3-05bff48a317d', cwd: '/proj', git: { branch: 'main' }, cli_version: '1.2', timestamp: '2026-06-10T10:00:00Z' };
 
 test('codex parse() yields a deduped, tool-aware record stream with a total session', () => {
@@ -296,9 +307,7 @@ test('codex parse() heals a touched-but-unchanged source instead of re-fingerpri
   const first = drain(parse({ key: path, sessionId: '' }, null));
   const before = statSync(path);
   // cp -p / rsync -a preserve mtime and size while ctime necessarily changes.
-  utimesSync(path, before.atime, before.mtime);
-  const touched = statSync(path);
-  assert.notEqual(touched.ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+  const touched = touchWithChangedCtime(path, before);
 
   const second = drain(parse({ key: path, sessionId: '' }, first.ret));
   assert.deepEqual(second.values, [], 'a touch with no new bytes emits nothing');
@@ -321,8 +330,7 @@ test('codex strict reconcile heals a touched-but-unchanged source', () => {
   ]);
   const first = drain(parse({ key: path, sessionId: '' }, null));
   const before = statSync(path);
-  utimesSync(path, before.atime, before.mtime);
-  assert.notEqual(statSync(path).ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+  touchWithChangedCtime(path, before);
 
   const metrics = createCodexParseMetrics();
   const second = drain(parse({ key: path, sessionId: '', meta: { readMode: 'strict' } }, first.ret, metrics));
@@ -341,8 +349,7 @@ test('codex parse() patches the aggregate when a touch coincides with a title ch
   ]);
   const first = drain(parse({ key: path, sessionId: '', meta: { indexedTitle: 'Old Title' } }, null));
   const before = statSync(path);
-  utimesSync(path, before.atime, before.mtime);
-  assert.notEqual(statSync(path).ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+  touchWithChangedCtime(path, before);
 
   const second = drain(parse({
     key: path, sessionId: '',

@@ -62,6 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_main_timeline
   WHERE agent_id IS NULL AND COALESCE(visibility, 'visible') = 'visible';
 CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_catalogue_order
+  ON sessions(COALESCE(ended_at, started_at) DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_project_start ON sessions(project, started_at);
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source);
 CREATE INDEX IF NOT EXISTS idx_messages_usage_day
   ON messages(timestamp, COALESCE(source, 'claude'), input_tokens, output_tokens)
@@ -74,6 +77,8 @@ CREATE INDEX IF NOT EXISTS idx_tc_message ON tool_calls(message_uuid);
 CREATE INDEX IF NOT EXISTS idx_tc_file ON tool_calls(file_path);
 CREATE INDEX IF NOT EXISTS idx_tr_session ON tool_results(session_id);
 CREATE INDEX IF NOT EXISTS idx_tr_message ON tool_results(message_uuid);
+CREATE INDEX IF NOT EXISTS idx_tr_failure_session ON tool_results(session_id)
+  WHERE is_error = 1 OR content LIKE 'Exit code %';
 CREATE INDEX IF NOT EXISTS idx_sa_session ON subagents(session_id);
 CREATE INDEX IF NOT EXISTS idx_wf_session ON workflows(session_id);
 CREATE INDEX IF NOT EXISTS idx_wa_run ON workflow_agents(run_id);

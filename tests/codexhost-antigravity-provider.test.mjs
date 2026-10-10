@@ -10,6 +10,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { createCodexHostAntigravityProvider } from '../packages/core/src/providers/codexhost-antigravity.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { createProviderIndexPlan, indexProviderPlan } from '../packages/core/src/provider-indexing.ts';
+import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { refreshSessionProjectPaths } from '../packages/core/src/index-finalize.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -48,6 +50,24 @@ function discover(provider, indexed = [], cursors = new Map()) {
     reportIncompleteInventory: (issue) => issues.push(issue),
   });
   return { units, issues };
+}
+
+function seedIndexedSession(source) {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const unit = discover(source.provider).units[0];
+  const cursor = persist(db, unit, source.provider.parse(unit, null));
+  db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, 0, 0, NULL)')
+    .run(source.provider.indexVersionMarker);
+  return { db, unit, cursor };
+}
+
+function runIndexPlan(db, provider, options = {}) {
+  const plan = createProviderIndexPlan(db, createProviderRegistry([provider]), options);
+  const result = indexProviderPlan({
+    db, plan, runTransaction: (_label, work) => work(), onError: () => 'skip',
+  });
+  return { plan, result };
 }
 
 test('CodexHost Antigravity history indexes user, assistant, and tool evidence without duplicating native harnesses', () => {
@@ -170,4 +190,111 @@ test('failed command retains the upstream error when no output was recorded', ()
   const result = [...source.provider.parse(unit, null)].find((row) => row.kind === 'tool_result');
   assert.equal(result.content, 'permission denied');
   assert.equal(result.is_error, 1);
+});
+
+for (const replay of [
+  { name: 'forced rebuild', options: { force: true } },
+  { name: 'canonical marker replay', options: {} },
+]) {
+  test(`missing Antigravity history preserves last-good rows during ${replay.name}`, () => {
+    const source = setup();
+    const { db, unit, cursor } = seedIndexedSession(source);
+    if (replay.name === 'canonical marker replay') {
+      db.prepare('DELETE FROM index_state WHERE jsonl_path = ?').run(source.provider.indexVersionMarker);
+    }
+    rmSync(source.historyPath);
+
+    const { plan } = runIndexPlan(db, source.provider, replay.options);
+
+    assert.equal(plan.items.length, 0, 'unavailable content must not be replaced by metadata-only output');
+    assert.equal(plan.incompleteProviders.has(source.provider.name), true);
+    assert.match(plan.inventoryIssues[0].error, /history is unavailable/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(unit.sessionId).n, 4);
+    assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(unit.key).cursor, cursor);
+    db.close();
+  });
+}
+
+test('known metadata-only Antigravity mappings remain replayable without false inventory gaps', () => {
+  const source = setup();
+  rmSync(source.historyPath);
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const unit = discover(source.provider).units[0];
+  const cursor = persist(db, unit, source.provider.parse(unit, null));
+  db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, 0, 0, NULL)')
+    .run(source.provider.indexVersionMarker);
+
+  const { plan, result } = runIndexPlan(db, source.provider, { force: true });
+
+  assert.equal(plan.items.length, 1, JSON.stringify({ incomplete: [...plan.incompleteProviders], issues: plan.inventoryIssues }));
+  assert.equal(plan.incompleteProviders.has(source.provider.name), false);
+  assert.equal(result.complete, true);
+  assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(unit.sessionId).message_count, 0);
+  assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(unit.key).cursor, cursor);
+  db.close();
+});
+
+test('missing cursor provenance fails closed when an indexed Antigravity sidecar is absent', () => {
+  const source = setup();
+  const { db, unit } = seedIndexedSession(source);
+  db.prepare('DELETE FROM index_state WHERE jsonl_path = ?').run(unit.key);
+  rmSync(source.historyPath);
+
+  const { plan } = runIndexPlan(db, source.provider, { force: true });
+
+  assert.equal(plan.items.length, 0);
+  assert.equal(plan.incompleteProviders.has(source.provider.name), true);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(unit.sessionId).n, 4);
+  db.close();
+});
+
+test('malformed required Antigravity message text reports incomplete inventory and preserves old text', () => {
+  const source = setup();
+  const { db, unit, cursor } = seedIndexedSession(source);
+  delete source.history.turns[0].items[2].item.text;
+  source.write();
+
+  const { plan, result } = runIndexPlan(db, source.provider);
+
+  assert.equal(plan.items.length, 0);
+  assert.equal(plan.incompleteProviders.has(source.provider.name), true);
+  assert.equal(result.complete, false);
+  assert.equal(db.prepare('SELECT text FROM messages WHERE uuid = ?').get(`${unit.sessionId}:t000001:item:000003`).text,
+    'redacted assistant response');
+  assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(unit.key).cursor, cursor);
+  db.close();
+});
+
+test('failed Antigravity turn without item results emits a visible, expandable failure message', () => {
+  const source = setup();
+  source.history.turns[0].items = [];
+  source.history.turns[0].outcome = {
+    status: 'failed', error: { code: 'QUOTA_EXCEEDED', message: 'Antigravity Turn ended with status ERROR: quota exhausted', retryable: false },
+  };
+  source.write();
+  const unit = discover(source.provider).units[0];
+  const records = [...source.provider.parse(unit, null)];
+  const failureUuid = `${unit.sessionId}:t000001:outcome`;
+  const failure = records.find((record) => record.kind === 'message' && record.uuid === failureUuid);
+
+  assert.ok(failure, 'the turn-level failure is part of the canonical transcript');
+  assert.equal(failure.role, 'system');
+  assert.equal(failure.visibility, 'visible');
+  assert.match(failure.text, /quota exhausted/);
+  assert.equal(records.find((record) => record.kind === 'session').message_count, 2);
+  assert.equal(source.provider.indexVersionMarker.endsWith('v2__'), true, 'new canonical records require a replay marker bump');
+  const raw = source.provider.raw({ source: source.provider.name, messageUuid: failureUuid,
+    session: { id: unit.sessionId, jsonl_path: source.mappingPath }, agentId: null });
+  assert.match(raw.messageText, /quota exhausted/);
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  persist(db, unit, source.provider.parse(unit, null));
+  const storedFailure = db.prepare('SELECT role, text, visibility FROM messages WHERE uuid = ?').get(failureUuid);
+  assert.equal(storedFailure.role, 'system');
+  assert.equal(storedFailure.text, failure.text);
+  assert.equal(storedFailure.visibility, 'visible');
+  assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(unit.sessionId).message_count, 2);
+  db.close();
 });

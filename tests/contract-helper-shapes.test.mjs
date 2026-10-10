@@ -118,6 +118,17 @@ test('context() shape matches api-reference.md', () => {
   db.close();
 });
 
+test('messages() shape matches api-reference.md', () => {
+  const db = fixture();
+  const api = createQueryApi(db);
+  const result = api.messages({ around: 'm-child', relation: 'parents', includeSession: true });
+  exactKeys(result, ['anchor', 'messages', 'session', 'hasMore', 'nextCursor'], 'messages()');
+  assert.deepEqual(result.messages.map(m => m.uuid), ['m-root', 'm-child']);
+  const page = api.messages({ sessionId: 'sid-1', limit: 1 });
+  exactKeys(page.nextCursor, ['timestamp', 'uuid'], 'messages() nextCursor');
+  db.close();
+});
+
 test('fileHistory() row shape matches api-reference.md', () => {
   const db = fixture();
   const row = createQueryApi(db).fileHistory('/x/file.ts')[0];

@@ -10,6 +10,11 @@ dist/
 app/out/
 HANDOFF.md
 .obelisk/
-app/build/
-app/scripts/
+app/build/*
+!app/build/icon.icns
+!app/build/icon.svg
+!app/build/sparkle-public-key.txt
+app/scripts/*
+!app/scripts/sparkle-packaging.mjs
+!app/scripts/update-release.mjs
 app/*.html

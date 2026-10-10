@@ -23,7 +23,7 @@ import type {
 } from './types.ts';
 
 export const name = 'codexhost-antigravity';
-export const CODEXHOST_ANTIGRAVITY_CANONICAL_TRANSCRIPT_MARKER = '__codexhost_antigravity_canonical_transcript_v1__';
+export const CODEXHOST_ANTIGRAVITY_CANONICAL_TRANSCRIPT_MARKER = '__codexhost_antigravity_canonical_transcript_v2__';
 const CURSOR_TAG = 'codexhost-antigravity-snapshot-v1';
 const HISTORY_DIR = 'antigravity-history';
 const MAPPING_DIR = join('mapping-store', 'threads');
@@ -54,6 +54,47 @@ function object(value: unknown): JsonObject | null {
 
 function text(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function validateHistory(history: JsonObject, path: string): void {
+  const turns = history.turns as unknown[];
+  for (const turnCandidate of turns) {
+    const turn = object(turnCandidate);
+    if (turn === null || !Array.isArray(turn.input) || !Array.isArray(turn.items)) {
+      throw new Error(`Malformed CodexHost Antigravity turn: ${path}`);
+    }
+    const outcome = object(turn.outcome);
+    const status = text(outcome?.status);
+    if (status === null || !['succeeded', 'failed', 'cancelled', 'unknown'].includes(status)) {
+      throw new Error(`Malformed CodexHost Antigravity turn outcome: ${path}`);
+    }
+    if (status === 'failed' && text(object(outcome?.error)?.message) === null) {
+      throw new Error(`Malformed CodexHost Antigravity turn failure: ${path}`);
+    }
+    for (const inputCandidate of turn.input) {
+      const input = object(inputCandidate);
+      if (input?.type !== 'text' || typeof input.text !== 'string') {
+        throw new Error(`Malformed CodexHost Antigravity turn input: ${path}`);
+      }
+    }
+    for (const itemCandidate of turn.items) {
+      const envelope = object(itemCandidate);
+      const item = object(envelope?.item);
+      if (item === null || typeof item.type !== 'string') {
+        throw new Error(`Malformed CodexHost Antigravity turn item: ${path}`);
+      }
+      if ((item.type === 'agentMessage' || item.type === 'reasoning') && typeof item.text !== 'string') {
+        throw new Error(`Malformed CodexHost Antigravity ${item.type} text: ${path}`);
+      }
+      if (item.type === 'commandExecution' && typeof item.command !== 'string') {
+        throw new Error(`Malformed CodexHost Antigravity command: ${path}`);
+      }
+      if (item.type === 'toolExecution'
+        && (typeof item.toolName !== 'string' || !Object.prototype.hasOwnProperty.call(item, 'arguments'))) {
+        throw new Error(`Malformed CodexHost Antigravity tool execution: ${path}`);
+      }
+    }
+  }
 }
 
 function signature(path: string): string {
@@ -106,6 +147,7 @@ function sourceSnapshot(mappingPath: string, historyPath: string): SourceSnapsho
     || history.value.nativeSessionId !== nativeSessionId || !Array.isArray(history.value.turns))) {
     throw new Error(`Unsupported or mismatched CodexHost Antigravity history: ${historyPath}`);
   }
+  if (history !== null) validateHistory(history.value, historyPath);
   const digest = createHash('sha256').update(`${mapping.signature}\0${history?.signature ?? 'absent'}`).digest('base64url');
   return {
     historyPath, mappingPath, hostThreadId, nativeSessionId, cwd,
@@ -194,6 +236,10 @@ function projectedRecords(snapshot: SourceSnapshot, id: string): TranscriptRecor
         });
       }
     }
+    const outcome = object(turn.outcome);
+    if (outcome?.status === 'failed') {
+      addMessage(`${prefix}:outcome`, 'system', text(object(outcome.error)?.message), 'text', null);
+    }
   }
   if (messageCount === 0) {
     // Metadata-only mappings still need one hidden cwd witness so the shared
@@ -244,7 +290,7 @@ export function createCodexHostAntigravityProvider({
       }
       const units: IndexUnit[] = [];
       const live = new Set<string>();
-      const indexedByPath = new Map(indexed.map((session) => [normalize(session.jsonlPath), session.sessionId]));
+      const indexedByPath = new Map(indexed.map((session) => [normalize(session.jsonlPath), session]));
       for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
         if (!entry.name.endsWith('.json') || entry.name.startsWith('.')) continue;
         const mappingPath = join(mappingRoot, entry.name);
@@ -264,9 +310,15 @@ export function createCodexHostAntigravityProvider({
         const id = sessionId(snapshot.hostThreadId, snapshot.cwd);
         live.add(id);
         const key = normalize(mappingPath);
-        const priorId = indexedByPath.get(key);
+        const prior = indexedByPath.get(key);
+        const priorId = prior?.sessionId;
         const oldCursor = ctx.lastCursor(key);
-        if (snapshot.history === null && oldCursor?.includes(`${CURSOR_TAG}:present:`)) {
+        const knownCursors = [prior?.cursor, oldCursor]
+          .filter((cursor): cursor is string => typeof cursor === 'string');
+        const previouslyIndexed = prior !== undefined || oldCursor !== null;
+        const historyWasDefinitelyAbsent = knownCursors.length > 0
+          && knownCursors.every((cursor) => cursor.includes(`${CURSOR_TAG}:absent:`));
+        if (snapshot.history === null && previouslyIndexed && !historyWasDefinitelyAbsent) {
           issue(historyPath, 'Previously indexed Antigravity history is unavailable');
           continue;
         }
@@ -322,18 +374,29 @@ export function createCodexHostAntigravityProvider({
         const id = text(input.session?.id);
         if (path === null || id === null || !inside(mappingRoot, path)) return null;
         const match = /:t(\d{6}):(input|item):(\d{6})$/.exec(input.messageUuid);
-        if (match === null || !input.messageUuid.startsWith(`${id}:`)) return null;
+        const outcomeMatch = /:t(\d{6}):outcome$/.exec(input.messageUuid);
+        if ((match === null && outcomeMatch === null) || !input.messageUuid.startsWith(`${id}:`)) return null;
         const snapshot = sourceSnapshot(path, join(historyRoot, basename(path)));
         if (snapshot === null || snapshot.history === null || sessionId(snapshot.hostThreadId, snapshot.cwd) !== id) return null;
         if (input.cursor !== undefined && input.cursor !== snapshot.cursor) return null;
-        const turn = object((snapshot.history.turns as unknown[])[Number(match[1]) - 1]);
-        const value = match[2] === 'input'
-          ? (turn?.input as unknown[] | undefined)?.[Number(match[3]) - 1]
-          : (turn?.items as unknown[] | undefined)?.[Number(match[3]) - 1];
+        const turnIndex = Number((outcomeMatch ?? match)![1]);
+        const turn = object((snapshot.history.turns as unknown[])[turnIndex - 1]);
+        let value: unknown;
+        let messageText: string | null;
+        if (outcomeMatch !== null) {
+          value = turn?.outcome;
+          messageText = text(object(object(value)?.error)?.message);
+        } else if (match !== null) {
+          value = match[2] === 'input'
+            ? (turn?.input as unknown[] | undefined)?.[Number(match[3]) - 1]
+            : (turn?.items as unknown[] | undefined)?.[Number(match[3]) - 1];
+          const item = object(object(value)?.item);
+          messageText = match[2] === 'input' ? text(object(value)?.text)
+            : item?.type === 'agentMessage' || item?.type === 'reasoning' ? text(item.text) : null;
+        } else {
+          return null;
+        }
         if (value === undefined) return null;
-        const item = object(object(value)?.item);
-        const messageText = match[2] === 'input' ? text(object(value)?.text)
-          : item?.type === 'agentMessage' || item?.type === 'reasoning' ? text(item.text) : null;
         const raw = JSON.stringify(value);
         return { text: raw, totalLength: raw.length, offset: 0, limit: raw.length, hasMore: false, messageText };
       } catch { return null; }
