@@ -37,7 +37,7 @@ Project-like fields are distinct:
 - `memories.project`: stored project slug copied onto registered memory records.
 - `sessions.project_path`: stable absolute project-root approximation derived from message `cwd` when a session is first indexed or unresolved; slug decoding is only a fallback. Ordinary incremental indexing does not replace a resolved path with a later nested cwd.
 - `messages.cwd`: working directory at message time.
-- `sessions.source` / `messages.source`: transcript provider: `claude`, `codex`, `kimi`, or `pi`.
+- `sessions.source` / `messages.source`: transcript provider: `claude`, `codex`, `kimi`, `kiro`, or `pi`.
 - helper `project`: SQL `LIKE` over `sessions.project`, not exact membership.
 - helper `source`: optional provider filter. Omit it unless provenance matters.
 

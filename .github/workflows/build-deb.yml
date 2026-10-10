@@ -1,0 +1,179 @@
+name: Build and verify Debian App
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/build-deb.yml'
+      - '.github/workflows/release-app.yml'
+      - '.github/scripts/verify-deb-runtime.mjs'
+      - 'app/**'
+      - 'packages/core/**'
+      - 'packages/adaptive-watcher/**'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact_ready: ${{ steps.ready.outputs.artifact_ready }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate app and lockfile versions
+        id: version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('app/package.json', 'utf8'));
+          const lock = JSON.parse(readFileSync('app/package-lock.json', 'utf8'));
+          if ((process.env.EXPECTED_VERSION && process.env.EXPECTED_VERSION !== pkg.version) ||
+              lock.version !== pkg.version || lock.packages[''].version !== pkg.version) {
+            throw new Error('Debian package, app and lockfile versions must match');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${pkg.version}\n`);
+          NODE
+      - run: npm ci
+      - run: npm --prefix app ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Rebuild native dependencies for Electron
+        working-directory: app
+        run: npx --no-install electron-builder install-app-deps
+      - name: Verify Electron regressions
+        id: electron-regressions
+        run: xvfb-run -a npm --prefix app run test:electron:all
+      - name: Compare baseline after an Electron regression failure
+        if: ${{ !cancelled() && steps.electron-regressions.outcome == 'failure' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BASE_SHA" ]]; then exit 0; fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          work=$(mktemp -d "$RUNNER_TEMP/obelisk-baseline.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          git archive "$BASE_SHA" | tar -x -C "$work"
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$work/node_modules"
+          ln -s "$GITHUB_WORKSPACE/app/node_modules" "$work/app/node_modules"
+          cp -R packages/core/dist "$work/packages/core/dist"
+          cp app/tests/electron-session-images.mjs "$work/app/tests/electron-session-images.mjs"
+          cp app/tests/electron-session-virtualization.mjs "$work/app/tests/electron-session-virtualization.mjs"
+          cd "$work/app"
+          npx --no-install electron-vite build
+          echo "Baseline product: $BASE_SHA; current fixture and identical Electron runtime"
+          for suite in electron-session-images electron-session-virtualization; do
+            if xvfb-run -a npx --no-install electron --no-sandbox "tests/$suite.mjs"; then
+              echo "Baseline $suite passed; investigate the feature regression."
+            else
+              echo "Baseline $suite failed too; retain the failed feature gate and compare diagnostics."
+            fi
+          done
+      - name: Build amd64 Debian package
+        id: package
+        # Continue collecting package evidence after an unrelated renderer failure;
+        # the failed regression still fails this job and blocks publication.
+        if: ${{ !cancelled() && (success() || steps.electron-regressions.outcome == 'failure') }}
+        # Host Node 22 builds; the shipped app uses Electron's embedded Node.
+        run: npm --prefix app run dist:linux -- --x64 --publish never -c.linux.target=deb
+      - name: Record artifact integrity
+        id: integrity
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        working-directory: app/release
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sha256sum "Obelisk-$APP_VERSION-linux-amd64.deb" > linux-amd64.sha256
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const version = process.env.APP_VERSION;
+          const file = `Obelisk-${version}-linux-amd64.deb`;
+          const bytes = readFileSync(file);
+          writeFileSync('debian-amd64.json', JSON.stringify({ file, version, arch: 'x64',
+            size: bytes.length, sha512: createHash('sha512').update(bytes).digest('base64') })+'\n');
+          NODE
+      - uses: actions/upload-artifact@v4
+        id: artifact
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' }}
+        with:
+          name: linux-amd64
+          path: |
+            app/release/Obelisk-${{ steps.version.outputs.version }}-linux-amd64.deb
+            app/release/linux-amd64.sha256
+            app/release/debian-amd64.json
+          if-no-files-found: error
+
+      - id: ready
+        if: ${{ !cancelled() && steps.artifact.outcome == 'success' }}
+        run: echo 'artifact_ready=true' >> "$GITHUB_OUTPUT"
+
+  install:
+    if: ${{ !cancelled() && needs.build.outputs.artifact_ready == 'true' }}
+    needs: build
+    name: Install Debian package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: release
+      - name: Verify metadata and install through apt
+        env:
+          APP_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -c linux-amd64.sha256
+          deb="Obelisk-$APP_VERSION-linux-amd64.deb"
+          test "$(dpkg-deb -f "$deb" Package)" = obelisk
+          test "$(dpkg-deb -f "$deb" Version)" = "$APP_VERSION"
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "./$deb" xvfb desktop-file-utils
+          test "$(dpkg-query -W -f='${Version}' obelisk)" = "$APP_VERSION"
+          test "$(readlink -f /usr/bin/obelisk)" = /opt/Obelisk/obelisk
+          test -f /usr/share/applications/obelisk.desktop
+          desktop-file-validate /usr/share/applications/obelisk.desktop
+      - name: Install acceptance tooling
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: npm --prefix app ci
+      - name: Verify installed runtime, native modules and real app startup
+        env:
+          APP_VERSION: ${{ needs.build.outputs.version }}
+        run: xvfb-run -a node .github/scripts/verify-deb-runtime.mjs
+      - name: Verify two-version Debian upgrades and failure recovery
+        env:
+          APP_VERSION: ${{ needs.build.outputs.version }}
+        run: xvfb-run -a node app/tests/packaged-deb-updates.mjs "release/Obelisk-$APP_VERSION-linux-amd64.deb"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deb-acceptance-${{ matrix.os }}
+          path: /tmp/obelisk-deb-acceptance-*/evidence/**
+          if-no-files-found: ignore

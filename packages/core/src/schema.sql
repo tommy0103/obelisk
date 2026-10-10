@@ -62,6 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_main_timeline
   WHERE agent_id IS NULL AND COALESCE(visibility, 'visible') = 'visible';
 CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_catalogue_order
+  ON sessions(COALESCE(ended_at, started_at) DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_project_start ON sessions(project, started_at);
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source);
 CREATE INDEX IF NOT EXISTS idx_messages_usage_day
   ON messages(timestamp, COALESCE(source, 'claude'), input_tokens, output_tokens)

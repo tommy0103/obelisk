@@ -2,7 +2,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, shallowRef, watch, nextTick, onMounted, onUnmounted } from 'vue';
+import { useVirtualizer } from '@tanstack/vue-virtual';
 import { useRouter } from 'vue-router';
 import { state } from '../store.js';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
@@ -22,36 +23,109 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
 
 const homePath = (typeof process !== 'undefined' && process.env?.HOME) || '~';
 
-const visibleSessions = computed(() => {
-  const q = state.query.trim().toLowerCase();
-  return state.sessions
-    .filter(s => state.projectFilter === 'all' || s.project === state.projectFilter)
-    .filter(s => state.sourceFilter === 'all' || (s.source || 'claude') === state.sourceFilter)
-    .map(s => {
-      if (!q) return { ...s, messageHit: null };
-      const topMatch = (s.title || '').toLowerCase().includes(q) ||
-                       (s.project || '').toLowerCase().includes(q) ||
-                       (s.git_branch || '').toLowerCase().includes(q);
-      if (topMatch) return { ...s, messageHit: null };
-      return null;
-    })
-    .filter(Boolean)
-    .sort((a, b) => {
-      const ta = new Date(a.ended_at || a.started_at || 0).getTime();
-      const tb = new Date(b.ended_at || b.started_at || 0).getTime();
-      return state.sortDesc ? tb - ta : ta - tb;
-    });
-});
-
 const showProjectPrefix = computed(() => state.projectFilter === 'all');
 const showNoise = ref(false);
+const scrollElement = ref(null);
+const catalogueLoading = ref(true);
+const totals = ref({ normal: 0, quiet: 0 });
+const pages = shallowRef(new Map());
+const pending = new Set();
+const PAGE_SIZE = 100;
+let generation = 0;
+const options = () => ({
+  source: state.sourceFilter,
+  project: state.projectFilter,
+  query: state.query,
+  descending: state.sortDesc,
+});
 
-function isNoise(s) {
-  return !s.title;
+async function fetchPage(quiet, page, version, refresh = false) {
+  const key = `${quiet}:${page}`;
+  if ((!refresh && pages.value.has(key)) || pending.has(key)) return;
+  pending.add(key);
+  try {
+    const result = await window.obelisk.getSessionCatalogue({ ...options(), quiet, offset: page * PAGE_SIZE, limit: PAGE_SIZE });
+    if (version !== generation) return;
+    totals.value = { ...totals.value, [quiet ? 'quiet' : 'normal']: result.total };
+    const next = new Map(pages.value);
+    next.delete(key);
+    next.set(key, result.rows);
+    while (next.size > 8) next.delete(next.keys().next().value);
+    pages.value = next;
+  } catch (error) {
+    console.error('Failed to load session catalogue:', error);
+  } finally {
+    if (version === generation) pending.delete(key);
+  }
 }
 
-const normalSessions = computed(() => visibleSessions.value.filter(s => !isNoise(s)));
-const noiseSessions = computed(() => visibleSessions.value.filter(s => isNoise(s)));
+watch(() => [state.query, state.projectFilter, state.sourceFilter, state.sortDesc, state.catalogueVersion],
+  async (current, previous) => {
+    const version = ++generation;
+    const filtersChanged = !previous || current.slice(0, 4).some((value, index) => value !== previous[index]);
+    catalogueLoading.value = true;
+    pending.clear();
+    const requests = new Map([['false:0', [false, 0]], ['true:0', [true, 0]]]);
+    if (filtersChanged) {
+      pages.value = new Map();
+      totals.value = { normal: 0, quiet: 0 };
+    } else {
+      // Retain the mounted rows and list height while refresh IPC is pending.
+      // Discard offscreen pages so revisiting them fetches the new generation.
+      const retained = new Map();
+      for (const item of virtualRows.value) {
+        const request = pageForRow(item.index);
+        if (!request) continue;
+        const [quiet, page] = request;
+        const key = `${quiet}:${page}`;
+        requests.set(key, request);
+        if (pages.value.has(key)) retained.set(key, pages.value.get(key));
+      }
+      pages.value = retained;
+    }
+    await Promise.all([...requests.values()].map(([quiet, page]) => fetchPage(quiet, page, version, true)));
+    if (version === generation) catalogueLoading.value = false;
+    if (version === generation && previous && filtersChanged) {
+      await nextTick();
+      scrollElement.value?.scrollTo(0, 0);
+    }
+  }, { immediate: true });
+
+const itemCount = computed(() => totals.value.normal + (totals.value.quiet ? 1 + (showNoise.value ? totals.value.quiet + 2 : 0) : 0));
+const virtualizer = useVirtualizer(computed(() => ({
+  count: itemCount.value,
+  getScrollElement: () => scrollElement.value,
+  estimateSize: index => index < totals.value.normal ? 72
+    : index === totals.value.normal ? 56
+      : index === totals.value.normal + 1 ? 28
+        : index === itemCount.value - 1 ? 40 : 64,
+  getItemKey: index => index,
+  overscan: 8,
+})));
+const virtualRows = computed(() => virtualizer.value.getVirtualItems());
+const totalSize = computed(() => virtualizer.value.getTotalSize());
+
+function rowAt(index) {
+  const normal = index < totals.value.normal;
+  const offset = normal ? index : index - totals.value.normal - 2;
+  if (!normal && (offset < 0 || offset >= totals.value.quiet)) return null;
+  return pages.value.get(`${!normal}:${Math.floor(offset / PAGE_SIZE)}`)?.[offset % PAGE_SIZE] || null;
+}
+
+function pageForRow(index) {
+  const normal = index < totals.value.normal;
+  const offset = normal ? index : index - totals.value.normal - 2;
+  return offset >= 0 && (normal || offset < totals.value.quiet)
+    ? [!normal, Math.floor(offset / PAGE_SIZE)] : null;
+}
+
+watch(virtualRows, rows => {
+  const version = generation;
+  for (const item of rows) {
+    const request = pageForRow(item.index);
+    if (request) void fetchPage(...request, version);
+  }
+}, { immediate: true });
 
 function titleHTML(session) {
   return highlightPlain(session.title || '(untitled)', state.query.trim());
@@ -105,7 +179,7 @@ function obeliskStyle(session) {
 <template>
   <div class="session-list-wrap">
     <!-- Empty state: no data source / debug toggle -->
-    <div v-if="state.loaded && (debugEmpty || (!visibleSessions.length && !state.query))" class="empty-content">
+    <div v-if="state.loaded && (debugEmpty || (!catalogueLoading && !itemCount && !state.query && !state.stats.sessions))" class="empty-content">
       <div class="empty-eyebrow">
         <span class="diamond"></span>
         <span>No data source connected</span>
@@ -140,74 +214,41 @@ function obeliskStyle(session) {
     </div>
 
     <!-- Empty state: search returned nothing -->
-    <div v-else-if="state.loaded && !visibleSessions.length" class="empty">
+    <div v-else-if="state.loaded && !catalogueLoading && !itemCount" class="empty">
       No sessions here.
       <span class="hint">{{ state.query ? 'Try a different search term.' : 'Press / to search.' }}</span>
     </div>
 
-    <div v-else class="session-list">
-      <div
-        v-for="s in normalSessions"
-        :key="s.id"
-        class="srow"
-        :class="{ cursor: state.cursorId === s.id }"
-        :data-session-id="s.id"
-        @click="openSession(s)"
-      >
-        <div class="srow-obelisk" :style="obeliskStyle(s)"></div>
-        <div class="srow-body">
-          <div class="srow-title" v-html="titleHTML(s)"></div>
-          <div class="srow-meta">
-            <template v-if="showProjectPrefix">
-              <span class="project-tag" v-html="projectLabel(s)"></span>
-              <span class="dot"></span>
-            </template>
-            <span>{{ s.message_count || 0 }} msg</span>
-          </div>
-        </div>
-        <div class="srow-right">{{ timeLabel(s) }}</div>
-      </div>
-
-      <!-- Noise fold banner -->
-      <div v-if="noiseSessions.length && !state.query" class="fold-banner" :class="{ expanded: showNoise }" @click="showNoise = !showNoise">
-        <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-          <path d="M4 2.5l3 3.5-3 3.5"/>
-        </svg>
-        <div class="body">
-          <strong>{{ noiseSessions.length }}</strong> quiet sessions hidden — untitled, likely tests or incomplete runs.
-        </div>
-        <span v-if="!showNoise" class="reveal-link">Show all</span>
-      </div>
-
-      <!-- Noise sessions (collapsed by default) -->
-      <div v-if="showNoise && noiseSessions.length" class="noise-group">
-        <div class="noise-group-head">
-          {{ noiseSessions.length }} sessions · untitled
-        </div>
-        <div
-          v-for="s in noiseSessions"
-          :key="s.id"
-          class="srow noise"
-          @click="openSession(s)"
-        >
-          <div class="srow-body">
-            <div class="srow-title">(untitled)</div>
-            <div class="srow-meta">
-              <template v-if="showProjectPrefix">
-                <span class="project-tag" v-html="projectLabel(s)"></span>
-                <span class="dot"></span>
-              </template>
-              <span>{{ s.message_count || 0 }} msg</span>
+    <div v-else ref="scrollElement" class="session-scroll">
+      <div class="session-list" :style="{ height: `${totalSize}px` }">
+        <div v-for="item in virtualRows" :key="item.key" :data-index="item.index"
+          class="virtual-row" :style="{ transform: `translateY(${item.start}px)` }">
+          <template v-if="rowAt(item.index)">
+            <div :class="['srow', { noise: item.index > totals.normal, cursor: state.cursorId === rowAt(item.index).id }]"
+              :data-session-id="rowAt(item.index).id" @click="openSession(rowAt(item.index))">
+              <div v-if="item.index < totals.normal" class="srow-obelisk" :style="obeliskStyle(rowAt(item.index))"></div>
+              <div class="srow-body">
+                <div class="srow-title" v-html="titleHTML(rowAt(item.index))"></div>
+                <div class="srow-meta">
+                  <template v-if="showProjectPrefix">
+                    <span class="project-tag" v-html="projectLabel(rowAt(item.index))"></span>
+                    <span class="dot"></span>
+                  </template>
+                  <span>{{ rowAt(item.index).message_count || 0 }} msg</span>
+                </div>
+              </div>
+              <div class="srow-right">{{ timeLabel(rowAt(item.index)) }}</div>
             </div>
+          </template>
+          <div v-else-if="item.index === totals.normal" class="fold-banner" :class="{ expanded: showNoise }" @click="showNoise = !showNoise">
+            <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 2.5l3 3.5-3 3.5"/></svg>
+            <div class="body"><strong>{{ totals.quiet }}</strong> quiet sessions hidden — untitled, likely tests or incomplete runs.</div>
+            <span v-if="!showNoise" class="reveal-link">Show all</span>
           </div>
-          <div class="srow-right">{{ timeLabel(s) }}</div>
+          <div v-else-if="item.index === totals.normal + 1" class="noise-group-head">{{ totals.quiet }} sessions · untitled</div>
+          <button v-else-if="item.index === itemCount - 1" class="noise-fold-bottom" @click="showNoise = false">Collapse</button>
+          <div v-else class="srow loading-row"></div>
         </div>
-        <button class="noise-fold-bottom" @click.stop="showNoise = false">
-          <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-            <path d="M4 2.5l3 3.5-3 3.5"/>
-          </svg>
-          Collapse
-        </button>
       </div>
     </div>
   </div>
@@ -216,11 +257,18 @@ function obeliskStyle(session) {
 <style scoped>
 .session-list-wrap {
   flex: 1;
-  overflow-y: auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
+.session-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.session-list { position: relative; }
+.virtual-row { position: absolute; top: 0; left: 0; width: 100%; }
+.srow { box-sizing: border-box; height: 72px; min-height: 0; overflow: hidden; }
+.srow.noise { height: 64px; }
+.fold-banner { box-sizing: border-box; height: 56px; }
+.noise-group-head { box-sizing: border-box; height: 28px; }
+.noise-fold-bottom { box-sizing: border-box; height: 40px; }
 
 .srow {
   display: grid;

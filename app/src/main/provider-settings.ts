@@ -32,6 +32,19 @@ export function setPersistedSetting(
   key: string,
   value: unknown,
 ): boolean {
+  const editionMatch = /^copilotEditions\.(stable|insiders)$/.exec(key);
+  if (editionMatch !== null) {
+    const editions = persisted.copilotEditions
+      && typeof persisted.copilotEditions === 'object'
+      && !Array.isArray(persisted.copilotEditions)
+      ? persisted.copilotEditions as Record<string, unknown>
+      : {};
+    if (value === false) editions[editionMatch[1]!] = false;
+    else delete editions[editionMatch[1]!];
+    if (Object.keys(editions).length === 0) delete persisted.copilotEditions;
+    else persisted.copilotEditions = editions;
+    return true;
+  }
   const providerMatch = /^providerRoots\.(.+)$/.exec(key);
   if (providerMatch === null) {
     if (value === null) delete persisted[key];
@@ -47,6 +60,7 @@ export function setPersistedSetting(
     : {};
   if (value === null) delete roots[providerId];
   else roots[providerId] = value;
+  if (providerId === 'copilot' && value === null) delete persisted.copilotDir;
   if (Object.keys(roots).length === 0) delete persisted.providerRoots;
   else persisted.providerRoots = roots;
   return true;

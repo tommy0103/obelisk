@@ -1,0 +1,5 @@
+{"id": "tangent-event-0", "timestamp": "2026-01-01T15:00:00Z", "payload": {"type": "assistant", "content": "Example tangent response", "operationType": "Summary"}}
+{"id": "tangent-event-1", "timestamp": "2026-01-01T15:00:00Z", "payload": {"type": "agent_note", "content": "Example tangent prompt"}}
+{"id": "tangent-event-2", "timestamp": "2026-01-01T15:00:00Z", "payload": {"type": "user", "content": "Example tangent prompt"}}
+{"id": "tangent-event-4", "timestamp": "2026-01-01T15:00:00Z", "payload": {"type": "assistant", "content": "Example tangent response", "operationType": "Say"}}
+{"id": "tangent-event-5", "timestamp": "2026-01-01T15:00:00Z", "payload": {"type": "assistant", "content": "Example tangent response", "operationType": "Reasoning"}}
