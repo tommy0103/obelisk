@@ -446,8 +446,12 @@ function createIndexerService({
     }
     heartbeatTimer = null;
     reconcileTimer = null;
-    if (watcher?.close) watcher.close();
+    const closed = watcher?.close ? Promise.resolve(watcher.close()) : Promise.resolve();
     watcher = null;
+    // Existing fire-and-forget callers remain safe; update cleanup awaits this
+    // promise and observes failures instead of quitting across a live watcher.
+    void closed.catch(() => {});
+    return closed;
   };
 
   return {

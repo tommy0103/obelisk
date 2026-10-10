@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { Virtualizer } from '../app/node_modules/@tanstack/vue-virtual/dist/esm/index.js';
 import { createViewportRangeExtractor } from '../app/src/renderer/src/session-timeline-viewport.mjs';
 
 const sessionDetail = readFileSync(
@@ -57,7 +58,6 @@ test('timeline viewport owns measurement and anchoring while SessionDetail alone
   assert.match(viewportModule, /useAnimationFrameWithResizeObserver:\s*true/);
   assert.match(viewportModule, /scrollPaddingEnd/);
   assert.match(viewportModule, /scrollToIndex/);
-  assert.match(viewportModule, /if \(!element\) return/);
   assert.match(sessionDetail, /isScrolling:\s*\(\) => userScroll\.isActive\(\)/);
   assert.doesNotMatch(sessionDetail, /timelineViewport\.isScrolling/);
   assert.match(
@@ -84,6 +84,50 @@ test('timeline viewport buffers by rendered pixels instead of a fixed row count'
   assert.equal(indexes[0], 44);
   assert.equal(indexes.at(-1), 170);
   assert.equal(indexes.length, 127);
+});
+
+test('timeline buffer covers the compensated reader position before scrollTop is reconciled', () => {
+  const rangeExtractor = createViewportRangeExtractor({
+    getScrollElement: () => ({ clientHeight: 700, scrollTop: 5000 }),
+    getScrollOffset: () => 4400,
+    getVirtualizer: () => ({
+      getVirtualItemForOffset: offset => ({ index: Math.floor(offset / 50) }),
+    }),
+  });
+
+  const indexes = rangeExtractor({
+    startIndex: 88,
+    endIndex: 101,
+    overscan: 6,
+    count: 1000,
+  });
+
+  assert.equal(indexes[0], 32);
+  assert.equal(indexes.at(-1), 158);
+});
+
+test('a physical scroll ahead of virtual-core never retains the old offscreen prefix', () => {
+  const instance = new Virtualizer({
+    count: 2000,
+    getScrollElement: () => null,
+    estimateSize: () => 150,
+    initialRect: { width: 1200, height: 700 },
+    scrollToFn: () => {},
+    observeElementRect: () => {},
+    observeElementOffset: () => {},
+  });
+  const staleRange = instance.calculateRange();
+  assert.equal(staleRange.startIndex, 0);
+  // A physical/compositor scroll is visible to DOM reads before the library's
+  // offset observer has published its corresponding range.
+  const extract = createViewportRangeExtractor({
+    getScrollElement: () => ({ clientHeight: 700, scrollTop: 150000 }),
+    getVirtualizer: () => instance,
+  });
+  const indexes = extract({ ...staleRange, count: 2000, overscan: 6 });
+  assert.equal(indexes[0], 981, 'the old prefix is not retained');
+  assert.equal(indexes.at(-1), 1023, 'the real viewport keeps its full pixel buffer');
+  assert.equal(indexes.length, 43, 'a far jump mounts one bounded viewport window');
 });
 
 test('timeline count and disclosure classes come from renderer state rather than DOM state', () => {
@@ -120,4 +164,68 @@ test('live patch state advances only after the visible snapshot commit is accept
     /materializeSessionDetailPatch\(snapshot\.patchRequest\);[\s\S]*await commitSessionSnapshot\(latest\);[\s\S]*acceptMessagePatch[\s\S]*clearSessionDirty/,
   );
   assert.match(commitLiveSnapshot, /markSessionDirty\(snapshot\.sessionId\)/);
+});
+
+// Vue sends a null ref on unmount. Exercise the real virtualizer's cleanup
+// through our wrapper rather than pinning a source-text null guard.
+test('virtual rows measure after the DOM patch and release disconnected references', async t => {
+  const virtualModuleUrl = new URL('../app/node_modules/@tanstack/vue-virtual/dist/esm/index.js', import.meta.url);
+  const virtualModule = await import(virtualModuleUrl.href);
+  const { effectScope, nextTick, ref } = await import('../app/node_modules/vue/index.mjs');
+  let instance;
+  const virtualMock = t.mock.module(virtualModuleUrl, {
+    namedExports: {
+      ...virtualModule,
+      useVirtualizer(options) {
+        const state = virtualModule.useVirtualizer(options);
+        instance = state.value;
+        return state;
+      },
+    },
+  });
+  t.after(() => virtualMock.restore());
+  const { useSessionTimelineViewport } = await import('../app/src/renderer/src/session-timeline-viewport.mjs?unmount-cleanup');
+  const scope = effectScope();
+  t.after(() => scope.stop());
+  const viewport = scope.run(() => useSessionTimelineViewport({
+    items: ref([0, 1, 2].map(index => ({ key: `row-${index + 1}`, kind: 'message', message: { text: 'row' } }))),
+    scrollElement: ref(null),
+    timelineElement: ref(null),
+    scrollMargin: ref(0),
+  }));
+  instance.getMeasurements();
+  instance.isScrolling = true;
+  let heightReads = 0;
+  const rows = [0, 1, 2].map(index => ({
+    isConnected: true,
+    getAttribute: () => String(index),
+    get offsetHeight() { heightReads++; return 120 + index; },
+    getBoundingClientRect() { heightReads++; return { height: 120 + index }; },
+  }));
+  const resize = instance.resizeItem;
+  instance.resizeItem = (...args) => {
+    assert.equal(heightReads, 3, 'all new heights are read before any size correction');
+    return resize(...args);
+  };
+  for (const row of rows) viewport.measureElement(row);
+  assert.equal(heightReads, 0, 'mount refs do not force layout inside the DOM patch');
+  await nextTick();
+  for (const [index, row] of rows.entries()) {
+    assert.equal(instance.elementsCache.get(`row-${index + 1}`), row, 'the mounted row is registered');
+    assert.equal(instance.itemSizeCache.get(`row-${index + 1}`), 120 + index, 'actual heights are published before paint');
+  }
+  const row = rows[0];
+  const measure = instance.measureElement;
+  let cleanupPasses = 0;
+  instance.measureElement = element => {
+    if (!element) cleanupPasses++;
+    return measure(element);
+  };
+  // Vue calls the null ref before removing the host element.
+  viewport.measureElement(null);
+  viewport.measureElement(null);
+  row.isConnected = false;
+  await nextTick();
+  assert.equal(instance.elementsCache.has('row-1'), false, 'the unmounted row is no longer retained');
+  assert.equal(cleanupPasses, 1, 'one Vue unmount batch performs one cache/observer cleanup pass');
 });

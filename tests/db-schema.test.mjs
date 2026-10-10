@@ -320,7 +320,7 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
-  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'omp' \| 'pi'/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'kiro' \| 'omp' \| 'pi'/);
   assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
@@ -340,15 +340,27 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
-  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
-  assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
-  assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);
-  assert.match(skill, /Reference Map/);
-  assert.match(skill, /references\/schema\.md.*raw SQL/i);
-  assert.match(skill, /references\/api-reference\.md.*helper/i);
-  assert.match(skill, /references\/query-patterns\.md.*synthesis/i);
-  assert.match(skill, /references\/pitfalls\.md.*error/i);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, Kiro, OMP, and Pi/);
+  const routes = [
+    ['references/schema.md', /raw SQL/i],
+    ['references/api-reference.md', /helper/i],
+    ['references/query-patterns.md', /synthesis/i],
+    ['references/retrieval-semantics.md', /correlation/i],
+    ['references/pitfalls.md', /error/i],
+  ];
+  for (const [path, trigger] of routes) {
+    const route = skill.split('\n').find(line => line.startsWith('|')
+      && line.includes(`](${path})`) && trigger.test(line.split('|')[1]));
+    assert.ok(route, `${path} must have a task-specific disclosure trigger`);
+    await readFile(new URL(`../skill-doc/${path}`, import.meta.url), 'utf8');
+  }
+
+  // Details belong to the references reached by these routes, not the entry.
+  const api = await readApiReference();
+  const semantics = await readFile(new URL('../skill-doc/references/retrieval-semantics.md', import.meta.url), 'utf8');
+  assert.match(api, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(semantics, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(semantics, /build the candidate session set from X first.*Y only inside that\s+set/s);
 });
 
 test('extractContentType maps Claude content blocks to the message evidence type', () => {

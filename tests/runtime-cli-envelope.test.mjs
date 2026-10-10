@@ -91,6 +91,34 @@ test('--query rejects a negative helper limit instead of returning unbounded res
   assert.equal(typeof payload.stack, 'string');
 });
 
+test('--query exposes bounded messages and preserves compatibility globals in the built CLI', () => {
+  const home = tempHome();
+  const scriptPath = join(home, 'message-page.mjs');
+  writeFileSync(scriptPath, `return {
+    page: messages({ sessionId: 'missing', limit: 2 }),
+    missing: messages('missing'),
+    compatibility: [typeof context, typeof thread, typeof recent, typeof trace, typeof workflows, typeof workflowTree],
+    rememberType: typeof remember
+  };`);
+  const result = runRuntime(['--query', scriptPath], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    page: { anchor: null, messages: [], session: null, hasMore: false, nextCursor: null },
+    missing: null, compatibility: Array(6).fill('function'), rememberType: 'undefined',
+  });
+});
+
+test('--query surfaces an invalid messages mode through the existing error envelope', () => {
+  const home = tempHome();
+  const scriptPath = join(home, 'invalid-message-window.mjs');
+  writeFileSync(scriptPath, "return messages({ around: 'missing', relation: 'parents', afterCount: 1 });");
+  const result = runRuntime(['--query', scriptPath], { home });
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.error, 'messages() parents relation requires afterCount: 0');
+  assert.equal(typeof payload.stack, 'string');
+});
+
 test('--attune surfaces a throw as { error, stack } and exits 1', () => {
   const home = tempHome();
   // Attune requires an initialized index; bring one up so the script's own

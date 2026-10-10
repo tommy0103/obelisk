@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { buildIndex } from './indexer.ts';
 import { createHermesProvider } from '../../../packages/core/src/providers/hermes.ts';
 import { createZcodeProvider } from '../../../packages/core/src/providers/zcode.ts';
+import { createKiroProvider } from '../../../packages/core/src/providers/kiro.ts';
 import type { RawLookup } from '../../../packages/core/src/providers/types.ts';
 
 if (!parentPort) throw new Error('indexer-worker must run as a worker thread');
@@ -27,7 +28,12 @@ port.on('message', ({ id, operation, args }: { id: number; operation?: string; a
       ? hermesProvider.raw(args as unknown as RawLookup)?.messageText ?? null
       : operation === 'readZcodeMessageText'
         ? zcodeProvider.raw(args as unknown as RawLookup)?.messageText ?? null
-        : buildIndex(args || {});
+        : operation === 'readKiroMessageText'
+          ? createKiroProvider({
+            rootDir: typeof args?.rootDir === 'string' ? args.rootDir : undefined,
+            openDatabase: sourcePath => new Database(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 }),
+          }).raw(args as unknown as RawLookup)?.messageText ?? null
+          : buildIndex(args || {});
     port.postMessage({ id, result });
   } catch (error) {
     port.postMessage({

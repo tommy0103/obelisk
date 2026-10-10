@@ -4,9 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
+import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
+import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -20,6 +24,91 @@ class TestDatabase {
   prepare(sql) { return this.db.prepare(sql); }
   close() { return this.db.close(); }
 }
+
+test('desktop worker indexes Insiders-only Copilot history by default and respects explicit roots', () => {
+  const base = makeTempDir('obelisk-copilot-worker-');
+  const envKeys = ['APPDATA', 'XDG_CONFIG_HOME', 'HOME', 'USERPROFILE'];
+  const previousEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+  try {
+    for (const key of envKeys) process.env[key] = base;
+    const [stable, insiders] = defaultCopilotUserDataRoots();
+    const project = join(base, 'project');
+    mkdirSync(project, { recursive: true });
+    const transcript = readFileSync(new URL('./fixtures/copilot/transcript-v1.jsonl', import.meta.url), 'utf8');
+    const sourceId = JSON.parse(transcript.split('\n', 1)[0]).data.sessionId;
+    const writeTranscript = (root, workspaceId, sessionId) => {
+      const workspace = join(root, 'workspaceStorage', workspaceId);
+      const transcripts = join(workspace, 'GitHub.copilot-chat', 'transcripts');
+      mkdirSync(transcripts, { recursive: true });
+      writeFileSync(join(workspace, 'workspace.json'), JSON.stringify({ folder: pathToFileURL(project).href }));
+      writeFileSync(join(transcripts, `${sessionId}.jsonl`), transcript.replaceAll(sourceId, sessionId));
+    };
+    writeTranscript(insiders, 'insiders-workspace', '44444444-4444-4444-8444-444444444444');
+    const claudeDir = join(base, '.claude');
+    const codexDir = join(base, '.codex');
+    const dbPath = join(base, '.obelisk', 'obelisk.sqlite');
+    const mainRuntime = createConfiguredBuiltinProviderRuntime({}, {
+      baseRoots: { claude: claudeDir, codex: codexDir },
+    });
+    const options = {
+      providerSettings: {}, providerRoots: mainRuntime.roots,
+      claudeDir, codexDir, dbPath, DatabaseImpl: TestDatabase,
+    };
+    assert.equal(mainRuntime.roots.copilot, stable);
+    buildIndex(options);
+    const countSessions = path => {
+      const db = new DatabaseSync(path);
+      try { return db.prepare("SELECT COUNT(*) AS total FROM sessions WHERE source = 'copilot'").get().total; }
+      finally { db.close(); }
+    };
+    assert.equal(countSessions(dbPath), 1, 'default desktop indexing finds Insiders-only sessions');
+
+    writeTranscript(stable, 'stable-workspace', '11111111-1111-4111-8111-111111111111');
+    buildIndex(options);
+    assert.equal(countSessions(dbPath), 2, 'default desktop indexing keeps both editions');
+
+    const explicitSettings = { providerRoots: { copilot: insiders } };
+    const explicitRuntime = createConfiguredBuiltinProviderRuntime(explicitSettings, {
+      baseRoots: { claude: claudeDir, codex: codexDir },
+    });
+    buildIndex({ ...options, providerSettings: explicitSettings, providerRoots: explicitRuntime.roots });
+    assert.equal(countSessions(dbPath), 2, 'turning off a Copilot directory retains its indexed history');
+    const insidersOnly = { copilotEditions: { stable: false } };
+    const insidersRuntime = createConfiguredBuiltinProviderRuntime(insidersOnly, {
+      baseRoots: { claude: claudeDir, codex: codexDir },
+    });
+    assert.equal(insidersRuntime.registry.watchTargets(insidersRuntime.roots).some((target) => target.path.startsWith(stable)), false);
+    assert.equal(insidersRuntime.registry.watchTargets(insidersRuntime.roots).some((target) => target.path.startsWith(insiders)), true);
+    const selectedDbPath = join(base, 'selected', 'obelisk.sqlite');
+    buildIndex({ ...options, providerSettings: insidersOnly, providerRoots: insidersRuntime.roots, dbPath: selectedDbPath });
+    assert.equal(countSessions(selectedDbPath), 1, 'only enabled Copilot directories are indexed');
+    const disabledSettings = { copilotEditions: { stable: false, insiders: false } };
+    const disabledRuntime = createConfiguredBuiltinProviderRuntime(disabledSettings, {
+      baseRoots: { claude: claudeDir, codex: codexDir },
+    });
+    assert.equal(disabledRuntime.registry.watchTargets(disabledRuntime.roots).some((target) => target.path.includes('copilot-chat')), false);
+    buildIndex({ ...options, providerSettings: disabledSettings, providerRoots: disabledRuntime.roots, dbPath: selectedDbPath });
+    assert.equal(countSessions(selectedDbPath), 1, 'disabling both directories retains indexed history');
+    buildIndex({ ...options, providerSettings: disabledSettings, providerRoots: disabledRuntime.roots, dbPath: selectedDbPath, force: true });
+    assert.equal(countSessions(selectedDbPath), 0, 'full rebuild only includes enabled Copilot directories');
+    const explicitDbPath = join(base, 'explicit', 'obelisk.sqlite');
+    buildIndex({ ...options, providerSettings: explicitSettings, providerRoots: explicitRuntime.roots, dbPath: explicitDbPath });
+    assert.equal(countSessions(explicitDbPath), 1, 'explicit root indexes only the selected edition');
+
+    writeTranscript(insiders, 'new-insiders-workspace', '22222222-2222-4222-8222-222222222222');
+    const restartedRuntime = createConfiguredBuiltinProviderRuntime(explicitSettings, {
+      baseRoots: { claude: claudeDir, codex: codexDir },
+    });
+    buildIndex({ ...options, providerSettings: explicitSettings, providerRoots: restartedRuntime.roots, dbPath: explicitDbPath });
+    assert.equal(countSessions(explicitDbPath), 2, 'explicit root remains single-root after refresh and restart');
+  } finally {
+    for (const key of envKeys) {
+      if (previousEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = previousEnv[key];
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
 
 test('app indexer persists every provider through one registry-driven loop', () => {
   const home = makeTempDir('obelisk-provider-indexer-');
@@ -88,6 +177,7 @@ test('serialized invalid provider settings stay disabled when the worker rebuild
         claude: './claude',
         codex: './codex',
         kimi: './kimi',
+        copilot: join(home, 'empty-copilot'),
       },
     },
     providerRoots: { kimi: join(home, '.kimi-code') },
@@ -138,6 +228,7 @@ test('an invalid provider root cannot erase a previously indexed source snapshot
         codex: './invalid',
         kimi: './invalid',
         pi: './invalid',
+        copilot: join(home, 'empty-copilot'),
       },
     },
     claudeDir: join(home, '.claude'),

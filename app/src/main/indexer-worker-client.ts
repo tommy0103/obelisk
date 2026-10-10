@@ -64,7 +64,7 @@ function createWorkerBuildIndex({
     return active;
   };
 
-  const request = (operation: 'buildIndex' | 'readZcodeMessageText' | 'readHermesMessageText', args: Record<string, unknown>) => new Promise((resolve, reject) => {
+  const request = (operation: 'buildIndex' | 'readZcodeMessageText' | 'readHermesMessageText' | 'readKiroMessageText', args: Record<string, unknown>) => new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject });
     ensureWorker().postMessage({ id, operation, args });
@@ -72,6 +72,7 @@ function createWorkerBuildIndex({
   const buildIndex = (args: Record<string, unknown> = {}) => request('buildIndex', args);
   const readZcodeMessageText = (args: Record<string, unknown>) => request('readZcodeMessageText', args);
   const readHermesMessageText = (args: Record<string, unknown>) => request('readHermesMessageText', args);
+  const readKiroMessageText = (args: Record<string, unknown>) => request('readKiroMessageText', args);
 
   const stop = () => {
     const current = worker;
@@ -81,7 +82,7 @@ function createWorkerBuildIndex({
     return termination;
   };
 
-  return { buildIndex, readZcodeMessageText, readHermesMessageText, stop };
+  return { buildIndex, readZcodeMessageText, readHermesMessageText, readKiroMessageText, stop };
 }
 
 export { createWorkerBuildIndex };
