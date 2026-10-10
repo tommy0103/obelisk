@@ -56,6 +56,46 @@ function text(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+function hasOnlyKeys(value: JsonObject, allowedKeys: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowedKeys.includes(key));
+}
+
+function hasValidHarnessError(value: unknown): boolean {
+  const error = object(value);
+  return error !== null
+    && hasOnlyKeys(error, ['code', 'message', 'retryable', 'diagnostic', 'stage', 'durationMs', 'stderrTail'])
+    && text(error.code) !== null
+    && text(error.message) !== null
+    && typeof error.retryable === 'boolean'
+    && (error.diagnostic === undefined || typeof error.diagnostic === 'string')
+    && (error.stage === undefined || typeof error.stage === 'string')
+    && (error.durationMs === undefined || (typeof error.durationMs === 'number' && Number.isFinite(error.durationMs)))
+    && (error.stderrTail === undefined || typeof error.stderrTail === 'string');
+}
+
+function validateOutcome(value: unknown, path: string, kind: 'turn' | 'item'): void {
+  const outcome = object(value);
+  const status = text(outcome?.status);
+  const statuses = kind === 'turn'
+    ? ['succeeded', 'failed', 'cancelled', 'unknown']
+    : ['succeeded', 'failed', 'cancelled'];
+  if (outcome === null || status === null || !statuses.includes(status)) {
+    throw new Error(`Malformed CodexHost Antigravity ${kind} outcome: ${path}`);
+  }
+  const outcomeKeys = status === 'failed' ? ['status', 'error']
+    : status === 'cancelled' || status === 'unknown' ? ['status', 'reason'] : ['status'];
+  if (!hasOnlyKeys(outcome, outcomeKeys)) {
+    throw new Error(`Malformed CodexHost Antigravity ${kind} outcome fields: ${path}`);
+  }
+  if (status === 'failed' && !hasValidHarnessError(outcome.error)) {
+    throw new Error(`Malformed CodexHost Antigravity ${kind} failure: ${path}`);
+  }
+  if ((status === 'cancelled' && outcome.reason !== undefined && typeof outcome.reason !== 'string')
+    || (status === 'unknown' && typeof outcome.reason !== 'string')) {
+    throw new Error(`Malformed CodexHost Antigravity ${kind} outcome reason: ${path}`);
+  }
+}
+
 function validateHistory(history: JsonObject, path: string): void {
   const turns = history.turns as unknown[];
   for (const turnCandidate of turns) {
@@ -63,14 +103,7 @@ function validateHistory(history: JsonObject, path: string): void {
     if (turn === null || !Array.isArray(turn.input) || !Array.isArray(turn.items)) {
       throw new Error(`Malformed CodexHost Antigravity turn: ${path}`);
     }
-    const outcome = object(turn.outcome);
-    const status = text(outcome?.status);
-    if (status === null || !['succeeded', 'failed', 'cancelled', 'unknown'].includes(status)) {
-      throw new Error(`Malformed CodexHost Antigravity turn outcome: ${path}`);
-    }
-    if (status === 'failed' && text(object(outcome?.error)?.message) === null) {
-      throw new Error(`Malformed CodexHost Antigravity turn failure: ${path}`);
-    }
+    validateOutcome(turn.outcome, path, 'turn');
     for (const inputCandidate of turn.input) {
       const input = object(inputCandidate);
       if (input?.type !== 'text' || typeof input.text !== 'string') {
@@ -79,6 +112,7 @@ function validateHistory(history: JsonObject, path: string): void {
     }
     for (const itemCandidate of turn.items) {
       const envelope = object(itemCandidate);
+      validateOutcome(envelope?.outcome, path, 'item');
       const item = object(envelope?.item);
       if (item === null || typeof item.type !== 'string') {
         throw new Error(`Malformed CodexHost Antigravity turn item: ${path}`);

@@ -266,6 +266,90 @@ test('malformed required Antigravity message text reports incomplete inventory a
   db.close();
 });
 
+for (const malformedOutcome of [
+  { name: 'a missing status envelope', apply: (envelope) => { delete envelope.outcome; } },
+  { name: 'success status with failure data', apply: (envelope) => {
+    envelope.outcome = { status: 'succeeded', error: { code: 'TOOL_ERROR', message: 'unreported native failure', retryable: false } };
+  } },
+  { name: 'an unknown field in a failure payload', apply: (envelope) => {
+    envelope.outcome.error.unexpected = 'not in the upstream contract';
+  } },
+  { name: 'an infinite failure duration from raw JSON', apply: (envelope) => {
+    envelope.outcome.error.message = 'changed native failure';
+  }, infiniteDuration: true },
+]) {
+  test(`malformed item outcome (${malformedOutcome.name}) preserves last-good tool failure and cursor`, () => {
+    const source = setup();
+    source.history.turns[0].items[0].outcome = {
+      status: 'failed',
+      error: { code: 'TOOL_ERROR', message: 'unreported native failure', retryable: false, durationMs: 1 },
+    };
+    source.write();
+    const { db, unit, cursor } = seedIndexedSession(source);
+    const callId = `${unit.sessionId}:t000001:item:000001:call`;
+    const previousResult = db.prepare('SELECT content, is_error FROM tool_results WHERE tool_use_id = ?').get(callId);
+    assert.equal(previousResult.content, 'redacted output\nunreported native failure');
+    assert.equal(previousResult.is_error, 1);
+
+    malformedOutcome.apply(source.history.turns[0].items[0]);
+    source.write();
+    if (malformedOutcome.infiniteDuration) {
+      const serializedHistory = readFileSync(source.historyPath, 'utf8');
+      const finiteDuration = '"retryable":false,"durationMs":1';
+      assert.ok(serializedHistory.includes(finiteDuration));
+      writeFileSync(source.historyPath, serializedHistory.replace(finiteDuration, '"retryable":false,"durationMs":1e400'));
+    }
+
+    const { plan, result } = runIndexPlan(db, source.provider);
+
+    assert.equal(plan.items.length, 0);
+    assert.equal(plan.incompleteProviders.has(source.provider.name), true);
+    assert.equal(result.complete, false);
+    const storedResult = db.prepare('SELECT content, is_error FROM tool_results WHERE tool_use_id = ?').get(callId);
+    assert.equal(storedResult.content, previousResult.content);
+    assert.equal(storedResult.is_error, previousResult.is_error);
+    assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(unit.key).cursor, cursor);
+    db.close();
+  });
+}
+
+for (const malformedTurnOutcome of [
+  { name: 'success status with failure data', apply: (turn) => {
+    turn.outcome = { status: 'succeeded', error: { code: 'TURN_ERROR', message: 'changed turn failure', retryable: false } };
+  } },
+  { name: 'a failed outcome missing retryability', apply: (turn) => { delete turn.outcome.error.retryable; } },
+  { name: 'unknown status without a reason', apply: (turn) => { turn.outcome = { status: 'unknown' }; } },
+]) {
+  test(`malformed turn outcome (${malformedTurnOutcome.name}) preserves last-good failure and cursor`, () => {
+    const source = setup();
+    source.history.turns[0].outcome = {
+      status: 'failed',
+      error: { code: 'TURN_ERROR', message: 'previous native turn failure', retryable: false },
+    };
+    source.write();
+    const { db, unit, cursor } = seedIndexedSession(source);
+    const failureUuid = `${unit.sessionId}:t000001:outcome`;
+    const previousFailure = db.prepare('SELECT role, text, visibility FROM messages WHERE uuid = ?').get(failureUuid);
+    assert.equal(previousFailure.text, 'previous native turn failure');
+    assert.equal(previousFailure.visibility, 'visible');
+
+    malformedTurnOutcome.apply(source.history.turns[0]);
+    source.write();
+
+    const { plan, result } = runIndexPlan(db, source.provider);
+
+    assert.equal(plan.items.length, 0);
+    assert.equal(plan.incompleteProviders.has(source.provider.name), true);
+    assert.equal(result.complete, false);
+    const storedFailure = db.prepare('SELECT role, text, visibility FROM messages WHERE uuid = ?').get(failureUuid);
+    assert.equal(storedFailure.role, previousFailure.role);
+    assert.equal(storedFailure.text, previousFailure.text);
+    assert.equal(storedFailure.visibility, previousFailure.visibility);
+    assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(unit.key).cursor, cursor);
+    db.close();
+  });
+}
+
 test('failed Antigravity turn without item results emits a visible, expandable failure message', () => {
   const source = setup();
   source.history.turns[0].items = [];
