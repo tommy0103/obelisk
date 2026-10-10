@@ -3,6 +3,7 @@
 
 import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
+import { createCodexHostAntigravityProvider } from './codexhost-antigravity.ts';
 import { createCopilotProvider, type CopilotChronicleOpener } from './copilot.ts';
 import { createDeepseekProvider } from './deepseek.ts';
 import { createHermesProvider, type HermesStoreOpener } from './hermes.ts';
@@ -36,6 +37,7 @@ export function createBuiltinProviderRegistry(
   return createProviderRegistry([
     createClaudeProvider({ rootDir: roots['claude'] }),
     createCodexProvider({ rootDir: roots['codex'] }),
+    createCodexHostAntigravityProvider({ rootDir: roots['codexhost-antigravity'] }),
     createCopilotProvider({ rootDir: roots['copilot'], userDataRoots: copilotUserDataRoots, openChronicle: openCopilotChronicle }),
     createDeepseekProvider({ rootDir: roots['deepseek'] }),
     createHermesProvider({ rootDir: roots['hermes'], openStore: openHermesStore }),

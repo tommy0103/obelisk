@@ -121,6 +121,7 @@ test('npm pack installs one platform-neutral CLI with its schema resource', () =
   const paths = metadata.files.map(file => file.path);
   assert.ok(paths.includes('dist/cli/src/obelisk.js'));
   assert.ok(paths.includes('dist/core/src/schema.sql'));
+  assert.ok(paths.includes('dist/core/src/providers/codexhost-antigravity.js'));
   assert.equal(paths.some(path => path.endsWith('.ts')), false);
 
   const tarball = join(packDir, metadata.filename);
@@ -147,4 +148,48 @@ test('npm pack installs one platform-neutral CLI with its schema resource', () =
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.equal(result.stdout.trim(), cliPackage.version);
+
+  // Exercise the installed command, not the source adapter, against a real
+  // redacted sidecar layout. Keep every source root away from the user's data.
+  const home = join(root, 'home');
+  const hostRoot = join(home, '.codexhost');
+  const mappingDir = join(hostRoot, 'mapping-store', 'threads');
+  const historyDir = join(hostRoot, 'antigravity-history');
+  mkdirSync(mappingDir, { recursive: true });
+  mkdirSync(historyDir, { recursive: true });
+  mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
+  const fixtureDir = join(repoRoot, 'tests', 'fixtures', 'codexhost-antigravity');
+  const mapping = JSON.parse(readFileSync(join(fixtureDir, 'mapping-v1.json'), 'utf8'));
+  const history = JSON.parse(readFileSync(join(fixtureDir, 'history-v1.json'), 'utf8'));
+  mapping.cwd = home;
+  history.turns[0].items[0].item.cwd = home;
+  writeFileSync(join(mappingDir, `${mapping.hostThreadId}.json`), JSON.stringify(mapping));
+  writeFileSync(join(historyDir, `${mapping.hostThreadId}.json`), JSON.stringify(history));
+  const query = join(home, 'antigravity-package-query.mjs');
+  writeFileSync(query, `
+    const rows = sessions({source:'codexhost-antigravity',limit:2});
+    const hits = rows.length === 1 ? search('redacted',{sessionId:rows[0].id,limit:4}) : [];
+    const assistant = hits.find(hit => hit.message.role === 'assistant');
+    return {sessions:rows.map(({source,project_path,message_count}) => ({source,project_path,message_count})),
+      hits:hits.map(hit => hit.message.text),
+      raw:assistant ? raw(assistant.message.uuid,{limit:1000}) : null};
+  `);
+  const indexed = spawnSync(installedBin, ['--query', query], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      HOME: home, USERPROFILE: home,
+      APPDATA: join(home, 'AppData', 'Roaming'), XDG_CONFIG_HOME: join(home, '.config'),
+      CODEXHOST_DATA_DIR: hostRoot, DSH_HOME: join(home, '.dsh'), HERMES_HOME: join(home, '.hermes'),
+    },
+  });
+  assert.equal(indexed.status, 0, indexed.stderr || indexed.stdout);
+  const evidence = JSON.parse(indexed.stdout);
+  assert.deepEqual(evidence.sessions, [{source:'codexhost-antigravity',project_path:home,message_count:4}]);
+  assert.deepEqual(evidence.hits.toSorted(), ['redacted assistant response', 'redacted user request']);
+  assert.equal(JSON.parse(evidence.raw.text).item.text, 'redacted assistant response');
+  assert.equal(evidence.raw.hasMore, false);
 });

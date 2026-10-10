@@ -67,6 +67,7 @@ test('built-in provider registry exposes every source without caller-side branch
   const registry = createBuiltinProviderRegistry({
     claude: '/sources/claude',
     codex: '/sources/codex',
+    'codexhost-antigravity': '/sources/codexhost',
     copilot: '/sources/copilot',
     deepseek: '/sources/deepseek',
     hermes: '/sources/hermes',
@@ -80,6 +81,7 @@ test('built-in provider registry exposes every source without caller-side branch
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
     { id: 'claude', name: 'Claude Code' },
     { id: 'codex', name: 'Codex' },
+    { id: 'codexhost-antigravity', name: 'CodexHost Antigravity' },
     { id: 'copilot', name: 'GitHub Copilot' },
     { id: 'deepseek', name: 'DeepSeek Harness' },
     { id: 'hermes', name: 'Hermes Agent' },
@@ -95,6 +97,8 @@ test('built-in provider registry exposes every source without caller-side branch
     { kind: 'tree', path: join('/sources/codex', 'sessions') },
     { kind: 'tree', path: join('/sources/codex', 'archived_sessions') },
     { kind: 'file', path: join('/sources/codex', 'session_index.jsonl') },
+    { kind: 'tree', path: join('/sources/codexhost', 'antigravity-history') },
+    { kind: 'tree', path: join('/sources/codexhost', 'mapping-store', 'threads') },
     { kind: 'file', path: join('/sources/copilot', 'globalStorage', 'github.copilot-chat', 'session-store.db') },
     { kind: 'file', path: join('/sources/copilot', 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
     { kind: 'tree', path: join('/sources/copilot', 'workspaceStorage') },
