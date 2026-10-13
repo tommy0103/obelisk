@@ -163,11 +163,9 @@ export function positionTooltip(el, x, y) {
 
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';
-  // Find the shortest project_path for this slug (most likely the project root)
-  const sessions = state.sessions.filter(s => s.project === slug && s.project_path);
-  if (sessions.length) {
-    const shortest = sessions.reduce((a, b) => a.project_path.length <= b.project_path.length ? a : b);
-    const parts = shortest.project_path.split('/');
+  const projectPath = state.projects.find(project => project.project === slug)?.project_path;
+  if (projectPath) {
+    const parts = projectPath.split('/');
     return parts[parts.length - 1];
   }
   return slug.replace(/^-/, '');

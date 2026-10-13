@@ -48,6 +48,7 @@ const appRoot = join(here, '..');
 const sessionId = 'session-image-test';
 const channels = [
   'db:getSessions',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -191,6 +192,9 @@ function sessionSummary() {
 
 function registerHandlers() {
   ipcMain.handle('db:getSessions', () => [sessionSummary()]);
+  ipcMain.handle('db:getSessionCatalogue', (_event, opts) => ({
+    rows: opts.quiet || opts.offset ? [] : [sessionSummary()], total: opts.quiet ? 0 : 1,
+  }));
   ipcMain.handle('db:getSessionMessages', () => messages);
   ipcMain.handle('db:getSessionToolCalls', () => []);
   ipcMain.handle('db:getSessionToolResults', () => []);
@@ -198,8 +202,8 @@ function registerHandlers() {
   ipcMain.handle('db:getSessionWorkflows', () => []);
   ipcMain.handle('db:getSessionSummaries', () => []);
   ipcMain.handle('db:getMemories', () => []);
-  ipcMain.handle('db:getProjects', () => [{ project: 'image-fixture', count: 1 }]);
-  ipcMain.handle('db:getStats', () => ({}));
+  ipcMain.handle('db:getProjects', () => [{ project: 'image-fixture', session_count: 1 }]);
+  ipcMain.handle('db:getStats', () => ({ sessions: 1 }));
   ipcMain.handle('settings:get', () => ({}));
 }
 

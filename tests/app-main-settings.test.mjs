@@ -24,6 +24,7 @@ class SqliteCompatDatabase {
   pragma(statement) { this.db.exec(`PRAGMA ${statement}`); }
   exec(sql) { return this.db.exec(sql); }
   close() { return this.db.close(); }
+  function(name, options, callback) { this.db.function(name, options, callback); }
   prepare(sql) {
     const stmt = this.db.prepare(sql);
     return {
@@ -169,6 +170,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const windows = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -272,6 +274,7 @@ test('main process watches every root declared by the built-in provider registry
   const ipcHandlers = new Map();
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -408,6 +411,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
   const sent = [];
 
   class FakeDatabase {
+    function() {}
     constructor() { databaseOpens += 1; }
     pragma() {}
     exec() {}
@@ -517,6 +521,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
   const queries = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -957,6 +962,8 @@ test('session catalogue includes older sessions beyond 1000 across providers and
       i % 2 ? 'codex' : 'claude', new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString());
   }
   setup.exec('COMMIT');
+  setup.exec("UPDATE sessions SET started_at = '2026-01-01T00:00:00.000Z' WHERE CAST(SUBSTR(id, 11) AS INTEGER) < 10");
+  setup.exec("UPDATE sessions SET git_branch = 'old-release' WHERE id = 'catalogue-1'");
   setup.close();
   const ipcHandlers = new Map();
   const appHandlers = new Map();
@@ -1000,6 +1007,39 @@ test('session catalogue includes older sessions beyond 1000 across providers and
     const projects = ipcHandlers.get('db:getProjects')(null, { source: 'all' });
     assert.equal(projects.find(p => p.project === 'older-only').session_count, 5);
     assert.equal(projects.reduce((sum, p) => sum + p.session_count, 0), 1105);
+    const page = opts => ipcHandlers.get('db:getSessionCatalogue')(null, { source: 'all', ...opts });
+    assert.equal(page({ limit: 1000 }).rows.length, 100, 'untrusted IPC cannot request an unbounded page');
+    assert.equal(page({ offset: 1000, limit: 100 }).rows[0].id, 'catalogue-104');
+    assert.equal(page({ offset: 1100 }).rows.at(-1).id, 'catalogue-0');
+    assert.deepEqual(page({ query: 'session 1', project: 'older-only', descending: false }).rows.map(s => s.id), ['catalogue-1']);
+    assert.equal(page({ source: 'codex', project: 'older-only' }).total, 2);
+    assert.deepEqual(page({ query: 'old-release' }).rows.map(s => s.id), ['catalogue-1']);
+    const lastPage = page({ offset: 1100, limit: 5 }).rows.map(s => s.id);
+    const previousPage = page({ offset: 1095, limit: 5 }).rows.map(s => s.id);
+    assert.equal(new Set([...previousPage, ...lastPage]).size, 10, 'tied timestamps across pages have no duplicates');
+    assert.equal(previousPage.at(-1), 'catalogue-5');
+    assert.equal(lastPage[0], 'catalogue-4');
+    assert.deepEqual([...lastPage].slice(-2), ['catalogue-1', 'catalogue-0']);
+    assert.deepEqual(page({ offset: 1105, limit: 5, descending: false }).rows, []);
+    assert.deepEqual(page({ offset: 0, limit: 2, descending: false }).rows.map(s => s.id), ['catalogue-0', 'catalogue-1']);
+    const activity = ipcHandlers.get('db:getActivitySessions')(null, { from: '2026-01-01', to: '2026-01-02' });
+    assert.ok(activity.total >= 2);
+    assert.equal(activity.rows.length, Math.min(200, activity.total));
+    const update = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+    try {
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('École', 'catalogue-0');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('ÜBER', 'catalogue-2');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Συνάντηση', 'catalogue-4');
+      update.prepare('UPDATE sessions SET project = ?, git_branch = ? WHERE id = ?').run('ÉQUIPE', 'DÉVELOP', 'catalogue-3');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('100%_literal\\path', 'catalogue-6');
+    } finally { update.close(); }
+    for (const [query, id] of [['école', 'catalogue-0'], ['über', 'catalogue-2'], ['συνάντηση', 'catalogue-4'], ['équipe', 'catalogue-3'], ['dévelop', 'catalogue-3'], ['%_literal\\path', 'catalogue-6']]) {
+      assert.deepEqual(page({ query }).rows.map(row => row.id), [id],
+        'database catalogue search preserves Unicode case-insensitive literal matching');
+      assert.equal(page({ query }).total, 1, 'search counts use the same matching semantics');
+    }
+    assert.equal(page({ query: 'session_' }).total, 0, 'underscore is literal, not a wildcard');
+
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -1091,6 +1131,12 @@ test('main process migrates an existing app database before source-filtered IPC 
       memories: 0,
       memoriesArchived: 0,
     });
+    const migrated = new DatabaseSync(dbPath);
+    assert.ok(migrated.prepare('PRAGMA index_list(sessions)').all().some(index => index.name === 'idx_sessions_catalogue_order'));
+    assert.ok(migrated.prepare(`EXPLAIN QUERY PLAN SELECT id FROM sessions
+      ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 100`).all()
+      .some(step => step.detail.includes('idx_sessions_catalogue_order')));
+    migrated.close();
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -1190,6 +1236,7 @@ test('closing the last macOS window releases background resources until activati
   let quitCalled = false;
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() { serviceEvents.push('db-close'); }
@@ -1321,6 +1368,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
   let publishRebuild = false;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
       openedDbPaths.push(dbPath);
@@ -1504,6 +1552,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   const serviceEvents = [];
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.dbPath = dbPath;
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
@@ -1618,6 +1667,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   let buildIndexCalls = 0;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1717,6 +1767,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
   let finishRebuild;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1830,6 +1881,7 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
   const sent = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -1919,6 +1971,7 @@ test('the win:control IPC applies only whitelisted window actions to the sender 
   let maximized = false;
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}

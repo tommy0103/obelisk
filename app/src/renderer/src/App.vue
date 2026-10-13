@@ -48,7 +48,7 @@ const platform = window.obelisk?.platform ?? null;
 const activeCount = computed(() => state.memories.filter(m => !m.archived).length);
 const archivedCount = computed(() => state.memories.filter(m => m.archived).length);
 const totalMemoryCount = computed(() => state.memories.length);
-const sessionCount = computed(() => state.sessions.length);
+const sessionCount = computed(() => state.stats.sessions || 0);
 
 const currentRouteType = computed(() => {
   const name = route.name;
@@ -61,7 +61,7 @@ const currentRouteType = computed(() => {
 
 const sidebarProjectsForCurrentScope = (search = state.projectSearch) => buildSidebarProjects({
   routeType: currentRouteType.value,
-  sessions: state.sessions,
+  sessions: currentRouteType.value === 'sessions' ? state.projects.map(p => ({ project: p.project })) : state.sessions,
   memories: state.memories,
   projects: state.projects,
   view: state.view,

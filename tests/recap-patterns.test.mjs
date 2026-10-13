@@ -19,16 +19,16 @@ const cards = [
 
 test('skill routes only the explicit recap intent to the split recap overview', async () => {
   const skill = await read('skill-doc/SKILL.md');
+  const overview = await read('skill-doc/references/recap/overview.md');
 
-  assert.match(skill, /## Intent Routing/);
-  assert.match(skill, /references\/recap\/overview\.md/);
-  assert.match(skill, /first word is `recap`/i);
-  assert.match(skill, /Everything after `recap` is the recap target/);
-  assert.match(skill, /`\/obelisk recap this week`/);
-  assert.match(skill, /`\/obelisk recap this month`/);
-  assert.match(skill, /`\/obelisk recap last week`/);
-  assert.match(skill, /`\/obelisk recap last month`/);
-  assert.match(skill, /do not load\s+`references\/recap\/overview\.md`/);
+  assert.match(skill, /Explicit `\/obelisk recap \.\.\.`.*references\/recap\/overview\.md.*before the first query/);
+  assert.match(skill, /first word after `\/obelisk` is `recap`/i);
+  assert.match(skill, /ordinary\s+weekly\/monthly summaries do not select that workflow/);
+  assert.match(overview, /first word after `\/obelisk` is `recap`/i);
+  assert.match(overview, /Everything after\s+`recap` is the target period or style hint/);
+  for (const period of ['this week', 'this month', 'last week', 'last month']) {
+    assert.ok(overview.includes(`\`${period}\``), `${period} must remain supported`);
+  }
   assert.doesNotMatch(skill, /NetEase-style chart/);
   assert.doesNotMatch(skill, /playful personal progress recap/);
 });

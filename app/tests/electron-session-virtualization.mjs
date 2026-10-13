@@ -22,6 +22,7 @@ const nearTailEscapeAppendIndex = scrollingAppendIndex + 1;
 const tailAppendIndex = nearTailEscapeAppendIndex + 1;
 const channels = [
   'db:getSessions',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -573,6 +574,16 @@ function registerHandlers() {
     }
     return stressGlobalCatalogue ? sessionSummaries() : [sessionSummary()];
   });
+  ipcMain.handle('db:getSessionCatalogue', async (_event, opts) => {
+    if (firstSessionListRead) {
+      firstSessionListRead = false;
+      await delay(120);
+    }
+    const rows = (stressGlobalCatalogue ? sessionSummaries() : [sessionSummary()])
+      .filter(session => Boolean(!session.title) === Boolean(opts.quiet))
+      .filter(session => !opts.query || session.title.toLowerCase().includes(opts.query.toLowerCase()));
+    return { rows: rows.slice(opts.offset, opts.offset + opts.limit), total: rows.length };
+  });
   ipcMain.handle('db:getSessionMessages', () => { ipcReads.messages++; return messages; });
   ipcMain.handle('db:getSessionToolCalls', () => { ipcReads.toolCalls++; return toolCalls; });
   ipcMain.handle('db:getSessionToolResults', () => { ipcReads.toolResults++; return toolResults; });
@@ -616,9 +627,9 @@ function registerHandlers() {
   ipcMain.handle('db:getMemories', () => { globalReads.memories++; return []; });
   ipcMain.handle('db:getProjects', () => {
     globalReads.projects++;
-    return [{ project: 'quiet-zero', count: 1 }];
+    return [{ project: 'quiet-zero', session_count: 1 }];
   });
-  ipcMain.handle('db:getStats', () => { globalReads.stats++; return {}; });
+  ipcMain.handle('db:getStats', () => { globalReads.stats++; return { sessions: 1 }; });
   ipcMain.handle('settings:get', () => ({}));
 }
 
@@ -939,11 +950,11 @@ async function run() {
 
   await win.webContents.executeJavaScript(`window.location.hash = '#/sessions'`, true);
   await waitFor(win.webContents, `!document.querySelector('.virtual-timeline')`, 'session detail deactivation');
-  for (let attempt = 0; attempt < 100 && globalReads.sessions === globalReadsBeforeWheelUpdate.sessions; attempt++) {
+  for (let attempt = 0; attempt < 100 && globalReads.stats === globalReadsBeforeWheelUpdate.stats; attempt++) {
     await delay(20);
   }
   const expectedGlobalReadsAfterLeaving = Object.fromEntries(
-    Object.entries(globalReadsBeforeWheelUpdate).map(([key, value]) => [key, value + 1]),
+    Object.entries(globalReadsBeforeWheelUpdate).map(([key, value]) => [key, value + (key === 'sessions' ? 0 : 1)]),
   );
   assert(
     JSON.stringify(globalReads) === JSON.stringify(expectedGlobalReadsAfterLeaving),
@@ -1234,6 +1245,11 @@ async function run() {
   // Slow only the gesture/settlement path: stale navigation and deferred row
   // measurement must preserve the reader even when renderer callbacks lag.
   // Stationary commit performance is still measured at normal CPU speed.
+  win.show();
+  app.focus({ steal: true });
+  win.focus();
+  for (let attempt = 0; attempt < 40 && !win.isFocused(); attempt++) await delay(20);
+  if (!win.isFocused()) throw new Error('Live scroll probe requires a focused window');
   await win.webContents.debugger.sendCommand('Emulation.setCPUThrottlingRate', { rate: 12 });
   currentSessionTitle = 'Live metadata title';
   const scrollProbe = await win.webContents.executeJavaScript(`new Promise(resolve => {

@@ -42,21 +42,20 @@ function commitStoredSessionMetadata(sessionId, metadata) {
 }
 
 /**
- * Fetch the global catalogue without mutating renderer state. Navigation can
+ * Fetch global aggregates without mutating renderer state. Navigation can
  * then gate a reply that started before SessionDetail became active.
  */
 export async function fetchInitialData() {
-  const [rawMemories, rawSessions, stats, projects] = await Promise.all([
+  const [rawMemories, stats, projects] = await Promise.all([
     window.obelisk.getMemories(),
-    window.obelisk.getSessions({ source: 'all', limit: null }),
     window.obelisk.getStats({ source: 'all' }),
     window.obelisk.getProjects({ source: 'all' })
   ]);
-  return { rawMemories, rawSessions, stats, projects };
+  return { rawMemories, stats, projects };
 }
 
-/** Commit a fetched global catalogue snapshot to shared renderer state. */
-export function commitInitialData({ rawMemories, rawSessions, stats, projects }) {
+/** Commit fetched aggregates; list pages are owned by the mounted list. */
+export function commitInitialData({ rawMemories, stats, projects }) {
   // Transform memories: DB records -> render-layer shape
   state.memories = (rawMemories || []).map(m => ({
     ...m,
@@ -67,21 +66,9 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects })
     markdown: null  // loaded on demand via loadMemoryMarkdown
   }));
 
-  // The catalogue now owns the latest metadata; route overlays can retire.
-  state.sessionTitleOverrides.clear();
-
-  // Sessions: merge with existing data to preserve already-loaded messages
-  const existingSessions = new Map(state.sessions.map(s => [s.id, s]));
-  state.sessions = (rawSessions || []).map(s => {
-    const existing = existingSessions.get(s.id);
-    return {
-      ...s,
-      messages: existing?.messages?.length ? existing.messages : []
-    };
-  });
-
   state.projects = projects || [];
   state.stats = stats || {};
+  state.catalogueVersion++;
   state.loaded = true;
 }
 
@@ -94,8 +81,7 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects })
 export async function loadSessionDetail(sessionId) {
   // A direct route can open before the catalogue loads or while its refresh is
   // deferred. Resolve metadata by exact ID instead of requiring list membership.
-  const metadata = sessionMetadata(state.sessions.find(candidate => candidate.id === sessionId)
-    ?? (await window.obelisk.getSessions({ source: 'all', sessionId, limit: 1 }))[0]);
+  const metadata = sessionMetadata((await window.obelisk.getSessions({ source: 'all', sessionId, limit: 1 }))[0]);
   if (!metadata) return null;
   const [messages, toolCalls, toolResults, subagents, workflows, summaries] = await Promise.all([
     window.obelisk.getSessionMessages(sessionId),
@@ -167,6 +153,13 @@ export function getCachedSessionDetail(sessionId) {
   });
 }
 
+/** Publish the accepted route's metadata without retaining another transcript. */
+export function commitActiveSessionMetadata(session) {
+  if (!session) return;
+  state.sessions = [sessionMetadata(session)];
+  state.sessionTitleOverrides.delete(session.id);
+}
+
 function commitSessionDetail(sessionId, { messages, workflows = [], summaries = [] }, { updateStore, metadata = null }) {
   const session = state.sessions.find(candidate => candidate.id === sessionId);
   const assembled = {
@@ -179,8 +172,10 @@ function commitSessionDetail(sessionId, { messages, workflows = [], summaries = 
   if (workflows.length > 0) assembled.workflow = workflows[0];
 
   if (updateStore) {
+    state.sessionTitleOverrides.delete(sessionId);
     const index = state.sessions.findIndex(candidate => candidate.id === sessionId);
     if (index !== -1) state.sessions[index] = assembled;
+    else state.sessions = [assembled];
   }
   return assembled;
 }

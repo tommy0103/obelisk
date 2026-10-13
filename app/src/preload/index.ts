@@ -6,6 +6,8 @@ import type { UpdateState } from '../shared/update-types.ts';
 import type {
   SessionPatch,
   SessionPatchCursor,
+  SessionCatalogueOptions,
+  ActivitySessionsOptions,
   SessionsQueryOptions,
   SourceQueryOptions,
   UsageStatsOptions,
@@ -23,6 +25,8 @@ contextBridge.exposeInMainWorld('obelisk', {
     return () => ipcRenderer.removeListener('obelisk:update-state', listener);
   },
   getSessions: (opts?: SessionsQueryOptions) => ipcRenderer.invoke('db:getSessions', opts),
+  getSessionCatalogue: (opts?: SessionCatalogueOptions) => ipcRenderer.invoke('db:getSessionCatalogue', opts),
+  getActivitySessions: (opts: ActivitySessionsOptions) => ipcRenderer.invoke('db:getActivitySessions', opts),
   getSessionMessages: (id: string) => ipcRenderer.invoke('db:getSessionMessages', id),
   getSessionToolCalls: (id: string) => ipcRenderer.invoke('db:getSessionToolCalls', id),
   getSessionToolResults: (id: string) => ipcRenderer.invoke('db:getSessionToolResults', id),

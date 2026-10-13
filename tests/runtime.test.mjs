@@ -105,6 +105,7 @@ test('runtime attune scripts expose only memory mutation helpers', () => {
       searchType: typeof search,
       sqlType: typeof sql,
       overviewType: typeof overview,
+      messagesType: typeof messages,
       result: remember({
         path: ${JSON.stringify(memoryPath)},
         project: 'runtime-test',
@@ -122,6 +123,7 @@ test('runtime attune scripts expose only memory mutation helpers', () => {
   assert.equal(payload.searchType, 'undefined');
   assert.equal(payload.sqlType, 'undefined');
   assert.equal(payload.overviewType, 'undefined');
+  assert.equal(payload.messagesType, 'undefined');
   assert.equal(payload.result.path, memoryPath);
 });
 

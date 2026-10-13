@@ -35,6 +35,8 @@ import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
   SessionMetadata,
+  SessionCatalogueOptions,
+  ActivitySessionsOptions,
   SessionsQueryOptions,
   SourceQueryOptions,
   WindowControlAction,
@@ -217,6 +219,12 @@ function openDb(
   if (!fs.existsSync(dbPath)) return null;
   db = new Database(dbPath, { readonly: false });
   db.pragma('busy_timeout = 5000');
+  // Match the catalogue's original JavaScript substring semantics, including
+  // Unicode case conversion and literal %, _ and backslashes.
+  db.function('catalogue_contains', { deterministic: true },
+    (title: string | null, project: string | null, branch: string | null, query: string) =>
+      title?.toLowerCase().includes(query) || project?.toLowerCase().includes(query)
+        || branch?.toLowerCase().includes(query) ? 1 : 0);
   const lease = writerLeaseMode === 'acquire' ? acquireAppWriterLease(dbPath) : null;
   if (writerLeaseMode === 'caller-held' || lease) {
     try {
@@ -719,6 +727,49 @@ ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
   return db.prepare(sql).all(...params);
 });
 
+ipcMain.handle('db:getSessionCatalogue', (_, opts: SessionCatalogueOptions = {}) => {
+  if (!db) return { rows: [], total: 0 };
+  const limit = Number.isSafeInteger(opts.limit) ? Math.max(1, Math.min(opts.limit!, 100)) : 100;
+  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const sourceFilter = sourceWhereClause(opts);
+  if (sourceFilter.sql) { clauses.push(sourceFilter.sql); params.push(...sourceFilter.params); }
+  if (opts.project && opts.project !== 'all') { clauses.push('project = ?'); params.push(opts.project); }
+  if (opts.quiet) clauses.push("(title IS NULL OR title = '')");
+  else clauses.push("title IS NOT NULL AND title != ''");
+  const query = opts.query?.trim().toLowerCase();
+  if (query) {
+    clauses.push('catalogue_contains(title, project, git_branch, ?)');
+    params.push(query);
+  }
+  const where = `WHERE ${clauses.join(' AND ')}`;
+  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions ${where}`).get(...params) as { count: number }).count;
+  const direction = opts.descending === false ? 'ASC' : 'DESC';
+  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions ${where}
+    ORDER BY COALESCE(ended_at, started_at) ${direction}, id ${direction} LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset);
+  return { rows, total };
+});
+
+ipcMain.handle('db:getActivitySessions', (_, opts: ActivitySessionsOptions) => {
+  if (!db) return { rows: [], total: 0 };
+  if (!/^\d{4}-\d\d-\d\d/.test(opts?.from) || !/^\d{4}-\d\d-\d\d/.test(opts?.to)) {
+    throw new Error('Activity date range must use ISO dates');
+  }
+  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
+  const where = 's.started_at < ? AND COALESCE(s.ended_at, s.started_at) >= ?';
+  const params = [opts.to, opts.from];
+  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions s WHERE ${where}`).get(...params) as { count: number }).count;
+  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS.split(', ').map(column => `s.${column}`).join(', ')},
+    EXISTS (SELECT 1 FROM sessions earlier WHERE earlier.project = s.project
+      AND earlier.id != s.id AND earlier.started_at < s.started_at) AS has_earlier
+    FROM sessions s WHERE ${where}
+    ORDER BY COALESCE(s.ended_at, s.started_at) DESC, s.id DESC LIMIT 200 OFFSET ?`)
+    .all(...params, offset);
+  return { rows, total };
+});
+
 ipcMain.handle('db:getSessionMessages', (_, sessionId) => {
   return querySessionMessages(sessionId);
 });
@@ -790,8 +841,9 @@ ipcMain.handle('db:getSessionSummaries', (_, sessionId) => {
 ipcMain.handle('db:getMemories', () => {
   if (!db) return [];
   return db.prepare(`
-    SELECT id, session_id, project, message_start, message_end, path, anchors, summary, created_at, deleted_at, deleted_reason
-    FROM memories ORDER BY created_at DESC
+    SELECT m.id, m.session_id, m.project, m.message_start, m.message_end, m.path, m.anchors,
+           m.summary, m.created_at, m.deleted_at, m.deleted_reason, s.title AS session_title
+    FROM memories m LEFT JOIN sessions s ON s.id = m.session_id ORDER BY m.created_at DESC
   `).all();
 });
 

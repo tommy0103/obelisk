@@ -6,6 +6,7 @@ import { ref, shallowRef, computed, reactive, onMounted, onBeforeUnmount, onUnmo
 import { useRouter, useRoute } from 'vue-router';
 import { state, FOLDER_SVG, getSessionSummary } from '../store.js';
 import {
+  commitActiveSessionMetadata,
   fetchSessionDetailPatch,
   getCachedSessionDetail,
   loadSessionDetail,
@@ -226,7 +227,7 @@ onUnmounted(() => {
 });
 
 watch(() => session.value?.id, async sessionId => {
-  if (sessionId === props.id && messages.value.length === 0) {
+  if (sessionId === props.id && messages.value.length === 0 && !loading.value) {
     await loadMessages({ force: true });
   }
 });
@@ -253,6 +254,7 @@ async function loadMessages({ force = false } = {}) {
   try {
     const latest = await fetchSessionSnapshot(requestedSessionId, { force });
     if (revision !== loadRevision || requestedSessionId !== props.id) return;
+    commitActiveSessionMetadata(latest);
     await commitSessionSnapshot(latest);
     committed = true;
   } finally {
@@ -303,7 +305,7 @@ async function loadLiveSnapshot() {
   const patchRequest = await fetchSessionDetailPatch(sessionId);
   // Decode IPC and publish reactive rows in separate tasks. Yield here so the
   // coordinator can also recheck scroll ownership before any visible commit.
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await scheduler.yield();
   return { sessionId, revision, patchRequest };
 }
 

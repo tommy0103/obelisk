@@ -13,6 +13,7 @@ const sessionId = 'file-ref-session';
 const cwd = '/tmp/obelisk-file-ref-fixture';
 const channels = [
   'db:getSessions',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -110,6 +111,9 @@ function createSettingsGate() {
 
 function registerHandlers() {
   ipcMain.handle('db:getSessions', () => [summary()]);
+  ipcMain.handle('db:getSessionCatalogue', (_event, opts) => ({
+    rows: opts.quiet || opts.offset ? [] : [summary()], total: opts.quiet ? 0 : 1,
+  }));
   ipcMain.handle('db:getSessionMessages', () => messages);
   ipcMain.handle('db:getSessionToolCalls', () => []);
   ipcMain.handle('db:getSessionToolResults', () => []);
@@ -127,8 +131,8 @@ function registerHandlers() {
   ipcMain.handle('db:getSessionSummaries', () => []);
   ipcMain.handle('db:getMessageFullText', () => null);
   ipcMain.handle('db:getMemories', () => []);
-  ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', count: 1 }]);
-  ipcMain.handle('db:getStats', () => ({}));
+  ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', session_count: 1 }]);
+  ipcMain.handle('db:getStats', () => ({ sessions: 1 }));
   ipcMain.handle('settings:get', async () => {
     const snapshot = {
       editorScheme: 'vscode',

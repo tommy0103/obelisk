@@ -13,9 +13,9 @@ test('session sidebar projects follow database recency order instead of label or
     { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444' },
   ];
   const projects = [
-    { project: '-Users-dev-Code-quiet-zero' },
-    { project: '-Users-dev-Code-sample-cli-' },
-    { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444' },
+    { project: '-Users-dev-Code-quiet-zero', session_count: 2 },
+    { project: '-Users-dev-Code-sample-cli-', session_count: 1 },
+    { project: '-Users-dev-Library-Application-Support-Example-App-namespaces-release-stable-data-projects-00000000-1111-2222-3333-444444444444', session_count: 1 },
   ];
   const labels = {
     '-Users-dev-Code-sample-cli-': 'sample-cli+',
