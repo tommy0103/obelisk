@@ -74,7 +74,8 @@
 // the retired `source.kind: 'plugin'` with producer-owned kinds
 // (`runtime-context`, `system-prompt`, …) — the meta rule
 // (`source.kind !== 'user'`) is unaffected. Event types v4 adds fall through
-// the projection's `default:` branch.
+// the projection's `default:` branch. The lifted message-level `isError`
+// supplements the released wrapper flag and optional `data.error` metadata.
 
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -315,8 +316,9 @@ function toolResultContent(content: unknown): string {
   return parts.join('\n');
 }
 
-function toolResultIsError(data: Record<string, unknown>, content: unknown): 0 | 1 {
-  if (data.error !== undefined) return 1;
+function toolResultIsError(data: Record<string, unknown>, message: Record<string, unknown>): 0 | 1 {
+  if (data.error !== undefined || message.isError === true) return 1;
+  const content = message.content;
   if (!Array.isArray(content)) return 0;
   return content.some(block => isRecord(block) && block.isError === true) ? 1 : 0;
 }
@@ -1359,7 +1361,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
             kind: 'tool_result', tool_use_id: toolId,
             message_uuid: toolUseUuid(dbId, record.data.turn, record.data.step),
             session_id: sessionId, content: trunc(content), file_path: null,
-            is_error: toolResultIsError(record.data, message.content),
+            is_error: toolResultIsError(record.data, message),
           });
           // Subagent spawns are self-contained in their result text, so the link
           // survives any parse window (the spawn tool/call may be in an earlier frame).

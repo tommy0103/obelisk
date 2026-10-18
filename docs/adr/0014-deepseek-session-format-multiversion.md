@@ -157,18 +157,19 @@ The per-version review ADR-0014 asks for, verified against the v4 writer
 - **`surfaceOp` replacement semantics remain deliberately unapplied** — the
   verbatim append-only decision above is version-independent.
 - **`system/message` remains unindexed** (parity with v0/v2, and with v3).
-- **One known, v4-only fidelity gap, left open on purpose.** A tool result whose
-  failure is carried *only* by message-level `message.isError` (no `data.error`
-  and no block-level flag) still records `is_error = 0`; the adapter reads
-  `data.error` plus block-level `isError`. That is exactly where the flag lived
-  before v4: in v0–v3 the released wrapper carries it (`message.content[0]
-  .isError`, verified on the real v0 fixture, with no message-level field
-  present), and the v4 migration lifts that same flag onto the message. The gap
-  is therefore v4-only — no v0–v3 log can carry a message-level flag, so reading
-  it would change no already-stored row and needs no `indexVersionMarker` bump.
-  It is a one-line addition to `toolResultIsError`; it is left out here only to
-  keep this change to one thing (the supported range), and folding it in is a
-  one-line follow-up if the stricter treatment is preferred.
+- **Tool failures retain their meaning across migration.** The adapter reads
+  message-level `message.isError` as well as `data.error` and the released
+  wrapper's block-level flag. The V3-to-V4 migration lifts the wrapper flag
+  onto the message without necessarily adding `data.error`; ignoring the new
+  location would turn an already-indexed failure into success on replay.
+  Plain and zstd migration tests pin the failure before and after the twin
+  switch, including its call linkage and canonical round-trip equivalence.
+- **No additional `indexVersionMarker` bump for this release.** V4 support and
+  its error-flag projection ship together, so supported V0–V3 rows retain their
+  values. When an upstream migration publishes a V4 twin, its new member path
+  triggers snapshot fallback under the same session identity. If error-flag
+  handling were deferred until after V4 support shipped, correcting already
+  indexed V4 rows would require a replay/marker change.
 
 Fixtures: `tests/fixtures/deepseek/sessions/--dsh-v4--/v4-basic` was written
 through the real DSH 0.2.0-rc.2 writer (`JsonlSessionPersistence.create`/
@@ -182,11 +183,15 @@ v4 shapes are readable in the diff. One committed `assistant/message` per step,
 as the writer emits.
 `tests/deepseek-tree.test.mjs` asserts the v4 artifact is discovered, parsed,
 and persisted (all six message rows, the meta row, and the tool_call/
-tool_result pair), pins the step-scoped identity scheme's granularity (a
-repeated `(turn, step)` collapses onto one uuid, so the earlier row is
-replaced rather than stored twice) with a synthetic log, and asserts that the
-first version past the new range (5) is still rejected and still suppresses its
-project directory.
+tool_result pair) and checks direct assembly against the SQLite round trip.
+The `v4-failed-tool` twins were encoded with the released V3 codec and migrated
+by the DSH 0.2.0-rc.2 write-open path. The `v4-retry-resume` artifact was written
+with a failed `assistant/attempt`, one committed answer, then a reopened writer
+appending a second turn. Its test requires unique committed-message identities,
+both answers surviving, incremental/full replay equivalence, and the canonical
+round trip; it does not bless overwriting one committed answer with another.
+The first version past the new range (5) is still rejected and still suppresses
+its project directory.
 
 The historical plan document
 (`docs/deepseek-harness-v2-v3-multiversion-adapter-plan.md`) is left as the
