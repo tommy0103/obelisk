@@ -1,4 +1,4 @@
-# DeepSeek provider: session format multi-version support (v0–v3)
+# DeepSeek provider: session format multi-version support (v0–v4)
 
 **Context.** DeepSeek Harness (dsh) versions its session format with a
 monotonic integer carried both in the header line's `version` field and in the
@@ -120,3 +120,74 @@ keep one projection path.
   .interrupted`) are unchanged by this decision.
 
 Implementation detail: `docs/deepseek-harness-v2-v3-multiversion-adapter-plan.md`.
+
+**Amendment (2026-10-18): v4 support, and the per-version review it required.**
+
+DSH 0.2.0 writes session format **v4** (`session.v4.jsonl[.zstd]`, header
+`version: 4`). Under the v0–v3 gate above, every v4 artifact failed the header
+gate, so any project directory containing one was suppressed whole and an
+incremental build could never publish a complete snapshot
+(`incomplete_snapshot`) — the same failure #181/#173 reported one generation
+earlier. The decision is unchanged in kind, extended in range: **the version
+gate accepts `undefined`, 0, 1, 2, 3, and 4**; anything newer stays
+fail-closed (skip and record, project directory suppressed, never parsed as a
+known format). This supersedes the range in the "Version gate" bullet above;
+the title of this record follows the live range.
+
+The per-version review ADR-0014 asks for, verified against the v4 writer
+(dsh 0.2.0-rc.2, `packages/session/session-format-v3-to-v4`):
+
+- **`tool/result` carries a first-class tool-role message.** The released V3
+  wrapper (`message.content[0] = {type: 'tool-result', toolCallId, content,
+  isError?}`) is lifted into `message: {role: 'tool', toolCallId, content:
+  <direct block array>, source: {kind: 'tool', callId}, isError?}`. The adapter
+  reads `message.source.callId` and `message.content` and recurses only for
+  `type: 'tool-result'` blocks, so v4 results project 1:1 through the same code
+  path — one tool_call + one tool_result per call, no double projection.
+- **`source.kind: 'plugin'` is retired** in favour of producer-owned kinds
+  (`runtime-context`, `system-prompt`, `compact-checkpoint`, …). The meta rule
+  is `source.kind !== 'user'`, so injected rows keep classifying as
+  `is_meta = 1` with no rule change.
+- **Event types v4 adds fall through the projection's `default:` branch** and
+  are skipped, exactly like the v0–v3 log-only events listed under
+  Consequences (`step/*`, `turn/*`, `request/context`, `approval/policy`,
+  `permission/preset`, `sandbox/mode`, `workspace/changes`,
+  `command/run|done`, `todo/write`, `assistant/attempt`, `goal/change`,
+  `llm/retry*`, …).
+- **`surfaceOp` replacement semantics remain deliberately unapplied** — the
+  verbatim append-only decision above is version-independent.
+- **`system/message` remains unindexed** (parity with v0/v2, and with v3).
+- **One known, v4-only fidelity gap, left open on purpose.** A tool result whose
+  failure is carried *only* by message-level `message.isError` (no `data.error`
+  and no block-level flag) still records `is_error = 0`; the adapter reads
+  `data.error` plus block-level `isError`. That is exactly where the flag lived
+  before v4: in v0–v3 the released wrapper carries it (`message.content[0]
+  .isError`, verified on the real v0 fixture, with no message-level field
+  present), and the v4 migration lifts that same flag onto the message. The gap
+  is therefore v4-only — no v0–v3 log can carry a message-level flag, so reading
+  it would change no already-stored row and needs no `indexVersionMarker` bump.
+  It is a one-line addition to `toolResultIsError`; it is left out here only to
+  keep this change to one thing (the supported range), and folding it in is a
+  one-line follow-up if the stricter treatment is preferred.
+
+Fixtures: `tests/fixtures/deepseek/sessions/--dsh-v4--/v4-basic` was written
+through the real DSH 0.2.0-rc.2 writer (`JsonlSessionPersistence.create`/
+`append`, compression `none`) from hand-built event bodies — the same
+construction `scripts/gen-dsh-fixtures.mjs` uses for the v3 corpus. Every
+required field of each v4 event shape is present (`session/title` carries
+`messageSeqs`/`source`), and the fields the writer always emits are set
+(`tool/result`'s message-level `isError` and its `sourceEventSeqs`); ids and
+cwd are synthetic and no user path is carried. Committed uncompressed so the
+v4 shapes are readable in the diff. One committed `assistant/message` per step,
+as the writer emits.
+`tests/deepseek-tree.test.mjs` asserts the v4 artifact is discovered, parsed,
+and persisted (all six message rows, the meta row, and the tool_call/
+tool_result pair), pins the step-scoped identity scheme's granularity (a
+repeated `(turn, step)` collapses onto one uuid, so the earlier row is
+replaced rather than stored twice) with a synthetic log, and asserts that the
+first version past the new range (5) is still rejected and still suppresses its
+project directory.
+
+The historical plan document
+(`docs/deepseek-harness-v2-v3-multiversion-adapter-plan.md`) is left as the
+point-in-time record of the v0–v3 implementation, not updated for v4.

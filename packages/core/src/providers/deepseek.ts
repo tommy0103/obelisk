@@ -14,7 +14,7 @@
 // Format generations (ADR-0014): v0 is `session.jsonl`, N≥1 is `session.vN`;
 // an upstream write-open migrates by publishing a higher generation beside the
 // untouched source, so per session directory only the HIGHEST generation is
-// canonical. Supported versions: 0–3.
+// canonical. Supported versions: 0–4.
 //
 // A log is one immutable `SessionHeader` line followed by contiguous
 // `SessionEvent` lines ({type, seq, time, data}). The default artifact is a
@@ -67,6 +67,14 @@
 // pre-compaction history stays searchable (guarded by
 // tests/dsh-context-window-plugin.test.mjs); the replacement row simply
 // appends like any other event.
+//
+// Format v4 notes (ADR-0014 amendment): v4 lifts the released tool/result
+// wrapper block into a first-class tool-role message whose `source.callId` and
+// direct `content` block array are the fields already read here, and replaces
+// the retired `source.kind: 'plugin'` with producer-owned kinds
+// (`runtime-context`, `system-prompt`, …) — the meta rule
+// (`source.kind !== 'user'`) is unaffected. Event types v4 adds fall through
+// the projection's `default:` branch.
 
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -104,7 +112,7 @@ export const SESSION_FILE_RE = /^session(?:\.v([1-9][0-9]*))?\.jsonl(\.zstd)?$/;
 // Format versions this adapter projects (ADR-0014); v1 is physically v0.
 // Range comparison, not a lookup Set — mirrors pi's version gate.
 const MIN_FORMAT_VERSION = 0;
-const MAX_FORMAT_VERSION = 3;
+const MAX_FORMAT_VERSION = 4;
 const SUBAGENT_RESULT_RE = /started\s+subagent\s+(\S+)/;
 
 interface DshHeader {

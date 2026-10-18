@@ -1573,13 +1573,13 @@ test('an upstream v2→v3 migration continues the indexed session: no tombstone,
   db.close();
 });
 
-// The gate accepts 0–3 and nothing beyond: a version-4 file must never be
+// The gate accepts 0–4 and nothing beyond: a version-5 file must never be
 // parsed as a known format, and per CONTRIBUTING it must not poison the
 // provider — skip, record, and suppress the project directory.
-test('a version-4 header is rejected at the gate and suppresses its whole project directory (fail closed)', () => {
-  const dir = makeTempDir('obelisk-version4-');
+test('a version-5 header is rejected at the gate and suppresses its whole project directory (fail closed)', () => {
+  const dir = makeTempDir('obelisk-version5-');
   const sessionsDir = join(dir, 'sessions');
-  // A v4 artifact (the first rejectable generation) beside a healthy v0
+  // A v5 artifact (the first rejectable generation) beside a healthy v0
   // sibling in the SAME project directory.
   const projectDir = join(sessionsDir, '--tmp-dsh-project--');
   const write = (name, file, header, text) => {
@@ -1590,7 +1590,7 @@ test('a version-4 header is rejected at the gate and suppresses its whole projec
       JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
     ].join('\n') + '\n');
   };
-  write('v4-session', 'session.v4.jsonl', { ...HEADER, version: 4, id: 'v4-session' }, 'from the future');
+  write('v5-session', 'session.v5.jsonl', { ...HEADER, version: 5, id: 'v5-session' }, 'from the future');
   write('healthy-session', 'session.jsonl', { ...HEADER, id: 'healthy-session' }, 'healthy');
   // An unrelated project stays live.
   const otherDir = join(sessionsDir, '--other--', 'other-session');
@@ -1604,9 +1604,102 @@ test('a version-4 header is rejected at the gate and suppresses its whole projec
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
   assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'other projects stay live');
-  assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v4-session')),
+  assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v5-session')),
     'the whole project directory is suppressed — no partial snapshot');
-  assert.ok(issues.some((i) => i.error === 'Unsupported session format version 4'));
+  assert.ok(issues.some((i) => i.error === 'Unsupported session format version 5'));
+});
+
+// DSH ≥ 0.2.0 writes v4. Its two touched deltas — the released tool/result
+// wrapper lifted into a first-class tool-role message, and producer-owned
+// source kinds replacing `kind: 'plugin'` — land on fields this adapter
+// already reads, so a v4 artifact indexes with no new parsing path. The
+// fixture was written through the real DSH v4 writer (ADR-0014 amendment): a
+// two-step turn, one committed assistant/message per step, carrying the fields
+// the writer always emits.
+test('a v4 session artifact is indexed: messages, tool result, and meta rows all project', () => {
+  const fixtureRoot = fileURLToPath(new URL('./fixtures/deepseek/sessions', import.meta.url));
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: fixtureRoot });
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const unit = units.find((u) => u.meta.rootRawId === 'v4-basic');
+  assert.ok(unit, 'the v4 fixture artifact is discovered — v4 is never rejected as unsupported');
+  assert.ok(!issues.some((i) => i.path.includes('--dsh-v4--')), 'a v4 artifact raises no inventory issue');
+
+  const db = freshDb();
+  persist(db, unit, provider.parse(unit, null));
+  const dump = dumpDb(db);
+  assert.equal(dump.sessions.length, 1);
+  assert.equal(dump.sessions[0].title, 'v4 basic session');
+  // Every projectable row survives the round trip. The count is asserted so a
+  // dropped or overwritten row cannot hide behind a subset check — both
+  // assistant steps must be present.
+  assert.equal(dump.messages.length, 6, 'all six v4 messages are stored');
+  assert.ok(dump.messages.some((m) => m.text === 'please read a.ts' && m.is_meta === 0), 'the user message is indexed');
+  assert.ok(dump.messages.some((m) => m.text === 'Let me read it.' && m.content_type === 'text'), 'the step-1 answer is indexed');
+  assert.ok(dump.messages.some((m) => m.text === 'The file says hello.' && m.content_type === 'text'), 'the step-2 answer is indexed');
+  assert.ok(dump.messages.some((m) => m.content_type === 'tool_use'), 'the tool_use anchor is indexed');
+  assert.ok(dump.messages.some((m) => m.is_meta === 1 && m.text.includes('injected by the host')),
+    'a renamed producer source kind still classifies as meta (runtime-context ≠ user)');
+  assert.equal(dump.tool_calls.length, 1);
+  assert.equal(dump.tool_calls[0].name, 'read');
+  assert.equal(dump.tool_calls[0].file_path, '/dsh-fixtures/a.ts');
+  // v4's tool-role result: message.source.callId + a direct message.content
+  // block array — the exact fields toolResultContent/toolResultIsError read.
+  assert.equal(dump.tool_results.length, 1);
+  assert.equal(dump.tool_results[0].content, 'contents of a.ts');
+  assert.equal(dump.tool_results[0].is_error, 0);
+  assert.equal(dump.tool_results[0].message_uuid, dump.tool_calls[0].message_uuid, 'the result links to its call');
+  db.close();
+});
+
+// The step-scoped identity scheme has no per-event discriminator: one
+// (turn, step, kind) is one uuid, so a SECOND committed assistant/message in
+// the same step upserts onto the first row instead of adding a message — the
+// earlier row is replaced, not stored twice. This is a stated granularity
+// assumption, not a reachable upstream shape: DSH emits exactly one committed
+// assistant/message per step (the step-final one carries the assembled
+// content; a retried attempt is `assistant/attempt`, and packed chunk rows and
+// the embedded `stream` are not expanded), which is what ADR-0011's per-step
+// anchor depends on. Pinned rather than "fixed" because a per-event
+// discriminator changes the uuid format, and CONTRIBUTING requires an
+// `indexVersionMarker` bump plus a full reindex for every existing DeepSeek
+// deployment when stored-row identity changes. The log below is deliberately
+// synthetic — this is the shape upstream never emits, and it is why a faithful
+// fixture must not put two assistant/messages in one step.
+test('the step-scoped identity has no per-event discriminator: a repeated (turn, step) collapses onto one uuid', () => {
+  const dir = makeTempDir('obelisk-step-identity-');
+  const sessionsDir = join(dir, 'sessions');
+  const sessionDir = join(sessionsDir, '--tmp-dsh-project--', 'repeat-step');
+  mkdirSync(sessionDir, { recursive: true });
+  const assistant = (seq, text) => JSON.stringify({
+    type: 'assistant/message', seq, time: 1753005601000 + seq, data: {
+      turn: 1, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text }], source: { kind: 'model', model: 'deepseek-v4-flash' }, id: `m-${seq}` },
+      usage: { inputTokens: 1, outputTokens: 1 },
+    },
+  });
+  writeFileSync(join(sessionDir, 'session.v4.jsonl'), [
+    JSON.stringify({ ...HEADER, version: 4, id: 'repeat-step' }),
+    JSON.stringify({ type: 'step/start', seq: 0, time: 1753005601000, data: { turn: 1, step: 1 } }),
+    assistant(1, 'first attempt'),
+    assistant(2, 'second attempt'),
+  ].join('\n') + '\n');
+
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  assert.ok(unit, 'the fixture passes the v4 gate');
+  const { values } = drain(provider.parse(unit, null));
+  const textRows = values.filter((r) => r.kind === 'message' && r.content_type === 'text');
+  assert.equal(textRows.length, 2, 'the projection emits both rows');
+  assert.equal(new Set(textRows.map((r) => r.uuid)).size, 1,
+    'both rows share one step-scoped uuid — the identity scheme has no per-event discriminator');
+
+  const db = freshDb();
+  persist(db, unit, provider.parse(unit, null));
+  const stored = dumpDb(db).messages.filter((m) => m.content_type === 'text');
+  assert.equal(stored.length, 1, 'the second row upserts onto the first, so one step yields one text row');
+  assert.equal(stored[0].text, 'second attempt', 'the later record wins, as the persist layer applies the stream in order');
+  db.close();
 });
 
 // v1 was never shipped in a tagged release but is physically v0: the gate
