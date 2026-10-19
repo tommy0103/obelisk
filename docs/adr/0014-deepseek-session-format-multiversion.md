@@ -158,12 +158,17 @@ The per-version review ADR-0014 asks for, verified against the v4 writer
   verbatim append-only decision above is version-independent.
 - **`system/message` remains unindexed** (parity with v0/v2, and with v3).
 - **Tool failures retain their meaning across migration.** The adapter reads
-  message-level `message.isError` as well as `data.error` and the released
-  wrapper's block-level flag. The V3-to-V4 migration lifts the wrapper flag
+  `data.error` in every format, the released `tool-result` wrapper's flag in
+  V0–V3, and message-level `message.isError` on V4 tool-role messages. The
+  V3-to-V4 migration lifts the wrapper flag
   onto the message without necessarily adding `data.error`; ignoring the new
   location would turn an already-indexed failure into success on replay.
   Plain and zstd migration tests pin the failure before and after the twin
   switch, including its call linkage and canonical round-trip equivalence.
+  Same-named extension fields have no error semantics: an outer V3 message
+  flag is preserved by migration as `plugin:message:isError`, while an
+  ordinary V4 content block may carry its own unrelated extension. Successful
+  V3/V4 writer/codec twins pin both collisions in plain and zstd form.
 - **No additional `indexVersionMarker` bump for this release.** V4 support and
   its error-flag projection ship together, so supported V0–V3 rows retain their
   values. When an upstream migration publishes a V4 twin, its new member path
@@ -185,7 +190,9 @@ as the writer emits.
 and persisted (all six message rows, the meta row, and the tool_call/
 tool_result pair) and checks direct assembly against the SQLite round trip.
 The `v4-failed-tool` twins were encoded with the released V3 codec and migrated
-by the DSH 0.2.0-rc.2 write-open path. The `v4-retry-resume` artifact was written
+by the DSH 0.2.0-rc.2 write-open path, as were the `v4-success-extensions`
+twins containing opaque outer-message and text-block flags. The
+`v4-retry-resume` artifact was written
 with a failed `assistant/attempt`, one committed answer, then a reopened writer
 appending a second turn. Its test requires unique committed-message identities,
 both answers surviving, incremental/full replay equivalence, and the canonical

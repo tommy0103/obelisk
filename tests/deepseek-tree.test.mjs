@@ -1701,6 +1701,46 @@ for (const zstd of [false, true]) {
   });
 }
 
+// These successful twins preserve extension fields through the real V3→V4
+// migration. An outer V3 message flag is opaque metadata; a V4 text block's
+// same-named extension is likewise not the tool result's status.
+for (const version of [3, 4]) {
+  for (const zstd of [false, true]) {
+    test(`v${version} success ignores isError extension metadata (${zstd ? 'zstd' : 'plain'})`, () => {
+      const dir = makeTempDir('obelisk-tool-error-extensions-');
+      const file = `session.v${version}.jsonl`;
+      const sessionsDir = stageFixtures(dir, ['v4-success-extensions'], { version: 4, include: [file] });
+      const path = join(sessionsDir, '--dsh-v4--', 'v4-success-extensions', file);
+      const rows = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
+      const message = rows.find((event) => event.type === 'tool/result').data.message;
+      if (version === 3) {
+        assert.equal(message.isError, true, 'the released outer extension exercises the collision');
+        assert.equal(message.content[0].isError, false, 'the actual wrapper reports success');
+      } else {
+        assert.equal(message.isError, false, 'the first-class tool message reports success');
+        assert.equal(message['plugin:message:isError'], true, 'migration preserves the outer extension as metadata');
+        assert.equal(message.content[0].isError, true, 'the ordinary text block retains its extension');
+      }
+      if (zstd) {
+        writeFileSync(`${path}.zstd`, mkFrame(rows));
+        rmSync(path);
+      }
+      const provider = createDeepseekProvider({ rootDir: sessionsDir });
+      const { unit, values } = parseFirst(provider);
+      const result = values.find((record) => record.kind === 'tool_result');
+      assert.equal(result.is_error, 0, 'extension metadata must not turn a successful tool into a failure');
+      assert.equal(result.content, 'Successful tool output');
+      const db = freshDb();
+      persist(db, unit, provider.parse(unit, null));
+      const dump = dumpDb(db);
+      assert.equal(dump.tool_results[0].is_error, 0, 'the persisted success matches the format-owned flag');
+      assert.equal(dump.tool_results[0].message_uuid, dump.tool_calls[0].message_uuid);
+      assertCanonicalRoundTrip(provider, unit, values);
+      db.close();
+    });
+  }
+}
+
 // The real loop records a failed model attempt as assistant/attempt, then one
 // committed assistant/message. Reopening the writer continues with a new turn;
 // it does not write two committed assistant messages into the same step.

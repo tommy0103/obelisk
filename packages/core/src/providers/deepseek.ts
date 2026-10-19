@@ -316,11 +316,14 @@ function toolResultContent(content: unknown): string {
   return parts.join('\n');
 }
 
-function toolResultIsError(data: Record<string, unknown>, message: Record<string, unknown>): 0 | 1 {
-  if (data.error !== undefined || message.isError === true) return 1;
+function toolResultIsError(data: Record<string, unknown>, message: Record<string, unknown>, formatVersion: number): 0 | 1 {
+  if (data.error !== undefined) return 1;
+  // V4 owns the message-level flag. In released formats that name is opaque
+  // message metadata; conversely, a V4 text block's extension is not a status.
+  if (formatVersion >= 4) return message.role === 'tool' && message.isError === true ? 1 : 0;
   const content = message.content;
   if (!Array.isArray(content)) return 0;
-  return content.some(block => isRecord(block) && block.isError === true) ? 1 : 0;
+  return content.some(block => isRecord(block) && block.type === 'tool-result' && block.isError === true) ? 1 : 0;
 }
 
 function totalInputTokens(usage: unknown): number | null {
@@ -1361,7 +1364,7 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
             kind: 'tool_result', tool_use_id: toolId,
             message_uuid: toolUseUuid(dbId, record.data.turn, record.data.step),
             session_id: sessionId, content: trunc(content), file_path: null,
-            is_error: toolResultIsError(record.data, message),
+            is_error: toolResultIsError(record.data, message, formatVersion),
           });
           // Subagent spawns are self-contained in their result text, so the link
           // survives any parse window (the spawn tool/call may be in an earlier frame).
