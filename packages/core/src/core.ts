@@ -69,7 +69,7 @@ function reportIncompleteInventory(build: unknown): void {
   }
 }
 
-function refreshQueryIndex(): ProviderRegistry {
+function refreshQueryIndex(): { providerRegistry: ProviderRegistry; invocationWaitOptions?: InvocationWaitOptions } {
   const settings = readPersistedProviderSettings();
   const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings, {
     openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
@@ -81,14 +81,21 @@ function refreshQueryIndex(): ProviderRegistry {
       throw new Error(`Obelisk index schema upgrade is blocked by ${schema.reason ?? 'an unknown writer'}`);
     }
     process.stderr.write(`Warning: ${settings.error}; index refresh skipped\n`);
-    return providerRegistry;
+    return {
+      providerRegistry,
+      // The nonce recovery passes a registry directly to buildIndex, bypassing
+      // its settings read. Unknown settings must disable that write path too.
+      // Keep immediate read-only nonce resolution and existing indexed queries,
+      // but do not build/poll for freshness we cannot safely provide.
+      invocationWaitOptions: { build: () => undefined, pollCapMs: 0 },
+    };
   }
   // The pre-query refresh is a full-inventory pass, and for a CLI-only user
   // it is their reconciliation: there is no watcher to reconcile against.
   // It therefore verifies prefixes (strict) instead of trusting cooperative
   // append checkpoints (RFC #172).
   reportIncompleteInventory(buildIndex({ providerRegistry, readMode: 'strict' }));
-  return providerRegistry;
+  return { providerRegistry };
 }
 
 function rethrowUnlessSchemaBlocked(error: unknown): never {
@@ -388,8 +395,8 @@ export function resolveInvokingSessionIdWithWait(
 
 // FTS search over indexed message text. Refreshes the index, then queries.
 export function searchText(text: string, opts?: Record<string, unknown>, invocation?: InvocationOptions): unknown {
-  const providerRegistry = refreshQueryIndex();
-  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry);
+  const { providerRegistry, invocationWaitOptions } = refreshQueryIndex();
+  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry, invocationWaitOptions);
   // Query against a freshly opened snapshot so results reflect the latest
   // published index.
   const db = openReadDb();
@@ -406,8 +413,8 @@ export function searchText(text: string, opts?: Record<string, unknown>, invocat
 
 // Execute a read-only CodeAct query script and resolve its returned value.
 export async function executeQuery(scriptContent: string, invocation?: InvocationOptions): Promise<unknown> {
-  const providerRegistry = refreshQueryIndex();
-  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry);
+  const { providerRegistry, invocationWaitOptions } = refreshQueryIndex();
+  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry, invocationWaitOptions);
   const db = openReadDb();
   try {
     try {
