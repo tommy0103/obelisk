@@ -24,3 +24,9 @@ obelisk --query /tmp/query.mjs
 `obelisk install` installs the separate docs-only agent skill from
 `tommy0103/obelisk-skill`. The CLI itself remains daemon-free: each command
 refreshes the local index when write ownership is available, then exits.
+
+DeepSeek Harness history defaults to `$DSH_HOME/sessions`, or
+`~/.dsh/sessions` when `DSH_HOME` is unset or blank. Like DSH, Obelisk expands
+bare `~`, `~/` and `~\` home prefixes and resolves relative `DSH_HOME` values
+against the process working directory. An explicitly configured DeepSeek
+source directory takes precedence and already names the sessions directory.

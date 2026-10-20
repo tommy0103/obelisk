@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { appendFileSync, chmodSync, copyFileSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { constants, zstdCompressSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
@@ -153,6 +153,67 @@ const PROBE = (() => {
 })();
 const ROOT_ID = PROBE.ROOT;
 const CHILD_ID = PROBE.CHILD;
+
+// DSH's home-paths resolver accepts ~, ~/, ~\\, and relative DSH_HOME values.
+// Keep the artifact real: this is the checked-in v4 writer fixture, not a
+// directory-shaped fake that never reaches discovery or raw lookup.
+for (const style of ['absolute', 'tilde-slash', 'tilde-backslash', 'relative', 'spaces', 'literal-tilde-name']) {
+  test(`DSH_HOME ${style} discovers and reads the real v4 artifact from the harness home`, () => {
+    const dir = makeTempDir('obelisk-dsh-home-');
+    const home = join(dir, style === 'spaces' ? ' home with spaces ' : style === 'literal-tilde-name' ? '~other' : 'home');
+    const sessions = join(home, 'sessions');
+    const target = join(sessions, '--dsh-v4--', 'v4-basic');
+    mkdirSync(target, { recursive: true });
+    copyFileSync(
+      new URL('./fixtures/deepseek/sessions/--dsh-v4--/v4-basic/session.v4.jsonl', import.meta.url),
+      join(target, 'session.v4.jsonl'),
+    );
+    const value = style === 'tilde-slash' ? `~/${relative(homedir(), home)}`
+      : style === 'tilde-backslash' ? `~\\${relative(homedir(), home)}`
+      : style === 'relative' || style === 'literal-tilde-name' ? relative(process.cwd(), home)
+      : home;
+    const prior = process.env.DSH_HOME;
+    try {
+      process.env.DSH_HOME = value;
+      const provider = createDeepseekProvider();
+      assert.equal(provider.descriptor.defaultRoot, sessions);
+      assert.deepEqual(provider.watchTargets(provider.descriptor.defaultRoot), [{ kind: 'tree', path: sessions }]);
+      const issues = [];
+      const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: issue => issues.push(issue) });
+      assert.deepEqual(issues, []);
+      assert.equal(units.length, 1);
+      const records = drain(provider.parse(units[0], null)).values;
+      const message = records.find(record => record.kind === 'message' && record.text === 'please read a.ts');
+      assert.ok(message);
+      const raw = provider.raw({ source: 'deepseek', messageUuid: message.uuid, session: null, agentId: null });
+      assert.ok(raw);
+      assert.match(raw.text, /please read a\.ts/);
+    } finally {
+      if (prior === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = prior;
+    }
+  });
+}
+
+test('DSH_HOME bare tilde, blank and unset values match harness home resolution', () => {
+  const prior = process.env.DSH_HOME;
+  try {
+    for (const value of ['~', '', ' \t ', undefined]) {
+      if (value === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = value;
+      assert.equal(createDeepseekProvider().descriptor.defaultRoot,
+        value === '~' ? join(homedir(), 'sessions') : join(homedir(), '.dsh', 'sessions'));
+    }
+    process.env.DSH_HOME = '~/not-the-explicit-source';
+    const explicit = join(makeTempDir('obelisk-dsh-explicit-'), 'sessions');
+    assert.equal(createDeepseekProvider({ rootDir: explicit }).descriptor.defaultRoot, explicit);
+    process.env.DSH_HOME = '~another-user';
+    assert.equal(createDeepseekProvider().descriptor.defaultRoot, join(resolve('~another-user'), 'sessions'));
+  } finally {
+    if (prior === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prior;
+  }
+});
 
 function freshDb() {
   const db = new DatabaseSync(':memory:');
@@ -560,7 +621,7 @@ test('resolves the sessions root from $DSH_HOME (blank counts as unset)', () => 
   const original = process.env.DSH_HOME;
   try {
     process.env.DSH_HOME = '/tmp/custom-dsh-home';
-    assert.equal(createDeepseekProvider().descriptor.defaultRoot, join('/tmp/custom-dsh-home', 'sessions'));
+    assert.equal(createDeepseekProvider().descriptor.defaultRoot, join(resolve('/tmp/custom-dsh-home'), 'sessions'));
     process.env.DSH_HOME = '   ';
     assert.equal(createDeepseekProvider().descriptor.defaultRoot, join(homedir(), '.dsh', 'sessions'));
     delete process.env.DSH_HOME;
