@@ -53,7 +53,10 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
 }
 
 export const name = 'claude';
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v3__';
+// v4: orphaned subagent transcripts now publish their session row. The marker
+// moves so an install that already indexed those transcripts (and therefore
+// holds their cursors) replays them once and gains the missing rows.
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v4__';
 
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
@@ -419,18 +422,53 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     }
   }
 
-  // Subagent transcripts do not own a session row (matches indexJsonl).
-  if (!isSubagent) {
+  // Subagent transcripts do not own a session row while their main transcript
+  // exists (matches indexJsonl). Claude can leave a session directory behind
+  // holding nothing but `subagents/` — the parent `<sessionId>.jsonl` was
+  // cleaned up or never flushed — and then no unit would ever publish that
+  // session: its records land in messages while the session itself disappears
+  // from the catalogue, from session detail, and from every statement that
+  // joins sessions. The subagent transcript is the only surviving witness, so
+  // it publishes the row. Counting is delta because several subagents share one
+  // session id; a replay would otherwise re-add the same messages, so
+  // repairOrphanedSessionCounts restates the count from the stored rows whenever
+  // this transcript is gone.
+  const mainTranscriptPath = isSubagent ? mainTranscriptPathOf(unit) : null;
+  const orphanedSubagent = mainTranscriptPath !== null && !existsSync(mainTranscriptPath);
+  if (!isSubagent || orphanedSubagent) {
     records.push({
-      kind: 'session', id: unit.sessionId, title: customTitle ?? aiTitle ?? historyTitle, project: unit.project || null,
-      started_at: sm.started_at, ended_at: sm.ended_at, git_branch: sm.git_branch,
-      version: sm.version, message_count: sm.n, countMode: skip > 0 ? 'delta' : 'total',
-      jsonl_path: unit.key, source: 'claude',
+      kind: 'session',
+      id: unit.sessionId,
+      title: isSubagent ? null : (customTitle ?? aiTitle ?? historyTitle),
+      project: unit.project || null,
+      started_at: sm.started_at,
+      ended_at: sm.ended_at,
+      git_branch: isSubagent ? null : sm.git_branch,
+      version: isSubagent ? null : sm.version,
+      message_count: sm.n,
+      countMode: isSubagent ? 'delta' : (skip > 0 ? 'delta' : 'total'),
+      jsonl_path: mainTranscriptPath ?? unit.key,
+      source: 'claude',
     });
   }
 
   yield* records;
   return `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+}
+
+/**
+ * The main transcript a subagent transcript belongs to.
+ *
+ * Subagent units live at `<project>/<sessionId>/subagents[/workflows/<run>]/<agent>.jsonl`,
+ * so the owning session file is `<project>/<sessionId>.jsonl` — which is not
+ * necessarily on disk any more (see the orphaned-subagent branch in parse).
+ */
+function mainTranscriptPathOf(unit: IndexUnit): string | null {
+  const marker = /[\\/]subagents[\\/]/.exec(unit.key);
+  // Unrecognized layout: never guess at a path we would then call missing.
+  if (marker === null) return null;
+  const sessionDir = unit.key.slice(0, marker.index);
+  return join(dirname(sessionDir), `${String(unit.sessionId ?? '')}.jsonl`);
 }
 
 function rawClaude(input: RawLookup): RawRecord | null {

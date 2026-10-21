@@ -6,9 +6,11 @@ import { existsSync } from 'node:fs';
 import { prepareRetainedSnapshot } from './snapshot.ts';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
+  backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
   ensureFtsReady,
   refreshSessionProjectPaths,
+  repairOrphanedSessionCounts,
 } from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
@@ -245,6 +247,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             });
             refreshSessionProjectPaths(db, null);
             backfillUnresolvedSessionProjectPathsOnce(db);
+            repairOrphanedSessionCounts(db);
+            backfillSessionTitles(db);
             healWorkflowParentLinks(db);
             ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -341,6 +345,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           // Per-unit paths commit atomically with their provider cursors above;
           // legacy unresolved rows use one explicit, convergent backfill.
           backfillUnresolvedSessionProjectPathsOnce(db);
+          repairOrphanedSessionCounts(db);
+          backfillSessionTitles(db);
           healWorkflowParentLinks(db);
           ensureFtsReady(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
