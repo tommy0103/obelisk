@@ -19,8 +19,16 @@ should be installed for the current project or globally.
 
 ```bash
 npm install --global @obelisk-apps/cli
-obelisk install
 ```
+
+CLI 0.3.1+ installs this skill automatically using the standard skills installer:
+global npm
+installs use global skill directories, and ordinary npm installs use the
+invoking project. Set `OBELISK_SKIP_SKILL_INSTALL=1` to install only the CLI.
+If skill setup fails, the CLI still works; retry with
+`obelisk install --global --yes` or `npx --no-install obelisk install --yes` from the project.
+Use npm's `--foreground-scripts` to see setup output, or `obelisk install` to
+choose a different scope interactively.
 
 The CLI is the executable runtime. This repository contains only the agent
 instructions and progressive-disclosure references.

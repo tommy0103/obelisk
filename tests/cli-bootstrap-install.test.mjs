@@ -20,6 +20,7 @@ test('root SKILL.md bootstraps the CLI before installing the official skill', ()
   const source = readFileSync(join(repoRoot, 'SKILL.md'), 'utf8');
 
   assert.match(source, /@obelisk-apps\/cli/);
+  assert.match(source, /OBELISK_SKIP_SKILL_INSTALL=1 npm install --global/);
   assert.match(source, /install\.sh/);
   assert.match(source, /obelisk --version/);
   assert.match(source, /obelisk install/);
@@ -53,11 +54,12 @@ test('install.sh installs and verifies only the CLI', () => {
   const home = makeTempDir('obelisk-install-script-');
   const fakeBin = join(home, 'bin');
   const npmCapture = join(home, 'npm-args');
+  const skipCapture = join(home, 'skip-skill');
   const obeliskCapture = join(home, 'obelisk-args');
   mkdirSync(fakeBin, { recursive: true });
 
   const npm = join(fakeBin, 'npm');
-  writeFileSync(npm, `#!/bin/sh\nprintf '%s\\n' "$@" > "${npmCapture}"\n`);
+  writeFileSync(npm, `#!/bin/sh\nprintf '%s\\n' "$@" > "${npmCapture}"\nprintf '%s' "$OBELISK_SKIP_SKILL_INSTALL" > "${skipCapture}"\n`);
   chmodSync(npm, 0o755);
 
   const obelisk = join(fakeBin, 'obelisk');
@@ -75,6 +77,7 @@ test('install.sh installs and verifies only the CLI', () => {
   });
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(readFileSync(skipCapture, 'utf8'), '1');
   assert.deepEqual(readFileSync(npmCapture, 'utf8').trim().split('\n'), [
     'install',
     '--global',

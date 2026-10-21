@@ -25,10 +25,10 @@ asked to upgrade or repair it.
 Installing a global command changes the user's machine. Show the command and get
 the user's approval before running one of these official installation methods.
 
-With npm:
+With npm, skip automatic skill setup so step 3 can use the user's chosen scope:
 
 ```bash
-npm install --global @obelisk-apps/cli
+OBELISK_SKIP_SKILL_INSTALL=1 npm install --global @obelisk-apps/cli
 ```
 
 On macOS, Linux, or WSL, the official installer performs the same CLI-only
