@@ -39,7 +39,7 @@ function searchDb() {
   const db = new DatabaseSync(':memory:');
   db.exec(`
     CREATE TABLE sessions (
-      id TEXT PRIMARY KEY, title TEXT, project TEXT, started_at TEXT,
+      id TEXT PRIMARY KEY, title TEXT, project TEXT, project_path TEXT, started_at TEXT,
       source TEXT DEFAULT 'claude'
     );
     CREATE TABLE messages (
@@ -55,9 +55,9 @@ function searchDb() {
     CREATE INDEX idx_messages_ts ON messages(session_id, timestamp);
   `);
   db.prepare(`
-    INSERT INTO sessions (id, title, project, started_at)
-    VALUES (?, ?, ?, ?)
-  `).run('sid-search', 'Search session', 'quiet-zero', '2026-06-10T10:00:00Z');
+    INSERT INTO sessions (id, title, project, project_path, started_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('sid-search', 'Search session', 'quiet-zero', '/tmp/quiet-zero', '2026-06-10T10:00:00Z');
   const insert = db.prepare(`
     INSERT INTO messages (uuid, session_id, text, role, timestamp, model, cwd, content_type, is_meta, visibility)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -171,6 +171,26 @@ test('search exposes content_type on hits and temporal context', () => {
   assert.equal(rows[0].context[0].uuid, 'msg-thinking');
   assert.equal(rows[0].context[0].content_type, 'thinking');
   assert.equal(rows[0].context[0].is_meta, 0);
+  db.close();
+});
+
+test('search can return scoped snippets without automatic neighbor context', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+  const compact = api.search('needle', {
+    projectPath: '/tmp/quiet-zero', limit: 5, snippetTokens: 1, contextLimit: 0,
+  });
+  assert.deepEqual(compact.map(row => row.message.uuid), ['msg-text']);
+  assert.deepEqual(compact[0].context, []);
+  assert.match(compact[0].message.text, /needle/u);
+  assert.equal(compact[0].message.textLength, 'needle visible reply'.length);
+  assert.equal(compact[0].message.isSnippet, true);
+  assert.deepEqual(api.search('needle', { projectPath: '/tmp/other' }), []);
+  assert.equal(api.search('needle', { contextLimit: 1 })[0].context.length, 1);
+  assert.equal(api.search('needle', { limit: 1 })[0].message.isSnippet, undefined);
+  for (const opts of [{ contextLimit: -1 }, { contextLimit: 7 }, { snippetTokens: 0 }, { snippetTokens: 65 }]) {
+    assert.throws(() => api.search('needle', opts), RangeError);
+  }
   db.close();
 });
 

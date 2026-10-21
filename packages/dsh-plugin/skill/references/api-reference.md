@@ -98,6 +98,9 @@ Full-text search across all indexed message text using FTS5.
 | `opts.limit` | `number` | Max results, default 20 |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
+| `opts.projectPath` | `string` | Exact match on `sessions.project_path` |
+| `opts.contextLimit` | `number` | Temporal neighbors per hit, integer 0–6; default 6. Zero skips neighbor lookup |
+| `opts.snippetTokens` | `number` | Return a matched FTS excerpt instead of the full hit text, integer 1–64; omitted by default |
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
@@ -124,6 +127,18 @@ Hits and neighbors carry `visibility`.
 Use `context(uuid)` or `trace(uuid)` for causal/parent-chain expansion. Lower
 FTS rank sorts earlier; prefer returned order unless deliberately inspecting
 FTS ranking.
+
+For a compact first pass, use `search(topic, { projectPath, limit: 30,
+snippetTokens: 16, contextLimit: 0 })`; promising hits retain their UUID and
+session ID. When `snippetTokens` is set, `message.text` is a matched excerpt and
+`message.isSnippet` plus `message.textLength` mark that the full text was not
+returned. Expand selected UUIDs with `context(uuid)` or `raw(uuid)`; do not treat
+the excerpt as complete evidence. The CLI exposes the same controls as
+`--project-path`, `--limit`, `--snippet-tokens`, and `--context-limit`.
+The first argument after `--search` is search text, even when it begins with
+`--`; options follow that argument. A standalone `--` ends option parsing and
+treats everything after it as text: `obelisk --search -- --limit` searches for
+the literal flag name, and `obelisk --search needle -- --help` searches both terms.
 
 Valid FTS5 syntax in `text` is honored. Input that FTS5 would reject as
 malformed (for example a hyphenated term like `foo-bar`) does not error: it

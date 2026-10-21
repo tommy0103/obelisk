@@ -17,7 +17,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli as runRuntime } from './cli-test-helpers.mjs';
@@ -27,6 +27,29 @@ function tempHome() {
   const home = makeTempDir('obelisk-cli-envelope-');
   mkdirSync(join(home, '.claude'), { recursive: true });
   return home;
+}
+
+function populatedSearchHome() {
+  const home = tempHome();
+  // Adapt the captured Claude user-record shape; content, IDs and cwd are
+  // controlled test data, indexed by the real CLI rather than inserted mocks.
+  const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line)).find(row => row.type === 'user');
+  const projectPath = join(home, 'project_%');
+  const fullText = `${'prefix '.repeat(20)}needle ${'suffix '.repeat(20)}constructor toString __proto__ --help --limit --nonce --context-limit`;
+  for (const [id, cwd] of [['target', projectPath], ['other', join(home, 'project_X')]]) {
+    const dir = join(home, '.claude', 'projects', id);
+    mkdirSync(dir, { recursive: true });
+    const rows = ['context before', fullText, 'context after'].map((content, index) => ({
+      ...captured,
+      sessionId: `${id}-session`, uuid: `${id}-${index}`, cwd,
+      parentUuid: index === 0 ? null : `${id}-${index - 1}`,
+      timestamp: `2026-09-28T10:00:0${index}.000Z`,
+      message: { role: 'user', content },
+    }));
+    writeFileSync(join(dir, `${id}-session.jsonl`), rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+  }
+  return { home, projectPath, fullText };
 }
 
 test('--build emits { ok: true, db } pointing at the resolved db path', () => {
@@ -157,4 +180,67 @@ test('--search tolerates FTS-special input via safe tokenization', () => {
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.ok(Array.isArray(JSON.parse(result.stdout)), 'search must return a JSON array');
+});
+
+test('--search accepts bounded compact-result and exact-scope options', () => {
+  const { home, projectPath, fullText } = populatedSearchHome();
+  const baseline = runRuntime(['--search', 'needle'], { home });
+  assert.equal(baseline.status, 0, baseline.stderr || baseline.stdout);
+  const full = JSON.parse(baseline.stdout);
+  assert.deepEqual(full.map(row => row.message.uuid).sort(), ['other-1', 'target-1']);
+  const target = full.find(row => row.message.uuid === 'target-1');
+  assert.equal(target.message.text, fullText);
+  assert.equal(target.message.isSnippet, undefined);
+  assert.deepEqual(target.context.map(row => row.uuid), ['target-0', 'target-2']);
+
+  const result = runRuntime([
+    '--search', 'needle', '--limit', '10', '--project-path', projectPath,
+    '--snippet-tokens', '1', '--context-limit', '0',
+  ], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const compact = JSON.parse(result.stdout);
+  assert.equal(compact.length, 1, 'exact project scope excludes the SQL-LIKE-shaped sibling path');
+  assert.deepEqual(compact[0].message, {
+    ...target.message, text: '…needle…', textLength: fullText.length, isSnippet: true,
+  });
+  assert.deepEqual(compact[0].session, target.session);
+  assert.deepEqual(compact[0].context, []);
+
+  const invalid = runRuntime(['--search', 'needle', '--context-limit', '7'], { home });
+  assert.equal(invalid.status, 1);
+  assert.match(JSON.parse(invalid.stdout).error, /contextLimit/u);
+});
+
+test('--search keeps prototype property names as ordinary search text', () => {
+  const { home } = populatedSearchHome();
+  for (const parts of [['constructor'], ['constructor', 'needle'], ['needle', 'constructor'],
+    ['toString'], ['needle', 'toString'], ['__proto__'], ['needle', '__proto__']]) {
+    const result = runRuntime(['--search', ...parts], { home });
+    assert.equal(result.status, 0, `${parts.join(' ')}: ${result.stderr || result.stdout}`);
+    assert.deepEqual(JSON.parse(result.stdout).map(row => row.message.uuid).sort(), ['other-1', 'target-1']);
+  }
+});
+
+test('--search preserves option-like positional text and supports the -- delimiter', () => {
+  const { home, projectPath } = populatedSearchHome();
+  for (const parts of [['--help'], ['--limit'], ['--nonce'], ['--context-limit'],
+    ['--', '--help'], ['--', '--limit'], ['--', '--nonce'],
+    ['needle', '--', '--limit', '--help'], ['needle', '--', '--nonce']]) {
+    const result = runRuntime(['--search', ...parts], { home });
+    assert.equal(result.status, 0, `${parts.join(' ')}: ${result.stderr || result.stdout}`);
+    assert.deepEqual(JSON.parse(result.stdout).map(row => row.message.uuid).sort(), ['other-1', 'target-1']);
+  }
+  const scoped = runRuntime(['--search', '--limit', '--project-path', projectPath], { home });
+  assert.equal(scoped.status, 0, scoped.stderr || scoped.stdout);
+  assert.deepEqual(JSON.parse(scoped.stdout).map(row => row.message.uuid), ['target-1']);
+
+  for (const [parts, error] of [
+    [['--'], '--search requires text'],
+    [['needle', '--limit'], '--limit requires a value'],
+    [['needle', '--typo'], 'Unknown --search option: --typo'],
+  ]) {
+    const invalid = runRuntime(['--search', ...parts], { home });
+    assert.equal(invalid.status, 1);
+    assert.equal(JSON.parse(invalid.stdout).error, error);
+  }
 });

@@ -12,6 +12,8 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSyn
 import { join } from 'node:path';
 
 import { persist } from '../packages/core/src/persist.ts';
+import { createProviderIndexPlan, indexProviderPlanStrict } from '../packages/core/src/provider-indexing.ts';
+import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
 import { makeTempDir } from './temp-dirs.mjs';
@@ -102,6 +104,62 @@ function assertNormalAppendReads(metrics, sourceStat, suffixBytes) {
 
 const REAL_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url);
 const REAL_PREFIX_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized-prefix.jsonl', import.meta.url);
+
+test('Codex marker upgrade backfills stale session-index metadata from an unchanged real rollout once', t => {
+  const root = makeTempDir('obelisk-codex-metadata-backfill-');
+  const sessionsDir = join(root, 'sessions');
+  mkdirSync(sessionsDir);
+  const path = join(sessionsDir, 'rollout.jsonl');
+  copyFileSync(REAL_FIXTURE, path);
+  const rawId = JSON.parse(readFileSync(path, 'utf8').split('\n')[0]).payload.id;
+  const sessionId = `codex:${rawId}`;
+  const provider = createCodexProvider({ rootDir: root });
+  const registry = createProviderRegistry([provider]);
+  const db = freshDb();
+  t.after(() => db.close());
+  // The captured fixture sanitizes timestamps to p-NNNN. These later index
+  // timestamps preserve that ordering without changing any rollout records.
+  const beforeMeta = { indexedTitle: 'Before', indexedUpdatedAt: 'p-9991' };
+  const afterMeta = { indexedTitle: 'After', indexedUpdatedAt: 'p-9992' };
+  const beforeUnit = { key: path, sessionId, meta: beforeMeta };
+  const cursor = persist(db, beforeUnit, parse(beforeUnit, null));
+  // Literal old marker: referring to the current marker would make this test
+  // pass even if an upgrade never scheduled a backfill.
+  db.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed) VALUES (?,0,0)')
+    .run('__codex_canonical_transcript_v3__');
+  const sourceStat = statSync(path);
+  writeFileSync(join(root, 'session_index.jsonl'), `${JSON.stringify({
+    id: rawId, thread_name: afterMeta.indexedTitle, updated_at: afterMeta.indexedUpdatedAt,
+  })}\n`);
+  assert.deepEqual(provider.discover({ lastCursor: () => cursor }), [], 'the unchanged source alone cannot repair stale metadata');
+
+  const plan = createProviderIndexPlan(db, registry, { readMode: 'strict' });
+  assert.equal(plan.items.length, 1);
+  assert.equal(plan.items[0].cursor, null, 'an old-format index forces a snapshot backfill');
+  db.exec('BEGIN');
+  const result = indexProviderPlanStrict({ db, plan });
+  db.exec('COMMIT');
+  assert.equal(result.complete, true);
+  assert.equal(db.prepare('SELECT title,ended_at FROM sessions WHERE id=?').get(sessionId).title, 'After');
+  assert.equal(db.prepare('SELECT ended_at FROM sessions WHERE id=?').get(sessionId).ended_at, 'p-9992');
+  assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get(provider.indexVersionMarker));
+  const repairedStat = statSync(path);
+  assert.deepEqual(
+    [repairedStat.size, repairedStat.mtimeMs, repairedStat.ctimeMs],
+    [sourceStat.size, sourceStat.mtimeMs, sourceStat.ctimeMs],
+    'the repair does not modify the transcript',
+  );
+
+  const finalUnit = { key: path, sessionId, meta: afterMeta };
+  const expectedDb = freshDb();
+  t.after(() => expectedDb.close());
+  persist(expectedDb, finalUnit, parse(finalUnit, null));
+  assert.deepEqual(dumpDb(db), dumpDb(expectedDb), 'backfill equals a fresh canonical snapshot, including all message/tool rows');
+  assert.deepEqual(assembleSessionDetail(detailRows(db, sessionId)), assembleSessionDetail(drain(parse(finalUnit, null)).values));
+  const nextPlan = createProviderIndexPlan(db, registry, { readMode: 'strict' });
+  assert.equal(nextPlan.items.length, 0, 'an already-migrated index does not replay again');
+  assert.equal(nextPlan.pendingMarkers.size, 0);
+});
 
 test('Codex direct canonical assembly equals SQLite round-trip', () => {
   const path = join(makeTempDir('obelisk-codex-roundtrip-'), 'rollout.jsonl');
