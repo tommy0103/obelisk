@@ -92,7 +92,7 @@ interface IndexerServiceOptions {
   logger?: { warn?: (msg: string) => void };
 }
 
-const TRANSCRIPT_SUFFIXES = ['.jsonl.zstd', '.jsonl', '.json'] as const;
+const TRANSCRIPT_SUFFIXES = ['.jsonl.zstd', '.jsonl.zst', '.jsonl', '.json'] as const;
 
 function isTreeTranscriptCandidate(targetPath: string): boolean {
   return TRANSCRIPT_SUFFIXES.some((suffix) => targetPath.endsWith(suffix));

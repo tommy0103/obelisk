@@ -25,6 +25,8 @@ import {
   codexToolInput, codexToolOutput,
   extractMessageIsMeta, isSkillInstructions,
   readCodexGuardianThreadInfo,
+  isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes,
+  readCodexBufferLines, readCodexLines,
 } from '../parsing.ts';
 
 import type {
@@ -58,6 +60,20 @@ function codexTranscriptDirs(rootDir: string): string[] {
   ];
 }
 
+const CODEX_ZST_CURSOR_TAG = 'codex-zst-v1';
+
+function encodeCodexZstCursor(stat: Stats, completeLines: number): string {
+  return [
+    stat.mtimeMs,
+    completeLines,
+    stat.size,
+    stat.ctimeMs,
+    stat.ino,
+    CODEX_ZST_CURSOR_TAG,
+    stat.dev,
+  ].join(':');
+}
+
 // Cursor format: `${mtime}:${lines}:${completeLineOffset}:${ctimeMs}:${ino}`.
 // mtime+ctime+source identity still let discovery notice same-millisecond
 // rewrites. The provider state carries sourceSize because the outer size field
@@ -65,6 +81,17 @@ function codexTranscriptDirs(rootDir: string): string[] {
 function codexCursorSignatureDiffers(cursor: string, filePath: string): boolean {
   const stat = statSync(filePath);
   const parts = cursor.split(':');
+  if (isCodexCompressedPath(filePath)) {
+    return parts.length !== 7
+      || parts[5] !== CODEX_ZST_CURSOR_TAG
+      || !Number.isSafeInteger(Number(parts[1]))
+      || Number(parts[1]) < 0
+      || Number(parts[0]) !== stat.mtimeMs
+      || Number(parts[2]) !== stat.size
+      || Number(parts[3]) !== stat.ctimeMs
+      || Number(parts[4]) !== stat.ino
+      || Number(parts[6]) !== stat.dev;
+  }
   if (parts.length < 5) return true;
   let sourceSize = Number(parts[2]);
   try {
@@ -110,7 +137,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         : normalize(join(transcriptDir, changedPath));
       const inside = relative(transcriptDir, absolute);
       if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
-      if (absolute.toLowerCase().endsWith('.jsonl')) changedFiles.add(absolute);
+      if (isCodexTranscriptPath(absolute)) {
+        changedFiles.add(absolute);
+        if (isCodexCompressedPath(absolute)) {
+          changedFiles.add(absolute.slice(0, -'.zst'.length));
+        } else {
+          changedFiles.add(`${absolute}.zst`);
+        }
+      }
     }
   }
   return codexTranscriptDirs(rootDir).flatMap((transcriptDir) => (
@@ -145,17 +179,40 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       // guardian session rows; the v3 marker bump forces one full replay that
       // retracts them.
       if (!sessionIndexChanged && !fileChanged && unchangedSource) return [];
-      const guardian = readCodexGuardianThreadInfo(file.path);
+      let guardian: { threadRawId: string; lineNum: number } | null;
       let meta: any = null;
-      readLines(file.path, (line: string) => {
-        try {
-          const record = JSON.parse(line);
-          if (record?.type === 'session_meta' && record.payload?.id) {
-            meta = record.payload;
-            return false;
-          }
-        } catch { /* malformed source line */ }
-      });
+      try {
+        if (isCodexCompressedPath(file.path)) {
+          const decompressed = readCodexCompressedBytes(file.path);
+          guardian = readCodexGuardianThreadInfo(decompressed);
+          readCodexBufferLines(decompressed, (line: string) => {
+            try {
+              const record = JSON.parse(line);
+              if (record?.type === 'session_meta' && record.payload?.id) {
+                meta = record.payload;
+                return false;
+              }
+            } catch { /* malformed source line */ }
+          });
+        } else {
+          guardian = readCodexGuardianThreadInfo(file.path);
+          readLines(file.path, (line: string) => {
+            try {
+              const record = JSON.parse(line);
+              if (record?.type === 'session_meta' && record.payload?.id) {
+                meta = record.payload;
+                return false;
+              }
+            } catch { /* malformed source line */ }
+          });
+        }
+      } catch (error) {
+        ctx.reportIncompleteInventory?.({
+          path: file.path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return [];
+      }
       const rawId = meta ? codexRawId(meta.id) : null;
       const parentId = meta ? codexParentThreadId(meta) : null;
       const indexed = rawId ? sessionIndex.get(rawId) : undefined;
@@ -517,7 +574,29 @@ export function* parse(
   testHooks?: CodexParseTestHooks,
 ): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
-  const prior = decodeCodexCursor(_cursor);
+  const compressed = isCodexCompressedPath(unit.key);
+  if (compressed && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key)) {
+    if (metrics) metrics.plan = 'noop';
+    return _cursor;
+  }
+  const prior = compressed ? null : decodeCodexCursor(_cursor);
+  const decoded = compressed ? readCodexCompressedBytes(unit.key) : null;
+  if (compressed && metrics) metrics.sourceBytesRead += stat.size;
+
+  const readSourceLines = (
+    callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+    options: { start?: number; onBytesRead?: (bytes: number) => void } = {},
+  ): void => {
+    if (decoded !== null) {
+      if ((options.start ?? 0) !== 0) {
+        throw new Error('Compressed Codex rollout cannot resume at a byte offset');
+      }
+      readCodexBufferLines(decoded, callback);
+      return;
+    }
+    readLines(unit.key, callback, options);
+  };
+
   const readMode = unit.meta && typeof unit.meta === 'object' && 'readMode' in unit.meta
     && (unit.meta as { readMode?: unknown }).readMode === 'strict'
     ? 'strict'
@@ -531,7 +610,7 @@ export function* parse(
   // same device/inode, a complete-line checkpoint, and monotonic growth let us
   // seek to the suffix without reading the old prefix. Any failed gate falls
   // through to #148's fingerprinted verification/snapshot behavior.
-  const cooperativeCandidate = !guardianInvalidation && readMode === 'normal'
+  const cooperativeCandidate = !compressed && !guardianInvalidation && readMode === 'normal'
     && prior !== null
     && usableSourceIdentity(stat)
     && prior.completeLineOffset !== undefined
@@ -550,7 +629,7 @@ export function* parse(
   // Growth is the normal append signal; ctime necessarily changes when bytes
   // are appended. For same-size sources, require the unchanged ctime before
   // treating the file as a no-op, otherwise let fingerprinting detect rewrites.
-  const sameCheckpoint = !guardianInvalidation && cooperativeCandidate && stat.size === prior.size;
+  const sameCheckpoint = !compressed && !guardianInvalidation && cooperativeCandidate && stat.size === prior.size;
   const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
   const metadataChanged = sameCheckpoint && (
     prior.indexedTitle !== indexedMeta?.indexedTitle
@@ -584,19 +663,21 @@ export function* parse(
       endedAt,
     });
   }
-  const cooperativeAppend = cooperativeCandidate && stat.size > prior.size;
-  const fingerprint = cooperativeAppend
-    ? {
-      chunkHashes: prior!.chunkHashes,
-      prefixMatches: false,
-      bytesRead: 0,
-      complete: stat.size <= CODEX_MAX_CURSOR_CHUNK_HASHES * CODEX_FINGERPRINT_CHUNK_BYTES,
-    }
-    : fingerprintCodexFile(unit.key, stat.size, prior, metrics);
+  const cooperativeAppend = !compressed && cooperativeCandidate && stat.size > prior.size;
+  const fingerprint = compressed
+    ? { chunkHashes: [], prefixMatches: false, bytesRead: stat.size, complete: false }
+    : (cooperativeAppend
+      ? {
+        chunkHashes: prior!.chunkHashes,
+        prefixMatches: false,
+        bytesRead: 0,
+        complete: stat.size <= CODEX_MAX_CURSOR_CHUNK_HASHES * CODEX_FINGERPRINT_CHUNK_BYTES,
+      }
+      : fingerprintCodexFile(unit.key, stat.size, prior, metrics));
   const afterFingerprint = statSync(unit.key);
   if ((!cooperativeAppend && (fingerprint.bytesRead !== stat.size || !sameStat(stat, afterFingerprint)))
     || (cooperativeAppend && !sameSource(stat, afterFingerprint))) return _cursor;
-  const appendCandidate = !guardianInvalidation && (cooperativeAppend || (prior !== null
+  const appendCandidate = !compressed && !guardianInvalidation && (cooperativeAppend || (prior !== null
     && prior.verifiedPrefix === true
     && prior.threadRawId === codexRawId(prior.meta.id)
     && prior.dev === String(stat.dev)
@@ -622,7 +703,7 @@ export function* parse(
     let scannedCompleteLineOffset = start === 0 ? 0 : (appendCandidate ? prior!.completeLineOffset! : 0);
     let scannedTerminated = start === 0 ? true : (appendCandidate ? prior!.terminated : true);
     let malformed = false;
-    readLines(unit.key, (line: string, lineTerminated: boolean, endOffset?: number) => {
+    readSourceLines((line: string, lineTerminated: boolean, endOffset?: number) => {
       scannedTerminated = lineTerminated;
       if (!lineTerminated) return;
       scannedLineNum++;
@@ -689,7 +770,7 @@ export function* parse(
   // file cannot block a whole-snapshot rebuild.
   if (!sameStat(stat, afterScan)) return _cursor;
   if (scanResult.malformed) {
-    if (prior === null) return _cursor;
+    if (prior === null && (!compressed || _cursor === null)) return _cursor;
     throw new Error(CODEX_MALFORMED_LINE_ERROR);
   }
   const priorCompleteLineOffset = appendCandidate ? prior!.completeLineOffset! : null;
@@ -758,7 +839,9 @@ export function* parse(
   const responseMessageBloom = fast ? priorResponseBloom : emptyBloom();
   for (const key of eventMessageKeys) bloomAdd(eventMessageBloom, key);
   const previous = fast ? prior : null;
-  const basicCursor = `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}`;
+  const basicCursor = compressed
+    ? encodeCodexZstCursor(stat, completeLineCount)
+    : `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}`;
   const capturedMeta = metaRecord as { lineNum: number; obj: any } | null;
   if (capturedMeta === null) return basicCursor;
 
@@ -961,7 +1044,7 @@ export function* parse(
 
   let currentLine = fast ? prior!.lineCount : 0;
   const emitStart = fast ? prior!.size : 0;
-  readLines(unit.key, (line: string, lineTerminated: boolean) => {
+  readSourceLines((line: string, lineTerminated: boolean) => {
     if (!lineTerminated) return;
     currentLine++;
     try {
@@ -1001,44 +1084,55 @@ export function* parse(
   }
 
   const checkpointSize = completeLineOffset;
-  const outCursor = encodeCodexCursor(stat, completeLineCount, checkpointSize, {
-    v: CODEX_CURSOR_STATE_VERSION,
-    threadRawId,
-    meta,
-    completeLineOffset: checkpointSize,
-    sourceSize: stat.size,
-    dev: String(stat.dev),
-    sourceInode: String(stat.ino),
-    // A complete initial snapshot is verified by definition. Cooperative
-    // append keeps the old hashes only as stale metadata and must not claim
-    // that the enlarged prefix was verified.
-    verifiedPrefix: !cooperativeCandidate
-      && fingerprint.complete
-      && (prior === null || fingerprint.prefixMatches),
-    stateComplete,
-    indexedTitle: indexedMeta?.indexedTitle,
-    indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
-    chunkHashes: fingerprint.chunkHashes,
-    eventMessageBloom: eventMessageBloom.toString('base64url'),
-    responseMessageBloom: responseMessageBloom.toString('base64url'),
-    openCallMessageUuids: Object.fromEntries(openCallMessageUuids),
-    terminated,
-    currentCwd,
-    currentModel,
-    lastMessageUuid: sm.lastMessageUuid,
-    lastTextAssistant,
-    startedAt: sm.started_at,
-    endedAt: sm.ended_at,
-    gitBranch: sm.git_branch,
-    version: sm.version,
-    threadTitle: sm.threadTitle,
-    messageCount: sm.n,
-    totalInputTokens: sm.totalInputTokens,
-    totalOutputTokens: sm.totalOutputTokens,
-  });
+  const outCursor = compressed
+    ? encodeCodexZstCursor(stat, completeLineCount)
+    : encodeCodexCursor(stat, completeLineCount, checkpointSize, {
+        v: CODEX_CURSOR_STATE_VERSION,
+        threadRawId,
+        meta,
+        completeLineOffset: checkpointSize,
+        sourceSize: stat.size,
+        dev: String(stat.dev),
+        sourceInode: String(stat.ino),
+        // A complete initial snapshot is verified by definition. Cooperative
+        // append keeps the old hashes only as stale metadata and must not claim
+        // that the enlarged prefix was verified.
+        verifiedPrefix: !cooperativeCandidate
+          && fingerprint.complete
+          && (prior === null || fingerprint.prefixMatches),
+        stateComplete,
+        indexedTitle: indexedMeta?.indexedTitle,
+        indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
+        chunkHashes: fingerprint.chunkHashes,
+        eventMessageBloom: eventMessageBloom.toString('base64url'),
+        responseMessageBloom: responseMessageBloom.toString('base64url'),
+        openCallMessageUuids: Object.fromEntries(openCallMessageUuids),
+        terminated,
+        currentCwd,
+        currentModel,
+        lastMessageUuid: sm.lastMessageUuid,
+        lastTextAssistant,
+        startedAt: sm.started_at,
+        endedAt: sm.ended_at,
+        gitBranch: sm.git_branch,
+        version: sm.version,
+        threadTitle: sm.threadTitle,
+        messageCount: sm.n,
+        totalInputTokens: sm.totalInputTokens,
+        totalOutputTokens: sm.totalOutputTokens,
+      });
   if (metrics) metrics.emittedRecords += out.length;
   yield* out;
   return outCursor;
+}
+
+function existingCodexRepresentation(path: string): string | null {
+  const plain = isCodexCompressedPath(path)
+    ? path.slice(0, -'.zst'.length)
+    : path;
+  if (existsSync(plain)) return plain;
+  if (existsSync(`${plain}.zst`)) return `${plain}.zst`;
+  return null;
 }
 
 function findCodexFile(rootDir: string, rawThreadId: string): string | null {
@@ -1048,8 +1142,15 @@ function findCodexFile(rootDir: string, rawThreadId: string): string | null {
     if (!existsSync(current)) continue;
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
-      if (entry.isDirectory()) stack.push(path);
-      else if (entry.isFile() && entry.name.endsWith(`${rawThreadId}.jsonl`)) return path;
+      if (entry.isDirectory()) {
+        stack.push(path);
+      } else if (
+        entry.isFile()
+        && (entry.name.endsWith(`${rawThreadId}.jsonl`) || entry.name.endsWith(`${rawThreadId}.jsonl.zst`))
+      ) {
+        const resolved = existingCodexRepresentation(path);
+        if (resolved !== null) return resolved;
+      }
     }
   }
   return null;
@@ -1061,10 +1162,11 @@ function rawCodex(rootDir: string, input: RawLookup): RawRecord | null {
   const path = input.agentId === null && typeof input.session?.jsonl_path === 'string'
     ? input.session.jsonl_path
     : findCodexFile(rootDir, match[1]!);
-  if (path === null || !existsSync(path)) return null;
+  const resolvedPath = path !== null ? existingCodexRepresentation(path) : null;
+  if (resolvedPath === null) return null;
   let lineNumber = 0;
   let found: string | null = null;
-  readLines(path, (line: string) => {
+  readCodexLines(resolvedPath, (line: string) => {
     lineNumber++;
     if (lineNumber !== Number(match[2])) return;
     found = line;
