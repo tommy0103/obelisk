@@ -98,6 +98,7 @@ test('additive migrations preserve old index state and summary rows while adding
     `);
 
     migrateCoreSchemaColumns(db);
+    assert.equal(db.prepare("SELECT replay_required FROM index_state WHERE jsonl_path='unit'").get().replay_required, 0);
     assert.equal(
       db.prepare("SELECT cursor FROM index_state WHERE jsonl_path='unit'").get().cursor,
       null,

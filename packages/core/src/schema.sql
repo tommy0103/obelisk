@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS workflow_agents (
   phase TEXT, label TEXT, model TEXT, state TEXT,
   duration_ms INTEGER, tokens INTEGER, tool_calls INTEGER);
 CREATE TABLE IF NOT EXISTS index_state (
-  jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER, cursor TEXT);
+  jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER, replay_required INTEGER NOT NULL DEFAULT 0, cursor TEXT);
 CREATE TABLE IF NOT EXISTS summaries (
   id TEXT PRIMARY KEY, session_id TEXT, timestamp TEXT,
   source TEXT, content TEXT, visibility TEXT DEFAULT 'visible',

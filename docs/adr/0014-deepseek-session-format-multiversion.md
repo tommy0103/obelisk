@@ -1,4 +1,4 @@
-# DeepSeek provider: session format multi-version support (v0–v3)
+# DeepSeek provider: session format multi-version support (v0–v4)
 
 **Context.** DeepSeek Harness (dsh) versions its session format with a
 monotonic integer carried both in the header line's `version` field and in the
@@ -36,9 +36,12 @@ keep one projection path.
   post-migration twin pair from tripping the divergent-identity guard or
   double-indexing.
 - **Version gate**: accept `undefined`, 0, 1, 2, 3; anything newer stays
-  fail-closed (skip and record, suppress the project directory — CONTRIBUTING:
-  tolerate the unknown, never poison the provider). v1 is physically v0 and
-  takes the v0 path.
+  fail-closed for its complete root tree (skip and record, explicitly retain
+  last-good canonical rows, and continue unrelated trees — CONTRIBUTING:
+  tolerate the unknown, never poison the provider). Identity/ancestry are kept
+  for discovery only. Malformed version values and unreadable identity headers
+  remain inventory errors with project-level suppression. v1 is physically v0
+  and takes the v0 path.
 - **Seed-prefix marker**: v0/v1 keep using `header.seedLength`; v2/v3 drop it,
   so the inherited parent prefix ends at the last `session/end-seed` event
   with `data.inherited === true` (skip `seq <` that event's seq). The resolved
@@ -120,3 +123,94 @@ keep one projection path.
   .interrupted`) are unchanged by this decision.
 
 Implementation detail: `docs/deepseek-harness-v2-v3-multiversion-adapter-plan.md`.
+
+**Amendment (2026-10-18): v4 support, and the per-version review it required.**
+
+DSH 0.2.0 writes session format **v4** (`session.v4.jsonl[.zstd]`, header
+`version: 4`). Under the v0–v3 gate above, every v4 artifact failed the header
+gate, so any project directory containing one was suppressed whole and an
+incremental build could never publish a complete snapshot
+(`incomplete_snapshot`) — the same failure #181/#173 reported one generation
+earlier. The decision is unchanged in kind, extended in range: **the version
+gate accepts `undefined`, 0, 1, 2, 3, and 4**; anything newer stays
+fail-closed (skip and record, project directory suppressed, never parsed as a
+known format). This supersedes the range in the "Version gate" bullet above;
+the title of this record follows the live range.
+
+The per-version review ADR-0014 asks for, verified against the v4 writer
+(dsh 0.2.0-rc.2, `packages/session/session-format-v3-to-v4`):
+
+- **`tool/result` carries a first-class tool-role message.** The released V3
+  wrapper (`message.content[0] = {type: 'tool-result', toolCallId, content,
+  isError?}`) is lifted into `message: {role: 'tool', toolCallId, content:
+  <direct block array>, source: {kind: 'tool', callId}, isError?}`. The adapter
+  reads `message.source.callId` and `message.content` and recurses only for
+  `type: 'tool-result'` blocks, so v4 results project 1:1 through the same code
+  path — one tool_call + one tool_result per call, no double projection.
+- **`source.kind: 'plugin'` is retired** in favour of producer-owned kinds
+  (`runtime-context`, `system-prompt`, `compact-checkpoint`, …). The meta rule
+  is `source.kind !== 'user'`, so injected rows keep classifying as
+  `is_meta = 1` with no rule change.
+- **Event types v4 adds fall through the projection's `default:` branch** and
+  are skipped, exactly like the v0–v3 log-only events listed under
+  Consequences (`step/*`, `turn/*`, `request/context`, `approval/policy`,
+  `permission/preset`, `sandbox/mode`, `workspace/changes`,
+  `command/run|done`, `todo/write`, `assistant/attempt`, `goal/change`,
+  `llm/retry*`, …).
+- **`surfaceOp` replacement semantics remain deliberately unapplied** — the
+  verbatim append-only decision above is version-independent.
+- **`system/message` remains unindexed** (parity with v0/v2, and with v3).
+- **Tool failures retain their meaning across migration.** The adapter reads
+  `data.error` in every format, the released `tool-result` wrapper's flag in
+  V0–V3, and message-level `message.isError` on V4 tool-role messages. The
+  V3-to-V4 migration lifts the wrapper flag
+  onto the message without necessarily adding `data.error`; ignoring the new
+  location would turn an already-indexed failure into success on replay.
+  Plain and zstd migration tests pin the failure before and after the twin
+  switch, including its call linkage and canonical round-trip equivalence.
+  Same-named extension fields have no error semantics: an outer V3 message
+  flag is preserved by migration as `plugin:message:isError`, while an
+  ordinary V4 content block may carry its own unrelated extension. Successful
+  V3/V4 writer/codec twins pin both collisions in plain and zstd form.
+- **No additional `indexVersionMarker` bump for this release.** V4 support and
+  its error-flag projection ship together, so supported V0–V3 rows retain their
+  values. When an upstream migration publishes a V4 twin, its new member path
+  triggers snapshot fallback under the same session identity. If error-flag
+  handling were deferred until after V4 support shipped, correcting already
+  indexed V4 rows would require a replay/marker change.
+
+Fixtures: `tests/fixtures/deepseek/sessions/--dsh-v4--/v4-basic` was written
+through the real DSH 0.2.0-rc.2 writer (`JsonlSessionPersistence.create`/
+`append`, compression `none`) from hand-built event bodies — the same
+construction `scripts/gen-dsh-fixtures.mjs` uses for the v3 corpus. Every
+required field of each v4 event shape is present (`session/title` carries
+`messageSeqs`/`source`), and the fields the writer always emits are set
+(`tool/result`'s message-level `isError` and its `sourceEventSeqs`); ids and
+cwd are synthetic and no user path is carried. Committed uncompressed so the
+v4 shapes are readable in the diff. One committed `assistant/message` per step,
+as the writer emits.
+`tests/deepseek-tree.test.mjs` asserts the v4 artifact is discovered, parsed,
+and persisted (all six message rows, the meta row, and the tool_call/
+tool_result pair) and checks direct assembly against the SQLite round trip.
+The `v4-failed-tool` twins were encoded with the released V3 codec and migrated
+by the DSH 0.2.0-rc.2 write-open path, as were the `v4-success-extensions`
+twins containing opaque outer-message and text-block flags. The
+`v4-retry-resume` artifact was written
+with a failed `assistant/attempt`, one committed answer, then a reopened writer
+appending a second turn. Its test requires unique committed-message identities,
+both answers surviving, incremental/full replay equivalence, and the canonical
+round trip; it does not bless overwriting one committed answer with another.
+The first version past the new range (5) is still rejected. The 2026-10-20
+amendment below replaces project-wide suppression with explicit tree retention.
+
+The historical plan document
+(`docs/deepseek-harness-v2-v3-multiversion-adapter-plan.md`) is left as the
+point-in-time record of the v0–v3 implementation, not updated for v4.
+
+**Amendment (2026-10-20): safe future-format publication.** The v5 canonical
+marker repairs readable partial trees from the old directory-only suppression.
+The adapter checkpoint encoding remains v2. Force rebuilds retain affected
+last-good trees via the shared snapshot contract in ADR-0001; historical
+checkpoints remain identity evidence while per-unit replay is pending. Current
+and historical ownership are reconciled as described in ADR-0011. This combines
+with the v4 projection amendment above; v5 is the first unsupported generation.

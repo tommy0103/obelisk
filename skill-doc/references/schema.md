@@ -23,6 +23,12 @@ schema.
 - Kimi Code rows use `source='kimi'`.
 - OMP rows use `source='omp'`; session IDs are prefixed with `omp:`.
 - Pi rows use `source='pi'`; session IDs are prefixed with `pi:`.
+- OpenCode rows use `source='opencode'`; session IDs are prefixed with
+  `opencode:`. Obelisk indexes V1 and V2 SQLite databases (`opencode.db` and
+  channel stores; earlier JSON formats are not indexed). Canonical token
+  accounting folds provider breakdowns: V2 combines input + cache read/write
+  into `input_tokens` and output + reasoning into `output_tokens`; V1 uses
+  per-step `step-finish` usage with assistant-level fallback.
 - DeepSeek Harness rows use `source='deepseek'`; session IDs are prefixed with
   `deepseek:`. Subagent logs fold into their root parent session as sidechain
   messages (`is_sidechain=1`, `agent_id` = the subagent's `deepseek:` id), and

@@ -72,6 +72,11 @@ explicit path into the hot set for both startup and runtime activity:
 1. A startup/full inventory returns `watchHints` for recently processed
    transcripts, covering an active file whose descriptor was already open
    before the watcher started.
+   For virtual database-unit keys, an adapter may implement
+   `watchHints(unitKey)` to return actual source files (including its WAL).
+   Core expands and deduplicates these paths within the same bounded hint
+   budget, in the indexer worker. Adapters return no hints for excluded roots;
+   no provider-specific key parsing or directory scans run in Electron main.
 2. A new transcript is first visible as a topology `create` event on its tree.
    The package promotes that path before delivering the path invalidation; the
    caller's catch-up build reads all content written before promotion, and

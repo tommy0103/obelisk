@@ -8,6 +8,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { storedProviderCursor } from '../packages/core/src/provider-indexing.ts';
 import { buildIndex } from '../app/src/main/indexer.ts';
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
 import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
@@ -378,7 +379,9 @@ test('marker replay invalidates provider unit keys that differ from source paths
   incomplete = true;
   assert.equal(buildIndex(options).complete, false);
   db = new TestDatabase(dbPath);
-  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(unitKey).c, 0);
+  assert.equal(storedProviderCursor(db, unitKey), null, 'the old checkpoint cannot resume projection');
+  assert.equal(db.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(unitKey).replay_required, 1);
+  assert.equal(db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(unitKey).cursor, '10:1', 'historical identity evidence survives invalidation');
   db.close();
 
   incomplete = false;
@@ -548,4 +551,159 @@ test('force rebuild keeps legacy providers without inventory certification compa
   assert.equal(afterDb.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(unitKey).c, 1);
   assert.equal(afterDb.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(marker).c, 1);
   afterDb.close();
+});
+
+test('desktop worker exposes transient provider reads to the existing inventory retry path', async () => {
+  const { RetryableSourceReadError } = await import('../packages/core/src/providers/source-read-error.ts');
+  class TransactionDatabase extends TestDatabase { get inTransaction() { return this.db.isTransaction; } }
+  const home = makeTempDir('obelisk-provider-read-retry-'); let unstable = true;
+  const registry = createProviderRegistry([{
+    name: 'alpha', descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: home, color: '#123456' },
+    watchTargets: () => [], raw: () => null,
+    discover: ctx => ctx.lastCursor('alpha:unit') ? [] : [{ key: 'alpha:unit', sessionId: 'alpha:session' }],
+    *parse(unit) {
+      if (unstable) throw new RetryableSourceReadError(home, 'source changed before parse');
+      yield { kind: 'session', id: unit.sessionId, title: 'recovered', project: null, started_at: null, ended_at: null, git_branch: null, version: null, message_count: 0, countMode: 'total', jsonl_path: unit.key, source: 'alpha' };
+      return '10:0';
+    },
+  }]);
+  const options = { providerRegistry: registry, providerRoots: { alpha: home },
+    claudeDir: join(home, 'empty-claude'), codexDir: join(home, 'empty-codex'),
+    dbPath: join(home, 'index.sqlite'), DatabaseImpl: TransactionDatabase };
+  const failed = buildIndex(options);
+  assert.equal(failed.complete, false);
+  assert.deepEqual(failed.inventoryIssues, [{ provider: 'alpha', path: home, error: 'source changed before parse' }]);
+  unstable = false;
+  const retry = buildIndex(options);
+  assert.equal(retry.complete, true); assert.deepEqual(retry.inventoryIssues, []);
+  assert.equal(buildIndex(options).files, 0);
+});
+
+function atomicProvider(name = 'atomic') {
+  const state = { version: 0, fail: false, busy: false, retain: false, calls: [] };
+  const provider = {
+    name,
+    descriptor: { id: name, name: 'Atomic', vendor: 'Test', defaultRoot: '/atomic', color: '#123456' },
+    indexVersionMarker: '__atomic_v2__', watchTargets: () => [], raw: () => null,
+    discover(ctx) {
+      if (state.retain) ctx.retainSession(`${name}:a`);
+      return ['a', 'healthy', 'b'].map(id => ({
+        key: `${name}:${id}`, sessionId: `${name}:${id}`,
+        ...(id === 'healthy' ? {} : { atomicGroup: 'transfer' }),
+      })).filter(unit => ctx.lastCursor(unit.key) !== `${10 + state.version}:${state.version + 1}`);
+    },
+    *parse(unit, cursor) {
+      state.calls.push(unit.sessionId);
+      yield { kind: 'session', id: unit.sessionId, title: `v${state.version}`, project: null,
+        started_at: null, ended_at: null, git_branch: null, version: null,
+        message_count: cursor === null ? state.version + 1 : 1, countMode: cursor === null ? 'total' : 'delta',
+        jsonl_path: unit.key, source: name };
+      for (let version = cursor === null ? 0 : state.version; version <= state.version; version++) {
+        yield { kind: 'message', uuid: `${unit.sessionId}:${version}`, session_id: unit.sessionId, type: 'user',
+          parent_uuid: null, timestamp: null, role: 'user', text: `v${version}`, content_type: 'text',
+          is_meta: 0, visibility: 'visible', model: null, is_sidechain: 0, agent_id: null,
+          input_tokens: null, output_tokens: null, cwd: null, skill: null, source: name };
+      }
+      if (unit.sessionId === `${name}:b` && state.busy) {
+        state.busy = false;
+        throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+      }
+      if (unit.sessionId === `${name}:b` && state.fail) throw new Error('receiver failed after writing');
+      return `${10 + state.version}:${state.version + 1}`;
+    },
+  };
+  return { state, provider };
+}
+
+for (const replay of [false, true]) {
+  test(`a failed publication group rolls back every member and keeps unrelated progress (${replay ? 'marker replay' : 'incremental'})`, () => {
+    const home = makeTempDir('obelisk-atomic-rollback-');
+    const dbPath = join(home, 'index.sqlite');
+    const { state, provider } = atomicProvider();
+    const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+    const seed = replay ? { ...options, providerRegistry: createProviderRegistry([{ ...provider, indexVersionMarker: '__atomic_v1__' }]) } : options;
+    assert.equal(buildIndex(seed).complete, true);
+    state.version = 1;
+    state.fail = true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = buildIndex(options);
+      assert.equal(result.complete, false);
+      assert.deepEqual(result.affectedSessionIds, attempt === 0 ? ['atomic:healthy'] : []);
+      const db = new DatabaseSync(dbPath);
+      for (const id of ['a', 'b']) {
+        assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id=?').get(`atomic:${id}`).message_count, 1);
+        assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE session_id=?').get(`atomic:${id}`).n, 1);
+        const row = db.prepare('SELECT cursor,replay_required FROM index_state WHERE jsonl_path=?').get(`atomic:${id}`);
+        assert.equal(row.cursor, '10:1');
+        assert.equal(row.replay_required, 1);
+      }
+      assert.equal(db.prepare("SELECT message_count FROM sessions WHERE id='atomic:healthy'").get().message_count, 2);
+      db.close();
+    }
+    state.fail = false;
+    const recovered = buildIndex(options);
+    assert.equal(recovered.complete, true);
+    assert.deepEqual(recovered.affectedSessionIds, ['atomic:a', 'atomic:b']);
+    const db = new DatabaseSync(dbPath);
+    assert.equal(db.prepare('SELECT count(*) n FROM index_state WHERE replay_required=1').get().n, 0);
+    assert.ok(db.prepare('SELECT message_count FROM sessions').all().every(row => row.message_count === 2));
+    db.close();
+  });
+}
+
+test('a transient BUSY retries the whole publication group without double counting', () => {
+  const home = makeTempDir('obelisk-atomic-retry-');
+  const dbPath = join(home, 'index.sqlite');
+  const { state, provider } = atomicProvider();
+  const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+  assert.equal(buildIndex(options).complete, true);
+  state.version = 1;
+  state.busy = true;
+  state.calls.length = 0;
+  const result = buildIndex(options);
+  assert.equal(result.complete, true);
+  assert.deepEqual(state.calls, ['atomic:a', 'atomic:b', 'atomic:a', 'atomic:b', 'atomic:healthy']);
+  assert.deepEqual(result.affectedSessionIds, ['atomic:a', 'atomic:b', 'atomic:healthy']);
+  const db = new DatabaseSync(dbPath);
+  assert.ok(db.prepare('SELECT message_count FROM sessions').all().every(row => row.message_count === 2));
+  assert.equal(db.prepare('SELECT count(*) n FROM messages').get().n, 6);
+  db.close();
+});
+
+test('retaining one member preserves its entire publication group in a force snapshot', () => {
+  const home = makeTempDir('obelisk-atomic-retained-');
+  const dbPath = join(home, 'index.sqlite');
+  const { state, provider } = atomicProvider();
+  const options = { dbPath, providerRegistry: createProviderRegistry([provider]) };
+  assert.equal(buildIndex(options).complete, true);
+  state.version = 1;
+  state.retain = true;
+  state.calls.length = 0;
+  const result = buildIndex({ ...options, force: true });
+  assert.equal(result.complete, true);
+  assert.deepEqual(state.calls, ['atomic:healthy']);
+  const db = new DatabaseSync(dbPath);
+  assert.deepEqual(db.prepare('SELECT id,message_count FROM sessions ORDER BY id').all().map(row => [row.id,row.message_count]),
+    [['atomic:a',1],['atomic:b',1],['atomic:healthy',2]]);
+  db.close();
+});
+
+
+test('identical publication group keys remain isolated across providers', () => {
+  const home = makeTempDir('obelisk-atomic-provider-scope-');
+  const dbPath = join(home, 'index.sqlite');
+  const alpha = atomicProvider('alpha');
+  const beta = atomicProvider('beta');
+  const options = { dbPath, providerRegistry: createProviderRegistry([alpha.provider, beta.provider]) };
+  assert.equal(buildIndex(options).complete, true);
+  alpha.state.version = beta.state.version = 1;
+  alpha.state.fail = true;
+  const result = buildIndex(options);
+  assert.equal(result.complete, false);
+  assert.ok(result.affectedSessionIds.includes('beta:a') && result.affectedSessionIds.includes('beta:b'));
+  assert.ok(!result.affectedSessionIds.includes('alpha:a') && !result.affectedSessionIds.includes('alpha:b'));
+  const db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare("SELECT message_count FROM sessions WHERE id='alpha:a'").get().message_count, 1);
+  assert.equal(db.prepare("SELECT message_count FROM sessions WHERE id='beta:a'").get().message_count, 2);
+  db.close();
 });

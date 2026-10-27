@@ -187,3 +187,95 @@ test('Hermes profile stores reach the indexer through the declared tree file nam
     mock.reset();
   }
 });
+
+test('caller routes OpenCode dynamic channel databases without synchronous directory listing', async () => {
+  let captured = null;
+  const ctx = mock.module(WATCHER_URL, {
+    namedExports: {
+      createAdaptiveWatcher: (opts) => {
+        captured = opts;
+        return { stop() {}, ready: Promise.resolve() };
+      },
+    },
+  });
+  try {
+    const { createOpencodeProvider } = await import('../packages/core/src/providers/opencode.ts');
+    const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?watcher-opencode=${Date.now()}`);
+    const home = mkdtempSync(join(tmpdir(), 'obelisk-opencode-wf-'));
+    const opencodeDir = join(home, 'data');
+    mkdirSync(opencodeDir, { recursive: true });
+
+    const provider = createOpencodeProvider({
+      rootDir: opencodeDir,
+      homeDir: home,
+      openDatabase: () => { throw new Error('watcher filter must not open database'); },
+    });
+    const targets = provider.watchTargets(opencodeDir);
+
+    const timers = manualTimers();
+    const builds = [];
+    const service = createIndexerService({
+      buildIndex: async (args) => builds.push(args),
+      watchTargets: targets,
+      writeHeartbeat: () => {},
+      timers,
+      stabilityMs: 0,
+    });
+    service.start({ buildOnStart: false });
+
+    // Newly created channel database (created AFTER watcher started) promotes immediately
+    const channelDb = join(opencodeDir, 'opencode-dev.db');
+    const channelWal = join(opencodeDir, 'opencode-dev.db-wal');
+    writeFileSync(channelDb, '');
+    writeFileSync(channelWal, '');
+
+    assert.equal(captured.shouldPromote(channelDb), true, 'new channel db promotes immediately');
+    assert.equal(captured.shouldPromote(channelWal), true, 'new channel wal promotes immediately');
+    assert.equal(captured.shouldPromote(join(opencodeDir, 'opencode.db-shm')), false, 'shm is rejected');
+    assert.equal(captured.shouldPromote(join(opencodeDir, 'stray.db')), false, 'non-channel db is rejected');
+
+    captured.onInvalidate({ type: 'paths', paths: [channelDb] });
+    timers.flush();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      builds.flatMap((build) => build.changedPaths ?? []).includes(channelDb),
+      true,
+      'newly created channel db triggers index build',
+    );
+
+    service.stop();
+  } finally {
+    ctx.restore();
+    mock.reset();
+  }
+});
+
+test('merged OpenCode predicate preserves Hermes profile database names', async () => {
+  const { createProviderRegistry } = await import('../packages/core/src/providers/registry.ts');
+  const { createHermesProvider } = await import('../packages/core/src/providers/hermes.ts');
+  const { createOpencodeProvider } = await import('../packages/core/src/providers/opencode.ts');
+  let captured;
+  const ctx = mock.module(WATCHER_URL, { namedExports: { createAdaptiveWatcher: opts => {
+    captured = opts; return { stop() {}, ready: Promise.resolve() };
+  } } });
+  try {
+    const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?merged=${Date.now()}`);
+    const root = mkdtempSync(join(tmpdir(), 'obelisk-merged-watch-'));
+    const profiles = join(root, 'profiles');
+    mkdirSync(join(profiles, 'coder'), { recursive: true });
+    const wal = join(profiles, 'coder', 'state.db-wal'); writeFileSync(wal, '');
+    const targets = createProviderRegistry([
+      createHermesProvider({ rootDir: root }), createOpencodeProvider({ rootDir: profiles }),
+    ]).watchTargets();
+    const timers = manualTimers(); const builds = [];
+    const service = createIndexerService({ watchTargets: targets, stabilityMs: 0, timers,
+      writeHeartbeat() {}, buildIndex: async args => builds.push(args) });
+    try {
+      service.start({ buildOnStart: false });
+      assert.equal(captured.shouldPromote(wal), true);
+      captured.onInvalidate({ type: 'paths', paths: [wal] }); timers.flush();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(builds.map(b => b.changedPaths), [[wal]]);
+    } finally { service.stop(); }
+  } finally { ctx.restore(); mock.reset(); }
+});

@@ -28,6 +28,7 @@ import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+import { runCli } from './cli-test-helpers.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
@@ -987,10 +988,16 @@ test('an unknown higher header version is skipped and recorded, never parsed as 
     JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'future' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
   ].join('\n') + '\n');
   const issues = [];
+  const skipped = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    reportSkippedArtifact: (i) => skipped.push(i),
+  });
   assert.equal(units.length, 0);
-  assert.ok(issues.some((i) => i.error.includes('version 99')));
+  assert.ok(skipped.some((i) => i.error.includes('version 99')));
+  assert.deepEqual(issues, [], 'the artifact was enumerated, so it is a skip and not an inventory gap');
 });
 
 test('a permission-denied session dir is an inventory error, never a deletion', { skip: process.platform === 'win32' }, () => {
@@ -1263,14 +1270,15 @@ const V3_FIXTURES = fileURLToPath(new URL('./fixtures/deepseek/sessions/--dsh-v3
 
 // Copy generated fixture scenarios into a fresh temp sessions root so tests
 // can append without touching the pristine artifacts.
-function stageV3(dir, scenarios, { include = null } = {}) {
+function stageFixtures(dir, scenarios, { include = null, version = 3 } = {}) {
+  const fixtures = fileURLToPath(new URL(`./fixtures/deepseek/sessions/--dsh-v${version}--`, import.meta.url));
   const sessionsDir = join(dir, 'sessions');
   for (const scenario of scenarios) {
-    const target = join(sessionsDir, '--dsh-v3--', scenario);
+    const target = join(sessionsDir, `--dsh-v${version}--`, scenario);
     mkdirSync(target, { recursive: true });
-    for (const entry of readdirSync(join(V3_FIXTURES, scenario))) {
+    for (const entry of readdirSync(join(fixtures, scenario))) {
       if (include !== null && !include.includes(entry)) continue;
-      copyFileSync(join(V3_FIXTURES, scenario, entry), join(target, entry));
+      copyFileSync(join(fixtures, scenario, entry), join(target, entry));
     }
   }
   return sessionsDir;
@@ -1311,7 +1319,7 @@ function recodeCursor(cursor, state) {
 
 test('v3 zstd artifacts are discovered and projected; system prompts stay unindexed', () => {
   const dir = makeTempDir('obelisk-v3-basic-');
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-basic']) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-basic']) });
   const { unit, values } = parseFirst(provider);
   const session = values.find((r) => r.kind === 'session');
   assert.equal(session.version, '3');
@@ -1335,7 +1343,7 @@ test('v3 zstd artifacts are discovered and projected; system prompts stay uninde
 
 test('a multi-generation directory indexes only the highest generation', () => {
   const dir = makeTempDir('obelisk-v3-multigen-');
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-migrated']) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-migrated']) });
   const units = provider.discover({ lastCursor: () => null });
   assert.equal(units.length, 1, 'v2/v3 twins are one unit, not a duplicate or a divergence');
   const { values } = drain(provider.parse(units[0], null));
@@ -1354,7 +1362,7 @@ test('a multi-generation directory indexes only the highest generation', () => {
 
 test('a v2-only artifact parses: code-dispatch spelling, system prompt unindexed', () => {
   const dir = makeTempDir('obelisk-v2-only-');
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-migrated'], { include: ['session.v2.jsonl'] }) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-migrated'], { include: ['session.v2.jsonl'] }) });
   const { unit, values } = parseFirst(provider);
   const session = values.find((r) => r.kind === 'session');
   assert.equal(session.version, '2');
@@ -1369,7 +1377,7 @@ test('a v2-only artifact parses: code-dispatch spelling, system prompt unindexed
 
 test('compaction replace rows stay indexed: pre-compaction history remains searchable (ADR-0014)', () => {
   const dir = makeTempDir('obelisk-v3-compact-');
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-compacted']) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-compacted']) });
   const { values } = parseFirst(provider);
   const texts = values.filter((r) => r.kind === 'message').map((m) => m.text).filter(Boolean);
   // Obelisk indexes the append-only log verbatim: a replace surfaceOp does
@@ -1385,7 +1393,7 @@ test('compaction replace rows stay indexed: pre-compaction history remains searc
 
 test('a v3 seeded subagent skips the inherited prefix at the end-seed marker', () => {
   const dir = makeTempDir('obelisk-v3-seeded-');
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-seeded-parent', 'v3-seeded-child']) });
   const units = provider.discover({ lastCursor: () => null });
   assert.equal(units.length, 1, 'child folds into the parent tree');
   const { values } = drain(provider.parse(units[0], null));
@@ -1403,7 +1411,7 @@ test('PTC dispatches index as tool_call/tool_result under the outer run_code anc
   const dir = makeTempDir('obelisk-v3-ptc-');
   // The staged dir deliberately keeps session.migration.*.tmp /
   // session.v9.*.tmp write-noise siblings: discovery must ignore them.
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-ptc']) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-ptc']) });
   const { unit, values } = parseFirst(provider);
   const calls = values.filter((r) => r.kind === 'tool_call').map((c) => c.name).sort();
   assert.deepEqual(calls, ['read', 'run_code', 'write']);
@@ -1423,7 +1431,7 @@ test('PTC dispatches index as tool_call/tool_result under the outer run_code anc
 
 test('a replace surfaceOp in a new window stays on the fast path (no retraction, by design)', () => {
   const dir = makeTempDir('obelisk-v3-replace-win-');
-  const sessionsDir = stageV3(dir, ['v3-ptc']);
+  const sessionsDir = stageFixtures(dir, ['v3-ptc']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
@@ -1451,7 +1459,7 @@ test('a replace surfaceOp in a new window stays on the fast path (no retraction,
 
 test('PTC anchors resolve across windows while the parent is in flight, and prune at its result', () => {
   const dir = makeTempDir('obelisk-v3-ptc-anchor-');
-  const sessionsDir = stageV3(dir, ['v3-ptc']);
+  const sessionsDir = stageFixtures(dir, ['v3-ptc']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
 
@@ -1501,7 +1509,7 @@ test('PTC anchors resolve across windows while the parent is in flight, and prun
 
 test('watcher routing matches versioned filenames and ignores lock/tmp noise', () => {
   const dir = makeTempDir('obelisk-v3-watch-');
-  const sessionsDir = stageV3(dir, ['v3-basic']);
+  const sessionsDir = stageFixtures(dir, ['v3-basic']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
@@ -1516,7 +1524,7 @@ test('watcher routing matches versioned filenames and ignores lock/tmp noise', (
 
 test('raw() resolves v3 (zstd) source lines', () => {
   const dir = makeTempDir('obelisk-v3-raw-');
-  const provider = createDeepseekProvider({ rootDir: stageV3(dir, ['v3-basic']) });
+  const provider = createDeepseekProvider({ rootDir: stageFixtures(dir, ['v3-basic']) });
   const { unit, values } = parseFirst(provider);
   const userMsg = values.find((r) => r.kind === 'message' && r.text === 'please read a.ts');
   const raw = provider.raw({ source: 'deepseek', messageUuid: userMsg.uuid, session: { jsonl_path: unit.key }, agentId: null });
@@ -1529,7 +1537,7 @@ test('raw() resolves v3 (zstd) source lines', () => {
 test('an upstream v2→v3 migration continues the indexed session: no tombstone, no duplicate, no staleness', () => {
   const dir = makeTempDir('obelisk-v3-mig-cursor-');
   // Phase 1: only the v2 generation exists (the pre-migration on-disk state).
-  const sessionsDir = stageV3(dir, ['v3-migrated'], { include: ['session.v2.jsonl'] });
+  const sessionsDir = stageFixtures(dir, ['v3-migrated'], { include: ['session.v2.jsonl'] });
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const db = freshDb();
   const store = cursorStore();
@@ -1573,14 +1581,14 @@ test('an upstream v2→v3 migration continues the indexed session: no tombstone,
   db.close();
 });
 
-// The gate accepts 0–3 and nothing beyond: a version-4 file must never be
+// The gate accepts 0–4 and nothing beyond: a version-5 file must never be
 // parsed as a known format, and per CONTRIBUTING it must not poison the
-// provider — skip, record, and suppress the project directory.
-test('a version-4 header is rejected at the gate and suppresses its whole project directory (fail closed)', () => {
-  const dir = makeTempDir('obelisk-version4-');
+// provider — skip and record, withhold the affected tree, preserve siblings.
+test('a version-5 header withholds its tree while healthy sibling sessions stay live', () => {
+  const dir = makeTempDir('obelisk-version5-');
   const sessionsDir = join(dir, 'sessions');
-  // A v4 artifact (the first rejectable generation) beside a healthy v0
-  // sibling in the SAME project directory.
+  // A v5 artifact (the first rejectable generation) beside a healthy v0
+  // sibling in the SAME project directory, but a DIFFERENT session directory.
   const projectDir = join(sessionsDir, '--tmp-dsh-project--');
   const write = (name, file, header, text) => {
     const d = join(projectDir, name);
@@ -1590,7 +1598,7 @@ test('a version-4 header is rejected at the gate and suppresses its whole projec
       JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
     ].join('\n') + '\n');
   };
-  write('v4-session', 'session.v4.jsonl', { ...HEADER, version: 4, id: 'v4-session' }, 'from the future');
+  write('v5-session', 'session.v5.jsonl', { ...HEADER, version: 5, id: 'v5-session' }, 'from the future');
   write('healthy-session', 'session.jsonl', { ...HEADER, id: 'healthy-session' }, 'healthy');
   // An unrelated project stays live.
   const otherDir = join(sessionsDir, '--other--', 'other-session');
@@ -1601,12 +1609,193 @@ test('a version-4 header is rejected at the gate and suppresses its whole projec
   ].join('\n') + '\n');
 
   const issues = [];
+  const skipped = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    reportSkippedArtifact: (i) => skipped.push(i),
+  });
   assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'other projects stay live');
-  assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v4-session')),
-    'the whole project directory is suppressed — no partial snapshot');
-  assert.ok(issues.some((i) => i.error === 'Unsupported session format version 4'));
+  assert.ok(!units.some((u) => u.sessionId.includes('v5-session')),
+    'the unreadable session directory is withheld — no partial snapshot');
+  assert.ok(units.some((u) => u.sessionId.includes('healthy-session')),
+    'a sibling session the v5 file does not touch is still indexed');
+  assert.ok(skipped.some((i) => i.error === 'Unsupported session format version 5'),
+    'the skipped artifact is recorded for the user');
+  assert.deepEqual(issues, [],
+    'the path was enumerated, so an unsupported version must not certify the inventory as incomplete');
+});
+
+// DSH ≥ 0.2.0 writes v4. Its two touched deltas — the released tool/result
+// wrapper lifted into a first-class tool-role message, and producer-owned
+// source kinds replacing `kind: 'plugin'` — land on fields this adapter
+// already reads, with message-level isError handled explicitly. The
+// fixture was written through the real DSH v4 writer (ADR-0014 amendment): a
+// two-step turn, one committed assistant/message per step, carrying the fields
+// the writer always emits.
+test('a v4 session artifact is indexed: messages, tool result, and meta rows all project', () => {
+  const fixtureRoot = fileURLToPath(new URL('./fixtures/deepseek/sessions', import.meta.url));
+  const issues = [];
+  const provider = createDeepseekProvider({ rootDir: fixtureRoot });
+  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const unit = units.find((u) => u.meta.rootRawId === 'v4-basic');
+  assert.ok(unit, 'the v4 fixture artifact is discovered — v4 is never rejected as unsupported');
+  assert.ok(!issues.some((i) => i.path.includes('--dsh-v4--')), 'a v4 artifact raises no inventory issue');
+
+  const db = freshDb();
+  persist(db, unit, provider.parse(unit, null));
+  const dump = dumpDb(db);
+  assert.equal(dump.sessions.length, 1);
+  assert.equal(dump.sessions[0].title, 'v4 basic session');
+  // Every projectable row survives the round trip. The count is asserted so a
+  // dropped or overwritten row cannot hide behind a subset check — both
+  // assistant steps must be present.
+  assert.equal(dump.messages.length, 6, 'all six v4 messages are stored');
+  assert.ok(dump.messages.some((m) => m.text === 'please read a.ts' && m.is_meta === 0), 'the user message is indexed');
+  assert.ok(dump.messages.some((m) => m.text === 'Let me read it.' && m.content_type === 'text'), 'the step-1 answer is indexed');
+  assert.ok(dump.messages.some((m) => m.text === 'The file says hello.' && m.content_type === 'text'), 'the step-2 answer is indexed');
+  assert.ok(dump.messages.some((m) => m.content_type === 'tool_use'), 'the tool_use anchor is indexed');
+  assert.ok(dump.messages.some((m) => m.is_meta === 1 && m.text.includes('injected by the host')),
+    'a renamed producer source kind still classifies as meta (runtime-context ≠ user)');
+  assert.equal(dump.tool_calls.length, 1);
+  assert.equal(dump.tool_calls[0].name, 'read');
+  assert.equal(dump.tool_calls[0].file_path, '/dsh-fixtures/a.ts');
+  // v4's tool-role result: message.source.callId + a direct message.content
+  // block array — the exact fields toolResultContent/toolResultIsError read.
+  assert.equal(dump.tool_results.length, 1);
+  assert.equal(dump.tool_results[0].content, 'contents of a.ts');
+  assert.equal(dump.tool_results[0].is_error, 0);
+  assert.equal(dump.tool_results[0].message_uuid, dump.tool_calls[0].message_uuid, 'the result links to its call');
+  assertCanonicalRoundTrip(provider, unit, drain(provider.parse(unit, null)).values);
+  db.close();
+});
+
+// These twins were encoded/migrated by DSH 0.2.0-rc.2. The same failure
+// lives on a V3 wrapper and a V4 tool-role message, with no data.error.
+for (const zstd of [false, true]) {
+  test(`a failed tool stays failed after a v3→v4 migration (${zstd ? 'zstd' : 'plain'})`, () => {
+    const dir = makeTempDir('obelisk-v4-tool-failure-');
+    const sessionsDir = stageFixtures(dir, ['v4-failed-tool'], { version: 4, include: ['session.v3.jsonl'] });
+    const sessionDir = join(sessionsDir, '--dsh-v4--', 'v4-failed-tool');
+    const suffix = zstd ? '.jsonl.zstd' : '.jsonl';
+    if (zstd) {
+      const path = join(sessionDir, 'session.v3.jsonl');
+      writeFileSync(join(sessionDir, `session.v3${suffix}`), mkFrame(readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse)));
+      rmSync(path);
+    }
+    const provider = createDeepseekProvider({ rootDir: sessionsDir });
+    const db = freshDb();
+    const store = cursorStore();
+    const oldUnit = provider.discover(store.ctx())[0];
+    store.set(oldUnit.key, persist(db, oldUnit, provider.parse(oldUnit, null)));
+    assert.equal(dumpDb(db).tool_results[0].is_error, 1, 'the released wrapper marks the failure');
+
+    const source = new URL('./fixtures/deepseek/sessions/--dsh-v4--/v4-failed-tool/session.v4.jsonl', import.meta.url);
+    const v4 = readFileSync(source, 'utf8');
+    writeFileSync(join(sessionDir, `session.v4${suffix}`), zstd ? mkFrame(v4.trim().split('\n').map(JSON.parse)) : v4);
+    const units = provider.discover({
+      ...store.ctx(),
+      indexedSessions: () => [{ sessionId: oldUnit.sessionId, jsonlPath: oldUnit.key }],
+    });
+    assert.equal(units.length, 1);
+    const unit = units[0];
+    assert.equal(unit.sessionId, oldUnit.sessionId, 'migration preserves the session identity');
+    assert.ok(!unit.retractSessionIds?.length, 'the live session is not tombstoned');
+    assert.ok(unit.key.endsWith(`session.v4${suffix}`), 'the highest generation replaces its predecessor');
+    const { values } = drain(provider.parse(unit, store.ctx().lastCursor(unit.key)));
+    assert.ok(values.some((r) => r.kind === 'delete-session'), 'the changed artifact replays existing rows');
+    assert.equal(values.find((r) => r.kind === 'tool_result').is_error, 1, 'message.isError preserves the failure');
+    persist(db, unit, provider.parse(unit, store.ctx().lastCursor(unit.key)));
+    const dump = dumpDb(db);
+    assert.equal(dump.sessions.length, 1);
+    assert.equal(dump.tool_results.length, 1);
+    assert.equal(dump.tool_results[0].is_error, 1, 'an already-stored failure never becomes success');
+    assert.equal(dump.tool_results[0].content, 'Error: file not found');
+    assert.equal(dump.tool_results[0].message_uuid, dump.tool_calls[0].message_uuid);
+    assertCanonicalRoundTrip(provider, unit, values);
+    db.close();
+  });
+}
+
+// These successful twins preserve extension fields through the real V3→V4
+// migration. An outer V3 message flag is opaque metadata; a V4 text block's
+// same-named extension is likewise not the tool result's status.
+for (const version of [3, 4]) {
+  for (const zstd of [false, true]) {
+    test(`v${version} success ignores isError extension metadata (${zstd ? 'zstd' : 'plain'})`, () => {
+      const dir = makeTempDir('obelisk-tool-error-extensions-');
+      const file = `session.v${version}.jsonl`;
+      const sessionsDir = stageFixtures(dir, ['v4-success-extensions'], { version: 4, include: [file] });
+      const path = join(sessionsDir, '--dsh-v4--', 'v4-success-extensions', file);
+      const rows = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
+      const message = rows.find((event) => event.type === 'tool/result').data.message;
+      if (version === 3) {
+        assert.equal(message.isError, true, 'the released outer extension exercises the collision');
+        assert.equal(message.content[0].isError, false, 'the actual wrapper reports success');
+      } else {
+        assert.equal(message.isError, false, 'the first-class tool message reports success');
+        assert.equal(message['plugin:message:isError'], true, 'migration preserves the outer extension as metadata');
+        assert.equal(message.content[0].isError, true, 'the ordinary text block retains its extension');
+      }
+      if (zstd) {
+        writeFileSync(`${path}.zstd`, mkFrame(rows));
+        rmSync(path);
+      }
+      const provider = createDeepseekProvider({ rootDir: sessionsDir });
+      const { unit, values } = parseFirst(provider);
+      const result = values.find((record) => record.kind === 'tool_result');
+      assert.equal(result.is_error, 0, 'extension metadata must not turn a successful tool into a failure');
+      assert.equal(result.content, 'Successful tool output');
+      const db = freshDb();
+      persist(db, unit, provider.parse(unit, null));
+      const dump = dumpDb(db);
+      assert.equal(dump.tool_results[0].is_error, 0, 'the persisted success matches the format-owned flag');
+      assert.equal(dump.tool_results[0].message_uuid, dump.tool_calls[0].message_uuid);
+      assertCanonicalRoundTrip(provider, unit, values);
+      db.close();
+    });
+  }
+}
+
+// The real loop records a failed model attempt as assistant/attempt, then one
+// committed assistant/message. Reopening the writer continues with a new turn;
+// it does not write two committed assistant messages into the same step.
+test('v4 retry and resume preserve both committed answers across a SQLite round trip', () => {
+  const dir = makeTempDir('obelisk-v4-retry-resume-');
+  const sessionsDir = stageFixtures(dir, ['v4-retry-resume'], { version: 4 });
+  const path = join(sessionsDir, '--dsh-v4--', 'v4-retry-resume', 'session.v4.jsonl');
+  const lines = readFileSync(path, 'utf8').trim().split('\n');
+  const boundary = lines.findIndex((line) => {
+    const event = JSON.parse(line);
+    return event.type === 'turn/start' && event.data.turn === 2;
+  });
+  assert.ok(boundary > 0, 'the writer was reopened for a second turn');
+  assert.equal(lines.filter((line) => JSON.parse(line).type === 'assistant/attempt').length, 1);
+  writeFileSync(path, lines.slice(0, boundary).join('\n') + '\n');
+  const provider = createDeepseekProvider({ rootDir: sessionsDir });
+  const db = freshDb();
+  const store = cursorStore();
+  let unit = provider.discover(store.ctx())[0];
+  store.set(unit.key, persist(db, unit, provider.parse(unit, null)));
+  appendFileSync(path, lines.slice(boundary).join('\n') + '\n');
+  unit = provider.discover(store.ctx())[0];
+  const delta = drain(provider.parse(unit, store.ctx().lastCursor(unit.key)));
+  assert.equal(delta.values.find((r) => r.kind === 'session').countMode, 'delta');
+  store.set(unit.key, persist(db, unit, provider.parse(unit, store.ctx().lastCursor(unit.key))));
+  const { values } = drain(provider.parse(unit, null));
+  const messages = values.filter((r) => r.kind === 'message');
+  assert.equal(new Set(messages.map((r) => r.uuid)).size, messages.length, 'every committed message has a unique identity');
+  const answers = dumpDb(db).messages.filter((m) => m.role === 'assistant');
+  assert.deepEqual(answers.map((m) => m.text), ['Recovered after retry.', 'Continued after restart.']);
+  assert.equal(dumpDb(db).sessions[0].message_count, 4, 'retry attempts do not inflate the committed transcript');
+  const snapshot = freshDb();
+  persist(snapshot, unit, provider.parse(unit, null));
+  assert.deepEqual(dumpDb(db), dumpDb(snapshot), 'incremental resume equals a complete replay');
+  assertCanonicalRoundTrip(provider, unit, values);
+  assert.deepEqual(provider.discover(store.ctx()), [], 'the resumed session checkpoints normally');
+  snapshot.close();
+  db.close();
 });
 
 // v1 was never shipped in a tagged release but is physically v0: the gate
@@ -1643,7 +1832,7 @@ test('a version-1 header takes the v0 path: header seedLength still marks the in
 // must self-heal by recomputing the marker once (ADR-0014).
 test('seeded v3 appends stay on the fast path: the checkpointed seededPrefix (or a head recompute) keeps inherited rows out', () => {
   const dir = makeTempDir('obelisk-v3-seeded-fast-');
-  const sessionsDir = stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']);
+  const sessionsDir = stageFixtures(dir, ['v3-seeded-parent', 'v3-seeded-child']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
@@ -1702,7 +1891,7 @@ test('seeded v3 appends stay on the fast path: the checkpointed seededPrefix (or
 // parent prefix into the child's sidechain on every later window (ADR-0014).
 test('a seeded child indexed before its seed batch lands fails closed (no sticky cut 0)', () => {
   const dir = makeTempDir('obelisk-v3-seed-race-');
-  const sessionsDir = stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']);
+  const sessionsDir = stageFixtures(dir, ['v3-seeded-parent', 'v3-seeded-child']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
 
@@ -1741,7 +1930,7 @@ test('a seeded child indexed before its seed batch lands fails closed (no sticky
 // fallback (ADR-0014).
 test('a v1-shape cursor is rejected whole and self-heals via snapshot (never lenient-read)', () => {
   const dir = makeTempDir('obelisk-v1-cursor-');
-  const sessionsDir = stageV3(dir, ['v3-seeded-parent', 'v3-seeded-child']);
+  const sessionsDir = stageFixtures(dir, ['v3-seeded-parent', 'v3-seeded-child']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
@@ -1779,7 +1968,7 @@ test('a v1-shape cursor is rejected whole and self-heals via snapshot (never len
 // deterministic synthetic anchor — once — instead of dangling (ADR-0014).
 test('a dispatch on a parent-map miss mints a deterministic anchor once, never dangling', () => {
   const dir = makeTempDir('obelisk-v3-ptc-mint-');
-  const sessionsDir = stageV3(dir, ['v3-ptc']);
+  const sessionsDir = stageFixtures(dir, ['v3-ptc']);
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
   const store = cursorStore();
   const unit = provider.discover({ lastCursor: () => null })[0];
@@ -1828,7 +2017,7 @@ test('a dispatch on a parent-map miss mints a deterministic anchor once, never d
 // isError and the newer `error` field both mark a failed settle.
 test('nested run_code dispatches chain to the outer anchor; isError and error both mark failures', () => {
   const dir = makeTempDir('obelisk-v3-ptc-nested-');
-  const sessionsDir = stageV3(dir, ['v3-ptc']);
+  const sessionsDir = stageFixtures(dir, ['v3-ptc']);
   const path = join(sessionsDir, '--dsh-v3--', 'v3-ptc', 'session.v3.jsonl');
   appendFileSync(path, [
     { type: 'turn/start', seq: 13, time: 1753005608500, data: { turn: 2 } },
@@ -1857,4 +2046,32 @@ test('nested run_code dispatches chain to the outer anchor; isError and error bo
   const bashResult = values.find((r) => r.kind === 'tool_result' && r.tool_use_id === bash.id);
   assert.equal(bashResult.is_error, 1, 'a settle event with only the error field still marks failure');
   assertCanonicalRoundTrip(provider, unit, values);
+});
+
+// The user-visible consequence of the gate (issue #228 follow-up): one
+// newer-format artifact in ~/.dsh must not make `obelisk --build` unpublishable
+// for every other provider on the machine.
+test('a version-5 artifact no longer blocks the whole force build: healthy projects publish and the skip is recorded', () => {
+  const home = makeTempDir('obelisk-deepseek-v5-build-');
+  const sessionsDir = join(home, '.dsh', 'sessions');
+  const writeSession = (project, name, file, header, text) => {
+    const dir = join(sessionsDir, project, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, file), [
+      JSON.stringify(header),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+    ].join('\n') + '\n');
+  };
+  writeSession('--tmp-dsh-future--', 'v5-session', 'session.v5.jsonl', { ...HEADER, version: 5, id: 'v5-session' }, 'from the future');
+  writeSession('--tmp-dsh-healthy--', 'healthy-session', 'session.jsonl', { ...HEADER, id: 'healthy-session', cwd: '/tmp/dsh-healthy' }, 'healthy question');
+
+  const built = runCli(['--build'], { home, env: {} });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+  assert.deepEqual(JSON.parse(built.stdout), { ok: true, db: join(home, '.obelisk', 'obelisk.sqlite') });
+
+  const db = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  const ids = db.prepare("SELECT id FROM sessions WHERE source = 'deepseek' ORDER BY id").all().map((row) => row.id);
+  db.close();
+  assert.ok(ids.some((id) => id.includes('healthy-session')), 'the healthy project is indexed');
+  assert.ok(!ids.some((id) => id.includes('v5-session')), 'the unsupported artifact is never parsed as a known format');
 });

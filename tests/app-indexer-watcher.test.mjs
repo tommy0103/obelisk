@@ -16,6 +16,10 @@ import { join } from 'node:path';
 
 import { createIndexerService } from '../app/src/main/indexer-service.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { readRecentTranscriptHints } from '../packages/core/src/provider-indexing.ts';
+import { upstreamStore, upstreamSession, upstreamMessage } from './opencode-test-helpers.mjs';
 
 async function waitFor(cond, ms = 1000) {
   const deadline = Date.now() + ms;
@@ -348,4 +352,52 @@ test('an evicted hot file is re-seeded by a later reconcile hint', async () => {
     await service.stop();
     await service.idle();
   }
+});
+
+test('review regression: app startup seeds existing channel DB and WAL and detects writes without native events', async () => {
+  const { buildIndex } = await import('../app/src/main/indexer.ts');
+  class TestDatabase {
+    constructor(path) { this.db = new DatabaseSync(path); }
+    exec(sql) { return this.db.exec(sql); }
+    pragma(sql) { return this.db.exec(`PRAGMA ${sql}`); }
+    prepare(sql) { return this.db.prepare(sql); }
+    close() { this.db.close(); }
+  }
+  const home = makeTempDir('opencode-startup-channel-');
+  const root = join(home, 'source'); fs.mkdirSync(root);
+  const { db, provider, path } = upstreamStore('v2.0.32', 'opencode-feature.review.db', root);
+  db.exec('PRAGMA journal_mode=WAL');
+  upstreamSession(db, 's', 'session_v2');
+  upstreamMessage(db, 's', 'm', 'user', 1, { text: 'initial' });
+  const registry = createProviderRegistry([provider]);
+  const indexPath = join(home, 'index.sqlite');
+  const builds = [];
+  const service = createIndexerService({
+    watchTargets: registry.watchTargets(), hotPolling: true, watchPollMs: 20,
+    debounceMs: 0, stabilityMs: 0, reconcileMs: 0,
+    subscribe: async () => ({ unsubscribe: async () => {} }),
+    buildIndex: async args => {
+      const result = buildIndex({ ...args, claudeDir: join(home, '.claude'), dbPath: indexPath, providerRegistry: registry, DatabaseImpl: TestDatabase });
+      builds.push(result); return result;
+    },
+  });
+  async function waitFor(predicate) {
+    const deadline = Date.now() + 3000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, 'the polling path reaches the app build without native events');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  let index;
+  try {
+    service.start();
+    await waitFor(() => builds.some(r => r.complete));
+    assert.ok(builds[0].watchHints.includes(path));
+    assert.ok(builds[0].watchHints.includes(`${path}-wal`));
+    index = new DatabaseSync(indexPath, { readOnly: true });
+    assert.deepEqual(readRecentTranscriptHints(index, 64, registry), [path, `${path}-wal`]);
+    db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'updated through existing WAL' }));
+    await waitFor(() => index.prepare('SELECT text FROM messages').get()?.text === 'updated through existing WAL');
+    assert.ok(builds.length >= 2);
+  } finally { await service.stop(); index?.close(); db.close(); }
 });

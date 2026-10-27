@@ -16,6 +16,7 @@ import { namespacedSessionId as kimiSessionId } from '../packages/core/src/provi
 import { kiroSessionId } from '../packages/core/src/providers/kiro.ts';
 import { copilotSessionId } from '../packages/core/src/providers/copilot.ts';
 import { canonicalSessionId as zcodeSessionId } from '../packages/core/src/providers/zcode.ts';
+import { opencodeSessionId } from '../packages/core/src/providers/opencode-identity.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -647,6 +648,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawClaude = '8f39c2a1-7b45-4d83-a029-61e47f903bc2';
   const rawCopilot = '6b8a4d92-0f13-4c67-95ea-2d7419b03f86';
   const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
+  const rawOpencode = '77777777-7777-4777-8777-777777777777';
   const rawHermes = '20260101_120000_aaaaaa';
   const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
   const rawKiro = kiroHeader.id;
@@ -663,6 +665,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
   const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
   const canonicalKiro = kiroSessionId(rawKiro, kiroHeader.workspacePaths[0]);
+  const canonicalOpencode = opencodeSessionId(rawOpencode, '/Users/me/opencode/db.sqlite');
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -678,6 +681,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
   insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
   insertSession.run(canonicalKiro, kiroHeader.title, '-workspace-demo', kiroHeader.workspacePaths[0], kiroHeader.createdAt, kiroHeader.lastModifiedAt, null, 1, 'kiro');
+  insertSession.run(canonicalOpencode, 'Opencode session', '-Users-me-opencode', '/Users/me/opencode', '2026-09-18T00:30:00Z', '2026-09-18T00:45:00Z', null, 1, 'opencode');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -699,6 +703,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
     kimi: [rawKimi, [canonicalKimi]],
     kiro: [rawKiro, [canonicalKiro]],
     omp: [rawOmp, [canonicalOmp]],
+    opencode: [rawOpencode, [canonicalOpencode]],
     pi: [rawPi, [canonicalPiB, canonicalPiA]],
     zcode: [rawZcode, [canonicalZcode]],
   };
@@ -748,9 +753,9 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
 test('every provider embeds the native session id verbatim in its canonical id', () => {
   // Fragment resolution in sessions() depends on this: a native id is only
   // findable while it appears verbatim inside the canonical id. pi-family,
-  // deepseek, copilot, hermes, and kiro encode native ids with encodeURIComponent,
-  // which preserves this UUID-shaped fixture and Hermes's timestamp-shaped
-  // lookup fixture above. URL-unsafe native ids need explicit coverage.
+  // deepseek, copilot, hermes, kiro, and opencode encode native ids with
+  // encodeURIComponent, which preserves this UUID-shaped fixture and Hermes's
+  // timestamp-shaped lookup fixture above. URL-unsafe native ids need explicit coverage.
   const native = '99999999-9999-4999-8999-999999999999';
   const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
   const canonical = {
@@ -762,6 +767,7 @@ test('every provider embeds the native session id verbatim in its canonical id',
     kiro: kiroSessionId(native, '/Users/me/obelisk'),
     pi: piFamilySessionId(piHeader, 'pi'),
     omp: piFamilySessionId(piHeader, 'omp'),
+    opencode: opencodeSessionId(native, '/Users/me/obelisk/db.sqlite'),
     deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),
     copilot: copilotSessionId(native, '/Users/me/obelisk'),
     zcode: zcodeSessionId('/Users/me/obelisk/db/db.sqlite', native),

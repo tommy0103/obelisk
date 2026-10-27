@@ -73,6 +73,7 @@ test('built-in provider registry exposes every source without caller-side branch
     kimi: '/sources/kimi',
     kiro: '/sources/kiro',
     omp: '/sources/omp',
+    opencode: '/sources/opencode',
     pi: '/sources/pi',
     zcode: '/sources/zcode',
   });
@@ -86,6 +87,7 @@ test('built-in provider registry exposes every source without caller-side branch
     { id: 'kimi', name: 'Kimi Code' },
     { id: 'kiro', name: 'Kiro' },
     { id: 'omp', name: 'OMP' },
+    { id: 'opencode', name: 'OpenCode' },
     { id: 'pi', name: 'Pi' },
     { id: 'zcode', name: 'ZCode' },
   ]);
@@ -108,6 +110,9 @@ test('built-in provider registry exposes every source without caller-side branch
     { kind: 'file', path: join('/sources/kiro', 'data.sqlite3') },
     { kind: 'file', path: join('/sources/kiro', 'data.sqlite3-wal') },
     { kind: 'tree', path: join('/sources/omp') },
+    { kind: 'file', path: join('/sources/opencode', 'opencode.db') },
+    { kind: 'file', path: join('/sources/opencode', 'opencode.db-wal') },
+    { kind: 'tree', path: '/sources/opencode', fileNames: ['opencode-next.db', 'opencode-next.db-wal', 'opencode.db', 'opencode.db-wal'] },
     { kind: 'tree', path: join('/sources/pi') },
     { kind: 'file', path: join('/sources/zcode', 'db', 'db.sqlite') },
     { kind: 'file', path: join('/sources/zcode', 'db', 'db.sqlite-wal') },

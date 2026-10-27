@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Passive-pull indexing orchestration for the Core package.
+import { RetryableSourceReadError } from './providers/source-read-error.ts';
 import { existsSync } from 'node:fs';
+import { prepareRetainedSnapshot } from './snapshot.ts';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
   backfillUnresolvedSessionProjectPathsOnce,
@@ -30,6 +32,7 @@ import type { ProviderRegistry } from './providers/registry.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
+import { openOpencodeDatabaseWithNodeSqlite } from './providers/opencode-node.ts';
 
 interface SkippedFile {
   provider: string;
@@ -202,6 +205,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       registry = createConfiguredBuiltinProviderRuntime(settings.settings, {
         openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
         openHermesStore: openHermesStoreWithNodeSqlite,
+        openOpencodeDatabase: openOpencodeDatabaseWithNodeSqlite,
       }).registry;
     }
 
@@ -212,6 +216,15 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       const providerPlan = createProviderIndexPlan(db, registry, { force, readMode });
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
+      // Known-but-unprojectable artifacts are skips, not inventory gaps: they are
+      // surfaced like any other skipped file and must not withhold the snapshot.
+      for (const artifact of providerPlan.skippedArtifacts) {
+        skippedFiles.push({
+          provider: artifact.provider,
+          path: artifact.path,
+          error: artifact.error,
+        });
+      }
       if (force && incompleteProviders.length > 0) {
         return {
           skip: false,
@@ -219,21 +232,16 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           reason: 'incomplete_snapshot',
           incompleteProviders,
           inventoryIssues,
-          skipped: 0,
+          skipped: skippedFiles.length,
           skippedFiles,
         };
       }
 
       if (force) {
+        const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
         try {
           runRetryableWriteTransaction(txDb, () => {
-            // A force build publishes one complete source snapshot or nothing.
-            // The provider contract reserves no key prefix. A force snapshot
-            // recreates every unit cursor, provider marker, and system marker.
-            db.prepare('DELETE FROM index_state').run();
-            for (const table of ['messages', 'tool_calls', 'tool_results', 'sessions', 'summaries', 'subagents', 'workflows', 'workflow_agents']) {
-              db.prepare(`DELETE FROM ${table}`).run();
-            }
+            snapshot.reset();
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,
@@ -253,11 +261,14 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               reason: 'database_busy',
               incompleteProviders,
               inventoryIssues,
-              skipped: 0,
+              skipped: skippedFiles.length,
               skippedFiles,
             };
           }
           if (error instanceof ProviderIndexFailure) {
+            if (error.sourceError instanceof RetryableSourceReadError) {
+              inventoryIssues.push({ provider: error.item.provider.name, path: error.sourceError.sourcePath, error: error.sourceError.message });
+            }
             const skippedFile = {
               provider: error.item.provider.name,
               path: error.item.unit.key,
@@ -279,15 +290,17 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             };
           }
           throw error;
+        } finally {
+          snapshot.close();
         }
         return {
           skip: false,
           complete: true,
           incompleteProviders,
           inventoryIssues,
-          skipped: 0,
+          skipped: skippedFiles.length,
           skippedFiles,
-          watchHints: readRecentTranscriptHints(db),
+          watchHints: readRecentTranscriptHints(db, undefined, registry),
         };
       }
 
@@ -304,6 +317,9 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
+          if (error instanceof RetryableSourceReadError) {
+            inventoryIssues.push({ provider: provider.name, path: error.sourcePath, error: error.message });
+          }
           const detail = error as { message?: unknown; obelisk?: unknown } | null;
           const message = errorMessage(error);
           skippedFiles.push({
@@ -360,7 +376,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         inventoryIssues,
         skipped: skippedFiles.length,
         skippedFiles,
-        watchHints: readRecentTranscriptHints(db),
+        watchHints: readRecentTranscriptHints(db, undefined, registry),
       };
     } finally {
       db.close();

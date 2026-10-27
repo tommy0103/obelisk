@@ -56,6 +56,11 @@ async function main() {
         }
         throw new Error(`Index rebuild was not published: ${reason}${detail}`);
       }
+      if ('skippedFiles' in result) {
+        for (const issue of result.skippedFiles) {
+          process.stderr.write(`Warning: skipped ${issue.provider} artifact ${issue.path}: ${issue.error}\n`);
+        }
+      }
       process.stdout.write(JSON.stringify({ ok: true, db: DB_PATH }) + '\n');
     } catch (error) { fail(error); }
     return;

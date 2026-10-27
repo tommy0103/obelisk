@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
@@ -92,32 +92,48 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].git_branch, 'main');
 });
 
-test('codex v4 checkpoint resumes a cooperative append from its byte offset', () => {
-  const path = writeFixture([
-    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
-    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: '中文 😀 before offset' } },
-  ]);
-  const first = drain(parse({ key: path, sessionId: '' }, null));
-  const state = cursorState(first.ret);
-  assert.equal(state.v, 4);
-  assert.equal(typeof state.completeLineOffset, 'number');
-  assert.equal(state.completeLineOffset, first.ret.split(':')[2] * 1);
-  assert.equal(state.sourceSize, state.completeLineOffset);
-  assert.equal(typeof state.dev, 'string');
-  assert.equal(typeof state.sourceInode, 'string');
+// Real filesystem identities vary by Windows volume. Exercise both contracts
+// deterministically without requiring the host to offer a safe numeric inode.
+for (const [identity, inode, expectedPlan, verifiedPrefix] of [
+  ['safe', 123, 'cooperative-append', false],
+  ['unavailable', 0, 'verified-append', true],
+  ['unsafe', Number.MAX_SAFE_INTEGER + 1, 'verified-append', true],
+]) {
+  test(`codex v4 checkpoint resumes an append with ${identity} source identity`, async t => {
+    const fsMock = t.mock.module('node:fs', { namedExports: {
+      closeSync, existsSync, openSync, readdirSync, readSync,
+      statSync: (...args) => Object.assign(statSync(...args), { dev: 1, ino: inode }),
+    } });
+    t.after(() => fsMock.restore());
+    const { parse: parseWithIdentity } = await import(`../packages/core/src/providers/codex.ts?append-${identity}`);
+    const path = writeFixture([
+      { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+      { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: '中文 😀 before offset' } },
+    ]);
+    const first = drain(parseWithIdentity({ key: path, sessionId: '' }, null));
+    const state = cursorState(first.ret);
+    assert.equal(state.v, 4);
+    assert.equal(typeof state.completeLineOffset, 'number');
+    assert.equal(state.completeLineOffset, first.ret.split(':')[2] * 1);
+    assert.equal(state.sourceSize, state.completeLineOffset);
+    assert.equal(typeof state.dev, 'string');
+    assert.equal(typeof state.sourceInode, 'string');
 
-  const unchanged = drain(parse({ key: path, sessionId: '' }, first.ret));
-  assert.deepEqual(unchanged.values, [], 'an empty suffix emits no patch');
-  assert.equal(unchanged.ret, first.ret, 'an empty suffix does not advance the checkpoint');
+    const unchanged = drain(parseWithIdentity({ key: path, sessionId: '' }, first.ret));
+    assert.deepEqual(unchanged.values, [], 'an empty suffix emits no patch');
+    assert.equal(unchanged.ret, first.ret, 'an empty suffix does not advance the checkpoint');
 
-  appendFileSync(path, `${JSON.stringify({
-    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'after offset' },
-  })}\n`);
-  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
-  assert.deepEqual(second.values.filter(record => record.kind === 'message').map(record => record.text), ['after offset']);
-  assert.equal(second.values.some(record => record.kind === 'delete-session'), false);
-  assert.equal(cursorState(second.ret).verifiedPrefix, false);
-});
+    appendFileSync(path, `${JSON.stringify({
+      type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'after offset' },
+    })}\n`);
+    const metrics = createCodexParseMetrics();
+    const second = drain(parseWithIdentity({ key: path, sessionId: '' }, first.ret, metrics));
+    assert.deepEqual(second.values.filter(record => record.kind === 'message').map(record => record.text), ['after offset']);
+    assert.equal(second.values.some(record => record.kind === 'delete-session'), false);
+    assert.equal(metrics.plan, expectedPlan);
+    assert.equal(cursorState(second.ret).verifiedPrefix, verifiedPrefix);
+  });
+}
 
 test('codex parse() accepts a legacy #148 v4 cursor but replays it conservatively', () => {
   const path = writeFixture([

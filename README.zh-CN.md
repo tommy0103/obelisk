@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-你的 Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Hermes Agent、Kiro、Kimi Code、OMP、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
+你的 Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Hermes Agent、Kiro、Kimi Code、OMP、OpenCode、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
 
 [English](README.md) · **中文**
 
@@ -148,8 +148,8 @@ npm run dev
 | **Sessions** | 标题、项目、时间戳、git 分支、来源 | 全部 |
 | **Messages** | 完整文本、模型、token 用量、父子链 | 全部 |
 | **Tool calls** | 工具名、输入、文件路径 | 全部 |
-| **Subagents** | agent 类型、描述、完整对话 | Claude Code、Codex、DeepSeek Harness、Hermes Agent、Kiro V3、Kimi Code、ZCode |
-| **Summaries** | provider 自己产生的会话摘要 | Kiro V3、Kimi Code |
+| **Subagents** | agent 类型、描述、完整对话 | Claude Code、Codex、DeepSeek Harness、Hermes Agent、Kiro V3、Kimi Code、OpenCode、ZCode |
+| **Summaries** | provider 自己产生的会话摘要 | Kiro V3、Kimi Code、OpenCode |
 | **Workflows** | workflow 脚本、结果、每个 agent 的记录 | Claude Code |
 | **Memories** | 结论及其来源会话 | 注册的 markdown 文件 |
 
@@ -171,6 +171,7 @@ provider 前缀，不会撞。
 | Kiro | `~/.kiro/sessions` 和平台 `kiro-cli/data.sqlite3` 数据库 |
 | Kimi Code | `~/.kimi-code/sessions`（或 `$KIMI_CODE_HOME/sessions`） |
 | OMP | `~/.omp/agent/sessions` |
+| OpenCode | `~/.local/share/opencode/opencode.db`（或 `$XDG_DATA_HOME/opencode`、`$OPENCODE_DB` 与 channel 库；支持 V1/V2 SQLite，不含早期 JSON 格式） |
 | Pi | `~/.pi/agent/sessions` |
 | ZCode | `~/.zcode/cli/db/db.sqlite` |
 
@@ -185,11 +186,11 @@ inactive——默认查询看不到，支持的查询方法可以用 `includeIna
 | ZCode | rewind 保留区间和压缩可判定 inactive |
 | Kimi Code | undo/clear 可判定覆盖；保留实现还在路上 |
 | Hermes Agent | 不细分：压缩归档和 rewind 的行都存为 `inactive` |
+| OpenCode | 会话 revert 状态判定 inactive 历史 |
 | Claude Code | 来源本身不标记 rewind / 当前叶子状态 |
 | Codex | 会话没有分支概念 |
 
-非默认位置——比如 Pi 的 `--session-dir`、OMP 的自定义目录、VS Code
-Insiders 的 `User` 目录——可以在应用的 **Settings** 里手动选。
+非默认位置——比如 Pi 的 `--session-dir`、OMP 的自定义目录、OpenCode 数据根目录（显式配置优先于 `$OPENCODE_DB`）、VS Code Insiders 的 `User` 目录——可以在应用的 **Settings** 里手动选。
 
 适配器的内部细节（identity 哈希、覆盖重放、各 provider 的目录发现逻辑）见
 [检索语义](skill-doc/references/retrieval-semantics.md)和 [ADR](docs/adr/)。

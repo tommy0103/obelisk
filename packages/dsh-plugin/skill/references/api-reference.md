@@ -249,7 +249,7 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"pi"`, or `"zcode"`; omit for all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"`; omit for all |
 | `opts.sessionId` | `string` | Canonical session ID; a non-exact ref resolves as a literal fragment, capped at the 10 newest matches |
 | `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 

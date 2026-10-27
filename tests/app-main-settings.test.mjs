@@ -361,6 +361,13 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'file', path: defaultKiroDatabasePath({ homeDir: home }) },
       { kind: 'file', path: `${defaultKiroDatabasePath({ homeDir: home })}-wal` },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db') },
+      { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db-wal') },
+      {
+        kind: 'tree',
+        path: join(home, '.local', 'share', 'opencode'),
+        fileNames: ['opencode-next.db', 'opencode-next.db-wal', 'opencode.db', 'opencode.db-wal'],
+      },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
       { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
       { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite-wal') },

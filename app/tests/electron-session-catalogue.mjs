@@ -48,14 +48,15 @@ function handle(channel, callback) {
 async function waitFor(win, expression, label) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    if (await win.webContents.executeJavaScript(`Boolean(${expression})`)) return;
+    const result = await win.webContents.executeJavaScript(expression);
+    if (result) return result;
     await delay(30);
   }
   throw new Error(`Timed out waiting for ${label}`);
 }
 
 async function check(win, expression, label) {
-  await waitFor(win, expression, label);
+  await waitFor(win, `Boolean(${expression})`, label);
   console.log(`PASS: ${label}`);
 }
 
@@ -271,12 +272,18 @@ async function run() {
   await check(win, `${rows}.length > 0 && ${rows}.length < 80 && document.querySelector('.srow.noise')`,
     'expanded quiet sessions are virtualized and reachable');
   const quietRows = await win.webContents.executeJavaScript(`${rows}.length`);
-  const quietId = await win.webContents.executeJavaScript(`(() => {
+  await win.webContents.executeJavaScript("document.querySelector('.session-scroll').scrollTop = 0");
+  await check(win, `!document.querySelector('.srow.noise')`, 'quiet rows unmount outside overscan');
+  await win.webContents.executeJavaScript("document.querySelector('.session-scroll').scrollTop = document.querySelector('.session-scroll').scrollHeight");
+  // Virtual rows can unmount between separate IPC calls. Locate and click in
+  // one renderer task, retrying only while the requested row is not mounted.
+  const quietId = await waitFor(win, `(() => {
     const row = document.querySelector('.srow.noise');
+    if (!row) return null;
     const id = row.dataset.sessionId;
     row.click();
     return id;
-  })()`);
+  })()`, 'selecting a remounted quiet session');
   await check(win, `document.querySelector('[data-uuid="${quietId}-message"]')`, 'expanded quiet session opens its detail');
   assert.ok(calls.filter(([kind]) => kind === 'catalogue').every(([, opts]) => opts.limit <= 100), 'catalogue IPC stays bounded');
   assert.ok(Math.max(...pageBytes) < 100_000, 'no catalogue response transfers an unbounded IPC payload');

@@ -9,6 +9,8 @@ export type SqliteRow = Record<string, any>;
 
 export interface SqliteStatement {
   all(...bindings: any[]): SqliteRow[];
+  /** Both runtime bindings support streaming rows; optional for test doubles. */
+  iterate?(...bindings: any[]): Iterable<SqliteRow>;
   get(...bindings: any[]): SqliteRow | undefined;
   run(...bindings: any[]): unknown;
   /** better-sqlite3 only: true when the statement has no write effects. */
