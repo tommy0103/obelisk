@@ -9,8 +9,9 @@ Detailed reference for globals available inside `obelisk --query` and
 - Use `references/pitfalls.md` after runtime errors or confusing row shapes.
 
 Query scripts run inside an async IIFE with a 30-second timeout. Use `return` to
-emit JSON. `--query` scripts are read-only. `--attune` scripts expose only
-memory mutation helpers.
+emit JSON. The `--query` helper API is read-only, but the script itself runs
+with the privileges of the CLI process — see the security note in `SKILL.md`.
+`--attune` scripts expose only memory mutation helpers.
 
 ## Invocation Identity
 

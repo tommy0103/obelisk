@@ -7,8 +7,9 @@ description: >
   Memory: when the user says "记住这个", "remember this", "写入记忆", "save this conclusion", or when you determine a retrieval result contains a conclusion worth persisting.
 allowed-tools:
   - Read
-  - Bash(obelisk:*)
-  - Write
+  - Bash(obelisk --search *)
+  - Bash(obelisk --build)
+  - Bash(obelisk --version)
 ---
 
 # obelisk
@@ -55,8 +56,9 @@ JS
 obelisk --query "$qfile"
 ```
 
-The CLI runs the file in an async wrapper; `return` emits JSON. Queries are
-read-only, with no filesystem or network access inside the script. For broad
+The CLI runs the file in an async wrapper; `return` emits JSON. The helper
+API is read-only, but `--query` evaluates JavaScript with the privileges of
+the CLI process — it is not an isolated sandbox. Only run trusted scripts. For broad
 history, adapt the first-pass recipe in query patterns instead of this tiny
 keyword example.
 
