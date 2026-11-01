@@ -5,11 +5,12 @@
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
 // typed seam while remaining limited to node:fs/path/os.
-import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
 
 import type { InventoryIssue } from './providers/types.ts';
+import { createZstdFrameDecoder, scanZstdFrames } from './vendor/dsh-zstd.ts';
 
 const CLAUDE_DIR = join(homedir(), '.claude');
 const CODEX_DIR = join(homedir(), '.codex');
@@ -171,6 +172,68 @@ function readLines(
   }
 }
 
+function isCodexCompressedPath(path: string): boolean {
+  return path.endsWith('.jsonl.zst');
+}
+
+function isCodexTranscriptPath(path: string): boolean {
+  return path.endsWith('.jsonl') || isCodexCompressedPath(path);
+}
+
+function readCodexCompressedBytes(filePath: string): Buffer {
+  const source = readFileSync(filePath);
+  const { frames, tornStart } = scanZstdFrames(source);
+
+  if (tornStart !== undefined || frames.length === 0) {
+    throw new Error('Incomplete Zstandard Codex rollout');
+  }
+
+  const decoder = createZstdFrameDecoder();
+  const chunks: Buffer[] = [];
+
+  try {
+    for (const decoded of decoder.decode(source, frames)) {
+      chunks.push(Buffer.from(decoded));
+    }
+  } finally {
+    decoder.close();
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function readCodexBufferLines(
+  data: Buffer,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+): void {
+  let lineStart = 0;
+
+  while (true) {
+    const newline = data.indexOf(0x0a, lineStart);
+    if (newline < 0) break;
+
+    const line = data.toString('utf8', lineStart, newline);
+    lineStart = newline + 1;
+
+    if (line && callback(line, true, lineStart) === false) return;
+  }
+
+  if (lineStart < data.length) {
+    callback(data.toString('utf8', lineStart), false);
+  }
+}
+
+function readCodexLines(
+  filePath: string,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+): void {
+  if (isCodexCompressedPath(filePath)) {
+    readCodexBufferLines(readCodexCompressedBytes(filePath), callback);
+    return;
+  }
+  readLines(filePath, callback);
+}
+
 // ---- project-path + discovery helpers ----
 function legacyProjectPathFromSlug(project: string | null | undefined): string | null {
   if (!project) return null;
@@ -255,13 +318,30 @@ function discoverCodexJsonlFiles(
   const walk = (dir: string): void => {
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch (error) { reportIssue?.(sourceInventoryIssue(dir, error)); return; }
+    const plainNames = new Set(
+      entries
+        .filter(entry => entry.isFile() && entry.name.endsWith('.jsonl'))
+        .map(entry => entry.name),
+    );
+
     for (const entry of entries) {
       const fp = join(dir, entry.name);
+
       if (entry.isDirectory()) {
         walk(fp);
-      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-        files.push({ path: fp, source: 'codex' });
+        continue;
       }
+
+      if (!entry.isFile() || !isCodexTranscriptPath(entry.name)) continue;
+
+      if (
+        isCodexCompressedPath(entry.name)
+        && plainNames.has(entry.name.slice(0, -'.zst'.length))
+      ) {
+        continue;
+      }
+
+      files.push({ path: fp, source: 'codex' });
     }
   };
   walk(sessionsDir);
@@ -307,12 +387,19 @@ function codexIsGuardianThread(meta: JsonRecord, records: CodexLineRecord[] = []
   return records.some(({ obj }) => obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL || obj?.model === CODEX_AUTO_REVIEW_MODEL);
 }
 
-function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; lineNum: number } | null {
+function readCodexGuardianThreadInfo(source: string | Buffer): { threadRawId: string; lineNum: number } | null {
   let metaRecord: CodexLineRecord | null = null;
   let sawAutoReviewModel = false;
   let guardian = false;
   let lineNum = 0;
-  readLines(filePath, (line) => {
+  const lineReader = (cb: (line: string) => boolean | void) => {
+    if (typeof source === 'string') {
+      readCodexLines(source, cb);
+    } else {
+      readCodexBufferLines(source, cb);
+    }
+  };
+  lineReader((line) => {
     lineNum++;
     let obj: JsonRecord;
     try {
@@ -434,6 +521,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 export {
   CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
+  isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes, readCodexBufferLines, readCodexLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
