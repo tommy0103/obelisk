@@ -89,7 +89,7 @@ The default retrieval surface is:
 | Helper | Purpose |
 |---|---|
 | `overview` | Orient to projects and recent entry points. |
-| `sessions` | Locate sessions under structural filters. |
+| `sessions` | Locate sessions by canonical ID or native-ID fragment under structural filters. |
 | `search` | Find message evidence by topic. |
 | `messages` | Read one message, a bounded window, or a session interval (CLI 0.3.0+). |
 | `memories` | Recall previously saved conclusions. |
