@@ -63,6 +63,10 @@ const SESSION_PATH_PREFIX = 'session:';
 // mistaken for a transcript path, and a force rebuild recreates it with everything else.
 const STORE_GATE_PREFIX = '__hermes_store_v1__:';
 const STORE_CURSOR_TAG = 'hermes-store-v1';
+// v2: the watermark counts non-NULL projected columns instead of summing their text lengths, so
+// the per-store pass reads record headers rather than every message body. The input changes once,
+// which replays a session the first time discovery compares it against an older cursor.
+const WATERMARK_VERSION = 2;
 
 // CLI-side read-only opener
 export type HermesStoreOpener = (path: string) => SqliteDb;
@@ -266,6 +270,10 @@ function sessionTotalTokens(row: SqliteRow): number | null {
 function fileSignature(path: string): string {
   try {
     const stat = statSync(path);
+    // A zero-length file carries no rows. SQLite may leave an empty WAL after a checkpoint, and
+    // counting its identity would move the gate from a read that changed nothing. A zero-length
+    // database can never be certified: opening it fails before any gate is written.
+    if (stat.size === 0) return 'absent';
     return [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':');
   } catch {
     return 'absent';
@@ -303,22 +311,25 @@ function storeFileState(dbPath: string): 'present' | 'missing' | 'unreadable' {
 }
 
 interface HermesStoreCursor {
-  /** The store gate the whole store was last certified at. */
+  /** The store gate the whole store was last examined at. */
   gate: string;
   /** Digest of the session ids the store enumerated at that gate. */
   sessions: string;
+  /** True when that examination scheduled nothing, so the store can be skipped outright. */
+  complete: boolean;
 }
 
-/** `${mtime}:0:${STORE_CURSOR_TAG}:${gate}:${sessions}`. */
+/** `${mtime}:0:${STORE_CURSOR_TAG}:${gate}:${sessions}[:0|1]`. */
 function parseStoreCursor(cursor: Cursor): HermesStoreCursor | null {
   if (cursor === null) return null;
   const parts = cursor.split(':');
-  if (parts.length !== 5 || parts[2] !== STORE_CURSOR_TAG) return null;
-  return { gate: parts[3]!, sessions: parts[4]! };
+  if ((parts.length !== 5 && parts.length !== 6) || parts[2] !== STORE_CURSOR_TAG) return null;
+  // A gate written before the partial form existed only appeared after an empty scan.
+  return { gate: parts[3]!, sessions: parts[4]!, complete: parts[5] !== '0' };
 }
 
-function storeCursor(dbPath: string, gate: string, sessions: string): Cursor {
-  return [String(storeMtime(dbPath)), '0', STORE_CURSOR_TAG, gate, sessions].join(':');
+function storeCursor(dbPath: string, gate: string, sessions: string, complete = true): Cursor {
+  return [String(storeMtime(dbPath)), '0', STORE_CURSOR_TAG, gate, sessions, complete ? '1' : '0'].join(':');
 }
 
 /**
@@ -493,17 +504,20 @@ function readSessionRows(db: SqliteDb): SqliteRow[] {
 }
 
 /**
- * A per-session fingerprint: the mutable session fields plus the message watermark.
- * Mirrors copilot.ts's Chronicle fingerprint — parse() re-derives it and refuses to
- * write records for a session that changed after discovery.
+ * A per-session fingerprint: the mutable session fields plus a row-shape message watermark.
+ * parse() re-derives it and refuses to write records for a session that changed after discovery.
+ * The watermark reads no message body, and every aggregate below is answerable from the record
+ * header or the rowid. That rules out `timestamp`, `active` and `compacted`: upstream stores them
+ * after the large text columns, so reading any of them walks the text's overflow pages. An
+ * in-place edit to one of those, or to a body, reaches the index only through the exact digest,
+ * which runs when the store moved without an explained session change. `typeof` is the only NULL
+ * test SQLite answers from the header; `x IS NOT NULL` and `COUNT(x)` materialize the value.
  */
 const WATERMARK_AGGREGATES = `
-      COUNT(*) AS total, MAX(rowid) AS last_rowid, MAX(timestamp) AS last_at, MAX(id) AS last_id,
-      SUM(LENGTH(COALESCE(content, ''))) AS content_bytes,
-      SUM(LENGTH(COALESCE(tool_calls, ''))) AS calls_bytes,
-      SUM(COALESCE(active, 1)) AS active_sum,
-      SUM(COALESCE(compacted, 0)) AS compacted_sum,
-      SUM(LENGTH(COALESCE(display_kind, ''))) AS display_bytes`;
+      COUNT(*) AS total, MAX(rowid) AS last_rowid, MAX(id) AS last_id,
+      SUM(typeof(content) <> 'null') AS content_rows,
+      SUM(typeof(tool_calls) <> 'null') AS calls_rows,
+      SUM(typeof(display_kind) <> 'null') AS display_rows`;
 
 /**
  * Every session's watermark in one grouped query. Discovery runs this once per store
@@ -578,15 +592,13 @@ function sessionFingerprint(
         row['output_tokens'] ?? null,
       ],
       messages: [
+        WATERMARK_VERSION,
         Number(watermark?.['total'] ?? 0),
         watermark?.['last_rowid'] ?? null,
-        watermark?.['last_at'] ?? null,
         watermark?.['last_id'] ?? null,
-        Number(watermark?.['content_bytes'] ?? 0),
-        Number(watermark?.['calls_bytes'] ?? 0),
-        Number(watermark?.['active_sum'] ?? 0),
-        Number(watermark?.['compacted_sum'] ?? 0),
-        Number(watermark?.['display_bytes'] ?? 0),
+        Number(watermark?.['content_rows'] ?? 0),
+        Number(watermark?.['calls_rows'] ?? 0),
+        Number(watermark?.['display_rows'] ?? 0),
       ],
     }),
   );
@@ -1222,6 +1234,14 @@ export function createHermesProvider({
           const stored = parseStoreCursor(ctx.lastCursor(gateKey));
           const indexedIds = new Set(dbIndexed.map(session => session.sessionId));
           const indexedSessions = sessionsDigest(indexedIds);
+          // A gate for this exact physical image, partial or not, means an earlier scan already
+          // compared every session's watermark at it and explained the write it saw. As long as
+          // the index still holds exactly the sessions the gate recorded, no new write can have
+          // landed and unchanged siblings stay deferred instead of being digested; only the
+          // sessions whose cursors are stale need a read.
+          const examinedAtGate = stored !== null
+            && stored.gate === gate
+            && stored.sessions === indexedSessions;
           const changedPaths = ctx.changedPaths ?? [];
           const storeDir = dirname(dbPath);
           // A hint naming anything under the store's directory — the database, its WAL, the
@@ -1241,13 +1261,14 @@ export function createHermesProvider({
             !hinted
             && forcedSessions.size === 0
             && stored !== null
+            && stored.complete
             && stored.gate === gate
             && stored.sessions === indexedSessions
           ) {
             // Certified at this gate, and the index holds exactly the sessions that were
             // enumerated then: skip the store without opening it. A write of any kind moves the
-            // gate, and a session the index lost or gained moves the set, so neither a change
-            // nor a pending retraction can hide behind this branch.
+            // gate, a session the index lost or gained moves the set, and a partial gate means
+            // the examination scheduled work, so a pending retry cannot hide behind this branch.
             for (const session of dbIndexed) liveSessionIds.add(session.sessionId);
             continue;
           }
@@ -1276,22 +1297,28 @@ export function createHermesProvider({
           // True when the digest pass could not run, so this scan never examined the sessions
           // whose gate moved and must not certify the store at this gate.
           let digestUnavailable = false;
+          // True when a scheduled unit cannot be re-detected from its cursor on the next scan: the
+          // exact digest found a body edit behind an unchanged watermark, or a hint named an
+          // unchanged session. Such a unit gets no gate row, because a partial gate would let the
+          // next scan certify the store without ever retrying the failed write.
+          let opaqueSchedule = false;
           const storeSessionIds: string[] = [];
           for (const entry of storeSessions) {
             const { session, cursor, rawSessionId, sessionId } = entry;
             liveSessionIds.add(sessionId);
             storeSessionIds.push(sessionId);
-            if (
-              !indexedIds.has(sessionId)
+            const changed = !indexedIds.has(sessionId)
               || cursor === null
-              || cursor.fingerprint !== session.fingerprint
-              || forcedSessions.has(rawSessionId)
-            ) {
+              || cursor.fingerprint !== session.fingerprint;
+            if (changed || forcedSessions.has(rawSessionId)) {
               // A new, grown or superseded session — or one the index no longer holds. A cursor
               // can outlive its canonical session row, so matching fingerprint alone cannot
               // certify that the session is still indexed.
               // parse() re-derives the fingerprint it hands back, so the cursor here only has to
               // be the one discovery believes in.
+              // A hint can name a session whose fingerprint did not move; a failed write of that
+              // unit leaves no cursor mismatch to retry from.
+              if (!changed) opaqueSchedule = true;
               scheduled.push({
                 entry,
                 cursor: sessionCursor(dbPath, gate, session.fingerprint, cursor?.digest ?? null),
@@ -1302,18 +1329,24 @@ export function createHermesProvider({
             candidates.push({ entry, stored: cursor });
           }
 
-          // For these sessions the gate moved but nothing the aggregates can see did, so only an
-          // exact digest of the projected rows can tell an in-place rewrite from an idle store.
-          // The pass runs on every scan that has candidates: skipping it whenever something else
-          // was scheduled would let a store written at least once per scan hide a same-length
-          // rewrite indefinitely. It is read-only and measured at ~250 ms over ~17k rows.
-          if (candidates.length > 0) {
+          // An unexplained store move — the gate advanced but no session's fingerprint did — is a
+          // WAL checkpoint, a write to a non-projected column, or an in-place body edit, and only
+          // the exact digest can tell the last one from the first two. When a session's
+          // fingerprint did change the write is explained: that session is parsed, and the
+          // unchanged siblings keep their cursors instead of being re-read. An in-place body edit
+          // of a projected text column — same length or not — hidden in that same commit is not
+          // attributable from public source metadata; it waits for the next unexplained move or a
+          // rebuild (opencode-adapter-incremental-plan.md: "do not claim a universal CDC
+          // protocol").
+          if (candidates.length > 0 && scheduled.length === 0 && !examinedAtGate) {
             let digestDb: SqliteDb | null = null;
             try {
               digestDb = openStore(dbPath);
               for (const { entry, stored } of candidates) {
                 const digest = exactSessionDigest(digestDb, entry.rawSessionId);
                 if (stored.digest === digest) continue;
+                // The body edit left the watermark alone, so only another digest run can retry it.
+                opaqueSchedule = true;
                 scheduled.push({
                   entry,
                   cursor: sessionCursor(dbPath, gate, entry.session.fingerprint, digest),
@@ -1361,11 +1394,13 @@ export function createHermesProvider({
             });
           }
 
-          if (scheduled.length === 0 && !digestUnavailable) {
-            // Nothing needs (re)writing, so this read certified the whole store at this gate.
-            // Recording that here is what lets the next scan skip the store; it is deliberately
-            // withheld while any unit is scheduled, so a unit that fails to persist is retried
-            // instead of being swallowed by a gate that already claims the store is done.
+          // Record the examination even when this scan scheduled work, but only if every
+          // scheduled unit can be retried from its cursor alone (its fingerprint moved, or it was
+          // new or unindexed). A partial gate is never skipped (the skip branch requires
+          // `complete`), so the next scan reads those sessions again instead of trusting this
+          // examination. A digest- or hint-scheduled unit has no such cursor evidence, so no gate
+          // is written and the next scan re-examines the store.
+          if (!digestUnavailable && !opaqueSchedule) {
             units.push({
               key: gateKey,
               // No session: this unit carries no records, only the store's gate row. An empty
@@ -1381,7 +1416,12 @@ export function createHermesProvider({
                 cwd: null,
                 fingerprint: '',
                 schemaVersion: read.schemaVersion,
-                currentCursor: storeCursor(dbPath, gate, sessionsDigest(storeSessionIds)),
+                currentCursor: storeCursor(
+                  dbPath,
+                  gate,
+                  sessionsDigest(storeSessionIds),
+                  scheduled.length === 0,
+                ),
                 storeGate: true,
               } satisfies HermesUnitMeta,
             });
