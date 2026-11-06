@@ -13,6 +13,7 @@ import {
   statSync,
   symlinkSync,
   utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { join, win32 } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -278,19 +279,31 @@ const indexedFrom = units => sessionUnits(units).map(unit => ({
  * the second certifies the store gate — so tests that assert what a later round schedules use
  * this rather than a hand-built cursor map.
  */
-function indexFixture(provider) {
+function indexFixture(provider, { transactional = false } = {}) {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
   const registry = createProviderRegistry([provider]);
-  const run = (options = {}) => {
+  const run = (options = {}, onError = (error) => { throw error; }) => {
     const plan = createProviderIndexPlan(db, registry, options);
     const result = indexProviderPlan({
       db,
       plan,
-      runTransaction: (_label, work) => work(),
-      onError: (error) => {
-        throw error;
-      },
+      // Production rolls a failing unit back on its own (ADR-0006). Failure tests need that, or a
+      // leaked retraction — not the stale cursor — is what makes the next scan re-read the session.
+      runTransaction: transactional
+        ? (_label, work) => {
+            db.exec('BEGIN');
+            try {
+              const value = work();
+              db.exec('COMMIT');
+              return value;
+            } catch (error) {
+              db.exec('ROLLBACK');
+              throw error;
+            }
+          }
+        : (_label, work) => work(),
+      onError,
     });
     return { plan, result };
   };
@@ -348,11 +361,11 @@ test('discover() enumerates the default store and every named profile, keyed by 
     const provider = createHermesProvider({ rootDir: layout.base, openStore });
     const units = discover(provider);
 
-    assert.equal(units.length, 3, 'one unit per session across the default store and the profile store');
+    assert.equal(units.length, 5, 'one unit per session, plus one gate per examined store');
     assert.equal(
       sessionUnits(units).length,
       3,
-      'the gate unit is only written once a store read scheduled nothing',
+      'the gate units carry no session',
     );
     const alpha = units.find(unit => unit.meta.rawSessionId === SESSION_ALPHA);
     const beta = units.find(unit => unit.meta.rawSessionId === SESSION_BETA);
@@ -1056,7 +1069,7 @@ test('an unreadable profiles directory reports an incomplete inventory instead o
     const first = discover(provider);
     const cursors = new Map(first.map(unit => [unit.key, unit.meta.currentCursor]));
     const indexed = indexedFrom(first);
-    assert.equal(first.length, 3, 'the fixture starts with every session reachable');
+    assert.equal(first.length, 5, 'the fixture starts with every session reachable, plus two gates');
 
     const profilesDir = join(layout.base, 'profiles');
     chmodSync(profilesDir, 0o000);
@@ -1204,7 +1217,7 @@ test('an indexed home that is unavailable reports an incomplete inventory instea
     const first = discover(provider);
     const cursors = new Map(first.map(unit => [unit.key, unit.meta.currentCursor]));
     const indexed = indexedFrom(first);
-    assert.equal(first.length, 3);
+    assert.equal(first.length, 5, 'three sessions and the two default-store gates');
     assert.equal(indexed.every(session => session.jsonlPath.startsWith(layout.base)), true);
 
     renameSync(layout.base, moved);
@@ -1756,9 +1769,9 @@ test('a write to one session leaves the other sessions of the store unscheduled'
     });
 
     const round = index.run();
-    assert.equal(round.plan.items.length, 1, 'one appended row is one unit, not the whole store');
+    assert.equal(round.plan.items.length, 2, 'the changed session plus the store gate');
+    assert.equal(round.result.committed.length, 2, 'the session and the gate both commit');
     assert.deepEqual(scheduledSessionIds(round), [alphaId], 'only the session that changed is scheduled');
-    assert.equal(round.result.committed.length, 1);
     assert.equal(
       storedProviderCursor(index.db, betaKey),
       betaCursor,
@@ -1773,11 +1786,13 @@ test('a write to one session leaves the other sessions of the store unscheduled'
   }
 });
 
-// Regression: the exact-digest fallback used to run only in a round that scheduled nothing else,
-// so a session rewritten in place with a same-length value stayed stale for as long as any other
-// session kept being written. The aggregates cannot attribute such a rewrite, so the digest pass
-// has to run on the same scan that already has work.
-test('a same-length in-place rewrite is scheduled beside another session of the store', () => {
+// The exact digest is reserved for an unexplained store move. An in-place body edit of a projected
+// text column — a same-length rewrite here — hidden in the same commit as another session's
+// legitimate write is not attributable from public source metadata
+// (docs/opencode-adapter-incremental-plan.md: "do not claim a universal CDC protocol"), so it is
+// reconciled on the next unexplained move instead of re-reading every session beside it. This is
+// the accepted limit of the incremental path; a rebuild reconciles it immediately.
+test('an in-place rewrite waits for an unexplained store move instead of re-reading the store', () => {
   const layout = fixtureHome();
   const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
   try {
@@ -1790,7 +1805,8 @@ test('a same-length in-place rewrite is scheduled beside another session of the 
     settle(index);
 
     // One commit: an appended row in Alpha, and a same-length rewrite of Beta's first row, which
-    // moves no watermark aggregate and is only visible to the exact digest.
+    // moves no watermark aggregate and is only visible to the exact digest. A longer or shorter
+    // rewrite is equally invisible now that the watermark no longer sums text lengths.
     writeStore(layout.primaryPath, db => {
       appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'Appended once', timestamp: 1767226020 });
       const row = db.prepare('SELECT id, content FROM messages WHERE session_id = ? ORDER BY rowid LIMIT 1')
@@ -1800,12 +1816,230 @@ test('a same-length in-place rewrite is scheduled beside another session of the 
         .run(row.content.replace(/^./, char => (char === 'Z' ? 'Y' : 'Z')), row.id);
     });
 
-    const round = index.run();
+    const explained = index.run();
     assert.deepEqual(
-      scheduledSessionIds(round).sort(),
-      [alphaId, betaId].sort(),
-      'the appended session and the rewritten one are both scheduled',
+      scheduledSessionIds(explained),
+      [alphaId],
+      'only the explained session is read, not every sibling',
     );
+    settle(index);
+
+    // A write the projection ignores moves the gate without moving any watermark, so the move is
+    // unexplained and the exact digest runs — which names the rewritten session.
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE messages SET api_content = ? WHERE session_id = ?')
+        .run('[response interrupted]', SESSION_ALPHA);
+    });
+
+    const reconciled = index.run();
+    assert.deepEqual(
+      scheduledSessionIds(reconciled),
+      [betaId],
+      'the next unexplained move finds the same-length rewrite',
+    );
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// One explained write must settle the store in that scan: the partial gate it writes tells the
+// next scan the digest at this gate is already done, so the second scan only confirms and
+// certifies. Without that, every write made the following call pay a whole-store digest.
+test('an explained write settles and certifies the store in two cheap scans', () => {
+  const layout = fixtureHome();
+  let opens = 0;
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      opens += 1;
+      return openStore(path);
+    },
+  }));
+  try {
+    settle(index);
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    writeStore(layout.primaryPath, db => {
+      appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'One more line', timestamp: 1767226020 });
+    });
+
+    const work = index.run();
+    assert.deepEqual(scheduledSessionIds(work), [alphaId], 'only the dirty session is read');
+    const gateCursors = () => [...storedCursors(index.db).entries()]
+      .filter(([key]) => key.startsWith('__hermes_store_v1__:'));
+    const partialGates = () => gateCursors().filter(([, cursor]) => cursor.endsWith(':0'));
+    assert.equal(partialGates().length, 1, 'the written store keeps a partial gate while work is pending');
+
+    opens = 0;
+    const confirm = index.run();
+    assert.deepEqual(scheduledSessionIds(confirm), [], 'the confirmation scan schedules nothing');
+    assert.equal(opens, 1, 'it reads the store once for the cheap watermark, without a payload pass');
+    assert.equal(partialGates().length, 0, 'the confirmed gates are complete');
+
+    opens = 0;
+    assert.equal(index.run().plan.items.length, 0, 'and the store is idle');
+    assert.equal(opens, 0, 'with no store read');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// The partial gate retries a session whose fingerprint already changed: production applies every
+// unit in its own transaction and skips a failing one, so the gate row can commit after the session
+// it describes rolled back. The next scan must then read that session again instead of trusting
+// the store's partial examination.
+test('a failed scheduled unit leaves a partial gate and is retried on the next scan', () => {
+  const layout = fixtureHome();
+  let opens = 0;
+  let failNextPrimaryOpen = false;
+  const provider = createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      if (path === layout.primaryPath) {
+        opens += 1;
+        // Discovery's store read is the first open; the dirty session's parse is the second.
+        if (failNextPrimaryOpen && opens === 2) throw new Error('simulated EACCES while parsing');
+      }
+      return openStore(path);
+    },
+  });
+  const index = indexFixture(provider, { transactional: true });
+  try {
+    settle(index);
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    writeStore(layout.primaryPath, db => {
+      appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'One more line', timestamp: 1767226020 });
+    });
+
+    const partialGates = () => [...storedCursors(index.db).entries()]
+      .filter(([key]) => key.startsWith('__hermes_store_v1__:'))
+      .filter(([, cursor]) => cursor.endsWith(':0'));
+
+    opens = 0;
+    failNextPrimaryOpen = true;
+    const failed = index.run({}, () => 'skip');
+    assert.equal(failed.result.failedItems.length, 1, 'the dirty session failed to persist');
+    assert.equal(partialGates().length, 1, 'the gate is recorded as partial, not certified');
+
+    // The session cursor is still the one from before the write, so the next scan reads it again.
+    failNextPrimaryOpen = false;
+    const retry = index.run();
+    assert.deepEqual(scheduledSessionIds(retry), [alphaId], 'the failed session is retried');
+
+    settle(index);
+    assert.equal(partialGates().length, 0, 'and the store finally certifies');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// A unit scheduled by the exact digest has an unchanged watermark, so a failed persist leaves no
+// cursor mismatch to retry from. The gate must be withheld for that scan, or the next one would
+// certify the store and the detected edit would stay stale until an unrelated move.
+test('a failed digest-scheduled unit is retried on the next scan', () => {
+  const layout = fixtureHome();
+  let opens = 0;
+  let failAtOpen = null;
+  const provider = createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      if (path === layout.primaryPath) {
+        opens += 1;
+        // Discovery's read, the digest's read, then the rewritten session's parse.
+        if (opens === failAtOpen) throw new Error('simulated parse failure');
+      }
+      return openStore(path);
+    },
+  });
+  const index = indexFixture(provider, { transactional: true });
+  try {
+    settle(index);
+    const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+    // Beta needs a row of its own before it can be rewritten in place.
+    writeStore(layout.primaryPath, db => {
+      appendMessage(db, SESSION_BETA, 'assistant', { content: 'Beta baseline row', timestamp: 1767312060 });
+    });
+    settle(index);
+
+    // One commit: an appended row in Alpha and a same-length rewrite of Beta. The append explains
+    // the write, so Beta is not re-read now — only the next exact digest can see it.
+    writeStore(layout.primaryPath, db => {
+      appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'Appended once', timestamp: 1767226020 });
+      const row = db.prepare('SELECT id, content FROM messages WHERE session_id = ? ORDER BY rowid LIMIT 1')
+        .get(SESSION_BETA);
+      db.prepare('UPDATE messages SET content = ? WHERE id = ?')
+        .run(row.content.replace(/^./, char => (char === 'Z' ? 'Y' : 'Z')), row.id);
+    });
+    settle(index);
+
+    // A non-projected write moves the gate with no watermark change, so the digest runs and finds
+    // Beta. Its persist fails, and the gate row must not claim the store was examined.
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE messages SET api_content = ? WHERE session_id = ?').run('[x]', SESSION_ALPHA);
+    });
+    opens = 0;
+    failAtOpen = 3;
+    const failed = index.run({}, () => 'skip');
+    assert.equal(failed.result.failedItems.length, 1, 'the digest-scheduled unit failed');
+
+    failAtOpen = null;
+    const retry = index.run();
+    assert.deepEqual(
+      scheduledSessionIds(retry),
+      [betaId],
+      'the next scan re-runs the digest and retries the failed unit',
+    );
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// A zero-length WAL carries no frames. SQLite may create or leave one after a checkpoint, and
+// counting its stat identity in the gate would make the next refresh re-digest the whole store
+// from a read that changed nothing.
+test('a zero-length WAL does not move the store gate', () => {
+  const layout = fixtureHome();
+  let opens = 0;
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      opens += 1;
+      return openStore(path);
+    },
+  }));
+  try {
+    settle(index);
+    writeFileSync(join(layout.base, 'state.db-wal'), '');
+    opens = 0;
+    assert.equal(index.run().plan.items.length, 0, 'the empty WAL schedules no work');
+    assert.equal(opens, 0, 'and the store is not opened');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// The issue's cost shape: an explained write reads exactly one session's projected rows, however
+// many sessions the store holds. The watermark pass that precedes it reads no payload at all.
+test('an explained write reads only the dirty session\'s payload', () => {
+  const layout = fixtureHome();
+  let payloadReads = 0;
+  const opener = injectingOpener(() => { payloadReads += 1; });
+  const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore: opener.openStore }));
+  try {
+    settle(index);
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    writeStore(layout.primaryPath, db => {
+      appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'One more line', timestamp: 1767226020 });
+    });
+
+    payloadReads = 0;
+    const round = index.run();
+    assert.deepEqual(scheduledSessionIds(round), [alphaId], 'only the dirty session is scheduled');
+    assert.equal(payloadReads, 1, 'one session payload read, not the whole store');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
@@ -2107,9 +2341,10 @@ test('an incrementally updated index matches a from-scratch build of the same st
   const rebuild = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
   try {
     settle(incremental);
-    // A new session's first row, then an appended row plus a same-length rewrite (visible only to
-    // the exact digest), then a write to a column the projection ignores plus a rewind, then a
-    // deletion that has to retract.
+    // A new session's first row, then an appended row plus a same-length rewrite (which the
+    // incremental path may defer to the next unexplained move; the final rebuild comparison is
+    // what proves the outcome), then a write to a column the projection ignores plus a rewind,
+    // then a deletion that has to retract.
     writeStore(layout.primaryPath, db => {
       appendMessage(db, SESSION_BETA, 'assistant', { content: 'Beta first row', timestamp: 1767312060 });
     });
