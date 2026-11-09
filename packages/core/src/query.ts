@@ -22,6 +22,7 @@ const SQLITE_CONSTRAINT_PRIMARYKEY = 1555;
 interface QueryOptions extends Record<string, any> {
   limit?: number;
   sessionId?: string;
+  excludeSession?: string | string[];
   sessions?: string[];
   project?: string;
   projectPath?: string;
@@ -322,6 +323,7 @@ function createQueryApi(
     const {
       limit = 20,
       sessionId,
+      excludeSession,
       project,
       projectPath,
       after,
@@ -344,6 +346,16 @@ function createQueryApi(
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
+    const excluded = excludeSession === undefined ? []
+      : typeof excludeSession === 'string' ? [excludeSession] : excludeSession;
+    if (!Array.isArray(excluded) || excluded.some(id => typeof id !== 'string' || id.length === 0)) {
+      throw new TypeError('search() excludeSession must be a session ID or an array of session IDs');
+    }
+    if (excluded.length) {
+      const ids = [...new Set(excluded)];
+      where += ` AND mf.session_id NOT IN (${ids.map(() => '?').join(',')})`;
+      filterParams.push(...ids);
+    }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
     if (projectPath) { where += ' AND s.project_path=?'; filterParams.push(projectPath); }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }

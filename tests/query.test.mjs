@@ -1208,3 +1208,26 @@ test('sessions applies scope before each reference cap and unions both ID inputs
   assert.deepEqual(api.sessions({ sessionId: 'raw-exact', source: 'pi' }), []);
   db.close();
 });
+
+test('search excludes caller sessions before LIMIT while preserving compact, scoped results', () => {
+  const db = searchDb();
+  db.prepare('INSERT INTO sessions (id,title,project,project_path) VALUES (?,?,?,?)')
+    .run('other-session', 'Earlier evidence', 'quiet-zero', '/tmp/quiet-zero');
+  db.prepare('INSERT INTO messages (uuid,session_id,text,role,timestamp,visibility,cwd) VALUES (?,?,?,?,?,?,?)')
+    .run('other-evidence', 'other-session', 'needle independent evidence', 'assistant', '2026-06-09T10:00:00.000Z', 'visible', '/tmp/quiet-zero');
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  const api = createQueryApi(db);
+  try {
+    const results = api.search('needle', { excludeSession: 'sid-search', limit: 1,
+      projectPath: '/tmp/quiet-zero', snippetTokens: 8, contextLimit: 0 });
+    assert.deepEqual(results.map(hit => hit.message.uuid), ['other-evidence']);
+    assert.equal(results[0].message.isSnippet, true);
+    assert.deepEqual(results[0].context, []);
+    assert.deepEqual(api.search('needle', { excludeSession: ['sid-search', 'other-session'] }), []);
+    assert.deepEqual(api.search('needle', { excludeSession: [] }), api.search('needle'));
+    assert.deepEqual(api.search('needle', { sessionId: 'sid-search', excludeSession: 'sid-search' }), []);
+    assert.throws(() => api.search('needle', { excludeSession: [null] }), /excludeSession/);
+    assert.throws(() => api.search('needle', { excludeSession: 42 }), /excludeSession/);
+    assert.ok(api.search('needle', { excludeSession: 'other-session' }).every(hit => hit.message.visibility === 'visible'));
+  } finally { db.close(); }
+});
