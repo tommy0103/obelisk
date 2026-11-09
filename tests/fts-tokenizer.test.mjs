@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -139,19 +142,19 @@ test('the build debounce yields to a pending tokenizer switch', () => {
   }
 });
 
-test('daemon ownership still wins over a pending tokenizer switch', () => {
+test('fresh daemon rejects a tokenizer mismatch without changing either index', () => {
   const db = openSchemaDb();
   try {
     db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)').run('__app_heartbeat__', 100000);
-
-    assert.deepEqual(
-      shouldSkipBuild(db, { now: 110000, ftsTokenizer: 'trigram' }),
-      { skip: true, reason: 'daemon_active' },
-      'the app owns writes and runs the same migration itself',
-    );
-  } finally {
-    db.close();
-  }
+    const before = createSqlFor(db, 'messages_fts');
+    for (const ignoreDaemonOwnership of [false, true]) {
+      assert.throws(() => shouldSkipBuild(db, { now: 110000, ftsTokenizer: 'trigram', ignoreDaemonOwnership }), /OBELISK_FTS_TOKENIZER differs.*Restart/);
+      assert.equal(createSqlFor(db, 'messages_fts'), before);
+    }
+    assert.deepEqual(shouldSkipBuild(db, { now: 110000, ftsTokenizer: null }), { skip: true, reason: 'daemon_active' });
+    migrateFtsTokenizer(db, 'trigram');
+    assert.deepEqual(shouldSkipBuild(db, { now: 110000, ftsTokenizer: 'trigram' }), { skip: true, reason: 'daemon_active' });
+  } finally { db.close(); }
 });
 
 test('migrateFtsTokenizer is idempotent and reversible', () => {
@@ -229,3 +232,27 @@ for (const [binding, open] of [
     } finally { db.close(); }
   });
 }
+
+test('CLI reports an active-daemon tokenizer mismatch without touching the database', () => {
+  const home = makeTempDir('obelisk-tokenizer-daemon-');
+  const dir = join(home, '.obelisk');
+  mkdirSync(dir, { recursive: true });
+  const filename = join(dir, 'obelisk.sqlite');
+  const db = new DatabaseSync(filename);
+  db.exec(SCHEMA);
+  insertMessage(db, 'retained', 'searchable evidence');
+  db.prepare("INSERT INTO index_state(jsonl_path,mtime,lines_processed) VALUES('__app_heartbeat__',?,0)").run(Date.now());
+  const before = createSqlFor(db, 'messages_fts');
+  db.close();
+  const script = join(home, 'query.mjs');
+  writeFileSync(script, 'return stats();');
+  for (const args of [['--build'], ['--query', script]]) {
+    const result = runCli(args, { home, env: { OBELISK_FTS_TOKENIZER: 'trigram' } });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(JSON.parse(result.stdout).error, /OBELISK_FTS_TOKENIZER differs.*Restart/);
+  }
+  const check = new DatabaseSync(filename, { readOnly: true });
+  assert.equal(createSqlFor(check, 'messages_fts'), before);
+  assert.equal(ftsHits(check, 'searchable'), 1);
+  check.close();
+});

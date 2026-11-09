@@ -31,13 +31,20 @@ multiple steps, but the first locator should be the narrowest semantic fit. If a
 scope locator finds the relevant project/session/file, do not also run broad FTS
 unless scoped evidence is insufficient and `query_plan` says why.
 
+Session references resolve through `sessions()`: a raw provider uuid (pi-family
+canonical ids are `source:uuid:project-scope`, so the uuid is only a fragment)
+resolves to the containing sessions, capped at the 10 newest matches within the requested filters — a raw
+uuid normally resolves to exactly one session. All other helpers match
+`sessionId` exactly; feed them the canonical `id` from the `sessions()` row,
+never the raw uuid.
+
 Project-like fields are distinct:
 
 - `sessions.project`: provider-normalized project slug.
 - `memories.project`: stored project slug copied onto registered memory records.
 - `sessions.project_path`: absolute session path derived from message `cwd` when available; slug decoding is only a fallback.
 - `messages.cwd`: working directory at message time.
-- `sessions.source` / `messages.source`: transcript provider, currently `claude` or `codex`.
+- `sessions.source` / `messages.source`: transcript provider: `claude`, `codex`, `kimi`, `kiro`, `omp`, `opencode`, or `pi`.
 - helper `project`: SQL `LIKE` over `sessions.project`, not exact membership.
 - helper `source`: optional provider filter. Omit it unless provenance matters.
 
@@ -65,6 +72,14 @@ decisions. Prefer a learned faceted detail pass over `LIMIT 25` session windows.
 If vocabulary is still unclear, use a small filtered window and say so in
 `query_plan`.
 
+For correlation questions such as "while implementing X, did we discuss Y?",
+build the candidate session set from X first, then search for Y only inside that
+set. Independent global searches for X and Y do not establish that the topics
+belonged to the same work. Start with visible user/assistant text; use tool
+results to locate artifacts, not as conversation conclusions. Run an explicit
+inactive second pass only when superseded reasoning matters, and label it as
+historical rather than final.
+
 ### Structure Before Text
 
 Use the database shape before asking the model to read text. This means
@@ -84,15 +99,36 @@ Ordering and context are semantic:
 - `memories()` without `query` is newest first; `memories({ query })` is FTS-ranked over memory `summary`/`path`, with lower rank sorting earlier.
 - `fileHistory()` is oldest first.
 - `search().context` is temporal neighbors in one session, not causal context.
-- `context(uuid)` and `trace(uuid)` are for parent-chain/causal expansion.
+- `messages({ around: uuid })` is a bounded temporal window in one session and
+  agent, ordered by timestamp then UUID; it does not establish branch ancestry.
+- `messages({ around: uuid, relation: 'parents', beforeCount: 3 })` selects a
+  bounded ancestor tail in parent order. It counts after content/meta filtering
+  and does not infer a forward path across branches. Full-chain context/trace
+  remain compatibility capabilities, not the default retrieval surface.
+  They return only current evidence by default. Use `includeInactive: true` for
+  a Pi or OMP path that was tried and then superseded; hidden records remain
+  unavailable.
 
 ### Evidence Before Conclusion
 
 Obelisk's raw session layer stores original structure, not precompiled claims:
 sessions, messages, summaries, tool calls/results, files, subagents, workflows,
-parent chains, and raw JSONL windows. The memory layer can store
+parent chains, and raw JSONL/store windows. The memory layer can store
 human-approved markdown conclusions, but treat them as prior notes to compare
 against raw evidence when correctness matters.
+
+Providers fold native token breakdowns into canonical `input_tokens` and
+`output_tokens`: for example, OpenCode V2 folds input plus cache read/write into
+`input_tokens` and output plus reasoning into `output_tokens`, while V1 uses
+per-step `step-finish` accounting. When raw payloads are needed, `raw()` accesses
+the underlying transcript line or SQLite row projection (`opencode`).
+
+Pi and OMP can preserve a branch that was tried and later superseded as
+`visibility='inactive'`. Other sources either do not record supersession or
+discard it while indexing; an empty inactive result does not establish that
+nothing was abandoned. Default helpers return visible evidence. Opt into
+inactive evidence only when abandoned reasoning matters and label it as tried
+then superseded. Hidden records remain unavailable even with that option.
 
 For semantic questions, build a task-local evidence view:
 
@@ -132,28 +168,14 @@ conversation language.
 `memories()` returns active memories only. For raw SQL memory recall, include
 `deleted_at IS NULL`; archived memory records are management/audit data.
 
-The agent may decide whether to use, ignore, or verify a recalled memory for the
-current answer without user approval because no persistent state changes. If a
-user explicitly says a memory is wrong, outdated, should be forgotten, or should
-be replaced, that request is approval to mutate the exact matching memory. If
-the agent discovers the conflict without an explicit user request, it should
-answer from current evidence and ask before archiving or replacing the memory.
+Then synthesize the conclusion in the final answer. Identify prior memories
+naturally when they influence it; the task-local evidence view is not itself a
+stored Obelisk entity.
 
-Then synthesize the conclusion in the final answer. Do not pretend the raw
-evidence view is itself a stored Obelisk entity.
-
-After synthesis, check whether the conclusion should become a memory. Offer to
-write one when the result is durable, likely to help future sessions, and not
-already covered by `prior_memories`. Good candidates include design decisions,
-project conventions, abandoned alternatives, repeated failure causes, workflow
-patterns, and conclusions synthesized across multiple raw evidence points. Do
-not propose memory for one-off lookups, uncertain findings, or duplicate
-coverage. The offer is only a proposal: write the markdown file and run
-`--attune` only after user approval.
-
-Memory updates are archive-plus-write, not in-place edits: run `forget()` on the
-old record and `remember()` the replacement markdown file under the same user
-approval.
+If the conclusion may deserve persistent memory, read the
+[memory workflow](memory-workflow.md) for candidate selection and write steps.
+It links the authorization contract and mutation recipes; retrieval itself
+never changes memory state.
 
 ## Text Search Semantics
 

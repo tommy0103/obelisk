@@ -1,13 +1,16 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { assembleSessionDetail } from '../app/src/shared/session-detail-assembly.mjs';
 import { persist } from '../packages/core/src/persist.ts';
 import { parse } from '../packages/core/src/providers/codex.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 const PARENT_ID = '019ed000-0000-7000-8000-000000000101';
@@ -30,7 +33,7 @@ function writeRollout(path, meta, source) {
 }
 
 test('a replayed Codex call cannot steal the visible message tool association', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-codex-replay-'));
+  const dir = makeTempDir('obelisk-codex-replay-');
   const parentPath = join(dir, 'parent.jsonl');
   const replayPath = join(dir, 'replay.jsonl');
   writeRollout(parentPath, {

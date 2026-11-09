@@ -1,11 +1,24 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { hermesSessionId } from '../packages/core/src/providers/hermes.ts';
+import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
+import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
+import { canonicalDeepseekTreeSessionId, deepseekProjectScope } from '../packages/core/src/providers/deepseek-identity.ts';
+import { codexDbId } from '../packages/core/src/parsing.ts';
+import { namespacedSessionId as kimiSessionId } from '../packages/core/src/providers/kimi.ts';
+import { kiroSessionId } from '../packages/core/src/providers/kiro.ts';
+import { copilotSessionId } from '../packages/core/src/providers/copilot.ts';
+import { canonicalSessionId as zcodeSessionId } from '../packages/core/src/providers/zcode.ts';
+import { opencodeSessionId } from '../packages/core/src/providers/opencode-identity.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -36,34 +49,68 @@ function searchDb() {
   const db = new DatabaseSync(':memory:');
   db.exec(`
     CREATE TABLE sessions (
-      id TEXT PRIMARY KEY, title TEXT, project TEXT, started_at TEXT,
+      id TEXT PRIMARY KEY, title TEXT, project TEXT, project_path TEXT, started_at TEXT,
       source TEXT DEFAULT 'claude'
     );
     CREATE TABLE messages (
       uuid TEXT PRIMARY KEY, session_id TEXT, text TEXT, role TEXT,
       timestamp TEXT, model TEXT, cwd TEXT, content_type TEXT,
-      is_meta INTEGER DEFAULT 0, source TEXT DEFAULT 'claude'
+      is_meta INTEGER DEFAULT 0, visibility TEXT DEFAULT 'visible',
+      source TEXT DEFAULT 'claude'
     );
     CREATE VIRTUAL TABLE messages_fts USING fts5(
       uuid UNINDEXED, session_id UNINDEXED, text,
       content=messages, content_rowid=rowid
     );
+    CREATE INDEX idx_messages_ts ON messages(session_id, timestamp);
   `);
   db.prepare(`
-    INSERT INTO sessions (id, title, project, started_at)
-    VALUES (?, ?, ?, ?)
-  `).run('sid-search', 'Search session', 'quiet-zero', '2026-06-10T10:00:00Z');
+    INSERT INTO sessions (id, title, project, project_path, started_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('sid-search', 'Search session', 'quiet-zero', '/tmp/quiet-zero', '2026-06-10T10:00:00Z');
   const insert = db.prepare(`
-    INSERT INTO messages (uuid, session_id, text, role, timestamp, model, cwd, content_type, is_meta)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO messages (uuid, session_id, text, role, timestamp, model, cwd, content_type, is_meta, visibility)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  insert.run('msg-meta', 'sid-search', 'needle injected caveat', 'user', '2026-06-10T10:00:30Z', null, '/tmp/quiet-zero', 'text', 1);
-  insert.run('msg-text', 'sid-search', 'needle visible reply', 'assistant', '2026-06-10T10:01:00Z', 'claude-opus', '/tmp/quiet-zero', 'text', 0);
-  insert.run('msg-meta-near', 'sid-search', '<command-name>/exit</command-name>', 'user', '2026-06-10T10:01:30Z', null, '/tmp/quiet-zero', 'text', 1);
-  insert.run('msg-thinking', 'sid-search', 'nearby reasoning trace', 'assistant', '2026-06-10T10:02:00Z', 'claude-opus', '/tmp/quiet-zero', 'thinking', 0);
+  insert.run('msg-meta', 'sid-search', 'needle injected caveat', 'user', '2026-06-10T10:00:30Z', null, '/tmp/quiet-zero', 'text', 1, 'visible');
+  insert.run('msg-text', 'sid-search', 'needle visible reply', 'assistant', '2026-06-10T10:01:00Z', 'claude-opus', '/tmp/quiet-zero', 'text', 0, 'visible');
+  insert.run('msg-meta-near', 'sid-search', '<command-name>/exit</command-name>', 'user', '2026-06-10T10:01:30Z', null, '/tmp/quiet-zero', 'text', 1, 'visible');
+  insert.run('msg-thinking', 'sid-search', 'nearby reasoning trace', 'assistant', '2026-06-10T10:02:00Z', 'claude-opus', '/tmp/quiet-zero', 'thinking', 0, 'visible');
+  insert.run('msg-inactive', 'sid-search', 'needle superseded experiment', 'assistant', '2026-06-10T10:02:30Z', 'claude-opus', '/tmp/quiet-zero', 'text', 0, 'inactive');
+  insert.run('msg-inactive-meta', 'sid-search', 'needle superseded injected', 'user', '2026-06-10T10:02:40Z', null, '/tmp/quiet-zero', 'text', 1, 'inactive');
+  insert.run('msg-hidden', 'sid-search', 'needle abandoned branch', 'assistant', '2026-06-10T10:03:00Z', 'claude-opus', '/tmp/quiet-zero', 'text', 0, 'hidden');
   db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
   return db;
 }
+
+test('list helpers reject negative limits instead of returning unbounded results', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+  const calls = [
+    ['search() limit', -1, () => api.search('memory', { limit: -1 })],
+    ['search() limit', -5, () => api.search('memory', { limit: -5 })],
+    ['subagents() limit', -1, () => api.subagents({ limit: -1 })],
+    ['workflows() limit', -1, () => api.workflows({ limit: -1 })],
+    ['fileHistory() limit', -1, () => api.fileHistory('/tmp/file.ts', { limit: -1 })],
+    ['failures() limit', -1, () => api.failures({ limit: -1 })],
+    ['sessions() limit', -1, () => api.sessions({ limit: -1 })],
+    ['sessions() limit', -1, () => api.recent(-1)],
+    ['summaries() limit', -1, () => api.summaries({ limit: -1 })],
+    ['overview() limit', -1, () => api.overview({ limit: -1 })],
+    ['overview() projectLimit', -1, () => api.overview({ projectLimit: -1 })],
+    ['overview() memoryLimit', -1, () => api.overview({ memoryLimit: -1 })],
+    ['raw() limit', -1, () => api.raw('missing', { limit: -1 })],
+    ['raw() offset', -1, () => api.raw('missing', { offset: -1 })],
+    ['memories() limit', -1, () => api.memories({ limit: -1 })],
+  ];
+
+  for (const [label, value, call] of calls) {
+    assert.throws(call, { name: 'RangeError', message: `${label} must be non-negative (got ${value})` });
+  }
+  assert.deepEqual(api.search('memory', { limit: 0 }), []);
+  assert.deepEqual(api.sessions({ limit: 0 }), []);
+  db.close();
+});
 
 test('search falls back to safe tokenization for FTS-special input instead of throwing', () => {
   const db = searchDb();
@@ -75,6 +122,50 @@ test('search falls back to safe tokenization for FTS-special input instead of th
   const rows = api.search('needle-reply', { limit: 5 });
 
   assert.deepEqual(rows.map(r => r.message.uuid), ['msg-text']);
+  db.close();
+});
+
+test('search broadens only an empty query when the OR fallback is explicitly enabled', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+
+  assert.deepEqual(api.search('needle absent', { limit: 10 }), []);
+  assert.deepEqual(
+    api.search('needle absent', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+  );
+  assert.deepEqual(
+    new Set(api.search('needle absent', { fallback: 'or', includeInactive: true, limit: 10 }).map(row => row.message.uuid)),
+    new Set(['msg-text', 'msg-inactive']),
+    'the relaxed retry preserves visibility filtering',
+  );
+  assert.deepEqual(
+    api.search('needle reply', { fallback: 'or', limit: 10 }).map(row => row.message.uuid),
+    ['msg-text'],
+    'a non-empty primary result is not broadened',
+  );
+  db.close();
+});
+
+test('OR fallback retains scope, source, time, cwd and limit filters', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+  const opts = { fallback: 'or', limit: 10 };
+  for (const scope of [
+    { sessionId: 'missing-session' }, { project: 'missing-project' },
+    { source: 'codex' }, { cwd: '/other/project' },
+    { after: '2026-06-11T00:00:00Z' }, { before: '2026-06-09T00:00:00Z' },
+  ]) {
+    assert.deepEqual(api.search('needle absent', { ...opts, ...scope }), [], JSON.stringify(scope));
+  }
+  const scoped = { ...opts, sessionId: 'sid-search', project: 'quiet-zero',
+    source: 'claude', cwd: '/tmp/quiet-zero',
+    after: '2026-06-10T10:00:00Z', before: '2026-06-10T10:03:00Z' };
+  assert.deepEqual(api.search('needle absent', scoped).map(r => r.message.uuid), ['msg-text']);
+  assert.equal(api.search('needle absent', { ...scoped, includeMeta: true }).length, 2);
+  assert.equal(api.search('needle absent', { ...scoped, includeMeta: true, limit: 1 }).length, 1);
+  assert.deepEqual(api.search('needle absent', { ...scoped, limit: 0 }), []);
+  assert.deepEqual(api.search('---', opts), []);
   db.close();
 });
 
@@ -93,6 +184,64 @@ test('search exposes content_type on hits and temporal context', () => {
   db.close();
 });
 
+test('search can return scoped snippets without automatic neighbor context', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+  const compact = api.search('needle', {
+    projectPath: '/tmp/quiet-zero', limit: 5, snippetTokens: 1, contextLimit: 0,
+  });
+  assert.deepEqual(compact.map(row => row.message.uuid), ['msg-text']);
+  assert.deepEqual(compact[0].context, []);
+  assert.match(compact[0].message.text, /needle/u);
+  assert.equal(compact[0].message.textLength, 'needle visible reply'.length);
+  assert.equal(compact[0].message.isSnippet, true);
+  assert.deepEqual(api.search('needle', { projectPath: '/tmp/other' }), []);
+  assert.equal(api.search('needle', { contextLimit: 1 })[0].context.length, 1);
+  assert.equal(api.search('needle', { limit: 1 })[0].message.isSnippet, undefined);
+  for (const opts of [{ contextLimit: -1 }, { contextLimit: 7 }, { snippetTokens: 0 }, { snippetTokens: 65 }]) {
+    assert.throws(() => api.search('needle', opts), RangeError);
+  }
+  db.close();
+});
+
+test('search temporal context preserves null and duplicate-timestamp neighbors', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title) VALUES ('sid-neighbors', 'Neighbors')").run();
+  const insert = db.prepare(`
+    INSERT INTO messages (uuid, session_id, role, text, timestamp, is_meta, visibility)
+    VALUES (?, 'sid-neighbors', 'assistant', ?, ?, ?, ?)
+  `);
+  insert.run('hit', 'temporal-neighbor-needle', '2026-06-10T10:00:05.000Z', 0, 'visible');
+  insert.run('null-visible', 'context', null, 0, 'visible');
+  insert.run('equal-a', 'context', '2026-06-10T10:00:05.000Z', 0, 'visible');
+  insert.run('equal-meta', 'context', '2026-06-10T10:00:05.000Z', 1, 'visible');
+  insert.run('equal-b', 'context', '2026-06-10T10:00:05.000Z', 0, 'visible');
+  insert.run('before-1', 'context', '2026-06-10T10:00:04.000Z', 0, 'visible');
+  insert.run('after-1', 'context', '2026-06-10T10:00:06.000Z', 0, 'visible');
+  insert.run('before-2-inactive', 'context', '2026-06-10T10:00:03.000Z', 0, 'inactive');
+  insert.run('after-2', 'context', '2026-06-10T10:00:07.000Z', 0, 'visible');
+  insert.run('hidden', 'context', '2026-06-10T10:00:05.500Z', 0, 'hidden');
+  insert.run('before-3', 'context', '2026-06-10T10:00:02.000Z', 0, 'visible');
+  insert.run('after-3', 'context', '2026-06-10T10:00:08.000Z', 0, 'visible');
+  insert.run('null-hit', 'null-temporal-needle', null, 0, 'visible');
+
+  const api = createQueryApi(db);
+  const contextIds = api.search('temporal-neighbor-needle', { limit: 1 })[0]
+    .context.map(row => row.uuid);
+
+  assert.deepEqual(contextIds, [
+    'null-visible', 'null-hit', 'before-1', 'equal-a', 'equal-b', 'after-1',
+  ]);
+
+  assert.deepEqual(
+    api.search('null-temporal-needle', { limit: 1 })[0]
+      .context.map(row => row.uuid),
+    ['null-visible', 'before-1', 'hit', 'equal-a', 'equal-b', 'after-1'],
+  );
+  db.close();
+});
+
 test('search and thread omit meta messages by default and expose them on request', () => {
   const db = searchDb();
   const api = createQueryApi(db);
@@ -102,13 +251,341 @@ test('search and thread omit meta messages by default and expose them on request
   const withMeta = api.search('injected', { includeMeta: true, limit: 5 });
   assert.equal(withMeta[0].message.uuid, 'msg-meta');
   assert.equal(withMeta[0].message.is_meta, 1);
+  assert.deepEqual(api.search('abandoned', { includeMeta: true, limit: 5 }), []);
 
   assert.deepEqual(api.thread('sid-search').map(m => m.uuid), ['msg-text', 'msg-thinking']);
   assert.deepEqual(
     api.thread('sid-search', { includeMeta: true }).map(m => m.uuid),
     ['msg-meta', 'msg-text', 'msg-meta-near', 'msg-thinking'],
   );
+  assert.deepEqual(
+    api.thread('sid-search', { includeInactive: true }).map(m => [m.uuid, m.visibility]),
+    [
+      ['msg-text', 'visible'],
+      ['msg-thinking', 'visible'],
+      ['msg-inactive', 'inactive'],
+    ],
+  );
 
+  db.close();
+});
+
+test('inactive search is opt-in, orthogonal to meta filtering, and always labeled', () => {
+  const db = searchDb();
+  const api = createQueryApi(db);
+
+  assert.deepEqual(api.search('superseded', { limit: 5 }), []);
+  const inactive = api.search('superseded', { includeInactive: true, limit: 5 });
+  assert.deepEqual(inactive.map(row => [row.message.uuid, row.message.visibility]), [
+    ['msg-inactive', 'inactive'],
+  ]);
+  assert.equal(
+    inactive[0].context.every(row => row.visibility === 'visible' || row.visibility === 'inactive'),
+    true,
+  );
+
+  const withMeta = api.search('superseded', {
+    includeInactive: true,
+    includeMeta: true,
+    limit: 5,
+  });
+  assert.deepEqual(
+    withMeta.map(row => [row.message.uuid, row.message.visibility]).sort(),
+    [
+      ['msg-inactive', 'inactive'],
+      ['msg-inactive-meta', 'inactive'],
+    ],
+  );
+  assert.deepEqual(api.search('abandoned', { includeInactive: true, includeMeta: true }), []);
+  db.close();
+});
+
+test('context and trace reject hidden targets and omit hidden ancestors', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-chain', 'Visibility chain', 'pi');
+  const insert = db.prepare(`
+    INSERT INTO messages (
+      uuid,session_id,type,parent_uuid,role,text,timestamp,visibility,source
+    ) VALUES (?,?,?,?,?,?,?,?,?)
+  `);
+  insert.run('visible-root', 'sid-chain', 'user', null, 'user', 'root', '2026-08-02T10:00:00Z', 'visible', 'pi');
+  insert.run('hidden-parent', 'sid-chain', 'assistant', 'visible-root', 'assistant', 'secret', '2026-08-02T10:00:01Z', 'hidden', 'pi');
+  insert.run('visible-child', 'sid-chain', 'user', 'hidden-parent', 'user', 'continue', '2026-08-02T10:00:02Z', 'visible', 'pi');
+  insert.run('inactive-child', 'sid-chain', 'assistant', 'visible-root', 'assistant', 'superseded', '2026-08-02T10:00:03Z', 'inactive', 'pi');
+
+  const api = createQueryApi(db);
+  assert.equal(api.context('hidden-parent'), null);
+  assert.equal(api.context('hidden-parent', { includeInactive: true }), null);
+  assert.deepEqual(api.trace('hidden-parent'), []);
+  assert.deepEqual(api.trace('hidden-parent', { includeInactive: true }), []);
+  assert.equal(api.context('inactive-child'), null);
+  assert.deepEqual(api.trace('inactive-child'), []);
+  assert.deepEqual(
+    api.context('inactive-child', { includeInactive: true }).parentChain
+      .map(message => [message.uuid, message.visibility]),
+    [['visible-root', 'visible']],
+  );
+  assert.deepEqual(
+    api.trace('inactive-child', { includeInactive: true })
+      .map(message => [message.uuid, message.visibility]),
+    [
+      ['visible-root', 'visible'],
+      ['inactive-child', 'inactive'],
+    ],
+  );
+  assert.deepEqual(
+    api.context('visible-child').parentChain.map(message => message.uuid),
+    ['visible-root'],
+  );
+  assert.deepEqual(
+    api.trace('visible-child').map(message => message.uuid),
+    ['visible-root', 'visible-child'],
+  );
+  db.close();
+});
+
+test('raw rejects hidden targets and labels explicitly included inactive evidence', () => {
+  const db = searchDb();
+  const providerRegistry = {
+    raw: ({ messageUuid }) => ({
+      text: `raw:${messageUuid}`,
+      totalLength: `raw:${messageUuid}`.length,
+    }),
+  };
+  const api = createQueryApi(db, { providerRegistry });
+
+  assert.equal(api.raw('msg-hidden'), null);
+  assert.equal(api.raw('msg-hidden', { includeInactive: true }), null);
+  assert.equal(api.raw('msg-inactive'), null);
+  assert.deepEqual(
+    api.raw('msg-inactive', { includeInactive: true }),
+    {
+      text: 'raw:msg-inactive',
+      totalLength: 16,
+      offset: 0,
+      limit: 10000,
+      hasMore: false,
+      visibility: 'inactive',
+    },
+  );
+  assert.equal(api.raw('msg-text').text, 'raw:msg-text');
+  assert.equal(api.raw('msg-text').visibility, 'visible');
+  db.close();
+});
+
+test('raw looks up cursors by provider unit identity instead of source path', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,jsonl_path,source) VALUES (?,?,?,?)')
+    .run('sid-raw-key', 'Raw key', '/alpha/agents/main/wire.jsonl', 'alpha');
+  db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,content_type,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `).run('msg-raw-key', 'sid-raw-key', 'user', 'user', 'raw key', 'text', 'visible', 'alpha');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor)
+    VALUES (?,?,?,?)
+  `).run('alpha:unit', 10, 1, '10:1');
+  let cursor;
+  const provider = {
+    sessionUnitKey: () => 'alpha:unit',
+  };
+  const providerRegistry = {
+    get: () => provider,
+    raw(input) {
+      cursor = input.cursor;
+      return { text: 'raw', totalLength: 3 };
+    },
+  };
+
+  assert.equal(createQueryApi(db, { providerRegistry }).raw('msg-raw-key').text, 'raw');
+  assert.equal(cursor, '10:1');
+  db.close();
+});
+
+test('failures nextMessages does not leak hidden branch messages', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-failure', 'Failure branch', 'pi');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+  insertMessage.run('failure-result', 'sid-failure', 'user', 'toolResult', 'failed', '2026-08-02T10:00:00Z', 'visible', 'pi');
+  insertMessage.run('hidden-next', 'sid-failure', 'assistant', 'assistant', 'abandoned', '2026-08-02T10:00:01Z', 'hidden', 'pi');
+  insertMessage.run('inactive-next', 'sid-failure', 'assistant', 'assistant', 'superseded', '2026-08-02T10:00:02Z', 'inactive', 'pi');
+  insertMessage.run('visible-next', 'sid-failure', 'assistant', 'assistant', 'recovered', '2026-08-02T10:00:03Z', 'visible', 'pi');
+  db.prepare(`
+    INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json)
+    VALUES (?,?,?,?,?)
+  `).run('call-failure', 'failure-result', 'sid-failure', 'read', '{}');
+  db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `).run('call-failure', 'failure-result', 'sid-failure', 'failed', 1);
+
+  const row = createQueryApi(db).failures('sid-failure')[0];
+  assert.deepEqual(row.nextMessages.map(message => message.uuid), ['visible-next']);
+  assert.equal(row.visibility, 'visible');
+  assert.deepEqual(
+    createQueryApi(db).failures({ sessionId: 'sid-failure', includeInactive: true })[0]
+      .nextMessages.map(message => [message.uuid, message.visibility]),
+    [
+      ['inactive-next', 'inactive'],
+      ['visible-next', 'visible'],
+    ],
+  );
+  db.close();
+});
+
+test('failures gates both result and linked call message visibility', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-edge-visibility', 'Tool edge visibility', 'pi');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+  const insertCall = db.prepare(`
+    INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json,file_path)
+    VALUES (?,?,?,?,?,?)
+  `);
+  const insertResult = db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `);
+  for (const [index, callVisibility] of ['visible', 'inactive', 'hidden'].entries()) {
+    const callId = `call-${callVisibility}`;
+    insertMessage.run(
+      `message-${callVisibility}`,
+      'sid-edge-visibility',
+      'assistant',
+      'assistant',
+      null,
+      `2026-08-02T10:00:0${index * 2}Z`,
+      callVisibility,
+      'pi',
+    );
+    insertMessage.run(
+      `result-${callVisibility}`,
+      'sid-edge-visibility',
+      'user',
+      'toolResult',
+      `failed-${callVisibility}`,
+      `2026-08-02T10:00:0${index * 2 + 1}Z`,
+      'visible',
+      'pi',
+    );
+    insertCall.run(
+      callId,
+      `message-${callVisibility}`,
+      'sid-edge-visibility',
+      'read',
+      JSON.stringify({ path: `/${callVisibility}` }),
+      `/${callVisibility}`,
+    );
+    insertResult.run(
+      callId,
+      `result-${callVisibility}`,
+      'sid-edge-visibility',
+      `failed-${callVisibility}`,
+      1,
+    );
+  }
+  const api = createQueryApi(db);
+
+  assert.deepEqual(
+    api.failures('sid-edge-visibility').map(record => record.toolCall.id),
+    ['call-visible'],
+  );
+  assert.deepEqual(
+    api.failures({ sessionId: 'sid-edge-visibility', includeInactive: true })
+      .map(record => [record.toolCall.id, record.visibility])
+      .sort(),
+    [
+      ['call-inactive', 'inactive'],
+      ['call-visible', 'visible'],
+    ],
+  );
+  db.close();
+});
+
+test('failures preserves orphaned error results without linked messages or calls', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-orphan-failure', 'Orphan failure', 'codex');
+  db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `).run('missing-call', '', 'sid-orphan-failure', 'orphaned failure', 1);
+
+  const rows = createQueryApi(db).failures('sid-orphan-failure');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].toolCall, undefined);
+  assert.equal(rows[0].result.content, 'orphaned failure');
+  assert.equal(rows[0].visibility, 'visible');
+  assert.deepEqual(rows[0].nextMessages, []);
+  db.close();
+});
+
+test('summaries, file history, and failures expose inactive rows only on request', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('sid-structured', 'Structured visibility', 'pi');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+  const insertCall = db.prepare(`
+    INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json,file_path)
+    VALUES (?,?,?,?,?,?)
+  `);
+  const insertResult = db.prepare(`
+    INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,is_error)
+    VALUES (?,?,?,?,?)
+  `);
+  const insertSummary = db.prepare(`
+    INSERT INTO summaries (id,session_id,timestamp,source,content,visibility)
+    VALUES (?,?,?,?,?,?)
+  `);
+  for (const [index, visibility] of ['visible', 'inactive', 'hidden'].entries()) {
+    const suffix = visibility;
+    const uuid = `message-${suffix}`;
+    const callId = `call-${suffix}`;
+    const timestamp = `2026-08-02T10:00:0${index}Z`;
+    insertMessage.run(uuid, 'sid-structured', 'user', 'toolResult', suffix, timestamp, visibility, 'pi');
+    insertCall.run(callId, uuid, 'sid-structured', 'read', '{}', '/tmp/visibility.ts');
+    insertResult.run(callId, uuid, 'sid-structured', `failed-${suffix}`, 1);
+    insertSummary.run(`summary-${suffix}`, 'sid-structured', timestamp, 'pi:branch_summary', suffix, visibility);
+  }
+  const api = createQueryApi(db);
+
+  assert.deepEqual(api.fileHistory('/tmp/visibility.ts').map(row => row.visibility), ['visible']);
+  assert.deepEqual(
+    api.fileHistory('/tmp/visibility.ts', { includeInactive: true }).map(row => row.visibility),
+    ['visible', 'inactive'],
+  );
+  assert.deepEqual(api.failures('sid-structured').map(row => row.visibility), ['visible']);
+  assert.deepEqual(
+    api.failures({ sessionId: 'sid-structured', includeInactive: true })
+      .map(row => [row.visibility, row.result.visibility]),
+    [
+      ['inactive', 'inactive'],
+      ['visible', 'visible'],
+    ],
+  );
+  assert.deepEqual(api.summaries('sid-structured').map(row => row.visibility), ['visible']);
+  assert.deepEqual(
+    api.summaries({ sessionId: 'sid-structured', includeInactive: true })
+      .map(row => row.visibility),
+    ['inactive', 'visible'],
+  );
   db.close();
 });
 
@@ -180,6 +657,175 @@ test('overview returns a compact current-project map with bounded sessions', () 
   db.close();
 });
 
+test('sessions resolves raw provider native ids to canonical ids', () => {
+  const db = memoryDb();
+  const rawPi = '11111111-2222-4333-8444-555555555551';
+  const rawOmp = '22222222-2222-4333-8444-555555555552';
+  const rawKimi = '33333333-3333-4333-8444-555555555553';
+  const rawCodex = '44444444-4444-4333-8444-555555555554';
+  const rawDeepseek = '55555555-5555-4333-8444-555555555555';
+  // Shape-compatible lookup fixtures, not end-to-end provider ingestion fixtures.
+  const rawClaude = '8f39c2a1-7b45-4d83-a029-61e47f903bc2';
+  const rawCopilot = '6b8a4d92-0f13-4c67-95ea-2d7419b03f86';
+  const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
+  const rawOpencode = '77777777-7777-4777-8777-777777777777';
+  const rawHermes = '20260101_120000_aaaaaa';
+  const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
+  const rawKiro = kiroHeader.id;
+  // Canonical ids in each provider's own shape: pi/omp/deepseek/kiro namespace by
+  // project, kimi/codex prefix the native id, claude keeps the bare uuid.
+  const piHeader = (cwd) => ({ type: 'session', id: rawPi, cwd });
+  const canonicalPiA = piFamilySessionId(piHeader('/Users/me/a'), 'pi');
+  const canonicalPiB = piFamilySessionId(piHeader('/Users/me/b'), 'pi');
+  const canonicalOmp = piFamilySessionId({ type: 'session', id: rawOmp, cwd: '/Users/me/omp' }, 'omp');
+  const canonicalKimi = kimiSessionId(rawKimi);
+  const canonicalCodex = codexDbId(rawCodex);
+  const canonicalDeepseek = canonicalDeepseekTreeSessionId(rawDeepseek, deepseekProjectScope('/Users/me/ds'));
+  const canonicalCopilot = copilotSessionId(rawCopilot, '/Users/me/copilot');
+  const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
+  const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
+  const canonicalKiro = kiroSessionId(rawKiro, kiroHeader.workspacePaths[0]);
+  const canonicalOpencode = opencodeSessionId(rawOpencode, '/Users/me/opencode/db.sqlite');
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertSession.run(canonicalPiA, 'Pi session in project A', '-Users-me-a', '/Users/me/a', '2026-09-18T10:00:00Z', '2026-09-18T11:00:00Z', null, 7, 'pi');
+  insertSession.run(canonicalPiB, 'Same raw uuid in project B', '-Users-me-b', '/Users/me/b', '2026-09-18T09:00:00Z', '2026-09-18T12:00:00Z', null, 3, 'pi');
+  insertSession.run(canonicalOmp, 'Omp session', '-Users-me-omp', '/Users/me/omp', '2026-09-18T08:00:00Z', '2026-09-18T09:00:00Z', null, 2, 'omp');
+  insertSession.run(canonicalKimi, 'Kimi session', '-Users-me-kimi', '/Users/me/kimi', '2026-09-18T07:00:00Z', '2026-09-18T08:00:00Z', null, 4, 'kimi');
+  insertSession.run(canonicalCodex, 'Codex session', '-Users-me-codex', '/Users/me/codex', '2026-09-18T06:00:00Z', '2026-09-18T07:00:00Z', null, 5, 'codex');
+  insertSession.run(canonicalDeepseek, 'Deepseek session', '-Users-me-ds', '/Users/me/ds', '2026-09-18T05:00:00Z', '2026-09-18T06:00:00Z', null, 6, 'deepseek');
+  insertSession.run(rawClaude, 'Claude session', '-Users-me-claude', '/Users/me/claude', '2026-09-18T04:00:00Z', '2026-09-18T05:00:00Z', null, 1, 'claude');
+  insertSession.run(canonicalCopilot, 'Copilot session', '-Users-me-copilot', '/Users/me/copilot', '2026-09-18T03:00:00Z', '2026-09-18T04:00:00Z', null, 1, 'copilot');
+  insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
+  insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
+  insertSession.run(canonicalKiro, kiroHeader.title, '-workspace-demo', kiroHeader.workspacePaths[0], kiroHeader.createdAt, kiroHeader.lastModifiedAt, null, 1, 'kiro');
+  insertSession.run(canonicalOpencode, 'Opencode session', '-Users-me-opencode', '/Users/me/opencode', '2026-09-18T00:30:00Z', '2026-09-18T00:45:00Z', null, 1, 'opencode');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
+    VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
+  `);
+  insertMessage.run('mu-1', canonicalPiA, '2026-09-18T10:01:00Z');
+  db.prepare(`
+    INSERT INTO summaries (id, session_id, timestamp, source, content, visibility)
+    VALUES ('sum-1', ?, '2026-09-18T10:02:00Z', 'summary', 'summary text', 'visible')
+  `).run(canonicalPiA);
+  const api = createQueryApi(db);
+
+  // Every registered provider has an exercised native-ID lookup case.
+  const lookups = {
+    claude: [rawClaude, [rawClaude]],
+    codex: [rawCodex, [canonicalCodex]],
+    copilot: [rawCopilot, [canonicalCopilot]],
+    deepseek: [rawDeepseek, [canonicalDeepseek]],
+    hermes: [rawHermes, [canonicalHermes]],
+    kimi: [rawKimi, [canonicalKimi]],
+    kiro: [rawKiro, [canonicalKiro]],
+    omp: [rawOmp, [canonicalOmp]],
+    opencode: [rawOpencode, [canonicalOpencode]],
+    pi: [rawPi, [canonicalPiB, canonicalPiA]],
+    zcode: [rawZcode, [canonicalZcode]],
+  };
+  assert.deepEqual(Object.keys(lookups).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());
+  for (const [source, [native, expected]] of Object.entries(lookups)) {
+    assert.deepEqual(api.sessions({ sessionId: native }).map(row => row.id), expected, `${source} native-ID lookup`);
+  }
+
+  // The same uuid scoped to two projects returns every containing row, each
+  // labeled with project_path/started_at; other filters narrow as usual.
+  assert.deepEqual(
+    api.sessions({ sessionId: rawPi }).map(row => [row.id, row.project_path]),
+    [[canonicalPiB, '/Users/me/b'], [canonicalPiA, '/Users/me/a']],
+  );
+  assert.deepEqual(
+    api.sessions({ sessionId: rawPi, project: '-Users-me-a' }).map(row => row.id),
+    [canonicalPiA],
+  );
+
+  // Exact canonical ids keep today's behavior, in all input forms.
+  assert.equal(api.sessions({ sessionId: canonicalPiA }).length, 1);
+  assert.equal(api.sessions({ sessionId: 'sid-1' })[0].id, 'sid-1');
+  assert.deepEqual(api.sessions('sid-2').map(row => row.id), ['sid-2']);
+  assert.deepEqual(
+    api.sessions({ sessions: [rawKimi, 'sid-3', rawCodex] })
+      .map(row => row.id).sort(),
+    [canonicalKimi, 'sid-3', canonicalCodex].sort(),
+  );
+
+  // Unknown refs and SQL wildcards stay literal: no error, no fuzzy misses.
+  assert.deepEqual(api.sessions({ sessionId: 'ffffffff-0000-4000-8000-000000000000' }), []);
+  assert.deepEqual(api.sessions({ sessionId: 'sid-1%' }), []);
+  assert.deepEqual(api.sessions({ sessionId: 'sid_1' }), []);
+  // An empty array entry matches nothing, exactly as IN ('') always did.
+  assert.deepEqual(api.sessions({ sessions: ['', 'sid-1'] }).map(row => row.id), ['sid-1']);
+  assert.deepEqual(api.sessions({ sessions: [''] }), []);
+
+  // Other helpers keep exact matching; resolution is sessions()-only.
+  assert.equal(api.thread(rawPi).length, 0);
+  assert.equal(api.thread(canonicalPiA).length, 1);
+  assert.equal(api.summaries({ sessionId: canonicalPiA }).length, 1);
+  assert.deepEqual(api.summaries({ sessionId: rawPi }), []);
+
+  db.close();
+});
+
+test('every provider embeds the native session id verbatim in its canonical id', () => {
+  // Fragment resolution in sessions() depends on this: a native id is only
+  // findable while it appears verbatim inside the canonical id. pi-family,
+  // deepseek, copilot, hermes, kiro, and opencode encode native ids with
+  // encodeURIComponent, which preserves this UUID-shaped fixture and Hermes's
+  // timestamp-shaped lookup fixture above. URL-unsafe native ids need explicit coverage.
+  const native = '99999999-9999-4999-8999-999999999999';
+  const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
+  const canonical = {
+    // claude has no namespacing step: the canonical id is the native uuid.
+    claude: native,
+    hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
+    codex: codexDbId(native),
+    kimi: kimiSessionId(native),
+    kiro: kiroSessionId(native, '/Users/me/obelisk'),
+    pi: piFamilySessionId(piHeader, 'pi'),
+    omp: piFamilySessionId(piHeader, 'omp'),
+    opencode: opencodeSessionId(native, '/Users/me/obelisk/db.sqlite'),
+    deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),
+    copilot: copilotSessionId(native, '/Users/me/obelisk'),
+    zcode: zcodeSessionId('/Users/me/obelisk/db/db.sqlite', native),
+  };
+  assert.deepEqual(Object.keys(canonical).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());
+  for (const [source, id] of Object.entries(canonical)) {
+    assert.equal(
+      typeof id === 'string' && id.includes(native),
+      true,
+      `${source} canonical id ${id} must embed the native id verbatim`,
+    );
+  }
+});
+
+test('sessions fragment expansion is capped at the newest matches', () => {
+  const db = memoryDb();
+  // The same fragment embedded in more canonical ids than the expansion cap:
+  // id resolution is not fuzzy search, so the excess must be cut newest-first
+  // rather than planner-order.
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const cutoff = [];
+  for (let i = 0; i < 12; i++) {
+    const id = piFamilySessionId({ type: 'session', id: '66666666-6666-4666-8666-666666666666', cwd: `/Users/me/p${i}` }, 'pi');
+    const ended = `2026-09-18T${String(i).padStart(2, '0')}:00:00Z`;
+    insertSession.run(id, `copy ${i}`, `-Users-me-p${i}`, `/Users/me/p${i}`, ended, ended, null, 1, 'pi');
+    cutoff.push([id, ended]);
+  }
+  const api = createQueryApi(db);
+  const rows = api.sessions({ sessionId: '66666666-6666-4666-8666-666666666666' });
+  const expected = cutoff.slice(2).reverse().map(([id]) => id);
+  assert.equal(rows.length, 10);
+  assert.deepEqual(rows.map(row => row.id), expected);
+  db.close();
+});
+
 test('query api is read-only and does not expose attune helpers', () => {
   const db = memoryDb();
   const api = createQueryApi(db);
@@ -192,6 +838,103 @@ test('query api is read-only and does not expose attune helpers', () => {
     () => api.sql("INSERT INTO memories (id, path, summary) VALUES ('mem-x', '/tmp/x.md', 'x')"),
     /sql\(\) only supports read-only SELECT\/WITH queries/,
   );
+
+  db.close();
+});
+
+test('sql() accepts blocked keywords in literals, comments, and quoted identifiers', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+
+  // The issue #107 repro: all of these are read-only and must not be
+  // rejected for merely containing a blocked word.
+  assert.equal(api.sql("SELECT 'live update' AS text")[0].text, 'live update');
+  assert.equal(api.sql('SELECT 1 AS "delete"')[0].delete, 1);
+  assert.equal(api.sql('SELECT 1 AS x -- INSERT INTO t')[0].x, 1);
+  assert.equal(api.sql('SELECT 1 AS x /* DROP TABLE memories */')[0].x, 1);
+  // A blocked word inside a LIKE literal: no rows match, and that is the
+  // point — the query executes instead of being rejected.
+  assert.deepEqual(
+    api.sql("SELECT id FROM memories WHERE summary LIKE '%update%' ORDER BY id"),
+    [],
+  );
+  // Recursive CTEs and pragma table-valued functions are read-only too.
+  assert.equal(
+    api.sql('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<3) SELECT x FROM c').length,
+    3,
+  );
+  assert.ok(api.sql("SELECT name FROM pragma_table_info('memories')").length > 0);
+
+  db.close();
+});
+
+test('sql() rejects writes with a SELECT/WITH prefix without mutating the database', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+  const countMemories = () => db.prepare('SELECT COUNT(*) AS c FROM memories').get().c;
+
+  assert.throws(
+    () => api.sql("SELECT 1; DROP TABLE memories"),
+    /exactly one SQL statement/,
+  );
+
+  // The write denylist runs through node:sqlite's setAuthorizer, added in
+  // Node 24.10. On older supported Nodes (>=22.13) there is no prepare-time
+  // classifier; the read-only connection is the boundary there (covered by
+  // the next test), so these prepare-time assertions are capability-gated.
+  if (typeof db.setAuthorizer === 'function') {
+    assert.throws(
+      () => api.sql("WITH c AS (SELECT 1) INSERT INTO memories (id, path, summary) SELECT 'mem-x', '/tmp/x.md', 'x' FROM c"),
+      /sql\(\) only supports read-only SELECT\/WITH queries/,
+    );
+    assert.throws(
+      () => api.sql('WITH c AS (SELECT 1) DELETE FROM memories'),
+      /sql\(\) only supports read-only SELECT\/WITH queries/,
+    );
+    // The fixture database is writable, so these rows surviving proves the
+    // semantic checks — not the read-only connection — blocked the writes.
+  }
+  assert.equal(countMemories(), 3);
+
+  db.close();
+});
+
+test('a read-only connection fails writes closed on any supported Node version', () => {
+  // The final mutation boundary must hold even where the prepare-time
+  // authorizer does not exist (Node <24.10): the write fails at execute time
+  // and the index does not change.
+  const dir = makeTempDir('obelisk-readonly-boundary-');
+  const dbPath = join(dir, 'index.sqlite');
+  const seed = new DatabaseSync(dbPath);
+  seed.exec(SCHEMA);
+  seed.prepare('INSERT INTO memories (id, path, summary, created_at) VALUES (?, ?, ?, ?)')
+    .run('mem-1', '/m.md', 'seed memory', '2026-08-01T00:00:00Z');
+  seed.close();
+
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const api = createQueryApi(db);
+  assert.throws(
+    () => api.sql("WITH c AS (SELECT 1) INSERT INTO memories (id, path, summary) SELECT 'mem-x', '/tmp/x.md', 'x' FROM c"),
+    // With the authorizer: the contract error at prepare time. Without it
+    // (Node <24.10): SQLite's own read-only error at execute time.
+    /read-only SELECT\/WITH|readonly database/i,
+  );
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 1);
+  db.close();
+});
+
+test('sql() enforces one statement per call with clear failures', () => {
+  const db = memoryDb();
+  const api = createQueryApi(db);
+
+  assert.throws(() => api.sql('SELECT 1; SELECT 2'), /exactly one SQL statement/);
+  assert.throws(() => api.sql('SELECT 1;; SELECT 2'), /exactly one SQL statement/);
+  assert.throws(() => api.sql('SELECT 1; /* unterminated'), /exactly one SQL statement/);
+
+  // A trailing semicolon and trailing comments are still a single statement.
+  assert.equal(api.sql('SELECT 1;')[0]['1'], 1);
+  assert.equal(api.sql('SELECT 1; -- trailing comment')[0]['1'], 1);
+  assert.equal(api.sql('SELECT 1; /* trailing comment */')[0]['1'], 1);
 
   db.close();
 });
@@ -209,8 +952,55 @@ test('attune api exposes only memory mutation helpers', () => {
   db.close();
 });
 
+test('remember regenerates the id on a primary-key collision instead of overwriting', () => {
+  const memoryDir = makeTempDir('obelisk-remember-collision-');
+  const memoryPath = join(memoryDir, 'memory.md');
+  writeFileSync(memoryPath, '# Memory\n');
+
+  const inserted = [];
+  const attempted = [];
+  let failFirstInsert = true;
+  const fakeDb = {
+    prepare(sql) {
+      if (sql.startsWith('INSERT INTO memories')) {
+        return {
+          run: (...args) => {
+            attempted.push(args[0]);
+            if (failFirstInsert) {
+              failFirstInsert = false;
+              const error = new Error('UNIQUE constraint failed: memories.id');
+              error.errcode = 1555; // SQLITE_CONSTRAINT_PRIMARYKEY
+              throw error;
+            }
+            inserted.push(args);
+          },
+        };
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    },
+    exec() {},
+    close() {},
+  };
+
+  const result = createAttuneApi(fakeDb).remember({
+    path: memoryPath,
+    project: 'collision-test',
+    summary: 'Decision: memory ids regenerate on collision instead of overwriting.',
+  });
+
+  // The first attempt collided; the persisted row must carry a REGENERATED
+  // id (a retry of the same id would satisfy inserted[0][0] === result.id),
+  // and the existing row was never replaced (plain INSERT, not OR REPLACE).
+  assert.equal(attempted.length, 2);
+  assert.notEqual(attempted[0], attempted[1]);
+  assert.equal(inserted.length, 1);
+  assert.equal(inserted[0][0], result.id);
+  assert.equal(attempted[1], result.id);
+  assert.match(result.id, /^mem-[0-9a-f-]{36}$/);
+});
+
 test('remember stores absolute project-relative memory path', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
   const memoryPath = join(memoryDir, 'decision.md');
@@ -230,7 +1020,7 @@ test('remember stores absolute project-relative memory path', () => {
 });
 
 test('remember updates FTS recall for the registered memory immediately', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
   const memoryPath = join(memoryDir, 'query-plan.md');
@@ -272,7 +1062,7 @@ test('forget soft-deletes memory records from active recall', () => {
 });
 
 test('remember requires English summaries', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
   const memoryPath = join(memoryDir, 'decision.md');
@@ -293,7 +1083,7 @@ test('remember requires English summaries', () => {
 });
 
 test('remember rejects missing memory files', () => {
-  const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
+  const projectDir = makeTempDir('obelisk-memory-project-');
   const db = memoryDb({ projectPath: projectDir });
   const api = createAttuneApi(db);
 
@@ -306,5 +1096,115 @@ test('remember rejects missing memory files', () => {
     /remember\(\) memory file does not exist/,
   );
 
+  db.close();
+});
+
+test('subagents after/before narrow by the subagent activity interval, not session IDs', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,started_at) VALUES (?,?,?)')
+    .run('sid-agents', 'Subagent session', '2026-06-01T09:00:00Z');
+  const insertAgent = db.prepare(`
+    INSERT INTO subagents (agent_id,session_id,agent_type,description)
+    VALUES (?,?,?,?)
+  `);
+  insertAgent.run('agent-early', 'sid-agents', 'explore', 'Early agent');
+  insertAgent.run('agent-late', 'sid-agents', 'coder', 'Late agent');
+  insertAgent.run('agent-spanning', 'sid-agents', 'coder', 'Agent active across the bound');
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,role,text,timestamp,agent_id)
+    VALUES (?,?,?,?,?,?,?)
+  `);
+  insertMessage.run('m-early-1', 'sid-agents', 'assistant', 'assistant', 'early start', '2026-06-01T10:00:00Z', 'agent-early');
+  insertMessage.run('m-early-2', 'sid-agents', 'assistant', 'assistant', 'early end', '2026-06-01T10:05:00Z', 'agent-early');
+  insertMessage.run('m-late-1', 'sid-agents', 'assistant', 'assistant', 'late start', '2026-06-03T10:00:00Z', 'agent-late');
+  insertMessage.run('m-span-1', 'sid-agents', 'assistant', 'assistant', 'spanning start', '2026-06-01T12:00:00Z', 'agent-spanning');
+  insertMessage.run('m-span-2', 'sid-agents', 'assistant', 'assistant', 'spanning end', '2026-06-03T12:00:00Z', 'agent-spanning');
+  const api = createQueryApi(db);
+
+  // `after` keeps agents still active past the bound: the spanning agent's
+  // interval crosses 06-02 even though it started before it.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-late', 'agent-spanning'],
+  );
+  // `before` keeps agents already started by the bound.
+  assert.deepEqual(
+    api.subagents({ before: '2026-06-02T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-early', 'agent-spanning'],
+  );
+  // Combined bounds select every agent active during the window.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-01T09:00:00Z', before: '2026-06-04T00:00:00Z' }).map((row) => row.agent_id).sort(),
+    ['agent-early', 'agent-late', 'agent-spanning'],
+  );
+  // A window inside the spanning agent's interval matches it alone.
+  assert.deepEqual(
+    api.subagents({ after: '2026-06-02T00:00:00Z', before: '2026-06-03T00:00:00Z' }).map((row) => row.agent_id),
+    ['agent-spanning'],
+  );
+
+  db.close();
+});
+
+test('subagents() derives total_tokens from sidechain message usage when the provider stored none (ADR-0010)', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title, source) VALUES ('sid-sub', 'sub parent', 'deepseek')").run();
+  // The stored row carries no total_tokens: the value is derived at query time.
+  db.prepare("INSERT INTO subagents (agent_id, session_id, agent_type, description) VALUES ('deepseek:agent-1:scope', 'sid-sub', 'deepseek-official', 'helper')").run();
+  const insertMsg = db.prepare("INSERT INTO messages (uuid, session_id, type, role, text, timestamp, agent_id, input_tokens, output_tokens, source) VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insertMsg.run('sub-m1', 'sid-sub', 'assistant', 'assistant', 'a', '2026-06-01T00:00:00Z', 'deepseek:agent-1:scope', 10, 5, 'deepseek');
+  insertMsg.run('sub-m2', 'sid-sub', 'assistant', 'assistant', 'b', '2026-06-01T00:01:00Z', 'deepseek:agent-1:scope', 3, 2, 'deepseek');
+
+  const api = createQueryApi(db);
+  const row = api.subagents()[0];
+  assert.equal(row.total_tokens, 20); // (10+5) + (3+2)
+  assert.equal(row.messageCount, 2);
+  const ctx = api.context('sub-m1');
+  assert.equal(ctx.subagent.total_tokens, 20);
+  db.close();
+});
+
+test('subagents() never overrides a provider-stored total_tokens', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare("INSERT INTO sessions (id, title, source) VALUES ('sid-codex', 'codex parent', 'codex')").run();
+  // Codex stores total_tokens authoritatively at persist time; the derived
+  // message sum (30) must not replace the stored value (20).
+  db.prepare("INSERT INTO subagents (agent_id, session_id, agent_type, total_tokens) VALUES ('codex:agent-1', 'sid-codex', 'worker', 20)").run();
+  const insertMsg = db.prepare("INSERT INTO messages (uuid, session_id, type, role, text, timestamp, agent_id, input_tokens, output_tokens, source) VALUES (?,?,?,?,?,?,?,?,?,?)");
+  insertMsg.run('cx-m1', 'sid-codex', 'assistant', 'assistant', 'a', '2026-06-01T00:00:00Z', 'codex:agent-1', 10, 5, 'codex');
+
+  const api = createQueryApi(db);
+  assert.equal(api.subagents()[0].total_tokens, 20);
+  assert.equal(api.context('cx-m1').subagent.total_tokens, 20);
+  db.close();
+});
+
+test('sessions applies scope before each reference cap and unions both ID inputs', () => {
+  const db = memoryDb();
+  const insert = db.prepare('INSERT INTO sessions(id, project, source, git_branch, started_at, ended_at) VALUES(?,?,?,?,?,?)');
+  for (const ref of ['raw-a', 'raw-b']) {
+    for (let i = 0; i < 12; i++) {
+      const timestamp = `2026-09-18T${String(i).padStart(2, '0')}:00:00Z`;
+      insert.run(`pi:${ref}:p${i}`, `p${i}`, i === 0 ? 'omp' : 'pi', i === 0 ? 'target' : 'main', timestamp, timestamp);
+    }
+  }
+  insert.run('raw-exact', 'exact', 'claude', 'main', '2026', '2026');
+  insert.run('pi:raw-exact:shadow', 'exact', 'pi', 'main', '2026', '2026');
+  const api = createQueryApi(db);
+  for (const filter of [{ project: 'p0' }, { source: 'omp' }, { branch: 'target' }, { before: '2026-09-18T01:00:00Z' }]) {
+    assert.deepEqual(api.sessions({ sessionId: 'raw-a', ...filter }).map(row => row.id), ['pi:raw-a:p0']);
+    assert.deepEqual(api.sessions({ sessions: ['raw-a'], ...filter }).map(row => row.id), ['pi:raw-a:p0']);
+  }
+  const rows = api.sessions({ sessionId: 'raw-a', sessions: ['raw-b', 'raw-a', ''], limit: 100 });
+  assert.equal(rows.length, 20);
+  for (const ref of ['raw-a', 'raw-b']) {
+    assert.deepEqual(rows.filter(row => row.id.includes(ref)).map(row => row.id),
+      Array.from({ length: 10 }, (_, i) => `pi:${ref}:p${11 - i}`));
+  }
+  assert.deepEqual(api.sessions('raw-exact').map(row => row.id), ['raw-exact']);
+  assert.deepEqual(api.sessions({ sessionId: 'raw-exact', source: 'pi' }), []);
   db.close();
 });

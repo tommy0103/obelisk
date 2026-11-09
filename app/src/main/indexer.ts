@@ -1,22 +1,45 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import { RetryableSourceReadError } from '../../../packages/core/src/providers/source-read-error.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
+import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import {
+  backfillUnresolvedSessionProjectPathsOnce,
+  dropMessageFtsTriggers,
+  ensureFtsReady,
+  refreshSessionProjectPaths,
+} from '../../../packages/core/src/index-finalize.ts';
+import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
+import {
+  createConfiguredBuiltinProviderRuntime,
+  hasExplicitProviderRoot,
+  type PersistedProviderSettings,
+} from '../../../packages/core/src/provider-settings.ts';
 import {
   createProviderIndexPlan,
   indexProviderPlan,
+  indexProviderPlanStrict,
+  ProviderIndexFailure,
+  readRecentTranscriptHints,
+  readProviderIndexState,
+  readProviderSessionProvenance,
   writeProviderIndexMarkers,
+  type ProviderInventoryIssue,
+  type ProviderSessionProvenance,
+  type StoredProviderState,
 } from '../../../packages/core/src/provider-indexing.ts';
 import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapter } from '../../../packages/core/src/tx.ts';
 import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
-import {
-  inferProjectPath,
-} from '../../../packages/core/src/parsing.ts';
+import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,40 +72,57 @@ function openIndexDb({ dbPath = DEFAULT_DB_PATH, schemaPath = resolveSchemaPath(
   return db;
 }
 
-function copyMemoriesFromDb(db, sourceDbPath) {
-  if (!sourceDbPath || !fs.existsSync(sourceDbPath)) return false;
+function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionProvenance[]; indexState: ReadonlyMap<string, StoredProviderState> } {
+  if (!sourceDbPath || !fs.existsSync(sourceDbPath)) {
+    throw new Error(`Preserved Obelisk database is unavailable: ${sourceDbPath}`);
+  }
   db.prepare('ATTACH DATABASE ? AS previous_obelisk').run(sourceDbPath);
   try {
     const hasMemories = db.prepare(`
       SELECT name FROM previous_obelisk.sqlite_master
       WHERE type='table' AND name='memories'
     `).get();
-    if (!hasMemories) return false;
+    if (hasMemories) {
+      const sourceColumns = new Set(
+        db.prepare('PRAGMA previous_obelisk.table_info(memories)').all().map(column => column.name),
+      );
+      const targetColumns = [
+        'id',
+        'session_id',
+        'project',
+        'message_start',
+        'message_end',
+        'path',
+        'anchors',
+        'summary',
+        'created_at',
+        'deleted_at',
+        'deleted_reason',
+      ];
+      const selectList = targetColumns
+        .map(column => sourceColumns.has(column) ? column : `NULL AS ${column}`)
+        .join(',');
+      db.exec(`
+        INSERT OR REPLACE INTO memories (${targetColumns.join(',')})
+        SELECT ${selectList} FROM previous_obelisk.memories
+      `);
+    }
 
-    const sourceColumns = new Set(
-      db.prepare('PRAGMA previous_obelisk.table_info(memories)').all().map(column => column.name),
+    const hasSessions = db.prepare(`
+      SELECT name FROM previous_obelisk.sqlite_master
+      WHERE type='table' AND name='sessions'
+    `).get();
+    if (!hasSessions) {
+      throw new Error(`Preserved Obelisk database has no sessions table: ${sourceDbPath}`);
+    }
+    const sessionColumns = new Set(
+      db.prepare('PRAGMA previous_obelisk.table_info(sessions)').all().map(column => column.name),
     );
-    const targetColumns = [
-      'id',
-      'session_id',
-      'project',
-      'message_start',
-      'message_end',
-      'path',
-      'anchors',
-      'summary',
-      'created_at',
-      'deleted_at',
-      'deleted_reason',
-    ];
-    const selectList = targetColumns
-      .map(column => sourceColumns.has(column) ? column : `NULL AS ${column}`)
-      .join(',');
-    db.exec(`
-      INSERT OR REPLACE INTO memories (${targetColumns.join(',')})
-      SELECT ${selectList} FROM previous_obelisk.memories
-    `);
-    return true;
+    if (!sessionColumns.has('id') || !sessionColumns.has('jsonl_path')) {
+      throw new Error(`Preserved Obelisk sessions schema is incomplete: ${sourceDbPath}`);
+    }
+    const sessions = readProviderSessionProvenance(db, 'previous_obelisk');
+    return { sessions, indexState: readProviderIndexState(db, 'previous_obelisk') };
   } finally {
     db.exec('DETACH DATABASE previous_obelisk');
   }
@@ -107,26 +147,6 @@ function sessionIdFromChangedPath(projectsDir, changedPath) {
   return null;
 }
 
-function refreshSessionProjectPaths(db) {
-  const sessions = db.prepare('SELECT id, project FROM sessions').all();
-  const cwdStmt = db.prepare(`
-    SELECT cwd FROM messages
-    WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
-  `);
-  const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
-  for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map(row => row.cwd);
-    const projectPath = inferProjectPath(session.project, cwds);
-    if (projectPath) update.run(projectPath, session.id);
-  }
-}
-
-function rebuildFts(db) {
-  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-  db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
-}
-
 // PASSIVE by default: it checkpoints what it can without blocking concurrent
 // readers/writers, so it is safe to run after every build. A blocking TRUNCATE
 // (which reclaims the -wal file but needs exclusive access and can contend with
@@ -135,27 +155,6 @@ function checkpointDb(db, mode = 'PASSIVE') {
   try {
     db.pragma(`wal_checkpoint(${mode})`);
   } catch {}
-}
-
-const MESSAGE_FTS_TRIGGERS = [
-  'messages_fts_ai',
-  'messages_fts_ad',
-  'messages_fts_au',
-];
-
-function dropMessageFtsTriggers(db) {
-  for (const trigger of MESSAGE_FTS_TRIGGERS) {
-    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-  }
-}
-
-function ensureFtsReady(db, { force = false } = {}) {
-  const marker = '__fts_triggers_ready__';
-  const ready = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(marker);
-  if (ready && !force) return false;
-  rebuildFts(db);
-  writeIndexMarker(db, marker);
-  return true;
 }
 
 function writeIndexMarker(db, key, value = Date.now()) {
@@ -191,6 +190,7 @@ function writeHeartbeat({
 
 interface BuildIndexOptions {
   providerRoots?: Record<string, string>;
+  providerSettings?: PersistedProviderSettings;
   providerRegistry?: ProviderRegistry;
   claudeDir?: string;
   codexDir?: string;
@@ -200,7 +200,10 @@ interface BuildIndexOptions {
   DatabaseImpl?: new (dbPath: string) => any;
   LockDatabaseImpl?: new (dbPath: string) => any;
   force?: boolean;
+  reason?: string;
+  readMode?: 'normal' | 'strict';
   changedPaths?: string[];
+  retrySessionIds?: string[];
   preserveDbPath?: string | null;
   writerLeasePath?: string;
   writerLeaseWaitMs?: number;
@@ -208,6 +211,7 @@ interface BuildIndexOptions {
 }
 
 interface SkippedFile {
+  provider: string;
   path: string;
   error: string;
   diagnostics?: unknown;
@@ -221,6 +225,11 @@ interface BuildIndexResult {
   skipped: number;
   skippedFiles: SkippedFile[];
   deferred: boolean;
+  complete: boolean;
+  incompleteProviders: string[];
+  inventoryIssues: ProviderInventoryIssue[];
+  /** Most recently written transcripts (ADR-0009 hot-set seeding). */
+  watchHints?: string[];
   reason?: string;
 }
 
@@ -235,6 +244,9 @@ function deferredBuildResult(
     ftsRebuilt: false,
     skipped: 0,
     skippedFiles: [],
+    complete: false,
+    incompleteProviders: [],
+    inventoryIssues: [],
     ...overrides,
     deferred: true,
     reason,
@@ -243,6 +255,7 @@ function deferredBuildResult(
 
 function buildIndex({
   providerRoots = {},
+  providerSettings,
   providerRegistry,
   claudeDir = DEFAULT_CLAUDE_DIR,
   codexDir = path.join(path.dirname(claudeDir), '.codex'),
@@ -252,7 +265,10 @@ function buildIndex({
   DatabaseImpl = Database,
   LockDatabaseImpl = DatabaseImpl,
   force = false,
+  reason = undefined,
+  readMode = reason === 'reconcile' || reason === 'repair' ? 'strict' : 'normal',
   changedPaths = undefined,
+  retrySessionIds = [],
   preserveDbPath = null,
   writerLeasePath = writerLockPathFor(dbPath),
   writerLeaseWaitMs = 2000,
@@ -277,13 +293,18 @@ function buildIndex({
     const txDb = betterSqliteTransactionAdapter(db);
     let messageFtsTriggersDropped = false;
     try {
+      let priorSessions: ProviderSessionProvenance[] | undefined;
+      let priorIndexState: ReadonlyMap<string, StoredProviderState> | undefined;
       if (preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)) {
-        copyMemoriesFromDb(db, preserveDbPath);
+        const previous = copyPreservedDataFromDb(db, preserveDbPath);
+        priorSessions = previous.sessions;
+        priorIndexState = previous.indexState;
       }
       const defaultHome = os.homedir();
       const compatibilityHome = path.dirname(claudeDir);
       const relocatedDefaults = Object.fromEntries(
-        createBuiltinProviderRegistry().catalog().map((descriptor) => {
+        createBuiltinProviderRegistry().catalog().flatMap((descriptor) => {
+          if (descriptor.requiresExplicitRoot) return [];
           const relativeDefault = path.relative(defaultHome, descriptor.defaultRoot);
           const root = compatibilityHome !== defaultHome
             && relativeDefault
@@ -291,7 +312,7 @@ function buildIndex({
             && !path.isAbsolute(relativeDefault)
             ? path.join(compatibilityHome, relativeDefault)
             : descriptor.defaultRoot;
-          return [descriptor.id, root];
+          return [[descriptor.id, root]];
         }),
       );
       const roots = {
@@ -300,8 +321,44 @@ function buildIndex({
         codex: codexDir,
         ...providerRoots,
       };
-      const registry = providerRegistry ?? createBuiltinProviderRegistry(roots);
-      const providerPlan = createProviderIndexPlan(db, registry, { force, changedPaths });
+      const openCopilotChronicle = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true });
+      const openHermesStore = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true });
+      const openZcodeDatabase = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openKiroDatabase = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openOpencodeDatabase = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const registry = providerRegistry
+        ?? (providerSettings === undefined
+          ? createBuiltinProviderRegistry(roots, { homeDir: compatibilityHome, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase })
+          : createConfiguredBuiltinProviderRuntime(providerSettings, {
+            homeDir: compatibilityHome,
+            baseRoots: {
+              ...roots,
+              ...(!hasExplicitProviderRoot(providerSettings, 'copilot') ? { copilot: undefined } : {}),
+              ...(!hasExplicitProviderRoot(providerSettings, 'opencode') ? { opencode: undefined } : {}),
+            },
+            openCopilotChronicle,
+            openHermesStore,
+            openZcodeDatabase,
+            openKiroDatabase,
+            openOpencodeDatabase,
+          }).registry);
+      const providerPlan = createProviderIndexPlan(db, registry, {
+        force,
+        changedPaths,
+        priorSessions,
+        priorIndexState,
+        readMode,
+      });
       let latestSourceMtime = providerPlan.items.reduce((latest, { unit }) => {
         const providerCursor = (unit.meta as { currentCursor?: unknown } | undefined)?.currentCursor;
         if (typeof providerCursor === 'string') {
@@ -313,45 +370,33 @@ function buildIndex({
           return latest;
         }
       }, 0);
-
-      try {
-        if (force) {
-          runRetryableWriteTransaction(txDb, () => {
-            dropMessageFtsTriggers(db);
-            db.prepare("DELETE FROM index_state WHERE substr(jsonl_path, 1, 2) != '__'").run();
-            db.prepare("DELETE FROM messages").run();
-            db.prepare("DELETE FROM tool_calls").run();
-            db.prepare("DELETE FROM tool_results").run();
-            db.prepare("DELETE FROM sessions").run();
-            db.prepare("DELETE FROM summaries").run();
-            db.prepare("DELETE FROM subagents").run();
-            db.prepare("DELETE FROM workflows").run();
-            db.prepare("DELETE FROM workflow_agents").run();
-          }, { label: 'force-cleanup' });
-          messageFtsTriggersDropped = true;
-        }
-      } catch (error) {
-        if (isBeginBusyFailure(error)) {
-          return deferredBuildResult('database_busy', {
-            files: providerPlan.items.length,
-            latestSourceMtime,
-          });
-        }
-        throw error;
+      const discoveredSourceMtime = latestSourceMtime;
+      const incompleteProviders = [...providerPlan.incompleteProviders].sort();
+      const inventoryIssues = [...providerPlan.inventoryIssues];
+      const skipped: SkippedFile[] = [...providerPlan.skippedArtifacts];
+      if (force && incompleteProviders.length > 0) {
+        return {
+          files: providerPlan.items.length,
+          latestSourceMtime,
+          affectedSessionIds: [],
+          ftsRebuilt: false,
+          skipped: skipped.length,
+          skippedFiles: skipped,
+          deferred: false,
+          complete: false,
+          incompleteProviders,
+          inventoryIssues,
+          reason: 'incomplete_snapshot',
+        };
       }
+
       const affectedSessionIds = new Set<string>();
       const finalizeAffectedSessionIds = new Set<string>();
-      const changedMetaJsonlPaths = new Set<string>();
       if (Array.isArray(changedPaths)) {
         for (const changedPath of changedPaths) {
           const sessionId = sessionIdFromChangedPath(projectsDir, changedPath);
           const normalizedChangedPath = normalizeChangedPath(projectsDir, changedPath);
           const isMetaChange = normalizedChangedPath?.toLowerCase().endsWith('.meta.json');
-          if (isMetaChange && normalizedChangedPath) {
-            changedMetaJsonlPaths.add(
-              normalizedChangedPath.slice(0, -'.meta.json'.length) + '.jsonl',
-            );
-          }
           // Transcript files report their session only after their own transaction
           // commits. Workflow changes are applied during finalize, so stage those
           // IDs until the finalize transaction commits. Meta files map back to their
@@ -361,24 +406,139 @@ function buildIndex({
           }
         }
       }
-      const skipped: SkippedFile[] = [];
+      let ftsRebuilt = false;
+      const noteCommitted = ({ unit }, nextCursor) => {
+        if (nextCursor) {
+          latestSourceMtime = Math.max(
+            latestSourceMtime,
+            Number(nextCursor.split(':')[0]) || 0,
+          );
+        }
+        if (unit.sessionId) affectedSessionIds.add(unit.sessionId);
+        for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
+      };
+      const finalize = (providerResult) => {
+        if (force) {
+          refreshSessionProjectPaths(db, null);
+        } else {
+          refreshSessionProjectPaths(
+            db,
+            new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds]),
+          );
+          backfillUnresolvedSessionProjectPathsOnce(db);
+        }
+        healWorkflowParentLinks(db);
+        if (messageFtsTriggersDropped) installSchema(db, schemaPath);
+        ftsRebuilt = ensureFtsReady(db, { force });
+        writeIndexMarker(db, '__last_build__');
+        if (providerResult.complete) writeIndexMarker(db, '__app_last_successful_build__');
+        writeIndexMarker(db, '__indexer_owner_app__');
+        writeProviderIndexMarkers(db, providerPlan, providerResult);
+        if (latestSourceMtime) writeIndexMarker(db, '__last_source_mtime__', latestSourceMtime);
+      };
+
+      if (force) {
+        const previousDb = providerPlan.retainedSessions.length > 0 && preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)
+          ? new (DatabaseImpl as new (file: string, options: { readonly: boolean; fileMustExist: boolean }) => any)(preserveDbPath, { readonly: true, fileMustExist: true })
+          : undefined;
+        let snapshot: ReturnType<typeof prepareRetainedSnapshot> | undefined;
+        try {
+          snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions, previousDb);
+          const retainedSnapshot = snapshot;
+          runRetryableWriteTransaction(txDb, () => {
+            latestSourceMtime = discoveredSourceMtime;
+            affectedSessionIds.clear();
+            skipped.splice(0, skipped.length, ...providerPlan.skippedArtifacts);
+            ftsRebuilt = false;
+            dropMessageFtsTriggers(db);
+            messageFtsTriggersDropped = true;
+            retainedSnapshot.reset();
+            const providerResult = indexProviderPlanStrict({
+              db,
+              plan: providerPlan,
+              onCommitted: noteCommitted,
+            });
+            finalize(providerResult);
+          }, { label: 'force-rebuild' });
+        } catch (error) {
+          if (isBeginBusyFailure(error)) {
+            return deferredBuildResult('database_busy', {
+              files: providerPlan.items.length,
+              latestSourceMtime: discoveredSourceMtime,
+              incompleteProviders,
+              inventoryIssues,
+              skipped: skipped.length,
+              skippedFiles: skipped,
+            });
+          }
+          if (error instanceof ProviderIndexFailure) {
+            if (error.sourceError instanceof RetryableSourceReadError) {
+              inventoryIssues.push({ provider: error.item.provider.name, path: error.sourceError.sourcePath, error: error.sourceError.message });
+            }
+            skipped.push({
+              provider: error.item.provider.name,
+              path: error.item.unit.key,
+              error: error.sourceError instanceof Error
+                ? error.sourceError.message
+                : String(error.sourceError),
+              diagnostics: (error as { obelisk?: unknown }).obelisk,
+            });
+            console.warn(
+              `Warning: failed to index ${error.item.provider.name} unit ${error.item.unit.key}: ${error.message}`,
+            );
+            return {
+              files: providerPlan.items.length,
+              latestSourceMtime: discoveredSourceMtime,
+              affectedSessionIds: [],
+              ftsRebuilt: false,
+              skipped: skipped.length,
+              skippedFiles: skipped,
+              deferred: false,
+              complete: false,
+              incompleteProviders,
+              inventoryIssues,
+              reason: 'provider_failure',
+            };
+          }
+          throw error;
+        } finally {
+          try { snapshot?.close(); }
+          finally { previousDb?.close(); }
+        }
+        for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
+        return {
+          files: providerPlan.items.length,
+          latestSourceMtime,
+          affectedSessionIds: [...affectedSessionIds],
+          ftsRebuilt,
+          skipped: skipped.length,
+          skippedFiles: skipped,
+          deferred: false,
+          complete: true,
+          incompleteProviders,
+          inventoryIssues,
+          watchHints: readRecentTranscriptHints(db, undefined, registry),
+        };
+      }
+
       const providerResult = indexProviderPlan({
         db,
         plan: providerPlan,
         runTransaction: (label, work) => runRetryableWriteTransaction(txDb, work, { label }),
-        onCommitted: ({ unit }, nextCursor) => {
-          if (nextCursor) latestSourceMtime = Math.max(latestSourceMtime, Number(nextCursor.split(':')[0]) || 0);
-          if (unit.sessionId) affectedSessionIds.add(unit.sessionId);
-        },
+        onCommitted: noteCommitted,
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
+          if (error instanceof RetryableSourceReadError) {
+            inventoryIssues.push({ provider: provider.name, path: error.sourcePath, error: error.message });
+          }
           skipped.push({
+            provider: provider.name,
             path: unit.key,
-            error: (error as Error).message,
-            diagnostics: (error as { obelisk?: unknown }).obelisk,
+            error: error instanceof Error ? error.message : String(error),
+            diagnostics: (error as { obelisk?: unknown })?.obelisk,
           });
-          console.warn(`Warning: failed to index ${provider.name} unit ${unit.key}: ${(error as Error).message}`);
+          console.warn(`Warning: failed to index ${provider.name} unit ${unit.key}: ${error instanceof Error ? error.message : String(error)}`);
           return 'skip';
         },
       });
@@ -389,22 +549,13 @@ function buildIndex({
           affectedSessionIds: [...affectedSessionIds],
           skipped: skipped.length,
           skippedFiles: skipped,
+          incompleteProviders,
+          inventoryIssues,
         });
       }
-      let ftsRebuilt = false;
-      // Finalize is one transaction; a failure here fails the whole build (the
-      // index would otherwise be left inconsistent).
+      // Finalize is one transaction; a failure here fails the whole build.
       try {
-        runRetryableWriteTransaction(txDb, () => {
-          refreshSessionProjectPaths(db);
-          if (messageFtsTriggersDropped) installSchema(db, schemaPath);
-          ftsRebuilt = ensureFtsReady(db, { force });
-          writeIndexMarker(db, '__last_build__');
-          writeIndexMarker(db, '__app_last_successful_build__');
-          writeIndexMarker(db, '__indexer_owner_app__');
-          writeProviderIndexMarkers(db, providerPlan, providerResult);
-          if (latestSourceMtime) writeIndexMarker(db, '__last_source_mtime__', latestSourceMtime);
-        }, { label: 'finalize' });
+        runRetryableWriteTransaction(txDb, () => finalize(providerResult), { label: 'finalize' });
       } catch (error) {
         if (isBeginBusyFailure(error)) {
           return deferredBuildResult('database_busy', {
@@ -413,6 +564,8 @@ function buildIndex({
             affectedSessionIds: [...affectedSessionIds],
             skipped: skipped.length,
             skippedFiles: skipped,
+            incompleteProviders,
+            inventoryIssues,
           });
         }
         throw error;
@@ -426,6 +579,10 @@ function buildIndex({
         skipped: skipped.length,
         skippedFiles: skipped,
         deferred: false,
+        complete: providerResult.complete,
+        incompleteProviders,
+        inventoryIssues,
+        watchHints: readRecentTranscriptHints(db, undefined, registry),
       };
     } finally {
       if (messageFtsTriggersDropped) {

@@ -1,9 +1,14 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 
 import { extractContentType, extractMessageIsMeta } from '../packages/core/src/db.ts';
+import { migrateCoreSchemaColumns } from '../packages/core/src/schema-migrations.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 
 async function readExecutableSchema() {
   return readFile(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -45,9 +50,66 @@ test('messages schema stores the raw content block type', async () => {
 
   assert.match(source, /content_type TEXT/);
   assert.match(source, /is_meta INTEGER DEFAULT 0/);
+  assert.match(source, /CREATE INDEX IF NOT EXISTS idx_messages_usage_day/);
+  assert.match(source, /CREATE INDEX IF NOT EXISTS idx_messages_turn_duration/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages/);
   assert.match(source, /CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages/);
+});
+
+test('usage indexes accept provider timestamps without normalizing them', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    db.prepare(`
+      INSERT INTO messages (uuid, timestamp, input_tokens, source)
+      VALUES (?, ?, ?, ?)
+    `).run('raw-timestamp', 'now', 1, 'claude');
+
+    assert.equal(
+      db.prepare("SELECT timestamp FROM messages WHERE uuid='raw-timestamp'").get().timestamp,
+      'now',
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('summaries preserve usage from provider-owned summary model calls', async () => {
+  const source = await readExecutableSchema();
+
+  assert.match(source, /summaries \([\s\S]*visibility TEXT DEFAULT 'visible'[\s\S]*input_tokens INTEGER, output_tokens INTEGER/);
+  assert.match(source, /index_state \([\s\S]*cursor TEXT/);
+});
+
+test('additive migrations preserve old index state and summary rows while adding canonical fields', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`
+      CREATE TABLE index_state (
+        jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER
+      );
+      CREATE TABLE summaries (
+        id TEXT PRIMARY KEY, session_id TEXT, timestamp TEXT,
+        source TEXT, content TEXT
+      );
+      INSERT INTO index_state VALUES ('unit', 12, 3);
+      INSERT INTO summaries VALUES ('summary', 'session', NULL, 'legacy', 'kept');
+    `);
+
+    migrateCoreSchemaColumns(db);
+    assert.equal(db.prepare("SELECT replay_required FROM index_state WHERE jsonl_path='unit'").get().replay_required, 0);
+    assert.equal(
+      db.prepare("SELECT cursor FROM index_state WHERE jsonl_path='unit'").get().cursor,
+      null,
+    );
+    assert.deepEqual(
+      { ...db.prepare("SELECT content,visibility FROM summaries WHERE id='summary'").get() },
+      { content: 'kept', visibility: 'visible' },
+    );
+  } finally {
+    db.close();
+  }
 });
 
 test('tool results schema indexes live session patch lookups', async () => {
@@ -61,6 +123,120 @@ test('tool results schema indexes live session patch lookups', async () => {
     assert.ok(
       plan.some(row => /USING INDEX idx_tr_session/.test(String(row.detail))),
       `expected idx_tr_session lookup, got: ${plan.map(row => row.detail).join('; ')}`,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('tool results schema limits failure scans to failure rows', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    const plan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tr.*
+      FROM tool_results tr
+      LEFT JOIN messages rm ON rm.uuid=tr.message_uuid
+      LEFT JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      LEFT JOIN messages cm ON cm.uuid=tc.message_uuid
+      LEFT JOIN sessions s ON s.id=tr.session_id
+      WHERE (tr.is_error = 1 OR tr.content LIKE 'Exit code %')
+        AND COALESCE(rm.visibility,'visible')='visible'
+        AND COALESCE(cm.visibility,'visible')='visible'
+        AND COALESCE(s.source, 'claude') = ?
+      ORDER BY rm.timestamp DESC
+      LIMIT ?
+    `).all('codex', 50);
+
+    assert.ok(
+      plan.some(row => /USING INDEX idx_tr_failure_session/.test(String(row.detail))),
+      `expected partial failure index, got: ${plan.map(row => row.detail).join('; ')}`,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('failure index preserves NULL-source compatibility and visibility in the production helper', async () => {
+  const schema = await readExecutableSchema();
+  const outputs = [];
+  for (const indexed of [false, true]) {
+    const db = new DatabaseSync(':memory:');
+    try {
+      db.exec(schema);
+      if (!indexed) db.exec('DROP INDEX idx_tr_failure_session');
+      db.exec(`
+        INSERT INTO sessions (id, source) VALUES ('legacy', NULL), ('codex', 'codex');
+        INSERT INTO messages (uuid, session_id, timestamp, visibility) VALUES
+          ('visible', 'legacy', '2026-09-01T00:00:00.000Z', 'visible'),
+          ('inactive', 'legacy', '2026-09-02T00:00:00.000Z', 'inactive'),
+          ('hidden', 'legacy', '2026-09-03T00:00:00.000Z', 'hidden');
+        INSERT INTO tool_results (tool_use_id, session_id, message_uuid, content, is_error) VALUES
+          ('null-source', 'legacy', 'visible', 'failed', 1),
+          ('missing-session', 'absent', NULL, 'Exit code 1', 0),
+          ('codex-error', 'codex', NULL, 'failed', 1),
+          ('inactive-error', 'legacy', 'inactive', 'failed', 1),
+          ('hidden-error', 'legacy', 'hidden', 'failed', 1),
+          ('success', 'legacy', 'visible', 'ok', 0);
+      `);
+      const api = createQueryApi(db);
+      const ids = opts => api.failures(opts).map(row => row.result.tool_use_id);
+      assert.deepEqual(ids({ source: 'claude' }), ['null-source', 'missing-session']);
+      assert.deepEqual(ids({ source: 'codex' }), ['codex-error']);
+      assert.deepEqual(ids({ source: 'claude', includeInactive: true }),
+        ['inactive-error', 'null-source', 'missing-session']);
+      assert.deepEqual(ids({ source: 'claude', sessionId: 'legacy', limit: 1 }), ['null-source']);
+      outputs.push(api.failures({ source: 'claude', includeInactive: true }));
+    } finally {
+      db.close();
+    }
+  }
+  assert.deepEqual(outputs[1], outputs[0], 'adding the index must not change returned evidence');
+});
+
+test('session detail queries use the visible main timeline index', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(await readExecutableSchema());
+    const messagePlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT m.uuid FROM messages m
+      WHERE m.session_id = ? AND m.agent_id IS NULL
+        AND COALESCE(m.visibility, 'visible') = 'visible'
+      ORDER BY m.timestamp, m.uuid
+    `).all('session-1');
+    const toolCallPlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tc.* FROM messages m
+      CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+      WHERE m.session_id = ? AND m.agent_id IS NULL
+        AND COALESCE(m.visibility, 'visible') = 'visible'
+        AND tc.session_id = ?
+    `).all('session-1', 'session-1');
+    const toolResultPlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT tr.* FROM messages m
+      CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
+      WHERE m.session_id = ? AND m.agent_id IS NULL
+        AND COALESCE(m.visibility, 'visible') = 'visible'
+        AND tr.session_id = ?
+    `).all('session-1', 'session-1');
+
+    const details = plan => plan.map(row => String(row.detail));
+    assert.ok(
+      details(messagePlan).some(detail => /USING INDEX idx_messages_main_timeline/.test(detail)),
+      `expected main timeline index, got: ${details(messagePlan).join('; ')}`,
+    );
+    assert.ok(
+      /USING INDEX idx_messages_main_timeline/.test(details(toolCallPlan)[0])
+        && details(toolCallPlan).some(detail => /USING INDEX idx_tc_message/.test(detail)),
+      `expected main-timeline-first tool call lookup, got: ${details(toolCallPlan).join('; ')}`,
+    );
+    assert.ok(
+      /USING INDEX idx_messages_main_timeline/.test(details(toolResultPlan)[0])
+        && details(toolResultPlan).some(detail => /USING INDEX idx_tr_message/.test(detail)),
+      `expected main-timeline-first tool result lookup, got: ${details(toolResultPlan).join('; ')}`,
     );
   } finally {
     db.close();
@@ -125,10 +301,18 @@ test('schema reference stays focused on raw SQL structure', async () => {
 
   assert.ok(ref.split('\n').length < 420, 'schema.md should remain a quick SQL reference');
   assert.match(ref, /Raw SQL Quick Reference/i);
+  assert.match(ref, /Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi/);
+  assert.equal(
+    ref.match(/Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi`/g)?.length,
+    2,
+    'session and message source fields should document every provider',
+  );
   assert.match(ref, /references\/api-reference\.md/);
   assert.match(ref, /sessions\.id\s+<--\s+messages\.session_id/);
   assert.match(ref, /tool_calls.*does not have timestamps/i);
   assert.match(ref, /COALESCE\(m\.is_meta, 0\) = 0/);
+  assert.match(ref, /provider-attested superseded history/);
+  assert.match(ref, /Exact opaque provider cursor/);
   assert.doesNotMatch(ref, /#### `summaries\(opts\?\)`/);
   assert.doesNotMatch(ref, /#### `raw\(uuid, opts\?\)`/);
 });
@@ -137,8 +321,11 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'kiro' \| 'omp' \| 'pi'/);
+  assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
+  assert.match(ref, /Inactive summaries describe work that was tried and[\s\S]*then superseded/);
   assert.match(ref, /session_title/);
   assert.match(ref, /opts\.branch/);
   assert.match(ref, /#### `raw\(uuid, opts\?\)`/);
@@ -154,11 +341,27 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Reference Map/);
-  assert.match(skill, /references\/schema\.md.*raw SQL/i);
-  assert.match(skill, /references\/api-reference\.md.*helper/i);
-  assert.match(skill, /references\/query-patterns\.md.*synthesis/i);
-  assert.match(skill, /references\/pitfalls\.md.*error/i);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, Kiro, OMP, and Pi/);
+  const routes = [
+    ['references/schema.md', /raw SQL/i],
+    ['references/api-reference.md', /helper/i],
+    ['references/query-patterns.md', /synthesis/i],
+    ['references/retrieval-semantics.md', /correlation/i],
+    ['references/pitfalls.md', /error/i],
+  ];
+  for (const [path, trigger] of routes) {
+    const route = skill.split('\n').find(line => line.startsWith('|')
+      && line.includes(`](${path})`) && trigger.test(line.split('|')[1]));
+    assert.ok(route, `${path} must have a task-specific disclosure trigger`);
+    await readFile(new URL(`../skill-doc/${path}`, import.meta.url), 'utf8');
+  }
+
+  // Details belong to the references reached by these routes, not the entry.
+  const api = await readApiReference();
+  const semantics = await readFile(new URL('../skill-doc/references/retrieval-semantics.md', import.meta.url), 'utf8');
+  assert.match(api, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(semantics, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(semantics, /build the candidate session set from X first.*Y only inside that\s+set/s);
 });
 
 test('extractContentType maps Claude content blocks to the message evidence type', () => {

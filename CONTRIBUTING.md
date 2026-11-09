@@ -1,0 +1,415 @@
+# Contributing to Obelisk
+
+Thanks for contributing. This document exists because most PRs that stall here
+are not low-quality code — they pass lint, typecheck, and their own tests. They
+stall on a small number of recurring failures that are easy to avoid once
+someone names them.
+
+Read the section for the area you are changing. The verification contract at the
+bottom applies to every PR.
+
+---
+
+## Before you open a pull request
+
+- **Bug reports are always welcome** as issues — no permission needed.
+- **Bugfix PRs may be opened directly**, but state the reproduction and the root
+  cause in the description. Review turnaround is not guaranteed for PRs that did
+  not come out of an issue discussion.
+- **Feature or behavior-change PRs require an issue first.** Unsolicited ones
+  are closed without review — not because the code is bad, but because the
+  design conversation has to happen before the implementation, not after.
+- **Absorption is a normal outcome.** Sometimes the maintainer lands an
+  equivalent change directly instead of merging the PR — when the surrounding
+  design is still moving, or the fix touches code with constraints that are
+  faster to apply than to explain. When a change is absorbed this way, the
+  closing comment will say so.
+
+---
+
+## Six things that decide whether a PR lands
+
+**1. Run every sentence of your PR description end to end.**
+The single most common failure is a capability that is advertised but
+unreachable. If you describe a config option, use that option from the outermost
+entry point before submitting. If you post a screenshot, the input in that
+screenshot must be an input the code can actually handle.
+When changing build output, package contents, or runtime resource loading, verify
+the built or packaged artifact through the entry point users run, including its
+required resources. Source-level tests alone do not cover that boundary.
+
+**2. Write assertions in the words of the requirement, not the shape of the
+implementation.**
+Copy the sentence from the issue into your test name. If the issue says "without
+causing reader-position jumps", the assertion has to measure reader position —
+not "the row got taller". If a test hits behavior you did not expect, decide
+whether it is a bug before you pin it as expected.
+
+**3. Anything destructive must converge when re-run after an interruption.**
+Validate to the point of actual executability before you mutate. Put the whole
+sequence in one transaction. Never use the name of the target state as the
+completion marker. The test is: if the process dies on any line, does the next
+start heal itself?
+
+**4. Read the neighbouring implementation first, and reuse the concepts that
+already exist.**
+Adding a provider means reading all provider implementations in
+[`packages/core/src/providers/`](packages/core/src/providers/) in full first.
+Needing "don't display this row" means grepping for `visibility` before
+inventing a field. The burden of proof for a new concept, field, state, or file
+type is on the PR: say why the existing one is insufficient. The ADRs in
+`docs/adr/` are constraints, not suggestions.
+
+**5. Treat all transcript content as attacker-controlled.**
+It is written by third-party agents. Any path where a transcript value reaches
+`shell.*`, `fs.*`, `innerHTML`, or SQL/DDL is deny-by-default.
+
+**6. Re-run verification on the final head.**
+Merging main invalidates every claim in your PR description, including your own
+"known limitations". Run the suites that cover the line you touched, not only
+the test you added.
+
+---
+
+## Node and Electron runtimes
+
+Use **Node 22** for repository verification, matching the current CI workflows.
+The CLI's supported runtime floor is **22.13.0**, as declared in
+`packages/cli/package.json`. This host Node runs npm, builds, typechecking, lint,
+and `npm test`.
+
+The desktop app runs on **Electron's embedded Node**; Electron 43 uses Node 24.
+Installing Node 22 on the build host does not make the app run on Node 22. See
+[ADR-0005](docs/adr/0005-app-electron-vite-ts-esm.md) for the architectural
+distinction and the historical Electron 33 / Node 20 context.
+
+Install both dependency sets with `npm ci` and `npm --prefix app ci`, then run
+the repository Node checks. Before running Electron suites, rebuild native
+modules for Electron:
+
+```bash
+cd app
+npx --no-install electron-builder install-app-deps
+npm run test:electron:all
+```
+
+If returning to host-Node tests that load native modules, restore host-Node
+dependencies first; an Electron ABI build is not interchangeable with a
+host-Node build. For packaging, electron-builder performs the Electron rebuild.
+When changing Electron or native dependencies, verify the actual packaged
+executable's `process.versions` and load its bundled native modules, rather than
+inferring the app runtime from the CI `node-version` setting.
+
+## Renderer / Electron UI changes
+
+Proving the new element renders correctly is one third of the job. You also owe
+evidence that it does not disturb virtual scrolling, async timing, existing
+interactions, or the full Electron suites.
+
+- Any change that can affect row height — new elements, async media, fonts,
+  spacing, the shape of `renderMarkdown` output — needs a **reader-anchor
+  assertion**: content above the viewport settling must not move the row the
+  user is looking at. Follow the existing pattern in
+  `app/tests/electron-session-virtualization.mjs`.
+- Cover **three states, not just the final one**: mount, size-available-but-not-
+  loaded, and load/error. Progressive images reach their final size long before
+  `load` fires; signalling only on `load` will miss it.
+- **Idle and mid-scroll are different scenarios.** `virtual-core`'s `resizeItem`
+  skips scroll compensation for already-measured rows when
+  `scrollDirection === 'backward'`, so drift can be zero at rest and large while
+  scrolling up. Test both.
+- Run `npm run test:electron:all` (all suites), not only the suite you
+  added.
+- **Do not add `loading="lazy"` to virtualized rows.** Rows already mount near
+  the viewport; lazy only defers decode into the scroll itself.
+- **No hardcoded colors or type sizes inside shadow DOM.** Custom properties
+  pierce the shadow boundary — use `var(--muted)`, `var(--hairline-strong)`,
+  `var(--text-sm)`.
+- **One visual treatment per user-visible concept.** "Blocked source" and "failed
+  to load" are the same thing to a reader; they must not render two different
+  ways.
+- When you depend on a library's calling convention, either accept both shapes or
+  pin the assumption in code. A silent signature change that degrades every item
+  to a fallback is invisible to types and tests.
+- **Every renderer-side probe needs a deadline and an `error` → reject path.** A
+  promise with no rejection path plus a bare `await` turns a regression into a
+  hung CI job instead of a red one.
+- **No assertions with sub-pixel headroom.** Self-calibrate (e.g. take the median
+  gap of currently mounted rows as the baseline) instead of hardcoding a
+  threshold that a spacing tweak turns red.
+
+## Provider adapters
+
+- **Before requesting review, pass the adapter-review skill in a clean session.**
+  Run [`maintainer-skills/adapter-review/SKILL.md`](maintainer-skills/adapter-review/SKILL.md)
+  from a fresh agent session — not the session that wrote the code — and resolve
+  every blocking finding first. The authoring session shares the implementation's
+  assumptions; the skill encodes the failure patterns this repo's adapter reviews
+  keep hitting (identity/key asymmetry, destructive tombstones, migration
+  convergence, fixture authenticity), and it only works when the reviewer is not
+  the author.
+- **Read all provider implementations in
+  [`packages/core/src/providers/`](packages/core/src/providers/) before writing a
+  new adapter.**
+  The conventions there are earned: zero-padded ordinals in ids
+  (`parsing.ts` uses `padStart(6, '0')`), the
+  `__<provider>_canonical_transcript_vN__` marker, how `git_branch` is handled.
+- **Session identity must not be the source id alone.** Use a composite such as
+  (normalized cwd, header id). Explicit session ids are usually project-local, so
+  two projects may legitimately collide — and the second one indexed will
+  overwrite the first.
+- **A test must actually call `discover()`.** Asserting the resolved root string
+  passes even when the directory-layout assumption is wrong.
+- **Trace source-root selection through every runtime.** For defaults, explicit
+  overrides, and per-root switches, verify that settings, watch targets, worker
+  and CLI discovery agree. Cover restart and the empty selection, not just the
+  path displayed in Settings.
+- **Excluding a root is not evidence that its sessions were deleted.** Limit
+  inventory-based tombstones to roots actually scanned with a complete census.
+  Decide and test what happens to previously indexed sessions on both ordinary
+  refresh and deliberate full rebuild.
+- **Verify directory layout against the upstream source or format docs**, not
+  against what your own machine happens to look like. A tool's default root and
+  its custom root often have different nesting.
+- **The canonical transcript invariant (ADR-0007) is a hard gate**: assembling
+  directly from your adapter must equal assembling after a SQLite round-trip. Any
+  design where duplicate ids merge or overwrite breaks it.
+- **Never drop a record just because it has no text.** Image-only messages and
+  aborted turns that carry usage must still emit a row (`text: null`,
+  `content_type: 'unknown'`), or token accounting and the timeline develop holes.
+- **Bump `indexVersionMarker` whenever you change uuid format, role
+  normalization, or anything else affecting already-stored rows.** Otherwise the
+  mtime short-circuit in discovery leaves old-format rows in the database
+  forever.
+- **Express "this should not be shown" with the existing `visibility` field**
+  (`providers/types.ts`), which is defined as provider-normalized display
+  eligibility and already has a consumer in the assembler. Do not add a third
+  meaning to `is_sidechain`.
+- **Cursors must detect same-millisecond rewrites**: mtime + ctime + size + inode,
+  not mtime alone. Reconcile moves, copies, deletes, and replacements.
+- **Version gates must tolerate the unknown.** Throwing on an unexpected higher
+  version makes one bad file trigger a full re-index every run, because the
+  provider's index markers are withheld while any unit fails. Skip and record
+  instead of poisoning the provider.
+
+## Schema and migrations
+
+- `schema.sql` is pinned by sha256 in `tests/provider-schema-stability.test.mjs`.
+  Changing it is an explicit decision plus a full re-index: justify it in the PR
+  and update the hash in the same commit. Prefer additive changes.
+- **Destructive DDL goes in one transaction.** The repository already has
+  `runWriteTransaction` (`packages/core/src/tx.ts`) and both SQLite adapters, and
+  the entry points already hold the writer lease — you do not need to invent a
+  migration marker.
+- **Do not use the name of the target state as the completion marker.** If the
+  process is interrupted after CREATE but before the rebuild finishes, comparing
+  the current setting against the requested one reports success forever and the
+  data is never backfilled.
+- **Validate to executability, not to lexical shape.** A regex that accepts a
+  string SQLite will reject means you drop the table and then fail.
+- **Before writing one value across every table, check whether any table carries
+  its own arguments.** Overwriting them leaves the migration looking complete,
+  so it never self-heals.
+- **Any external input spliced into DDL needs an allowlist and an injection test
+  case.**
+
+## Main process and untrusted input
+
+- **Transcript paths must not reach `shell.openPath` unguarded.** On macOS,
+  `.app` / `.command` / `.sh` are executed, not opened. Confirmation dialogs must
+  default to Cancel.
+- **Reading a file because a transcript said so requires an allowlist**, scoped to
+  the session's project cwd or known source roots.
+- **Do not decode untrusted text through `innerHTML` or a detached `<textarea>`.**
+  Decode the specific entities your markdown library actually emits, escape on
+  the way out, and pin "decode exactly once" with a test (`&amp;lt;` must stay
+  `&lt;`).
+- **No synchronous IO in the main process.** A network mount or UNC path freezes
+  the whole UI. Use `fs.promises`.
+- **Do not broaden interception beyond your feature.** Catching every `file:`
+  navigation when you only meant to handle markdown links affects everyone else.
+- **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
+  `checkJs: false`, so a `.mjs` module has no type coverage at all.
+
+## CLI and tool error messages
+
+State what failed and the known cause, with only the context needed to diagnose
+or correct the problem. Preserve the underlying error; do not invent a cause or
+mask failure as success. Keep the message concise. Add corrective guidance only
+when it is specific and immediately useful.
+
+For multiple statements passed to `sql()`, compare these message bodies
+(the preferred message already exists in [`query.ts`](packages/core/src/query.ts)):
+
+- **Prefer:** `sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls`
+- **Avoid:** `sql() failed: invalid query`
+
+## Indexing, daemon, and write ownership
+
+- For retry and recovery paths, check both transient and persistent failures.
+  Preserve safe partial progress without claiming completion, keep unresolved
+  failures visible, and limit the frequency and cost of repeated attempts.
+- **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
+  is read-only: no write connection, no schema migration, no PRAGMA change, no
+  checkpoint, no indexing. Two narrow carve-outs, both recorded in ADR 0006:
+  the invocation-nonce freshness build, and memory mutations (`--attune`),
+  which write only the memory layer (`memories` + `memories_fts` via triggers)
+  and never migrate or configure the index. Guarded by
+  `tests/daemon-arbitration.test.mjs` and `tests/app-writer-lease.test.mjs`.
+- **If you add something that needs periodic refresh, prove its refresh point is
+  actually called repeatedly.** Hanging a full rebuild off a first-run-only gate
+  means it runs once and never again — and for existing installations, never at
+  all.
+- **`daemon_active` must not swallow a configuration change.** Distinguish
+  "correctly skipping" from "configuration mismatch"; the latter is an explicit
+  error, not a silent fallback to a stale index.
+- **State your reasoning when choosing triggers vs. full rebuild.** For example,
+  rows written with `INSERT OR REPLACE` do not fire DELETE triggers while
+  `recursive_triggers` is off, so a trigger-based refresh would leave stale text
+  behind.
+
+## Performance changes
+
+Measure the affected workload before optimizing, then compare the same workload
+before and after the change. Report enough context to judge the result, including
+workload size and measurement variability. Preserve required behavior, data
+ownership, merge semantics, and recovery guarantees; check those contracts before
+extending an optimization to another path. Make remaining costs and deliberate
+tradeoffs explicit.
+
+Timeline performance probes on shared hosted CI gate renderer **work**, using
+Chromium's thread CPU duration (`tdur`) when present and conservatively using the
+complete wall duration (`dur`) otherwise. Invalid durations fail measurement.
+Examine every renderer task, not only the task with the longest wall duration.
+The native wheel probe rejects work tasks >=50ms; stationary live commits retain
+an 8.33ms work budget; patch-preparation function work may exceed its no-update
+baseline by at most 2ms. Keep wall durations, RAF gaps and native compositor gaps
+in the diagnostics, and retain a <250ms catastrophic RAF-stall guardrail on the
+native wheel probe. Blank-frame, overlap, input-coverage and reader-anchor
+assertions remain required. These checks detect application work regressions and
+severe stalls; they do not certify that every displayed frame arrives within
+50ms on a shared runner. A controlled-performance-machine requirement is not
+part of the repository's CI infrastructure.
+
+## Desktop app development and release
+
+### Run and debug the app locally
+
+`electron-vite` starts the renderer dev server and launches Electron. On first
+run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available
+registered-provider transcripts, and then watches them for changes. Use
+**Settings** to select provider directories beyond the defaults. On Windows,
+Obelisk also checks common WSL distributions for the Claude Code directory.
+
+- Renderer changes use Vite hot module replacement. Open Electron DevTools with
+  `Cmd+Option+I` on macOS or `Ctrl+Shift+I` on Windows/Linux.
+- Main-process and preload logs appear in the terminal running `npm run dev`;
+  their source changes are rebuilt by electron-vite.
+- To attach a Node debugger to the Electron main process, start it with
+  `npm run dev -- --inspect=5858`, then attach your debugger to port `5858`.
+- The development app reads and updates the real `~/.obelisk` index. Back it up
+  before testing destructive rebuilds. For an isolated run, launch with a
+  disposable home directory (`HOME=/tmp/obelisk-dev npm run dev` on
+  macOS/Linux, or set a temporary `USERPROFILE` first on Windows), then select
+  fixture source directories in **Settings**.
+
+`better-sqlite3` provides prebuilt binaries for common platforms. If `npm ci`
+falls back to compiling it locally, install the platform's C/C++ build tools and
+run `npm ci` again.
+
+### Release the desktop app
+
+The **Release Desktop App** workflow builds Developer ID signed/notarized
+DMG and ZIP packages for macOS Apple Silicon (`arm64`) and Intel (`x64`), plus
+`Obelisk-<version>-linux-amd64.deb` for Linux Intel/AMD 64-bit systems. It runs
+repository checks and all six Electron suites, verifies the packaged native
+resources, and installs the Debian package on Ubuntu 22.04 and 24.04. All
+packages and update feeds are uploaded to one GitHub Release draft after the
+required build and acceptance jobs pass.
+
+The app checks and downloads updates in the background. Settings → About
+supports manual checks and retry; the sidebar notice offers View changes,
+Later, and Update & restart. macOS uses Sparkle, falling back to
+`electron-updater` only if the native bridge cannot initialize. Linux `.deb`
+installations use `DebUpdater`; replacing the system installation requests
+administrator authorization through Polkit. Cancelling leaves the staged
+update retryable. Existing 0.2.2 installations require one manual upgrade to
+this updater-enabled release. Linux arm64, AppImage and Windows update channels
+are not enabled by this workflow.
+
+The build host uses Node 22; the app runs on Electron 43's embedded Node 24.
+Artifact verification reports the embedded Electron, Node and ABI versions.
+See [the runtime explanation](docs/adr/0005-app-electron-vite-ts-esm.md) and
+[the runtime requirements above](#node-and-electron-runtimes).
+
+Configure these repository Actions secrets:
+
+| Secret | Value |
+| --- | --- |
+| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12`, including its private key |
+| `MAC_CSC_KEY_PASSWORD` | The `.p12` export password |
+| `APPLE_ID` | Apple Account email with access to the signing team |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
+| `APPLE_TEAM_ID` | The signing team's 10-character Team ID |
+| `SPARKLE_ED_PRIVATE_KEY` | Exported Sparkle EdDSA private key matching the app's trusted public key |
+
+The `SPARKLE_ED_PUBLIC_KEY` Actions variable must match
+`app/build/sparkle-public-key.txt`. Linux Debian builds need no Apple credentials.
+
+Update `app/package.json` and `app/package-lock.json` to the same version,
+merge the release changes, then push a matching tag such as `v0.2.4`.
+To retry an existing tag, select that tag as the ref in **Actions → Release
+Desktop App → Run workflow**; the optional tag input checks that selection.
+The workflow rejects version mismatches and never overwrites a published
+release. Review the draft's notes and downloads before publishing it.
+
+Use `verify_only=true` on a branch to build and verify all platforms without
+creating a tag or Release. **Build and verify Debian App** also runs directly
+on relevant PRs or by manual dispatch, leaving its verified `.deb` as an Actions
+artifact. Its two-version acceptance uses the actual package, shipped UI,
+`DebUpdater`, and real dpkg installation, with a test substitute for the
+administrator-authorization dialog. CLI npm publication remains independent.
+
+---
+
+## Verification contract
+
+Every PR:
+
+1. `npm test`, `npm run typecheck` (root and app tsconfig), `npm run lint` — all
+   green. Quote the **numbers** in the PR description.
+2. Touching `app/` also requires `npm run test:electron:all`.
+3. **After merging main, re-run everything.** Conclusions from before the merge —
+   including any "known limitation" you documented — are void.
+4. **Do not loosen an existing assertion.** If one must change, give it its own
+   section in the PR description explaining why the original was wrong.
+5. **Fixtures are real provider output**, not hand-written approximations.
+6. **Confirm your new tests actually run in CI** (`.github/workflows/`).
+7. For shared logic, choose coverage from the affected callers and provider
+   contracts. Exercise behavior that differs across providers or entry points;
+   do not let mocks erase those differences.
+
+## Scope and review
+
+- One PR does one thing. Note explicitly anything you deliberately left out.
+- Keep the PR title and description aligned with the final diff and verification.
+  Include incidental behavior changes and remove claims or limitations that no
+  longer apply.
+- If you are unsure about a design decision, say so in the PR instead of
+  guessing — an open question is cheaper to resolve than a silent assumption.
+- Do not ship a code path you have flagged to yourself as unverified. Writing
+  "this call site is worth another look" is honest, but it belongs in a follow-up
+  issue, not in the diff.
+- Use commit messages to preserve why a change was made, with any key tradeoff
+  needed to understand the decision. Keep the explanation brief and self-contained;
+  reference a commit, issue, or PR when useful, without repeating its discussion.
+
+### Clarify the need for new concepts
+
+When a contributor proposes a new concept, field, state, or file type, help
+clarify the problem it solves, why it is needed, and how it differs from existing
+concepts before committing to a design. Bring relevant implementation facts and
+design decisions into the discussion: explain where reuse fits and where it would
+erase a meaningful distinction. Apply the same reasoning to abstractions an agent
+proposes. Record the resulting rationale concisely in the issue or PR, carrying
+forward decisions already settled there.

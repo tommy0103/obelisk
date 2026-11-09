@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Claude Code provider adapter in Core (see docs/adr/0001).
 //
 // Pure: discovers Claude transcript files and parses one into a record stream.
@@ -6,15 +9,13 @@
 // persist layer consumes them. Session aggregates here reflect only THIS chunk
 // (started_at/ended_at/message_count); persist merges them with any existing row.
 
-import { createRequire } from 'node:module';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
-const require = createRequire(import.meta.url);
-const fs = require('node:fs');
 
 import {
   extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
-  filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir,
+  filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir, sourceInventoryIssue,
 } from '../parsing.ts';
 
 import type {
@@ -36,8 +37,23 @@ function cursorToSkip(cursor: Cursor): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
+// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
+// same-millisecond rewrites) lets a same-mtime tail completion or a
+// same-mtime replacement back into discovery. Legacy `${mtime}:${lines}`
+// cursors keep the mtime-only gate and upgrade on the next parse.
+function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
+  const stat = statSync(filePath);
+  const parts = cursor.split(':');
+  if (parts.length < 5) return Number(parts[0]) < stat.mtimeMs;
+  return Number(parts[0]) !== stat.mtimeMs
+    || Number(parts[2]) !== stat.size
+    || Number(parts[3]) !== stat.ctimeMs
+    || Number(parts[4]) !== stat.ino;
+}
+
 export const name = 'claude';
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v2__';
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v3__';
 
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
@@ -63,9 +79,12 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const projectsDir = join(rootDir, 'projects');
+  if (!existsSync(projectsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
+    ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
+  }
   const historyPath = normalize(join(rootDir, 'history.jsonl'));
   const historyTitles = new Map<string, string>();
-  if (fs.existsSync(historyPath)) {
+  if (existsSync(historyPath)) {
     readLines(historyPath, (line: string) => {
       try {
         const item = JSON.parse(line);
@@ -97,14 +116,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       changedWorkflowPaths.add(absolute);
     }
   }
-  const transcriptUnits = discoverJsonlFiles(projectsDir).filter((file) => {
+  const transcriptUnits = discoverJsonlFiles(projectsDir, ctx.reportIncompleteInventory).filter((file) => {
     const normalizedPath = normalize(file.path);
     if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath)) return false;
     const cursor = ctx.lastCursor(file.path);
     return historyChanged
       || forcedPaths.has(normalizedPath)
       || cursor === null
-      || Number(cursor.split(':')[0]) < fs.statSync(file.path).mtimeMs;
+      || cursorSignatureDiffers(cursor, file.path);
   }).map((f: any) => ({
     key: f.path,
     sessionId: f.sessionId,
@@ -118,20 +137,29 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   }));
 
   const workflowUnits: IndexUnit[] = [];
-  if (!fs.existsSync(projectsDir)) return transcriptUnits;
+  if (!existsSync(projectsDir)) return transcriptUnits;
   let projects: string[];
-  try { projects = fs.readdirSync(projectsDir); } catch { return transcriptUnits; }
+  try { projects = readdirSync(projectsDir); } catch (error) {
+    ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectsDir, error));
+    return transcriptUnits;
+  }
   for (const project of projects) {
     const projectPath = join(projectsDir, project);
     if (!isDir(projectPath)) continue;
     let sessionIds: string[];
-    try { sessionIds = fs.readdirSync(projectPath); } catch { continue; }
+    try { sessionIds = readdirSync(projectPath); } catch (error) {
+      ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectPath, error));
+      continue;
+    }
     for (const sessionId of sessionIds) {
       const workflowDir = join(projectPath, sessionId, 'workflows');
       if (!isDir(workflowDir)) continue;
       const mainTranscriptPath = join(projectPath, `${sessionId}.jsonl`);
       let files: string[];
-      try { files = fs.readdirSync(workflowDir); } catch { continue; }
+      try { files = readdirSync(workflowDir); } catch (error) {
+        ctx.reportIncompleteInventory?.(sourceInventoryIssue(workflowDir, error));
+        continue;
+      }
       for (const file of files) {
         if (!file.endsWith('.json')) continue;
         const workflowPath = join(workflowDir, file);
@@ -142,7 +170,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
           && !changedWorkflowPaths.has(normalizedPath)
           && !relationshipChanged
         ) continue;
-        const mtime = fs.statSync(workflowPath).mtimeMs;
+        const mtime = statSync(workflowPath).mtimeMs;
         const cursor = ctx.lastCursor(workflowPath);
         if (!relationshipChanged && cursor !== null && Number(cursor.split(':')[0]) >= mtime) continue;
         workflowUnits.push({
@@ -170,9 +198,8 @@ function toolResultText(content: unknown): string {
 function workflowParentToolUseId(
   transcriptPath: string,
   runId: string,
-  workflowName: string | null,
 ): string | null {
-  if (!fs.existsSync(transcriptPath)) return null;
+  if (!existsSync(transcriptPath)) return null;
   const workflowToolIds = new Set<string>();
   let parentToolUseId: string | null = null;
   readLines(transcriptPath, (line: string) => {
@@ -192,7 +219,7 @@ function workflowParentToolUseId(
     for (const block of content) {
       if (block?.type !== 'tool_result' || !workflowToolIds.has(block.tool_use_id)) continue;
       const text = toolResultText(block.content);
-      if (!text.includes(runId) && !(workflowName && text.includes(workflowName))) continue;
+      if (!text.includes(runId)) continue;
       parentToolUseId = block.tool_use_id;
       return false;
     }
@@ -201,10 +228,10 @@ function workflowParentToolUseId(
 }
 
 function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
-  const mtime = fs.statSync(unit.key).mtimeMs;
+  const mtime = statSync(unit.key).mtimeMs;
   const outCursor = `${mtime}:1`;
   let workflow: any;
-  try { workflow = JSON.parse(fs.readFileSync(unit.key, 'utf8')); } catch { return outCursor; }
+  try { workflow = JSON.parse(readFileSync(unit.key, 'utf8')); } catch { return outCursor; }
   if (!workflow?.runId) return outCursor;
   const meta = unit.meta as ClaudeWorkflowUnitMeta;
   const progress = Array.isArray(workflow.workflowProgress) ? workflow.workflowProgress : [];
@@ -216,7 +243,6 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
     parent_tool_use_id: workflowParentToolUseId(
       meta.mainTranscriptPath,
       workflow.runId,
-      workflow.workflowName || null,
     ),
     task_id: workflow.taskId || null,
     script: workflow.script || null,
@@ -251,15 +277,18 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     return yield* parseWorkflow(unit);
   }
   const skip = cursorToSkip(cursor);
-  const mtime = fs.statSync(unit.key).mtimeMs;
+  const stat = statSync(unit.key);
+  const mtime = stat.mtimeMs;
   const isSubagent = unit.isSubagent === true;
   const records: TranscriptRecord[] = [];
+  const historyTitle = ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null;
+  let aiTitle: string | null = null;
+  let customTitle: string | null = null;
   const sm = {
     started_at: null as string | null,
     ended_at: null as string | null,
     git_branch: null as string | null,
     version: null as string | null,
-    title: ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null,
     n: 0,
   };
   const subagentStats = {
@@ -269,14 +298,35 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   };
 
   let lineNum = 0;
-  readLines(unit.key, (line: string) => {
+  // Lines the cursor may safely skip on the next parse. A line only counts
+  // when it parsed, or when it is newline-terminated (mid-file garbage keeps
+  // the legacy count). An unterminated tail that fails to parse may still be
+  // growing — counting it would permanently skip the completed line.
+  let cursorLines = 0;
+  readLines(unit.key, (line: string, terminated: boolean) => {
     lineNum++;
     let obj: any;
-    try { obj = JSON.parse(line); } catch { return; }
+    let parsed = true;
+    try { obj = JSON.parse(line); } catch { parsed = false; }
+    if (parsed || terminated) cursorLines = lineNum;
+    if (!parsed) return;
     const sid = unit.sessionId;
     const ts = obj.timestamp || null;
     const msg = obj.message || {};
     const usage = msg.usage || {};
+
+    // Claude Code now persists app-, CLI-, and hook-assigned session names as
+    // `custom-title` records. Scan title metadata across the whole transcript,
+    // including cursor-skipped lines, so incremental parses retain the intended
+    // precedence without depending on the previously persisted title.
+    if (obj.type === 'custom-title' && obj.customTitle) {
+      customTitle = obj.customTitle;
+      return;
+    }
+    if (obj.type === 'ai-title' && obj.aiTitle) {
+      aiTitle = obj.aiTitle;
+      return;
+    }
 
     if (isSubagent && (obj.type === 'user' || obj.type === 'assistant')) {
       if (ts && (!subagentStats.startedAt || ts < subagentStats.startedAt)) subagentStats.startedAt = ts;
@@ -285,7 +335,6 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     }
     if (lineNum <= skip) return;
 
-    if (obj.type === 'ai-title' && obj.aiTitle) { sm.title = obj.aiTitle; return; }
     if (obj.type === 'system' && obj.subtype === 'away_summary' && obj.content) {
       records.push({ kind: 'summary', id: obj.uuid || `${sid}-away-${ts}`, session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content });
       return;
@@ -339,9 +388,9 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
 
   if (isSubagent && unit.agentId) {
     const metaPath = unit.key.replace(/\.jsonl$/, '.meta.json');
-    if (fs.existsSync(metaPath)) {
+    if (existsSync(metaPath)) {
       try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
         const workflowRunId = (unit.meta as { workflowRunId?: string } | undefined)?.workflowRunId;
         if (workflowRunId) {
           records.push({
@@ -373,7 +422,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   // Subagent transcripts do not own a session row (matches indexJsonl).
   if (!isSubagent) {
     records.push({
-      kind: 'session', id: unit.sessionId, title: sm.title, project: unit.project || null,
+      kind: 'session', id: unit.sessionId, title: customTitle ?? aiTitle ?? historyTitle, project: unit.project || null,
       started_at: sm.started_at, ended_at: sm.ended_at, git_branch: sm.git_branch,
       version: sm.version, message_count: sm.n, countMode: skip > 0 ? 'delta' : 'total',
       jsonl_path: unit.key, source: 'claude',
@@ -381,7 +430,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   }
 
   yield* records;
-  return `${mtime}:${lineNum}`;
+  return `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
 }
 
 function rawClaude(input: RawLookup): RawRecord | null {
@@ -394,7 +443,7 @@ function rawClaude(input: RawLookup): RawRecord | null {
       ? join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', 'workflows', runId, `${input.agentId}.jsonl`)
       : join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', `${input.agentId}.jsonl`);
   }
-  if (!fs.existsSync(sourcePath)) return null;
+  if (!existsSync(sourcePath)) return null;
   let found: string | null = null;
   readLines(sourcePath, (line: string) => {
     if (!line.includes(input.messageUuid)) return;
@@ -427,9 +476,9 @@ export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: {
     name,
     descriptor: { id: name, name: 'Claude Code', vendor: 'Anthropic', defaultRoot: rootDir, color: '#d97757' },
     indexVersionMarker: CLAUDE_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [
-      join(configuredRoot, 'projects'),
-      join(configuredRoot, 'history.jsonl'),
+    watchTargets: (configuredRoot) => [
+      { kind: 'tree', path: join(configuredRoot, 'projects') },
+      { kind: 'file', path: join(configuredRoot, 'history.jsonl') },
     ],
     discover: (ctx) => discoverAt(rootDir, ctx),
     parse,

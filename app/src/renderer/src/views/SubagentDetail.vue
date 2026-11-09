@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2026 tommy0103 and contributors. -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
 <script setup>
 import { ref, onMounted, watch, computed } from 'vue';
 import { useRouter } from 'vue-router';
@@ -37,6 +40,10 @@ async function handleLoadFull(uuid, el) {
     el.remove();
   }
 }
+
+function renderMsgMarkdown(msg, text, variant) {
+  return renderMarkdown(text, { variant, cwd: msg?.cwd || null, sessionId: msg?.session_id || null });
+}
 </script>
 
 <template>
@@ -69,7 +76,7 @@ async function handleLoadFull(uuid, el) {
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
-              <div class="thinking-body" v-html="renderMarkdown(msg.text, { variant: 'msg' })"></div>
+              <div class="thinking-body" v-html="renderMsgMarkdown(msg, msg.text, 'msg')"></div>
             </div>
           </template>
 
@@ -81,7 +88,7 @@ async function handleLoadFull(uuid, el) {
                 <span class="meta-label">System</span>
                 <span class="meta-preview">{{ (msg.text || '').replace(/<[^>]+>/g, '').slice(0, 80) }}</span>
               </button>
-              <div class="meta-body" v-html="renderMarkdown(msg.text, { variant: 'compact' })"></div>
+              <div class="meta-body" v-html="renderMsgMarkdown(msg, msg.text, 'compact')"></div>
             </div>
           </template>
 
@@ -96,9 +103,9 @@ async function handleLoadFull(uuid, el) {
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
-              <div class="thinking-body" v-html="renderMarkdown(msg._thinking, { variant: 'msg' })"></div>
+              <div class="thinking-body" v-html="renderMsgMarkdown(msg, msg._thinking, 'msg')"></div>
             </div>
-            <div v-if="msg.text" v-html="renderMarkdown(msg.text, { variant: 'msg' })"></div>
+            <div v-if="msg.text" v-html="renderMsgMarkdown(msg, msg.text, 'msg')"></div>
             <div v-else-if="!msg.tool_calls?.length" class="msg-text empty-text">(no text content)</div>
             <button
               v-if="isTextTruncated(msg.text)"

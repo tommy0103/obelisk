@@ -2,7 +2,8 @@
 
 These are copyable CodeAct patterns for `obelisk --query` scripts plus
 `--attune` memory mutation patterns. They are not new APIs. Adapt them to the
-user's scope and return compact evidence.
+user's scope and return compact evidence. Before persistent memory changes,
+read the [memory workflow](memory-workflow.md).
 
 Read this before the first query for broad synthesis, progress summaries,
 design history, weekly/monthly reviews, or questions that ask what the user did,
@@ -13,7 +14,9 @@ aggregation.
 ## First Pass: Overview + Recall + Evidence
 
 Use this for broad synthesis before writing custom SQL. It gives the agent a
-map, prior notes, and raw session evidence in one bounded result. Then run a
+map, prior notes, and raw session evidence in one bounded result. Semantic
+recall can use `fallback: 'or'` on zero hits; omit it for exact scopes or
+sentinels where an empty result is meaningful. Then run a
 faceted detail pass if the first pass reveals useful projects, sessions, files,
 or terms.
 
@@ -56,7 +59,7 @@ return {
     rank: m.rank,
     summary: m.summary?.slice(0, 260),
   })),
-  session_evidence: search(topic.replace(/[-_]/g, ' '), { ...scoped, limit: 8 })
+  session_evidence: search(topic.replace(/[-_]/g, ' '), { ...scoped, limit: 8, fallback: 'or' })
     .slice(0, 6)
     .map(h => ({
       session_id: h.session.id,
@@ -107,14 +110,15 @@ Use `search()` to locate candidates, then expand only the strongest hits.
 ```js
 const hits = search('"runtime query"', { project: '%quiet-zero%', limit: 8 });
 return hits.slice(0, 5).map(h => {
-  const c = context(h.message.uuid);
+  const c = messages({ around: h.message.uuid, relation: 'parents', beforeCount: 3,
+    contentTypes: ['text'] });
   return {
     session_id: h.session.id,
     session_title: h.session.title,
     uuid: h.message.uuid,
     timestamp: h.message.timestamp,
     snippet: h.message.text?.slice(0, 240),
-    parentChain: (c?.parentChain || []).slice(-3).map(m => ({
+    ancestors: (c?.messages || []).filter(m => m.uuid !== h.message.uuid).map(m => ({
       uuid: m.uuid,
       role: m.role,
       snippet: m.text?.slice(0, 120),
@@ -349,6 +353,7 @@ for (const { facet, terms } of learnedFacets) {
     JOIN sessions s ON s.id = m.session_id
     WHERE m.session_id IN (${sessionIds.map(() => '?').join(',')})
       AND m.text IS NOT NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
       AND (${clauses})
     ORDER BY m.timestamp
     LIMIT 3
@@ -448,6 +453,7 @@ const before = sql(
   `SELECT uuid, role, timestamp, substr(text,1,200) AS snippet
    FROM messages
    WHERE session_id=? AND timestamp<?
+     AND COALESCE(visibility, 'visible') = 'visible'
    ORDER BY timestamp DESC LIMIT 3`,
   s.session_id,
   s.timestamp
@@ -456,6 +462,7 @@ const after = sql(
   `SELECT uuid, role, timestamp, substr(text,1,200) AS snippet
    FROM messages
    WHERE session_id=? AND timestamp>?
+     AND COALESCE(visibility, 'visible') = 'visible'
    ORDER BY timestamp ASC LIMIT 3`,
   s.session_id,
   s.timestamp
@@ -532,6 +539,7 @@ const counts = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   GROUP BY tc.name
   ORDER BY failure_count DESC, last_failure_at DESC
@@ -551,6 +559,7 @@ const examples = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   ORDER BY m.timestamp DESC
   LIMIT 8
@@ -580,6 +589,7 @@ const groups = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   GROUP BY s.id
   ORDER BY last_failure_at DESC
@@ -598,6 +608,7 @@ const examples = sql(`
   JOIN messages m ON m.uuid = tr.message_uuid
   JOIN sessions s ON s.id = tr.session_id
   WHERE tr.is_error = 1
+    AND COALESCE(m.visibility, 'visible') = 'visible'
     AND s.project LIKE ?
   ORDER BY m.timestamp DESC
   LIMIT 12
@@ -606,45 +617,11 @@ const examples = sql(`
 return { groups, examples };
 ```
 
-## Workflow Tree Compact View
+## Advanced Workflow Investigation
 
-Find the run with `workflows()` under scope, then project `workflowTree()` into
-compact fields. Do not return raw `script`, `result_json`, or the full tree.
-
-```js
-const runs = workflows({ project: '%quiet-zero%', limit: 30 });
-const target = runs.find(w =>
-  /session[-_ ]journal/i.test(`${w.workflow_name || ''} ${w.task_id || ''} ${w.run_id || ''}`)
-);
-if (!target) {
-  return {
-    found: false,
-    candidates: runs.slice(0, 8).map(w => ({
-      run_id: w.run_id,
-      workflow_name: w.workflow_name,
-      timestamp: w.timestamp,
-      agent_count: w.agent_count,
-    })),
-  };
-}
-
-const tree = workflowTree(target.run_id);
-return {
-  run_id: target.run_id,
-  workflow_name: target.workflow_name,
-  status: tree?.status ?? target.status,
-  timestamp: tree?.timestamp ?? target.timestamp,
-  agent_count: tree?.agent_count ?? tree?.agents?.length ?? target.agent_count,
-  agents: (tree?.agents || []).map(a => ({
-    agent_id: a.agent_id,
-    phase: a.phase,
-    label: a.label,
-    state: a.state,
-    tokens: a.tokens,
-    messageCount: a.messageCount,
-  })),
-};
-```
+For workflow-specific metadata and trees, see
+[advanced-helpers.md](advanced-helpers.md). These compatibility capabilities are
+outside the default retrieval surface.
 
 ## Subagent Metadata Recall
 
@@ -694,6 +671,7 @@ const row = sql(`
   SELECT uuid, length(text) AS indexed_len
   FROM messages
   WHERE length(text) >= 10000
+    AND COALESCE(visibility, 'visible') = 'visible'
   LIMIT 1
 `)[0];
 if (!row) return null;

@@ -1,21 +1,30 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Core's pure parse/discover helpers — node:sqlite-free by construction, so the compiled
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
 // typed seam while remaining limited to node:fs/path/os.
-import { createRequire } from 'node:module';
-const require = createRequire(import.meta.url);
-const fs = require('node:fs');
-const path = require('node:path');
-const os = require('node:os');
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join, normalize } from 'node:path';
 
-const CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const CODEX_DIR = path.join(os.homedir(), '.codex');
-const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
-const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
+import type { InventoryIssue } from './providers/types.ts';
+
+const CLAUDE_DIR = join(homedir(), '.claude');
+const CODEX_DIR = join(homedir(), '.codex');
+const PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
+const CODEX_SESSIONS_DIR = join(CODEX_DIR, 'sessions');
 const TEXT_LIMIT = 10000;
 
 type JsonRecord = Record<string, any>;
 type JsonValue = any;
+
+function sourceInventoryIssue(path: string, error: unknown): InventoryIssue {
+  return { path, error: error instanceof Error ? error.message : String(error) };
+}
+
+type DiscoveryIssueHandler = (issue: InventoryIssue) => void;
 
 export interface ClaudeJsonlFile {
   path: string;
@@ -38,14 +47,27 @@ interface CodexLineRecord {
 }
 
 // ---- message/text helpers ----
+/**
+ * Slice a string to `limit` UTF-16 code units without leaving half of a surrogate pair at the cut.
+ * A lone surrogate has no UTF-8 form, so every store that persists the text rewrites it (SQLite
+ * writes U+FFFD) and the record no longer matches what the provider emitted — which ADR-0007
+ * forbids. Rare, but it is exactly what a limit that lands on an emoji produces.
+ */
+function sliceText(s: string, limit: number): string {
+  if (s.length <= limit) return s;
+  const boundary = s.charCodeAt(limit - 1);
+  const splitsPair = boundary >= 0xd800 && boundary <= 0xdbff;
+  return s.slice(0, splitsPair ? limit - 1 : limit);
+}
+
 function trunc(s: any): any {
-  return typeof s === 'string' && s.length > TEXT_LIMIT ? s.slice(0, TEXT_LIMIT) : s;
+  return typeof s === 'string' ? sliceText(s, TEXT_LIMIT) : s;
 }
 
 function truncJson(obj: JsonValue, limit = TEXT_LIMIT): string | null {
   if (obj === null || obj === undefined) return null;
   const walk = (v: JsonValue): JsonValue => {
-    if (typeof v === 'string') return v.length > limit ? v.slice(0, limit) + '...[truncated]' : v;
+    if (typeof v === 'string') return v.length > limit ? sliceText(v, limit) + '...[truncated]' : v;
     if (Array.isArray(v)) return v.map(walk);
     if (typeof v === 'object' && v !== null) {
       const out: JsonRecord = {};
@@ -102,26 +124,50 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
   return ['Read', 'Edit', 'Write', 'NotebookEdit'].includes(name) ? (input.file_path || null) : null;
 }
 
-function isDir(p: string): boolean { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
+function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
-function readLines(filePath: string, callback: (line: string) => boolean | void): void {
-  const fd = fs.openSync(filePath, 'r');
+interface ReadLinesOptions {
+  start?: number;
+  onBytesRead?: (bytes: number) => void;
+}
+
+function readLines(
+  filePath: string,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+  { start = 0, onBytesRead }: ReadLinesOptions = {},
+): void {
+  const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
-  let remainder = '';
+  let remainder = Buffer.alloc(0);
   let bytesRead;
+  let position = start;
   try {
-    while ((bytesRead = fs.readSync(fd, buf, 0, bufSize)) > 0) {
-      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
-      const lines = chunk.split('\n');
-      remainder = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line && callback(line) === false) return;
+    while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      onBytesRead?.(bytesRead);
+      const chunkStart = position;
+      position += bytesRead;
+      const chunk = buf.subarray(0, bytesRead);
+      const combinedStart = chunkStart - remainder.length;
+      const data = remainder.length === 0 ? chunk : Buffer.concat([remainder, chunk]);
+      let lineStart = 0;
+      while (true) {
+        const newline = data.indexOf(0x0a, lineStart);
+        if (newline < 0) break;
+        const line = data.toString('utf8', lineStart, newline);
+        lineStart = newline + 1;
+        if (line && callback(line, true, combinedStart + lineStart) === false) return;
       }
+      // `buf` is reused by the next readSync; retain an owned copy so a line
+      // spanning chunks is never overwritten before it is completed.
+      remainder = Buffer.from(data.subarray(lineStart));
     }
-    if (remainder) callback(remainder);
+    // `terminated: false` — the final chunk had no trailing newline, so this
+    // tail may still be growing (or may simply be an unterminated last line;
+    // the caller cannot tell, and must decide what that means).
+    if (remainder.length > 0) callback(remainder.toString('utf8'), false);
   } finally {
-    fs.closeSync(fd);
+    closeSync(fd);
   }
 }
 
@@ -132,8 +178,8 @@ function legacyProjectPathFromSlug(project: string | null | undefined): string |
 }
 
 function normalizeObservedCwd(cwd: unknown): string | null {
-  if (typeof cwd !== 'string' || !cwd.trim() || !path.isAbsolute(cwd)) return null;
-  return path.normalize(cwd);
+  if (typeof cwd !== 'string' || !cwd.trim() || !isAbsolute(cwd)) return null;
+  return normalize(cwd);
 }
 
 function projectSlugFromPath(projectPath: string | null): string | null {
@@ -155,41 +201,44 @@ function inferProjectPath(project: string | null | undefined, observedCwds: unkn
   return best?.path || legacyProjectPathFromSlug(project);
 }
 
-function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
+function discoverJsonlFiles(
+  projectsDir = PROJECTS_DIR,
+  reportIssue?: DiscoveryIssueHandler,
+): ClaudeJsonlFile[] {
   const files: ClaudeJsonlFile[] = [];
-  if (!fs.existsSync(projectsDir)) return files;
+  if (!existsSync(projectsDir)) return files;
   let projects;
-  try { projects = fs.readdirSync(projectsDir); } catch (e) { process.stderr.write(`Warning: cannot read projects dir: ${e instanceof Error ? e.message : String(e)}\n`); return files; }
+  try { projects = readdirSync(projectsDir); } catch (error) { reportIssue?.(sourceInventoryIssue(projectsDir, error)); return files; }
   for (const proj of projects) {
-    const projPath = path.join(projectsDir, proj);
+    const projPath = join(projectsDir, proj);
     if (!isDir(projPath)) continue;
     let entries;
-    try { entries = fs.readdirSync(projPath); } catch { continue; }
+    try { entries = readdirSync(projPath); } catch (error) { reportIssue?.(sourceInventoryIssue(projPath, error)); continue; }
     for (const f of entries) {
       if (f.endsWith('.jsonl'))
-        files.push({ path: path.join(projPath, f), sessionId: f.slice(0, -6), project: proj, isSubagent: false });
+        files.push({ path: join(projPath, f), sessionId: f.slice(0, -6), project: proj, isSubagent: false });
     }
     for (const sd of entries) {
-      const saDir = path.join(projPath, sd, 'subagents');
+      const saDir = join(projPath, sd, 'subagents');
       if (!isDir(saDir)) continue;
       let saEntries;
-      try { saEntries = fs.readdirSync(saDir); } catch { continue; }
+      try { saEntries = readdirSync(saDir); } catch (error) { reportIssue?.(sourceInventoryIssue(saDir, error)); continue; }
       for (const sf of saEntries) {
         if (sf.endsWith('.jsonl'))
-          files.push({ path: path.join(saDir, sf), sessionId: sd, project: proj, isSubagent: true, agentId: sf.slice(0, -6) });
+          files.push({ path: join(saDir, sf), sessionId: sd, project: proj, isSubagent: true, agentId: sf.slice(0, -6) });
       }
-      const wfRoot = path.join(saDir, 'workflows');
+      const wfRoot = join(saDir, 'workflows');
       if (!isDir(wfRoot)) continue;
       let wfDirs;
-      try { wfDirs = fs.readdirSync(wfRoot); } catch { continue; }
+      try { wfDirs = readdirSync(wfRoot); } catch (error) { reportIssue?.(sourceInventoryIssue(wfRoot, error)); continue; }
       for (const wfDir of wfDirs) {
-        const wfPath = path.join(wfRoot, wfDir);
+        const wfPath = join(wfRoot, wfDir);
         if (!isDir(wfPath)) continue;
         let wfEntries;
-        try { wfEntries = fs.readdirSync(wfPath); } catch { continue; }
+        try { wfEntries = readdirSync(wfPath); } catch (error) { reportIssue?.(sourceInventoryIssue(wfPath, error)); continue; }
         for (const wf of wfEntries) {
           if (wf.endsWith('.jsonl'))
-            files.push({ path: path.join(wfPath, wf), sessionId: sd, project: proj, isSubagent: true, agentId: wf.slice(0, -6), workflowRunId: wfDir });
+            files.push({ path: join(wfPath, wf), sessionId: sd, project: proj, isSubagent: true, agentId: wf.slice(0, -6), workflowRunId: wfDir });
         }
       }
     }
@@ -197,14 +246,17 @@ function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
   return files;
 }
 
-function discoverCodexJsonlFiles(sessionsDir = CODEX_SESSIONS_DIR): CodexJsonlFile[] {
+function discoverCodexJsonlFiles(
+  sessionsDir = CODEX_SESSIONS_DIR,
+  reportIssue?: DiscoveryIssueHandler,
+): CodexJsonlFile[] {
   const files: CodexJsonlFile[] = [];
-  if (!fs.existsSync(sessionsDir)) return files;
+  if (!existsSync(sessionsDir)) return files;
   const walk = (dir: string): void => {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch (error) { reportIssue?.(sourceInventoryIssue(dir, error)); return; }
     for (const entry of entries) {
-      const fp = path.join(dir, entry.name);
+      const fp = join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(fp);
       } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
@@ -244,16 +296,21 @@ function codexParentThreadId(meta: JsonRecord): string | null {
     || null;
 }
 
+// Legacy guardian threads surface as records from the internal auto-review
+// model rather than as explicit subagent metadata.
+const CODEX_AUTO_REVIEW_MODEL = 'codex-auto-review';
+
 function codexIsGuardianThread(meta: JsonRecord, records: CodexLineRecord[] = []): boolean {
   const subagent = meta?.source?.subagent;
   if (subagent?.other === 'guardian') return true;
   if (meta?.thread_source !== 'subagent') return false;
-  return records.some(({ obj }) => obj?.payload?.model === 'codex-auto-review' || obj?.model === 'codex-auto-review');
+  return records.some(({ obj }) => obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL || obj?.model === CODEX_AUTO_REVIEW_MODEL);
 }
 
 function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; lineNum: number } | null {
-  const records: CodexLineRecord[] = [];
   let metaRecord: CodexLineRecord | null = null;
+  let sawAutoReviewModel = false;
+  let guardian = false;
   let lineNum = 0;
   readLines(filePath, (line) => {
     lineNum++;
@@ -263,17 +320,24 @@ function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; l
     } catch {
       return;
     }
-    records.push({ lineNum, obj });
+    sawAutoReviewModel ||= obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL
+      || obj?.model === CODEX_AUTO_REVIEW_MODEL;
     if (obj?.type === 'session_meta' && obj.payload?.id) {
       metaRecord = { lineNum, obj };
-      if (obj.payload?.source?.subagent?.other === 'guardian') return false;
+      if (obj.payload?.source?.subagent?.other === 'guardian') {
+        guardian = true;
+        return false;
+      }
       if (obj.payload?.thread_source !== 'subagent') return false;
     }
-    if (metaRecord && codexIsGuardianThread(metaRecord.obj.payload, records)) return false;
+    if (metaRecord && sawAutoReviewModel) {
+      guardian = true;
+      return false;
+    }
   });
   const capturedMeta = metaRecord as CodexLineRecord | null;
   const meta = capturedMeta?.obj?.payload;
-  if (!meta || !codexIsGuardianThread(meta, records)) return null;
+  if (!meta || !guardian) return null;
   const threadRawId = codexRawId(meta.id);
   return threadRawId ? { threadRawId, lineNum } : null;
 }
@@ -368,10 +432,10 @@ function codexToolOutput(payload: JsonRecord): string | null {
 }
 
 export {
-  fs, path, os, CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
+  CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
-  discoverJsonlFiles, discoverCodexJsonlFiles,
+  discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
   readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole, parseCodexJsonInput,
   codexUsage, codexEventText, codexMessagePayloadText, codexVisibleMessageKey, codexToolInput, codexToolOutput,

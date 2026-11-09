@@ -1,15 +1,19 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import type {
   ProviderAdapter,
   ProviderDescriptor,
   RawLookup,
   RawRecord,
+  WatchTarget,
 } from './types.ts';
 
 export interface ProviderRegistry {
   catalog(): ProviderDescriptor[];
   get(source: string): ProviderAdapter | undefined;
   list(): ProviderAdapter[];
-  watchRoots(configuredRoots?: Readonly<Record<string, string>>): string[];
+  watchTargets(configuredRoots?: Readonly<Record<string, string>>): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }
 
@@ -29,13 +33,41 @@ export function createProviderRegistry(providers: readonly ProviderAdapter[]): P
     catalog: () => list().map((provider) => ({ ...provider.descriptor })),
     get: (source) => byId.get(source),
     list,
-    watchRoots: (configuredRoots = {}) => [
-      ...new Set(
-        list().flatMap((provider) =>
-          provider.watchRoots(configuredRoots[provider.name] ?? provider.descriptor.defaultRoot),
-        ),
-      ),
-    ],
+    watchTargets: (configuredRoots = {}) => {
+      const byKey = new Map<string, WatchTarget>();
+      for (const provider of list()) {
+        for (const target of provider.watchTargets(configuredRoots[provider.name] ?? provider.descriptor.defaultRoot)) {
+          const key = `${target.kind}:${target.path}`;
+          const previous = byKey.get(key);
+          if (previous === undefined) {
+            byKey.set(key, target);
+          } else if (target.kind === 'tree' && (previous.fileNames || target.fileNames || (previous as any).matches || (target as any).matches)) {
+            const prevMatches = (previous as any).matches;
+            const nextMatches = (target as any).matches;
+            const combinedMatches = prevMatches && nextMatches
+              ? (fn: string) => prevMatches(fn) || nextMatches(fn)
+              : (prevMatches ?? nextMatches);
+            const fileNames = previous.fileNames || target.fileNames
+              ? [...new Set([...(previous.fileNames ?? []), ...(target.fileNames ?? [])])].sort()
+              : undefined;
+            const mergedTarget: WatchTarget = {
+              ...previous,
+              ...(fileNames ? { fileNames } : {}),
+            };
+            if (combinedMatches) {
+              Object.defineProperty(mergedTarget, 'matches', {
+                value: combinedMatches,
+                enumerable: false,
+                writable: true,
+                configurable: true,
+              });
+            }
+            byKey.set(key, mergedTarget);
+          }
+        }
+      }
+      return [...byKey.values()];
+    },
     raw: (input) => byId.get(input.source)?.raw(input) ?? null,
   };
 }

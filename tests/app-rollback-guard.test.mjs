@@ -1,16 +1,20 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Regression tests for the write-transaction runner (docs/adr/0006):
 //  - a transient BUSY (auto-rolled-back txn) is retried and recovers;
-//  - a persistent BUSY exhausts retries, and that file is SKIPPED, not fatal;
+//  - a persistent BUSY exhausts retries without publishing a partial force rebuild;
 //  - the guarded rollback never masks the real error ("cannot rollback ...").
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 import { buildIndex } from '../app/src/main/indexer.ts';
+import { createClaudeProvider } from '../packages/core/src/providers/claude.ts';
 const { DatabaseSync } = require('node:sqlite');
 
 // Wraps node:sqlite and simulates SQLite auto-rollback-on-error: a poisoned write
@@ -57,7 +61,7 @@ function makeDbClass(shouldPoison) {
 }
 
 function twoFileHome(alphaContent, betaContent) {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-tx-'));
+  const home = makeTempDir('obelisk-tx-');
   const projectDir = join(home, '.claude', 'projects', '-tmp-proj');
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(join(home, '.obelisk'), { recursive: true });
@@ -71,7 +75,7 @@ function twoFileHome(alphaContent, betaContent) {
 }
 
 function subagentHome(description = 'first description') {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-meta-tx-'));
+  const home = makeTempDir('obelisk-meta-tx-');
   const projectDir = join(home, '.claude', 'projects', '-tmp-proj');
   const subagentDir = join(projectDir, 'session', 'subagents');
   const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
@@ -180,7 +184,7 @@ test('a transient BUSY during a file transaction is retried and recovers', () =>
   assert.equal(result.skipped, 0);
 });
 
-test('a persistent BUSY exhausts retries and skips just that file, not the build', () => {
+test('a persistent BUSY rolls back the complete force rebuild', () => {
   const { home, dbPath, projectsDir } = twoFileHome('POISON alpha', 'hello beta');
   // Always poison writes that carry alpha's marker text; beta is untouched.
   const Db = makeDbClass((args) => args.some(a => typeof a === 'string' && a.includes('POISON')));
@@ -191,7 +195,8 @@ test('a persistent BUSY exhausts retries and skips just that file, not the build
   const check = new DatabaseSync(dbPath);
   const sessions = check.prepare('SELECT id FROM sessions ORDER BY id').all().map(r => r.id);
   check.close();
-  assert.deepEqual(sessions, ['beta'], 'the persistently-failing file is skipped; the other indexes');
+  assert.deepEqual(sessions, [], 'no partial force snapshot is published');
+  assert.equal(result.complete, false);
   assert.equal(result.skipped, 1, 'the skipped file is reported in the build result');
   assert.equal(result.skippedFiles[0].diagnostics?.phase, 'work', 'diagnostics record the failing phase');
 });
@@ -219,6 +224,49 @@ test('BEGIN contention during finalize defers the build', () => {
   });
   assert.equal(result.deferred, true);
   assert.equal(result.reason, 'database_busy');
+});
+
+test('a marker replay resumes after the last committed file when the next transaction defers', () => {
+  const { home, dbPath, projectsDir } = subagentHome();
+  const StableDb = makeDbClass(() => false);
+  assert.equal(run(home, dbPath, projectsDir, StableDb).complete, true);
+
+  const marker = createClaudeProvider({ rootDir: join(home, '.claude') }).indexVersionMarker;
+  let db = new DatabaseSync(dbPath);
+  db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(marker);
+  db.close();
+
+  const InterruptedDb = makeBeginBusyDbClass(beginCall => beginCall === 2);
+  const interrupted = buildIndex({
+    force: false,
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    projectsDir,
+    dbPath,
+    DatabaseImpl: InterruptedDb,
+  });
+  assert.equal(interrupted.deferred, true);
+  assert.equal(interrupted.reason, 'database_busy');
+
+  db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(marker).c, 1);
+  db.close();
+
+  const resumed = buildIndex({
+    force: false,
+    claudeDir: join(home, '.claude'),
+    codexDir: join(home, '.codex'),
+    projectsDir,
+    dbPath,
+    DatabaseImpl: StableDb,
+  });
+  assert.equal(resumed.files, 1, 'the committed file is not replayed after restart');
+  assert.equal(resumed.complete, true);
+
+  db = new DatabaseSync(dbPath);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM sessions').get().c, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM messages').get().c, 2);
+  db.close();
 });
 
 test('a finalize database error is propagated instead of swallowed as malformed input', () => {

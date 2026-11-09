@@ -1,8 +1,12 @@
+<!-- Copyright (C) 2026 tommy0103 and contributors. -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
 <script setup>
 import { ref, shallowRef, computed, reactive, onMounted, onBeforeUnmount, onUnmounted, nextTick, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { state, FOLDER_SVG, getSessionSummary } from '../store.js';
 import {
+  commitActiveSessionMetadata,
   fetchSessionDetailPatch,
   getCachedSessionDetail,
   loadSessionDetail,
@@ -223,7 +227,7 @@ onUnmounted(() => {
 });
 
 watch(() => session.value?.id, async sessionId => {
-  if (sessionId === props.id && messages.value.length === 0) {
+  if (sessionId === props.id && messages.value.length === 0 && !loading.value) {
     await loadMessages({ force: true });
   }
 });
@@ -250,6 +254,7 @@ async function loadMessages({ force = false } = {}) {
   try {
     const latest = await fetchSessionSnapshot(requestedSessionId, { force });
     if (revision !== loadRevision || requestedSessionId !== props.id) return;
+    commitActiveSessionMetadata(latest);
     await commitSessionSnapshot(latest);
     committed = true;
   } finally {
@@ -285,7 +290,7 @@ async function fetchSessionSnapshot(sessionId, { force = false } = {}) {
   const messageSnapshot = force ? null : getCachedSessionDetail(sessionId);
   if (messageSnapshot) return messageSnapshot;
   const cached = state.sessions.find(session => session.id === sessionId);
-  if (cached && (force || !cached.messages || cached.messages.length === 0)) {
+  if (!cached || force || !cached.messages || cached.messages.length === 0) {
     return loadSessionDetail(sessionId);
   }
   return cached;
@@ -298,6 +303,9 @@ async function loadLiveSnapshot() {
   // full-load generation so a patch cannot invalidate cold-open layout work.
   const revision = loadRevision;
   const patchRequest = await fetchSessionDetailPatch(sessionId);
+  // Decode IPC and publish reactive rows in separate tasks. Yield here so the
+  // coordinator can also recheck scroll ownership before any visible commit.
+  await scheduler.yield();
   return { sessionId, revision, patchRequest };
 }
 
@@ -368,6 +376,9 @@ async function commitSessionSnapshot(latest) {
   await nextTick();
   timelineViewport.completeInitialSnapshot();
   if (restoreTail) await timelineViewport.scrollToEnd();
+  // DOM updates and their forced layout should not share the IPC reply task.
+  // Read geometry in the next rendering frame, after Vue has published rows.
+  await new Promise(resolve => requestAnimationFrame(resolve));
   syncTimelineScrollMargin();
   if (timelineReady.value) {
     if (!pendingFocusUuid.value) onScroll();

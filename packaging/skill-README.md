@@ -1,7 +1,7 @@
 # Obelisk Skill
 
 Explicit memory infrastructure for coding agents — a queryable SQLite evidence
-layer over local Claude Code and Codex session history.
+layer over local Claude Code, Codex, Kimi Code, and Pi session history.
 
 ## Install with your agent (recommended)
 
