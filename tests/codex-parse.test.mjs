@@ -374,7 +374,7 @@ test('codex parse() patches the aggregate when a touch coincides with a title ch
   const session = second.values.find(record => record.kind === 'session');
   assert.ok(session, 'the metadata change is patched in the healing pass');
   assert.equal(session.title, 'New Title');
-  assert.equal(session.ended_at, '2026-06-11T00:00:00Z');
+  assert.equal(session.ended_at, '2026-06-11T00:00:00.000Z');
   assert.equal(cursorState(second.ret).indexedTitle, 'New Title');
   assert.equal(second.ret.split(':', 6)[3], `${statSync(path).ctimeMs}`, 'the cursor heals in the same pass');
 });
@@ -554,7 +554,7 @@ test('codex parse() persists a session-index-only metadata refresh without repla
   }, first.ret));
   assert.deepEqual(second.values.map(record => record.kind), ['session']);
   assert.equal(second.values[0].title, 'After');
-  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00.000Z');
   assert.equal(cursorState(second.ret).indexedTitle, 'After');
 });
 
@@ -576,10 +576,10 @@ function assertVerifiedMetadataRefresh(parseSource, readMode = 'normal') {
 
   assert.deepEqual(second.values.map(record => record.kind), ['session'], 'metadata changes emit only the session aggregate');
   assert.equal(second.values[0].title, 'After');
-  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00.000Z');
   assert.equal(second.values[0].message_count, first.values.find(record => record.kind === 'session').message_count);
   assert.equal(cursorState(second.ret).indexedTitle, 'After');
-  assert.equal(cursorState(second.ret).indexedUpdatedAt, '2026-06-10T12:00:00Z');
+  assert.equal(cursorState(second.ret).indexedUpdatedAt, '2026-06-10T12:00:00.000Z');
   assert.equal(metrics.plan, 'verified-append', 'unsupported identities and strict mode still verify the prefix');
   assert.equal(metrics.sourceBytesRead, statSync(path).size, 'the prefix is fingerprinted once');
   assert.equal(metrics.jsonLinesParsed, 0, 'an unchanged rollout is not replayed');
