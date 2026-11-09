@@ -27,10 +27,15 @@ import {
   readPersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
+  resolveObeliskPaths,
+  warnLegacyStorageIgnored,
+} from '../../../packages/core/src/paths.ts';
+import {
   buildSourceCatalog,
   setPersistedSetting,
   type ProviderSourceIssue,
 } from './provider-settings.ts';
+import { preserveRejectedSettings } from './settings-preservation.ts';
 import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
@@ -54,6 +59,11 @@ import { createSessionPatch } from '../shared/session-patch.mjs';
 import { assembleSessionDetail } from '../shared/session-detail-assembly.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const OBELISK_PATHS = resolveObeliskPaths();
+const OBELISK_DIR = OBELISK_PATHS.dataDir;
+const RECAP_DIR = OBELISK_PATHS.recapDir;
+const SETTINGS_PATH = OBELISK_PATHS.settingsPath;
+let legacyStorageWarningShown = false;
 
 function detectClaudeDir() {
   // macOS / Linux: ~/.claude
@@ -85,6 +95,11 @@ let indexerService;
 let indexerWorker;
 let latestSourceIssues: ProviderSourceIssue[] = [];
 let latestSettingsError: string | null = null;
+// A recovery notice is deliberately kept apart from latestSettingsError: that variable
+// also gates the indexer (startIndexerService, migrations, rebuildIndex all treat a
+// non-null value as "settings unusable"). Once a corrupt file has been moved aside the
+// settings ARE usable again, so the notice must not block those paths.
+let latestSettingsRecovery: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
 
@@ -127,7 +142,10 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
     providerRegistry,
     claudeDir,
     codexDir,
-    dbPath: path.join(OBELISK_DIR, 'obelisk.sqlite'),
+    configDir: OBELISK_PATHS.configDir,
+    dataDir: OBELISK_PATHS.dataDir,
+    settingsPath: OBELISK_PATHS.settingsPath,
+    dbPath: OBELISK_PATHS.dbPath,
     projectsDir: path.join(claudeDir, 'projects'),
   };
 }
@@ -136,6 +154,12 @@ function migrateLegacyDbIfNeeded(
   paths = getRuntimePaths(),
   { writerLeaseMode = 'acquire' }: { writerLeaseMode?: WriterLeaseMode } = {},
 ) {
+  if (OBELISK_PATHS.layout !== 'legacy') {
+    if (!legacyStorageWarningShown) {
+      legacyStorageWarningShown = warnLegacyStorageIgnored(OBELISK_PATHS) !== null;
+    }
+    return false;
+  }
   if (fs.existsSync(paths.dbPath)) return;
   const legacyDbPath = path.join(paths.claudeDir, 'obelisk.sqlite');
   if (!fs.existsSync(legacyDbPath)) return;
@@ -493,8 +517,6 @@ function createWindow() {
   }
 }
 
-const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
-const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
 let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
 let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingObeliskChanges = new Set<string>();
@@ -1118,17 +1140,16 @@ ipcMain.handle('recap:read', (_, filename) => {
 
 // --- Settings ---
 
-const SETTINGS_PATH = path.join(OBELISK_DIR, 'settings.json');
-
-function loadPersistedSettings() {
-  const result = readPersistedProviderSettings(SETTINGS_PATH);
+function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
   if (latestSettingsError !== null) console.warn(latestSettingsError);
   return result.settings;
 }
 
 function savePersistedSettings(settings) {
-  if (!fs.existsSync(OBELISK_DIR)) fs.mkdirSync(OBELISK_DIR, { recursive: true });
+  if (!fs.existsSync(path.dirname(SETTINGS_PATH))) {
+    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+  }
   const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
@@ -1147,7 +1168,16 @@ ipcMain.handle('settings:get', async () => {
   const paths = getRuntimePaths(persisted);
   const copilotEditions = getCopilotEditions(persisted);
   const copilotCustomRoot = hasExplicitProviderRoot(persisted, 'copilot');
-  const { providerRoots, providerRegistry, claudeDir, codexDir, dbPath: dbFile } = paths;
+  const {
+    providerRoots,
+    providerRegistry,
+    claudeDir,
+    codexDir,
+    configDir,
+    dataDir,
+    settingsPath,
+    dbPath: dbFile,
+  } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
   const sourceStats = new Map<string, { sessionCount: number; lastIndexed: string }>();
@@ -1213,6 +1243,9 @@ ipcMain.handle('settings:get', async () => {
     copilotCustomRoot,
     claudeDir,
     codexDir,
+    configDir,
+    dataDir,
+    settingsPath,
     dbPath: dbFile,
     recapDir,
     autoRefresh: persisted.autoRefresh !== false,
@@ -1223,38 +1256,64 @@ ipcMain.handle('settings:get', async () => {
     lastIndexed,
     status: connected ? 'ok' : 'error',
     statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
+    settingsRecovery: latestSettingsRecovery,
   };
 });
 
-ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(async () => {
-  const persisted = loadPersistedSettings();
-  const providerRootChanged = setPersistedSetting(persisted, key, value);
-  savePersistedSettings(persisted);
+// A save yields while preserving a rejected file. Keep the complete read/backup/write
+// sequence ordered so another save cannot overwrite a stale snapshot or race its backup.
+// updateLifecycle still tracks queued saves immediately so update cleanup waits for them.
+let settingsWriteTail: Promise<unknown> = Promise.resolve();
+ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
+  const write = settingsWriteTail.then(async () => {
+    const currentRead = readPersistedProviderSettings(SETTINGS_PATH);
+    const persisted = loadPersistedSettings(currentRead);
+    // Preserve a file the shared reader rejected before the write below replaces it. Runs
+    // before the save, using this queued write's fresh read rather than latestSettingsError,
+    // so a stale flag from an earlier settings:get cannot skip or repeat it. Throwing here is the
+    // point: with no preserved copy the overwrite is the silent #42 loss.
+    const backupPath = await preserveRejectedSettings(SETTINGS_PATH, {
+      rename: (from, to) => fs.promises.rename(from, to),
+      copyFile: (from, to) => fs.promises.copyFile(from, to),
+    }, currentRead);
+    const providerRootChanged = setPersistedSetting(persisted, key, value);
+    savePersistedSettings(persisted);
+    if (backupPath !== null) {
+      latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
+      console.warn(latestSettingsRecovery);
+    }
 
-  if (key === 'autoRefresh') {
-    if (value === false && indexerService) {
+    if (key === 'autoRefresh') {
+      if (value === false && indexerService) {
+        await stopIndexerServiceAndWait();
+      } else if (value !== false) {
+        if (indexerService) await stopIndexerServiceAndWait();
+        startIndexerService({ buildOnStart: true });
+      }
+    }
+
+    const knownLegacyRootChanged = createBuiltinProviderRegistry({
+      claude: DEFAULT_CLAUDE_DIR,
+      codex: DEFAULT_CODEX_DIR,
+    }).catalog().some((provider) => key === `${provider.id}Dir`);
+    if (providerRootChanged || knownLegacyRootChanged) {
       await stopIndexerServiceAndWait();
-    } else if (value !== false) {
-      if (indexerService) await stopIndexerServiceAndWait();
-      startIndexerService({ buildOnStart: true });
+      const paths = getRuntimePaths(persisted);
+      migrateLegacyDbIfNeeded(paths);
+      openDb(paths.dbPath);
+      if (persisted.autoRefresh !== false) {
+        startIndexerService({ buildOnStart: true });
+      }
+      notifyIndexUpdated({ inventoryIssues: [] });
     }
-  }
-
-  const knownLegacyRootChanged = createBuiltinProviderRegistry({
-    claude: DEFAULT_CLAUDE_DIR,
-    codex: DEFAULT_CODEX_DIR,
-  }).catalog().some((provider) => key === `${provider.id}Dir`);
-  if (providerRootChanged || knownLegacyRootChanged) {
-    await stopIndexerServiceAndWait();
-    const paths = getRuntimePaths(persisted);
-    migrateLegacyDbIfNeeded(paths);
-    openDb(paths.dbPath);
-    if (persisted.autoRefresh !== false) {
-      startIndexerService({ buildOnStart: true });
-    }
-    notifyIndexUpdated({ inventoryIssues: [] });
-  }
-  return true;
+    // The save is what moves a rejected file aside, so the notice is returned here as well as
+    // from settings:get: the paths that save without reloading settings (editor, recap
+    // directory, auto-refresh) would otherwise never see it.
+    return { settingsRecovery: latestSettingsRecovery };
+  });
+  // A refused save must not prevent a later retry after the file becomes writable.
+  settingsWriteTail = write.catch(() => {});
+  return write;
 }));
 
 ipcMain.handle('settings:browseFolder', async (event) => {

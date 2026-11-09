@@ -104,7 +104,7 @@ for (const runtime of ['built CLI', 'App SQLite']) {
       const session = db.prepare('SELECT * FROM sessions WHERE id=?').get('session');
       assert.equal(session.message_count, count, 'orphan count includes cached main and child rows');
       assert.equal(session.title, 'Named Session');
-      assert.equal(session.started_at, '2026-06-10T09:00:00Z');
+      assert.equal(session.started_at, '2026-06-10T09:00:00.000Z');
       assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?').get('cached-main').text, 'retainedonlyneedle');
       assert.equal(db.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'retainedonlyneedle'").get().uuid, 'cached-main');
       assert.equal(db.prepare('SELECT input_json FROM tool_calls WHERE id=?').get('cached-tool').input_json, '{"file_path":"/work/project/file"}');

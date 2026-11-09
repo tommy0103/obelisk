@@ -142,8 +142,8 @@ test('orphaned subagent messages land in one browsable session row', () => {
   assert.equal(row.message_count, 3);
   assert.equal(row.project, PROJECT);
   assert.equal(row.project_path, '/work/project');
-  assert.equal(row.started_at, '2026-06-10T10:00:00Z');
-  assert.equal(row.ended_at, '2026-06-10T10:02:00Z');
+  assert.equal(row.started_at, '2026-06-10T10:00:00.000Z');
+  assert.equal(row.ended_at, '2026-06-10T10:02:00.000Z');
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(SESSION_ID).n, 3);
 
   assert.equal(backfillSessionTitles(db), 1);
