@@ -74,6 +74,7 @@ input { font: inherit; color: inherit; }
 
 .titlebar {
   height: 32px; width: 100%;
+  position: relative;
   -webkit-app-region: drag;
   background: rgba(0,0,0,0.15);
   backdrop-filter: blur(20px);
@@ -81,6 +82,9 @@ input { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--hairline);
   flex-shrink: 0; z-index: 100;
   display: flex; align-items: center; justify-content: center;
+  padding: 0 16px;
+}
+.titlebar.mac {
   padding: 0 16px 0 78px;
 }
 .titlebar-text {
@@ -96,6 +100,30 @@ input { font: inherit; color: inherit; }
 .titlebar-text .sep { margin: 0 6px; color: var(--muted-2); }
 .titlebar-text .scope { color: var(--muted); }
 .titlebar-text .scope-leaf { color: var(--fg-2); font-family: var(--font-mono); font-size: 11.5px; }
+.titlebar-controls {
+  position: absolute;
+  right: 6px; top: 0;
+  height: 100%;
+  display: flex; align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+.titlebar.has-controls .titlebar-text {
+  max-width: calc(100% - 130px);
+}
+.titlebar-btn {
+  width: 40px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  color: var(--muted); cursor: default;
+}
+.titlebar-btn:hover { background: var(--surface-hi); color: var(--fg-2);}
+.titlebar-btn-close:hover { background: var(--danger-soft); color: var(--danger); }
+.titlebar-icon {
+  width: 12px; height: 12px;
+  display: inline-flex; align-items: center;
+}
+.titlebar-icon svg{ width: 12px; height: 12px; display: block; }
 
 button, input, .row, .sidebar-item, .toolbar-btn,
 .row-action, .row-checkbox, .crumb, .provenance-link,

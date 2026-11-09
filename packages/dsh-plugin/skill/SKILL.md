@@ -1,26 +1,27 @@
 ---
 name: obelisk
 description: >
-  Search and query past Claude Code, Codex, Kimi Code, and Pi session history.
+  Search and query past Claude Code, Codex, Kimi Code, Kiro, and Pi session history.
   Reactive: when the user asks "how did I fix X", "what did we do last time", "find the session where", "上次怎么修的", "之前的session", "历史记录".
   Proactive: when the user references past work you lack context for, when you're about to modify a file with complex edit history, when the user says "继续之前的" or "continue where we left off", or when understanding prior decisions would improve your current response.
   Memory: when the user says "记住这个", "remember this", "写入记忆", "save this conclusion", or when you determine a retrieval result contains a conclusion worth persisting.
 allowed-tools:
   - Read
-  - Bash(obelisk:*)
-  - Write
+  - Bash(obelisk --search *)
+  - Bash(obelisk --build)
+  - Bash(obelisk --version)
 ---
 
 # obelisk
 
-Search and query local Claude Code, Codex, Kimi Code, and Pi session history.
+Search and query local Claude Code, Codex, Kimi Code, Kiro, and Pi session history.
 Obelisk indexes sessions, messages, tool calls, tool results, summaries,
 subagents, workflows, workflow agents, parent chains, and raw JSONL lines into
 SQLite + FTS5.
 
-Obelisk has four transcript sources. Treat all of them as ordinary sessions by
+Obelisk has several transcript sources. Treat all of them as ordinary sessions by
 default: Claude rows use `source='claude'`, Codex rows use `source='codex'`,
-Kimi Code rows use `source='kimi'`, and Pi rows use `source='pi'`. Use `source`
+Kimi Code rows use `source='kimi'`, Kiro rows use `source='kiro'`, and Pi rows use `source='pi'`. Use `source`
 only when provenance matters or the user asks to scope to one provider.
 Provider-specific records are projected into the same canonical tables; some
 providers may not emit every kind of subagent or workflow metadata.
@@ -79,8 +80,9 @@ Custom query:
 3. Parse JSON stdout and answer with concise evidence.
 
 The query file runs inside `(async () => { ... })()`. Use `return` to emit JSON.
-Query scripts are read-only: `remember()` and `forget()` are not available, and
-`sql()` only accepts read-only SELECT/WITH queries.
+The query helper API is read-only: `remember()` and `forget()` are not available,
+and `sql()` only accepts read-only SELECT/WITH queries. The script itself still
+runs with the privileges of the CLI process — see the security note above.
 
 ## Your Own Session In Results
 
@@ -316,6 +318,7 @@ Keep queries scoped, bounded, and structural.
 - Plan Before Probe: for conclusion, broad history, failure investigation, or file evolution, write a bounded retrieval script instead of spending turns on intermediate results.
 - Structure Before Text: compute counts, joins, grouping, dedupe, and projection in SQL or JS; keep runtime JSON compact, ideally under 10k-12k chars for synthesis tasks.
 - Evidence Before Conclusion: return compact evidence with stable IDs (`session_id`, `uuid`, `tool_call_id`, `run_id`, `agent_id`) and short snippets, then synthesize in the final answer.
+- Compact First Pass When Useful: `search(topic, { projectPath, limit: 30, snippetTokens: 16, contextLimit: 0 })` returns scoped matched excerpts without six automatic neighbors per hit. Expand selected UUIDs with `context(uuid)` or `raw(uuid)` before treating an excerpt as full evidence; keep the default full result when it is already the right size.
 - Exclude Meta By Default: `is_meta=1` rows are injected/control-plane transcript material. Helpers hide them by default; raw SQL for ordinary conversation evidence should include `COALESCE(m.is_meta,0)=0` unless meta rows are the investigation target.
 - Exclude Superseded Paths By Default: ordinary evidence must use exact visible-only filtering. Opt into inactive Pi history only to explain an abandoned path, and label it as tried then superseded.
 - Persist Durable Conclusions: after answering, if retrieval produced a durable conclusion that future sessions are likely to reuse and `memories()` does not already cover it, explicitly offer to write a memory. Keep the offer brief. Do not write the markdown file or run `--attune` until the user approves.
@@ -473,5 +476,5 @@ See `references/query-patterns.md` for longer recipes.
 
 - First run builds the index. Later runs update incrementally.
 - DB location: `~/.obelisk/obelisk.sqlite`; old `~/.claude/obelisk.sqlite` is copied forward if needed.
-- Query scripts run in a sandboxed VM with no filesystem or network access from inside the script.
+- Query scripts run in a `node:vm` context with only the documented API exposed. The VM is not an isolated sandbox — scripts run with the privileges of the CLI process. Only run trusted scripts.
 - Indexed text and stored tool inputs/results are truncated to 10k chars. Use `raw(uuid, { offset, limit })` for specific JSONL windows.

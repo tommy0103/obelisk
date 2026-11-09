@@ -15,7 +15,7 @@ export default tseslint.config(
     ignores: [
       'node_modules/**',
       'app/**',
-      'dist/**',
+      '**/dist/**',
       'release/**',
       '.dev.docs/**',
       '.obelisk/**',

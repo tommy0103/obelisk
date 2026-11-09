@@ -9,8 +9,9 @@ Detailed reference for globals available inside `obelisk --query` and
 - Use `references/pitfalls.md` after runtime errors or confusing row shapes.
 
 Query scripts run inside an async IIFE with a 30-second timeout. Use `return` to
-emit JSON. `--query` scripts are read-only. `--attune` scripts expose only
-memory mutation helpers.
+emit JSON. The `--query` helper API is read-only, but the script itself runs
+with the privileges of the CLI process — see the security note in `SKILL.md`.
+`--attune` scripts expose only memory mutation helpers.
 
 ## Invocation Identity
 
@@ -98,6 +99,9 @@ Full-text search across all indexed message text using FTS5.
 | `opts.limit` | `number` | Max results, default 20 |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
+| `opts.projectPath` | `string` | Exact match on `sessions.project_path` |
+| `opts.contextLimit` | `number` | Temporal neighbors per hit, integer 0–6; default 6. Zero skips neighbor lookup |
+| `opts.snippetTokens` | `number` | Return a matched FTS excerpt instead of the full hit text, integer 1–64; omitted by default |
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
@@ -124,6 +128,18 @@ Hits and neighbors carry `visibility`.
 Use `context(uuid)` or `trace(uuid)` for causal/parent-chain expansion. Lower
 FTS rank sorts earlier; prefer returned order unless deliberately inspecting
 FTS ranking.
+
+For a compact first pass, use `search(topic, { projectPath, limit: 30,
+snippetTokens: 16, contextLimit: 0 })`; promising hits retain their UUID and
+session ID. When `snippetTokens` is set, `message.text` is a matched excerpt and
+`message.isSnippet` plus `message.textLength` mark that the full text was not
+returned. Expand selected UUIDs with `context(uuid)` or `raw(uuid)`; do not treat
+the excerpt as complete evidence. The CLI exposes the same controls as
+`--project-path`, `--limit`, `--snippet-tokens`, and `--context-limit`.
+The first argument after `--search` is search text, even when it begins with
+`--`; options follow that argument. A standalone `--` ends option parsing and
+treats everything after it as text: `obelisk --search -- --limit` searches for
+the literal flag name, and `obelisk --search needle -- --help` searches both terms.
 
 Valid FTS5 syntax in `text` is honored. Input that FTS5 would reject as
 malformed (for example a hyphenated term like `foo-bar`) does not error: it
@@ -232,7 +248,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'pi', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'kiro' | 'pi', session_count, last_session_at }]
   }
 }
 ```
@@ -251,14 +267,25 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"`; omit for all |
-| `opts.sessionId` | `string` | Exact session ID |
-| `opts.sessions` | `string[]` | Restrict to session IDs |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"`; omit for all |
+| `opts.sessionId` | `string` | Canonical session ID; a non-exact ref resolves as a literal fragment, capped at the 10 newest matches |
+| `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 
 Returns `Array<session_row>`.
+Only `sessions()` resolves fragments; every other helper matches `sessionId`
+exactly. Fragments match literally, so `%` and `_` in them are not SQL
+wildcards, and expand to at most the 10 newest containing sessions within the
+requested project/source/time/branch filters; entries
+from `sessionId` and `sessions` union. A raw native id normally resolves to
+exactly one session; several rows mean the id is not unique (for example a
+copied session file), so narrow with `project` or `source`.
 `message_count` describes the visible canonical transcript; inactive and hidden
 records do not increase it. The invoking session row carries
 `is_invoking: true` (see Invocation Identity); other rows omit the field.
+
+Passing a string is treated as `sessionId`. An exact canonical ID takes priority
+globally, even if other filters exclude it; no containing session is substituted.
+Unknown references and empty entries in the `sessions` array match nothing.
 
 #### `recent(n?)`
 

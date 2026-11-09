@@ -1,7 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { computed, nextTick, onScopeDispose, ref } from 'vue';
+import { computed, nextTick, onScopeDispose, ref, triggerRef } from 'vue';
 import {
   defaultRangeExtractor,
   elementScroll,
@@ -46,6 +46,7 @@ export function estimateTimelineItemSize(item) {
 export function createViewportRangeExtractor({
   getScrollElement,
   getVirtualizer,
+  getScrollOffset,
   bufferViewports = 4,
 }) {
   return range => {
@@ -58,15 +59,19 @@ export function createViewportRangeExtractor({
     // the scroll event. Buffer in pixels so short rows do not collapse a
     // count-based overscan into less than one trackpad gesture.
     const bufferSize = viewportSize * bufferViewports;
-    const scrollOffset = element.scrollTop || 0;
+    const scrollOffset = getScrollOffset?.() ?? (element.scrollTop || 0);
     const first = instance.getVirtualItemForOffset(Math.max(0, scrollOffset - bufferSize));
     const last = instance.getVirtualItemForOffset(
       scrollOffset + viewportSize + bufferSize,
     );
     if (!first || !last) return defaultRangeExtractor(range);
 
-    const startIndex = Math.max(0, Math.min(first.index, range.startIndex));
-    const endIndex = Math.min(range.count - 1, Math.max(last.index, range.endIndex));
+    // The DOM offset can already have advanced while virtual-core still holds
+    // the previous range. Unioning that stale range with the physical viewport
+    // mounts the entire intervening transcript on a far jump. The pixel window
+    // itself covers the viewport, including suppressed scroll compensation.
+    const startIndex = Math.max(0, first.index);
+    const endIndex = Math.min(range.count - 1, last.index);
     return Array.from(
       { length: endIndex - startIndex + 1 },
       (_, offset) => startIndex + offset,
@@ -111,9 +116,14 @@ export function useSessionTimelineViewport({
     onSuppressedAdjustment: applySuppressedAdjustment,
   });
   let virtualizer = null;
+  let rangeRefreshPending = false;
   const rangeExtractor = createViewportRangeExtractor({
     getScrollElement: () => scrollElement.value,
     getVirtualizer: () => virtualizer?.value,
+    // Suppressed size corrections move the timeline with translate instead of
+    // scrollTop. Measure the window we will reveal when that compensation is
+    // committed, so the final scroll does not mount another unmeasured prefix.
+    getScrollOffset: () => (scrollElement.value?.scrollTop || 0) + suppressedAdjustment,
   });
   virtualizer = useVirtualizer(computed(() => ({
     count: items.value.length,
@@ -133,6 +143,23 @@ export function useSessionTimelineViewport({
     useAnimationFrameWithResizeObserver: true,
     measureElement: measureVirtualElement,
     scrollToFn: scrollPolicy.scrollToFn,
+    onChange: instance => {
+      if (rangeRefreshPending) return;
+      rangeRefreshPending = true;
+      // The pixel buffer depends on measurements outside the visible range,
+      // which virtual-core's index memo does not track. Refresh after Vue has
+      // published the measurement batch, rather than re-entering geometry
+      // derivation in the middle of a row's ref/resize callback.
+      nextTick(() => {
+        rangeRefreshPending = false;
+        if (!scrollElement.value || virtualizer?.value !== instance) return;
+        instance.setOptions({
+          ...instance.options,
+          rangeExtractor: range => rangeExtractor(range),
+        });
+        triggerRef(virtualizer);
+      });
+    },
   })));
 
   const virtualRows = computed(() => virtualizer.value.getVirtualItems());
@@ -247,9 +274,36 @@ export function useSessionTimelineViewport({
     suppressedAdjustment = 0;
   }
 
+  const pendingRowMeasurements = new Set();
+  let rowMeasurementPending = false;
+
   function measureElement(element) {
-    if (!element) return;
-    virtualizer.value.measureElement(element);
+    if (element) pendingRowMeasurements.add(element);
+    if (rowMeasurementPending) return;
+    rowMeasurementPending = true;
+    // Vue clears refs before removing DOM and mounts each row before the rest
+    // of the patch is complete. Read every new height after the patch, then
+    // publish corrections together: no layout reads between DOM/scroll writes.
+    nextTick(() => {
+      rowMeasurementPending = false;
+      const instance = virtualizer.value;
+      const rows = [...pendingRowMeasurements]
+        .filter(row => row.isConnected)
+        .map(row => {
+          const index = instance.indexFromElement(row);
+          const key = instance.options.getItemKey(index);
+          const isNew = instance.elementsCache.get(key) !== row;
+          return { row, index, height: isNew ? row.offsetHeight : null };
+        });
+      pendingRowMeasurements.clear();
+      instance.measureElement(null);
+      for (const { row, index, height } of rows) {
+        // Seed the real height before registration. virtual-core otherwise
+        // skips first measurements during a gesture, exposing overlapping rows.
+        if (height !== null) instance.resizeItem(index, height);
+        instance.measureElement(row);
+      }
+    });
   }
 
   async function settleAfterUserScroll(commit = () => Promise.resolve()) {
@@ -285,6 +339,10 @@ export function useSessionTimelineViewport({
         : null;
     settlementActive = true;
     try {
+      // Replace any pending scrollToIndex reconciliation with the reader's
+      // current offset. The policy suppresses the physical write here; using
+      // the public API also lets virtual-core retire the old navigation target.
+      instance.scrollToOffset(scrollOffset, { behavior: 'auto' });
       // Publish the coalesced live patch inside the same geometry transaction.
       // Real row sizes remain live throughout; only scrollTop corrections are
       // suppressed until the reader anchor can be reconciled once.
@@ -362,6 +420,9 @@ export function useSessionTimelineViewport({
   }
 
   function runWithMeasurementRetry(scroll) {
+    // A new explicit location must not inherit the translation that compensated
+    // the previous wheel gesture. Reconcile against the unshifted timeline.
+    clearSuppressedAdjustment();
     scroll();
     const targetWindow = scrollElement.value?.ownerDocument?.defaultView;
     if (!targetWindow) return Promise.resolve();

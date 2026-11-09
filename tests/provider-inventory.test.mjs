@@ -3,13 +3,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createClaudeProvider } from '../packages/core/src/providers/claude.ts';
 import { createCodexProvider } from '../packages/core/src/providers/codex.ts';
 import { createKimiProvider } from '../packages/core/src/providers/kimi.ts';
+import { createZcodeProvider } from '../packages/core/src/providers/zcode.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const providers = [
@@ -72,4 +73,38 @@ test('Kimi recovers its session unit key from canonical wire provenance', () => 
     sessionId: 'kimi:legacy',
     jsonlPath: join(sessionDir, 'wire.jsonl'),
   }), sessionDir);
+});
+
+test('zcode reports an unusable database as incomplete inventory, never as empty', () => {
+  const root = makeTempDir('obelisk-zcode-inventory-');
+  mkdirSync(join(root, 'db'), { recursive: true });
+  writeFileSync(join(root, 'db', 'db.sqlite'), 'not a sqlite database');
+  const provider = createZcodeProvider({ rootDir: root });
+  let issue;
+  const units = provider.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{ sessionId: 'zcode:abc:sess_prior', jsonlPath: join(root, 'db', 'db.sqlite#z:sess_prior') }],
+    reportIncompleteInventory(value) { issue = value; },
+  });
+  assert.deepEqual(units, []);
+  assert.ok(issue, 'a present-but-unreadable source is reported, not silently empty');
+});
+
+test('zcode treats a missing database as incomplete only when prior sessions exist', () => {
+  const root = makeTempDir('obelisk-zcode-inventory-missing-');
+  const provider = createZcodeProvider({ rootDir: root });
+  const issues = [];
+  const context = {
+    lastCursor: () => null,
+    reportIncompleteInventory(value) { issues.push(value); },
+  };
+
+  assert.deepEqual(provider.discover(context), []);
+  assert.deepEqual(issues, []);
+  assert.deepEqual(provider.discover({
+    ...context,
+    indexedSessions: () => [{ sessionId: 'prior', jsonlPath: join(root, 'db', 'db.sqlite#z:sess_prior') }],
+  }), []);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].path, join(root, 'db', 'db.sqlite'));
 });

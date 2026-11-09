@@ -34,6 +34,9 @@ The single most common failure is a capability that is advertised but
 unreachable. If you describe a config option, use that option from the outermost
 entry point before submitting. If you post a screenshot, the input in that
 screenshot must be an input the code can actually handle.
+When changing build output, package contents, or runtime resource loading, verify
+the built or packaged artifact through the entry point users run, including its
+required resources. Source-level tests alone do not cover that boundary.
 
 **2. Write assertions in the words of the requirement, not the shape of the
 implementation.**
@@ -50,8 +53,9 @@ start heal itself?
 
 **4. Read the neighbouring implementation first, and reuse the concepts that
 already exist.**
-Adding a provider means reading `claude.ts`, `codex.ts`, and `kimi.ts` in full
-first. Needing "don't display this row" means grepping for `visibility` before
+Adding a provider means reading all provider implementations in
+[`packages/core/src/providers/`](packages/core/src/providers/) in full first.
+Needing "don't display this row" means grepping for `visibility` before
 inventing a field. The burden of proof for a new concept, field, state, or file
 type is on the PR: say why the existing one is insufficient. The ADRs in
 `docs/adr/` are constraints, not suggestions.
@@ -66,6 +70,35 @@ Merging main invalidates every claim in your PR description, including your own
 the test you added.
 
 ---
+
+## Node and Electron runtimes
+
+Use **Node 22** for repository verification, matching the current CI workflows.
+The CLI's supported runtime floor is **22.13.0**, as declared in
+`packages/cli/package.json`. This host Node runs npm, builds, typechecking, lint,
+and `npm test`.
+
+The desktop app runs on **Electron's embedded Node**; Electron 43 uses Node 24.
+Installing Node 22 on the build host does not make the app run on Node 22. See
+[ADR-0005](docs/adr/0005-app-electron-vite-ts-esm.md) for the architectural
+distinction and the historical Electron 33 / Node 20 context.
+
+Install both dependency sets with `npm ci` and `npm --prefix app ci`, then run
+the repository Node checks. Before running Electron suites, rebuild native
+modules for Electron:
+
+```bash
+cd app
+npx --no-install electron-builder install-app-deps
+npm run test:electron:all
+```
+
+If returning to host-Node tests that load native modules, restore host-Node
+dependencies first; an Electron ABI build is not interchangeable with a
+host-Node build. For packaging, electron-builder performs the Electron rebuild.
+When changing Electron or native dependencies, verify the actual packaged
+executable's `process.versions` and load its bundled native modules, rather than
+inferring the app runtime from the CI `node-version` setting.
 
 ## Renderer / Electron UI changes
 
@@ -85,7 +118,7 @@ interactions, or the full Electron suites.
   skips scroll compensation for already-measured rows when
   `scrollDirection === 'backward'`, so drift can be zero at rest and large while
   scrolling up. Test both.
-- Run `npm run test:electron:all` (all five suites), not only the suite you
+- Run `npm run test:electron:all` (all suites), not only the suite you
   added.
 - **Do not add `loading="lazy"` to virtualized rows.** Rows already mount near
   the viewport; lazy only defers decode into the scroll itself.
@@ -107,7 +140,17 @@ interactions, or the full Electron suites.
 
 ## Provider adapters
 
-- **Read `claude.ts`, `codex.ts`, and `kimi.ts` before writing a new adapter.**
+- **Before requesting review, pass the adapter-review skill in a clean session.**
+  Run [`maintainer-skills/adapter-review/SKILL.md`](maintainer-skills/adapter-review/SKILL.md)
+  from a fresh agent session — not the session that wrote the code — and resolve
+  every blocking finding first. The authoring session shares the implementation's
+  assumptions; the skill encodes the failure patterns this repo's adapter reviews
+  keep hitting (identity/key asymmetry, destructive tombstones, migration
+  convergence, fixture authenticity), and it only works when the reviewer is not
+  the author.
+- **Read all provider implementations in
+  [`packages/core/src/providers/`](packages/core/src/providers/) before writing a
+  new adapter.**
   The conventions there are earned: zero-padded ordinals in ids
   (`parsing.ts` uses `padStart(6, '0')`), the
   `__<provider>_canonical_transcript_vN__` marker, how `git_branch` is handled.
@@ -117,6 +160,14 @@ interactions, or the full Electron suites.
   overwrite the first.
 - **A test must actually call `discover()`.** Asserting the resolved root string
   passes even when the directory-layout assumption is wrong.
+- **Trace source-root selection through every runtime.** For defaults, explicit
+  overrides, and per-root switches, verify that settings, watch targets, worker
+  and CLI discovery agree. Cover restart and the empty selection, not just the
+  path displayed in Settings.
+- **Excluding a root is not evidence that its sessions were deleted.** Limit
+  inventory-based tombstones to roots actually scanned with a complete census.
+  Decide and test what happens to previously indexed sessions on both ordinary
+  refresh and deliberate full rebuild.
 - **Verify directory layout against the upstream source or format docs**, not
   against what your own machine happens to look like. A tool's default root and
   its custom root often have different nesting.
@@ -180,8 +231,24 @@ interactions, or the full Electron suites.
 - **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
   `checkJs: false`, so a `.mjs` module has no type coverage at all.
 
+## CLI and tool error messages
+
+State what failed and the known cause, with only the context needed to diagnose
+or correct the problem. Preserve the underlying error; do not invent a cause or
+mask failure as success. Keep the message concise. Add corrective guidance only
+when it is specific and immediately useful.
+
+For multiple statements passed to `sql()`, compare these message bodies
+(the preferred message already exists in [`query.ts`](packages/core/src/query.ts)):
+
+- **Prefer:** `sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls`
+- **Avoid:** `sql() failed: invalid query`
+
 ## Indexing, daemon, and write ownership
 
+- For retry and recovery paths, check both transient and persistent failures.
+  Preserve safe partial progress without claiming completion, keep unresolved
+  failures visible, and limit the frequency and cost of repeated attempts.
 - **The heartbeat decides who may write.** While a daemon is fresh, the CLI side
   is read-only: no write connection, no schema migration, no PRAGMA change, no
   checkpoint, no indexing. Two narrow carve-outs, both recorded in ADR 0006:
@@ -201,6 +268,108 @@ interactions, or the full Electron suites.
   `recursive_triggers` is off, so a trigger-based refresh would leave stale text
   behind.
 
+## Performance changes
+
+Measure the affected workload before optimizing, then compare the same workload
+before and after the change. Report enough context to judge the result, including
+workload size and measurement variability. Preserve required behavior, data
+ownership, merge semantics, and recovery guarantees; check those contracts before
+extending an optimization to another path. Make remaining costs and deliberate
+tradeoffs explicit.
+
+Timeline performance probes on shared hosted CI gate renderer **work**, using
+Chromium's thread CPU duration (`tdur`) when present and conservatively using the
+complete wall duration (`dur`) otherwise. Invalid durations fail measurement.
+Examine every renderer task, not only the task with the longest wall duration.
+The native wheel probe rejects work tasks >=50ms; stationary live commits retain
+an 8.33ms work budget; patch-preparation function work may exceed its no-update
+baseline by at most 2ms. Keep wall durations, RAF gaps and native compositor gaps
+in the diagnostics, and retain a <250ms catastrophic RAF-stall guardrail on the
+native wheel probe. Blank-frame, overlap, input-coverage and reader-anchor
+assertions remain required. These checks detect application work regressions and
+severe stalls; they do not certify that every displayed frame arrives within
+50ms on a shared runner. A controlled-performance-machine requirement is not
+part of the repository's CI infrastructure.
+
+## Desktop app development and release
+
+### Run and debug the app locally
+
+`electron-vite` starts the renderer dev server and launches Electron. On first
+run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available
+registered-provider transcripts, and then watches them for changes. Use
+**Settings** to select provider directories beyond the defaults. On Windows,
+Obelisk also checks common WSL distributions for the Claude Code directory.
+
+- Renderer changes use Vite hot module replacement. Open Electron DevTools with
+  `Cmd+Option+I` on macOS or `Ctrl+Shift+I` on Windows/Linux.
+- Main-process and preload logs appear in the terminal running `npm run dev`;
+  their source changes are rebuilt by electron-vite.
+- To attach a Node debugger to the Electron main process, start it with
+  `npm run dev -- --inspect=5858`, then attach your debugger to port `5858`.
+- The development app reads and updates the real `~/.obelisk` index. Back it up
+  before testing destructive rebuilds. For an isolated run, launch with a
+  disposable home directory (`HOME=/tmp/obelisk-dev npm run dev` on
+  macOS/Linux, or set a temporary `USERPROFILE` first on Windows), then select
+  fixture source directories in **Settings**.
+
+`better-sqlite3` provides prebuilt binaries for common platforms. If `npm ci`
+falls back to compiling it locally, install the platform's C/C++ build tools and
+run `npm ci` again.
+
+### Release the desktop app
+
+The **Release Desktop App** workflow builds Developer ID signed/notarized
+DMG and ZIP packages for macOS Apple Silicon (`arm64`) and Intel (`x64`), plus
+`Obelisk-<version>-linux-amd64.deb` for Linux Intel/AMD 64-bit systems. It runs
+repository checks and all six Electron suites, verifies the packaged native
+resources, and installs the Debian package on Ubuntu 22.04 and 24.04. All
+packages and update feeds are uploaded to one GitHub Release draft after the
+required build and acceptance jobs pass.
+
+The app checks and downloads updates in the background. Settings → About
+supports manual checks and retry; the sidebar notice offers View changes,
+Later, and Update & restart. macOS uses Sparkle, falling back to
+`electron-updater` only if the native bridge cannot initialize. Linux `.deb`
+installations use `DebUpdater`; replacing the system installation requests
+administrator authorization through Polkit. Cancelling leaves the staged
+update retryable. Existing 0.2.2 installations require one manual upgrade to
+this updater-enabled release. Linux arm64, AppImage and Windows update channels
+are not enabled by this workflow.
+
+The build host uses Node 22; the app runs on Electron 43's embedded Node 24.
+Artifact verification reports the embedded Electron, Node and ABI versions.
+See [the runtime explanation](docs/adr/0005-app-electron-vite-ts-esm.md) and
+[the runtime requirements above](#node-and-electron-runtimes).
+
+Configure these repository Actions secrets:
+
+| Secret | Value |
+| --- | --- |
+| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12`, including its private key |
+| `MAC_CSC_KEY_PASSWORD` | The `.p12` export password |
+| `APPLE_ID` | Apple Account email with access to the signing team |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
+| `APPLE_TEAM_ID` | The signing team's 10-character Team ID |
+| `SPARKLE_ED_PRIVATE_KEY` | Exported Sparkle EdDSA private key matching the app's trusted public key |
+
+The `SPARKLE_ED_PUBLIC_KEY` Actions variable must match
+`app/build/sparkle-public-key.txt`. Linux Debian builds need no Apple credentials.
+
+Update `app/package.json` and `app/package-lock.json` to the same version,
+merge the release changes, then push a matching tag such as `v0.2.4`.
+To retry an existing tag, select that tag as the ref in **Actions → Release
+Desktop App → Run workflow**; the optional tag input checks that selection.
+The workflow rejects version mismatches and never overwrites a published
+release. Review the draft's notes and downloads before publishing it.
+
+Use `verify_only=true` on a branch to build and verify all platforms without
+creating a tag or Release. **Build and verify Debian App** also runs directly
+on relevant PRs or by manual dispatch, leaving its verified `.deb` as an Actions
+artifact. Its two-version acceptance uses the actual package, shipped UI,
+`DebUpdater`, and real dpkg installation, with a test substitute for the
+administrator-authorization dialog. CLI npm publication remains independent.
+
 ---
 
 ## Verification contract
@@ -216,12 +385,31 @@ Every PR:
    section in the PR description explaining why the original was wrong.
 5. **Fixtures are real provider output**, not hand-written approximations.
 6. **Confirm your new tests actually run in CI** (`.github/workflows/`).
+7. For shared logic, choose coverage from the affected callers and provider
+   contracts. Exercise behavior that differs across providers or entry points;
+   do not let mocks erase those differences.
 
 ## Scope and review
 
 - One PR does one thing. Note explicitly anything you deliberately left out.
+- Keep the PR title and description aligned with the final diff and verification.
+  Include incidental behavior changes and remove claims or limitations that no
+  longer apply.
 - If you are unsure about a design decision, say so in the PR instead of
   guessing — an open question is cheaper to resolve than a silent assumption.
 - Do not ship a code path you have flagged to yourself as unverified. Writing
   "this call site is worth another look" is honest, but it belongs in a follow-up
   issue, not in the diff.
+- Use commit messages to preserve why a change was made, with any key tradeoff
+  needed to understand the decision. Keep the explanation brief and self-contained;
+  reference a commit, issue, or PR when useful, without repeating its discussion.
+
+### Clarify the need for new concepts
+
+When a contributor proposes a new concept, field, state, or file type, help
+clarify the problem it solves, why it is needed, and how it differs from existing
+concepts before committing to a design. Bring relevant implementation facts and
+design decisions into the discussion: explain where reuse fits and where it would
+erase a meaningful distinction. Apply the same reasoning to abstractions an agent
+proposes. Record the resulting rationale concisely in the issue or PR, carrying
+forward decisions already settled there.
