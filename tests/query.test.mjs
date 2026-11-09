@@ -1215,6 +1215,7 @@ test('search excludes caller sessions before LIMIT while preserving compact, sco
     .run('other-session', 'Earlier evidence', 'quiet-zero', '/tmp/quiet-zero');
   db.prepare('INSERT INTO messages (uuid,session_id,text,role,timestamp,visibility,cwd) VALUES (?,?,?,?,?,?,?)')
     .run('other-evidence', 'other-session', 'needle independent evidence', 'assistant', '2026-06-09T10:00:00.000Z', 'visible', '/tmp/quiet-zero');
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
   const api = createQueryApi(db);
   try {
     const results = api.search('needle', { excludeSession: 'sid-search', limit: 1,
