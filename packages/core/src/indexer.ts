@@ -314,8 +314,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       }
 
       if (force) {
-        const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
         try {
+          const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
           runRetryableWriteTransaction(txDb, () => {
             snapshot.reset();
             const providerResult = indexProviderPlanStrict({
@@ -329,6 +329,10 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
           }, { label: 'force-rebuild' });
+          // On failure the outer finally closes this connection and its temp
+          // tables. A failed staging cleanup must not replace the primary
+          // publication/rollback error before it can be attributed below.
+          snapshot.close();
         } catch (error) {
           if (error instanceof ProviderIndexFailure) {
             rethrowIfIndexWriterReadOnly(db, error);
@@ -370,9 +374,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               skippedFiles,
             };
           }
-          throw error;
-        } finally {
-          snapshot.close();
+          throw indexAccessFailure(error);
         }
         return {
           skip: false,
