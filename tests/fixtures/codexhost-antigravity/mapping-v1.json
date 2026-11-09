@@ -1,0 +1,22 @@
+{
+  "formatVersion": 1,
+  "revision": 1,
+  "hostThreadId": "0fffe08e-eeb4-40ee-98d2-701bc8f1dbc4",
+  "createRequestId": "redacted-request",
+  "harnessId": "antigravity",
+  "state": "ready",
+  "nativeSessionRef": {
+    "harnessId": "antigravity",
+    "nativeSessionId": "fd8da84c-b2c8-48f1-9ee4-755b188eab4e",
+    "formatVersion": 1
+  },
+  "cwd": "C:\\fixture-project",
+  "title": "redacted title",
+  "archived": false,
+  "transportModelId": "gemini-3.8-flash",
+  "ephemeral": false,
+  "historyMode": "paginated",
+  "turnMappings": [],
+  "createdAt": "2026-09-30T01:00:00.000Z",
+  "updatedAt": "2026-09-30T01:05:00.000Z"
+}
