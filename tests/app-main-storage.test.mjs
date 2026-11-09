@@ -56,12 +56,15 @@ function registerMocks(defs) {
   };
 }
 
-test('Electron main uses custom config and data paths from the shared resolver', async () => {
+for (const layout of ['custom', 'xdg']) {
+test(`Electron main reads and saves settings through shared ${layout} config and data paths`, async () => {
   const home = makeTempDir('obelisk-app-main-storage-');
   const customHome = join(home, 'portable', 'obelisk');
-  const dbPath = join(customHome, 'obelisk.sqlite');
+  const configDir = layout === 'custom' ? customHome : join(home, 'xdg-config', 'obelisk');
+  const dataDir = layout === 'custom' ? customHome : join(home, 'xdg-data', 'obelisk');
+  const dbPath = join(dataDir, 'obelisk.sqlite');
   mkdirSync(join(home, '.claude'), { recursive: true });
-  mkdirSync(customHome, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
   writeFileSync(dbPath, '');
 
   const originalEnv = Object.fromEntries([
@@ -78,10 +81,10 @@ test('Electron main uses custom config and data paths from the shared resolver',
   Object.assign(process.env, {
     HOME: home,
     USERPROFILE: home,
-    OBELISK_HOME: join('~', 'portable', 'obelisk'),
-    OBELISK_USE_XDG: '',
-    XDG_CONFIG_HOME: '',
-    XDG_DATA_HOME: '',
+    OBELISK_HOME: layout === 'custom' ? join('~', 'portable', 'obelisk') : '',
+    OBELISK_USE_XDG: layout === 'xdg' ? '1' : '',
+    XDG_CONFIG_HOME: join(home, 'xdg-config'),
+    XDG_DATA_HOME: join(home, 'xdg-data'),
     PI_CODING_AGENT_DIR: '',
     PI_CODING_AGENT_SESSION_DIR: '',
     KIMI_CODE_HOME: '',
@@ -95,6 +98,7 @@ test('Electron main uses custom config and data paths from the shared resolver',
     constructor(path) {
       this.path = path;
     }
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -119,6 +123,7 @@ test('Electron main uses custom config and data paths from the shared resolver',
       };
       windows.push(this);
     }
+    on() {}
     loadFile() {}
     loadURL() {}
     close() {}
@@ -178,16 +183,16 @@ test('Electron main uses custom config and data paths from the shared resolver',
     await new Promise(resolve => setImmediate(resolve));
 
     const settings = await ipcHandlers.get('settings:get')();
-    assert.equal(settings.configDir, customHome);
-    assert.equal(settings.dataDir, customHome);
-    assert.equal(settings.settingsPath, join(customHome, 'settings.json'));
+    assert.equal(settings.configDir, configDir);
+    assert.equal(settings.dataDir, dataDir);
+    assert.equal(settings.settingsPath, join(configDir, 'settings.json'));
     assert.equal(settings.dbPath, dbPath);
-    assert.equal(settings.recapDir, join(customHome, 'recap'));
-    assert.deepEqual(watchPaths, [customHome]);
+    assert.equal(settings.recapDir, join(dataDir, 'recap'));
+    assert.deepEqual(watchPaths, [dataDir]);
 
     await ipcHandlers.get('settings:set')(null, 'editorScheme', 'cursor');
     assert.deepEqual(
-      JSON.parse(readFileSync(join(customHome, 'settings.json'), 'utf8')),
+      JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf8')),
       { editorScheme: 'cursor' },
     );
     assert.equal(existsSync(join(home, '.obelisk', 'settings.json')), false);
@@ -200,3 +205,4 @@ test('Electron main uses custom config and data paths from the shared resolver',
     rmSync(home, { recursive: true, force: true });
   }
 });
+}

@@ -42,8 +42,7 @@ function absoluteEnvPath(
   { expandHome = false }: { expandHome?: boolean } = {},
 ): string | null {
   if (typeof value !== 'string' || value.trim().length === 0) return null;
-  const trimmed = value.trim();
-  const expanded = expandHome ? expandTilde(trimmed, homeDir) : trimmed;
+  const expanded = expandHome ? expandTilde(value, homeDir) : value;
   if (!isAbsolute(expanded)) {
     if (name === 'OBELISK_HOME') {
       throw new Error('OBELISK_HOME must be an absolute path or begin with ~');

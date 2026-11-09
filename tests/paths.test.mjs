@@ -172,3 +172,13 @@ test('an existing legacy directory alone does not trigger a Claude database warn
   );
   assert.deepEqual(warnings, []);
 });
+
+test('storage environment paths preserve whitespace in actual directory names', () => {
+  const paths = resolveObeliskPaths({ homeDir: '/home/probe',
+    env: { OBELISK_HOME: '/portable/obelisk ' }, pathExists: () => false });
+  assert.equal(paths.dataDir, '/portable/obelisk ');
+  const xdg = resolveObeliskPaths({ homeDir: '/home/probe', pathExists: () => false,
+    env: { OBELISK_USE_XDG: '1', XDG_CONFIG_HOME: '/xdg/config ', XDG_DATA_HOME: '/xdg/data ' } });
+  assert.equal(xdg.configDir, '/xdg/config /obelisk');
+  assert.equal(xdg.dataDir, '/xdg/data /obelisk');
+});
