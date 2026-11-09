@@ -330,10 +330,6 @@ function isTrigramMessagesFts(db: SqliteDb): boolean {
 const SNIPPET_BEFORE = 60;
 const SNIPPET_AFTER = 100;
 
-// Hit-centered snippet: the head of a long message often does not contain the
-// match at all, so slice a window around the earliest term occurrence instead
-// of truncating from the front. Returns null when no term appears literally
-// (e.g. raw FTS5 syntax queries), in which case the caller has message.text.
 function firstLiteralHit(text: string, terms: string[]): number {
   let hit = -1;
   for (const term of terms) {
@@ -346,6 +342,10 @@ function firstLiteralHit(text: string, terms: string[]): number {
   return hit;
 }
 
+// Hit-centered snippet: the head of a long message often does not contain the
+// match at all, so slice a window around the earliest term occurrence instead
+// of truncating from the front. Returns null when no term appears literally
+// (e.g. raw FTS5 syntax queries), in which case the caller has message.text.
 function makeSnippet(rawText: unknown, terms: string[]): string | null {
   const text = String(rawText ?? '');
   if (!text || terms.length === 0) return null;
