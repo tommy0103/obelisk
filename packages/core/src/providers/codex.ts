@@ -29,6 +29,8 @@ import {
   readCodexBufferLines, readCodexLines,
 } from '../parsing.ts';
 
+import { RetryableSourceReadError } from './source-read-error.ts';
+
 import type {
   Cursor,
   DiscoverContext,
@@ -625,8 +627,24 @@ export function* parse(
 ): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
   const compressed = isCodexCompressedPath(unit.key);
-  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean; forceSnapshot?: boolean; replaceSnapshot?: boolean } | undefined;
-  if (sourceMeta?.forceSnapshot) _cursor = null;
+  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean; forceSnapshot?: boolean; replaceSnapshot?: boolean; [key: string]: unknown } | undefined;
+  if (sourceMeta?.forceSnapshot) {
+    // A null fresh cursor can mean a torn/unstable source, not an empty
+    // contribution. Stage and validate the whole snapshot before publishing
+    // anything; otherwise root retraction could commit without its child.
+    const freshUnit = { ...unit, meta: { ...sourceMeta, forceSnapshot: false, replaceSnapshot: false } };
+    const fresh = parse(freshUnit, null, metrics, testHooks);
+    const records: TranscriptRecord[] = [];
+    let step = fresh.next();
+    while (!step.done) { records.push(step.value); step = fresh.next(); }
+    if (step.value === null || (sourceMeta.replaceSnapshot
+      && !records.some(record => record.kind === 'session' && record.id === unit.sessionId))) {
+      throw new RetryableSourceReadError(unit.key, 'Archive contributor did not produce a complete stable snapshot');
+    }
+    if (sourceMeta.replaceSnapshot) yield { kind: 'delete-session', sessionId: unit.sessionId };
+    yield* records;
+    return step.value;
+  }
   if (compressed && !sourceMeta?.guardian && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key)) {
     if (sourceMeta?.sessionIndexChanged) {
       // The archive did not change, but session_index.jsonl is a separate

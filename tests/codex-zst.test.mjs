@@ -401,6 +401,11 @@ test('Plain to Compressed to Resumed Plaintext atomically preserves unchanged ch
     assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE session_id=?').get(sessionId).n, 80);
     writeFileSync(archive, zstdCompressSync(bytes));
     unlinkSync(plain);
+    const childBytes = readFileSync(child);
+    writeFileSync(child, Buffer.concat([childBytes, Buffer.from('invalid completed line\n')]));
+    assert.throws(() => run([plain, archive, child]), /complete stable snapshot/);
+    assert.deepEqual(projection(), initial, 'real malformed child parsing cannot commit a root-only projection');
+    writeFileSync(child, childBytes);
     const compressed = run([plain, archive]);
     assert.equal(compressed.items.length, 2);
     assert.ok(compressed.items.every(item => item.unit.atomicGroup === compressed.items[0].unit.atomicGroup));
