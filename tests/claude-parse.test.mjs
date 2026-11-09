@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -205,7 +205,8 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
 
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
-  for (const unit of units) persist(db, unit, provider.parse(unit, null));
+  const cursors = new Map();
+  for (const unit of units) cursors.set(unit.key, persist(db, unit, provider.parse(unit, null)));
   const workflows = db.prepare('SELECT * FROM workflows').all();
   for (const row of workflows) row.agents = db.prepare('SELECT * FROM workflow_agents WHERE run_id=?').all(row.run_id);
   const persistedDetail = assembleSessionDetail({
@@ -218,6 +219,40 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
     summaries: db.prepare('SELECT * FROM summaries').all(),
   });
   assert.deepEqual(persistedDetail, detail);
+
+  // Reuse the same established workflow fixture across the main→orphan
+  // ownership transition and subsequent child-only updates.
+  const context = { lastCursor: key => cursors.get(key) ?? null, previousCursor: key => cursors.get(key) ?? null };
+  const mainPath = join(projectDir, 'sid-workflow.jsonl');
+  unlinkSync(mainPath);
+  const orphan = provider.discover({ ...context, changedPaths: [mainPath] });
+  assert.equal(orphan.length, 1);
+  const freshOrphan = assembleSessionDetail([...provider.parse(orphan[0], null)]);
+  for (const unit of orphan) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, freshOrphan.messages.length);
+  assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, freshOrphan.session.message_count);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
+
+  const childPath = join(workflowAgentDir, 'agent-7.jsonl');
+  const child = JSON.parse(readFileSync(childPath, 'utf8'));
+  child.message.content = 'updated review';
+  writeFileSync(childPath, JSON.stringify(child) + '\n');
+  const changed = provider.discover({ ...context, changedPaths: [childPath] });
+  for (const unit of changed) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1, 'child-only family update retains unchanged workflow ownership');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
+
+  const metaPath = join(workflowAgentDir, 'agent-7.meta.json');
+  const stableMeta = readFileSync(metaPath);
+  writeFileSync(metaPath, '{"agentType":');
+  const damaged = provider.discover({ ...context, changedPaths: [metaPath] });
+  db.exec('BEGIN');
+  assert.throws(() => persist(db, damaged[0], provider.parse(damaged[0], context.lastCursor(damaged[0].key))), /metadata is incomplete/);
+  db.exec('ROLLBACK');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1);
+  writeFileSync(metaPath, stableMeta);
   db.close();
 });
 
