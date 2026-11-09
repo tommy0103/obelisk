@@ -334,15 +334,22 @@ const SNIPPET_AFTER = 100;
 // match at all, so slice a window around the earliest term occurrence instead
 // of truncating from the front. Returns null when no term appears literally
 // (e.g. raw FTS5 syntax queries), in which case the caller has message.text.
+function firstLiteralHit(text: string, terms: string[]): number {
+  let hit = -1;
+  for (const term of terms) {
+    // Terms come from the alphanumeric query tokenizer. Matching against the
+    // original string preserves offsets when Unicode lowercasing expands a
+    // character (for example İ → i plus a combining dot).
+    const index = new RegExp(term, 'iu').exec(text)?.index ?? -1;
+    if (index !== -1 && (hit === -1 || index < hit)) hit = index;
+  }
+  return hit;
+}
+
 function makeSnippet(rawText: unknown, terms: string[]): string | null {
   const text = String(rawText ?? '');
   if (!text || terms.length === 0) return null;
-  const hay = text.toLowerCase();
-  let hit = -1;
-  for (const term of terms) {
-    const idx = hay.indexOf(term.toLowerCase());
-    if (idx !== -1 && (hit === -1 || idx < hit)) hit = idx;
-  }
+  const hit = firstLiteralHit(text, terms);
   if (hit === -1) return null;
   let start = Math.max(0, hit - SNIPPET_BEFORE);
   let end = Math.min(text.length, hit + SNIPPET_AFTER);
@@ -575,8 +582,8 @@ function createQueryApi(
       if (r.like_scan && snippetTokens !== undefined) {
         const raw = String(r.text ?? '');
         const chars = [...raw];
-        const term = snippetTerms.find(term => raw.toLowerCase().includes(term.toLowerCase()));
-        const hit = term ? [...raw.slice(0, raw.toLowerCase().indexOf(term.toLowerCase()))].length : 0;
+        const offset = Math.max(0, firstLiteralHit(raw, snippetTerms));
+        const hit = [...raw.slice(0, offset)].length;
         const start = Math.max(0, hit - Math.floor(snippetTokens / 3));
         const end = Math.min(chars.length, start + snippetTokens);
         r.text = (start ? '…' : '') + chars.slice(start, end).join('') + (end < chars.length ? '…' : '');

@@ -202,3 +202,24 @@ test('trigram short-token paths preserve compact controls and exact project scop
   assert.deepEqual(api.search('quick zz', { fallback: 'or', projectPath: '/other' }), []);
   db.close();
 });
+
+test('hit-centered previews retain original text offsets when Unicode lowercasing expands characters', () => {
+  for (const makeDb of [unicodeDb, trigramDb]) {
+    const db = makeDb();
+    try {
+      const text = 'İ'.repeat(300) + ' needle evidence';
+      db.prepare('INSERT INTO messages(uuid,session_id,role,text) VALUES(?,?,?,?)').run('unicode-preview', 's1', 'user', text);
+      const api = createQueryApi(db);
+      const hit = api.search('needle').find(hit => hit.message.uuid === 'unicode-preview');
+      assert.ok(hit);
+      assert.match(hit.snippet, /needle/);
+      assert.equal(hit.message.text, text);
+      const shortText = 'İ'.repeat(300) + ' xy evidence';
+      db.prepare('INSERT INTO messages(uuid,session_id,role,text) VALUES(?,?,?,?)').run('unicode-compact', 's1', 'user', shortText);
+      const compact = api.search('xy', { snippetTokens: 8, contextLimit: 0 }).find(hit => hit.message.uuid === 'unicode-compact');
+      assert.ok(compact);
+      assert.match(compact.message.text, /xy/);
+      assert.equal(compact.message.textLength, shortText.length);
+    } finally { db.close(); }
+  }
+});
