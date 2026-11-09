@@ -1,0 +1,375 @@
+name: Release Desktop App
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional expected tag; select the same tag as the workflow ref'
+        required: false
+        type: string
+      verify_only:
+        description: 'Sign and verify this branch without a tag or GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-app-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Validate release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$VERIFY_ONLY" == true ]]; then
+            exit 0
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo '::error::Expected an app version tag such as v0.2.4 or v0.2.4-rc.1'
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ]]; then
+            echo '::error::Select the existing version tag as the workflow ref; the tag input is only a consistency check'
+            exit 1
+          fi
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Match tag to app and lockfile versions
+        id: version
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('app/package.json', 'utf8'));
+          const lock = JSON.parse(readFileSync('app/package-lock.json', 'utf8'));
+          if ((process.env.VERIFY_ONLY !== 'true' && process.env.RELEASE_TAG !== `v${pkg.version}`) ||
+              lock.version !== pkg.version || lock.packages[''].version !== pkg.version) {
+            throw new Error('Release tag, app/package.json and app/package-lock.json must have the same version');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${pkg.version}\ntag=v${pkg.version}\n`);
+          NODE
+
+      - name: Require signing and notarization credentials
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_ED_PUBLIC_KEY: ${{ vars.SPARKLE_ED_PUBLIC_KEY }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID SPARKLE_ED_PUBLIC_KEY SPARKLE_ED_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository signing/update configuration: $name"
+              exit 1
+            fi
+          done
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { validateKeyPair } from './app/scripts/update-release.mjs';
+          const key = process.env.SPARKLE_ED_PUBLIC_KEY.trim();
+          validateKeyPair(key, process.env.SPARKLE_ED_PRIVATE_KEY);
+          if (key !== readFileSync('app/build/sparkle-public-key.txt', 'utf8').trim()) {
+            throw new Error('Repository public key differs from the app trusted key');
+          }
+          NODE
+
+  verify:
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+      - run: npm --prefix app ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Rebuild native modules for Electron
+        working-directory: app
+        # Node 22 hosts npm/build tools; Electron 43 runs the app with Node 24
+        # and its own ABI. Never use a host-Node native build in the shipped app.
+        run: npx --no-install electron-builder install-app-deps
+      - run: npm --prefix app run test:electron:all
+
+  build:
+    needs: prepare
+    name: Sign and notarize (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+      - run: npm --prefix app ci
+
+      - name: Build, sign and notarize DMG and ZIP
+        working-directory: app
+        env:
+          MAC_ARCH: ${{ matrix.arch }}
+          SPARKLE_ED_PUBLIC_KEY: ${{ vars.SPARKLE_ED_PUBLIC_KEY }}
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: >-
+          npm run dist:mac -- --"$MAC_ARCH" --publish never
+          -c.mac.forceCodeSigning=true
+          -c.mac.hardenedRuntime=true
+          -c.mac.notarize=true
+
+      - name: Verify the apps distributed in DMG and ZIP
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          MAC_ARCH: ${{ matrix.arch }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          verify_app() {
+            local app="$1"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            local signature
+            signature=$(codesign --display --verbose=4 "$app" 2>&1)
+            grep -F 'Authority=Developer ID Application:' <<< "$signature"
+            grep -Fx "TeamIdentifier=$APPLE_TEAM_ID" <<< "$signature"
+            grep -F '(runtime)' <<< "$signature"
+            spctl --assess --type execute --verbose=4 "$app"
+            xcrun stapler validate "$app"
+            APP_PATH="$app" EXPECTED_ARCH="$MAC_ARCH" ELECTRON_RUN_AS_NODE=1 \
+              "$app/Contents/MacOS/Obelisk" <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const resources = path.join(process.env.APP_PATH, 'Contents', 'Resources');
+          const asar = path.join(resources, 'app.asar');
+          assert.equal(process.arch, process.env.EXPECTED_ARCH);
+          const lock = JSON.parse(fs.readFileSync('app/package-lock.json', 'utf8'));
+          assert.equal(process.versions.electron, lock.packages['node_modules/electron'].version);
+          for (const asset of ['out/main/index.js', 'out/main/indexer-worker.js',
+            'out/preload/index.js', 'out/renderer/index.html']) {
+            assert.ok(fs.existsSync(path.join(asar, asset)), `Missing packaged asset: ${asset}`);
+          }
+          const schema = fs.readFileSync(path.join(asar, 'out/main/schema.sql'), 'utf8');
+          assert.equal(schema, fs.readFileSync('packages/core/src/schema.sql', 'utf8'));
+          assert.equal(schema, fs.readFileSync(path.join(resources, 'scripts/schema.sql'), 'utf8'));
+          const Database = require(path.join(asar, 'node_modules/better-sqlite3'));
+          const db = new Database(':memory:');
+          db.exec(schema);
+          db.close();
+          const plist = require('node:child_process').execFileSync('plutil', ['-convert', 'json', '-o', '-', path.join(process.env.APP_PATH, 'Contents/Info.plist')], { encoding: 'utf8' });
+          const info = JSON.parse(plist);
+          assert.equal(info.SUPublicEDKey, fs.readFileSync('app/build/sparkle-public-key.txt', 'utf8').trim());
+          assert.equal(info.SUFeedURL, `https://github.com/tommy0103/obelisk/releases/latest/download/appcast-${process.arch}.xml`);
+          assert.equal(info.SUAutomaticallyUpdate, false);
+          assert.equal(info.SUVerifyUpdateBeforeExtraction, true);
+          assert.ok(fs.existsSync(path.join(process.env.APP_PATH, 'Contents/Frameworks/Sparkle.framework/Sparkle')));
+          const bridge = require(path.join(resources, 'app.asar.unpacked/node_modules/electron-sparkle-updater/native/build/Release/sparkle_bridge.node'));
+          for (const method of ['init', 'checkForUpdates', 'installUpdateNow', 'setEventHandler']) assert.equal(typeof bridge[method], 'function');
+          assert.ok(fs.existsSync(path.join(resources, 'app-update.yml')));
+          const watcher = require(path.join(asar, 'node_modules/@parcel/watcher'));
+          assert.equal(typeof watcher.subscribe, 'function');
+          console.log(JSON.stringify({ arch: process.arch, electron: process.versions.electron,
+            node: process.versions.node, abi: process.versions.modules }));
+          console.log('Packaged runtime, native modules and schema verified');
+          NODE
+          }
+          dmg="app/release/Obelisk-$APP_VERSION-mac-$MAC_ARCH.dmg"
+          zip="app/release/Obelisk-$APP_VERSION-mac-$MAC_ARCH.zip"
+          work=$(mktemp -d "$RUNNER_TEMP/obelisk-verify.XXXXXX")
+          mounted=false
+          cleanup() {
+            if [[ "$mounted" == true ]]; then
+              hdiutil detach "$work/mount"
+            fi
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$work/mount"
+          mounted=true
+          ditto "$work/mount/Obelisk.app" "$work/dmg/Obelisk.app"
+          hdiutil detach "$work/mount"
+          mounted=false
+          verify_app "$work/dmg/Obelisk.app"
+          ditto -x -k "$zip" "$work/zip"
+          verify_app "$work/zip/Obelisk.app"
+
+      - name: Sign and verify Sparkle update archive
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          MAC_ARCH: ${{ matrix.arch }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/obelisk-sparkle.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --location --silent --show-error \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz \
+            -o "$work/sparkle.tar.xz"
+          printf '%s  %s\n' ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9 "$work/sparkle.tar.xz" | shasum -a 256 -c -
+          tar -xJf "$work/sparkle.tar.xz" -C "$work"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$work/private-key"
+          export SPARKLE_SIGN_TOOL="$work/bin/sign_update"
+          export SPARKLE_KEY_FILE="$work/private-key"
+          app=$(find app/release -maxdepth 2 -name 'Obelisk.app' -type d -print -quit)
+          export MIN_MAC_OS
+          MIN_MAC_OS=$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")
+          node app/scripts/update-release.mjs sign app/release
+          # Keep each builder manifest as build evidence without allowing a
+          # parallel artifact download to overwrite the other architecture.
+          if [[ -f app/release/latest-mac.yml ]]; then
+            mv app/release/latest-mac.yml "app/release/builder-mac-$MAC_ARCH.yml"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: |
+            app/release/Obelisk-${{ needs.prepare.outputs.version }}-mac-${{ matrix.arch }}.dmg
+            app/release/Obelisk-${{ needs.prepare.outputs.version }}-mac-${{ matrix.arch }}.zip
+            app/release/Obelisk-${{ needs.prepare.outputs.version }}-mac-${{ matrix.arch }}.*.blockmap
+            app/release/sparkle-${{ matrix.arch }}.json
+            app/release/builder-mac-${{ matrix.arch }}.yml
+          if-no-files-found: error
+
+  build-deb:
+    needs: prepare
+    uses: ./.github/workflows/build-deb.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  validate-feeds:
+    needs: [prepare, build, build-deb]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mac-*
+          merge-multiple: true
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: release
+      - name: Verify both signed feeds and the combined fallback manifest
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          INCLUDE_DEBIAN: 'true'
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          export RELEASE_NOTES_FILE="$RUNNER_TEMP/obelisk-verification-notes.md"
+          printf 'Obelisk %s validation artifacts\n' "$APP_VERSION" > "$RELEASE_NOTES_FILE"
+          node app/scripts/update-release.mjs assemble release
+
+  release:
+    if: ${{ !inputs.verify_only }}
+    needs: [prepare, verify, build, build-deb, validate-feeds]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mac-*
+          merge-multiple: true
+          path: release
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: release
+
+      - name: Assemble update feeds and upload verified assets to a release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          INCLUDE_DEBIAN: 'true'
+        run: |
+          set -euo pipefail
+          # Only reuse a draft. Never overwrite an already published release.
+          existing=$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .draft")
+          if [[ "$existing" == false ]]; then
+            echo '::error::Release is already published; use a new app version tag'
+            exit 1
+          fi
+          if [[ -z "$existing" ]]; then
+            args=(--draft --verify-tag --title "Obelisk $RELEASE_TAG" --generate-notes)
+            if [[ "$RELEASE_TAG" == *-* ]]; then args+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" "${args[@]}"
+          fi
+          export RELEASE_NOTES_FILE="$RUNNER_TEMP/obelisk-release-notes.md"
+          gh release view "$RELEASE_TAG" --json body --jq .body > "$RELEASE_NOTES_FILE"
+          node app/scripts/update-release.mjs assemble release
+          assets=(release/*.dmg release/*.zip release/*.deb release/linux-amd64.sha256 release/appcast-*.xml release/latest-mac.yml release/latest-linux.yml)
+          shopt -s nullglob
+          assets+=(release/*.blockmap)
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber

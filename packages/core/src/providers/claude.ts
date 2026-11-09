@@ -53,7 +53,7 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
 }
 
 export const name = 'claude';
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v2__';
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v3__';
 
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
@@ -281,12 +281,14 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   const mtime = stat.mtimeMs;
   const isSubagent = unit.isSubagent === true;
   const records: TranscriptRecord[] = [];
+  const historyTitle = ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null;
+  let aiTitle: string | null = null;
+  let customTitle: string | null = null;
   const sm = {
     started_at: null as string | null,
     ended_at: null as string | null,
     git_branch: null as string | null,
     version: null as string | null,
-    title: ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null,
     n: 0,
   };
   const subagentStats = {
@@ -313,6 +315,19 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     const msg = obj.message || {};
     const usage = msg.usage || {};
 
+    // Claude Code now persists app-, CLI-, and hook-assigned session names as
+    // `custom-title` records. Scan title metadata across the whole transcript,
+    // including cursor-skipped lines, so incremental parses retain the intended
+    // precedence without depending on the previously persisted title.
+    if (obj.type === 'custom-title' && obj.customTitle) {
+      customTitle = obj.customTitle;
+      return;
+    }
+    if (obj.type === 'ai-title' && obj.aiTitle) {
+      aiTitle = obj.aiTitle;
+      return;
+    }
+
     if (isSubagent && (obj.type === 'user' || obj.type === 'assistant')) {
       if (ts && (!subagentStats.startedAt || ts < subagentStats.startedAt)) subagentStats.startedAt = ts;
       if (ts && (!subagentStats.endedAt || ts > subagentStats.endedAt)) subagentStats.endedAt = ts;
@@ -320,7 +335,6 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     }
     if (lineNum <= skip) return;
 
-    if (obj.type === 'ai-title' && obj.aiTitle) { sm.title = obj.aiTitle; return; }
     if (obj.type === 'system' && obj.subtype === 'away_summary' && obj.content) {
       records.push({ kind: 'summary', id: obj.uuid || `${sid}-away-${ts}`, session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content });
       return;
@@ -408,7 +422,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   // Subagent transcripts do not own a session row (matches indexJsonl).
   if (!isSubagent) {
     records.push({
-      kind: 'session', id: unit.sessionId, title: sm.title, project: unit.project || null,
+      kind: 'session', id: unit.sessionId, title: customTitle ?? aiTitle ?? historyTitle, project: unit.project || null,
       started_at: sm.started_at, ended_at: sm.ended_at, git_branch: sm.git_branch,
       version: sm.version, message_count: sm.n, countMode: skip > 0 ? 'delta' : 'total',
       jsonl_path: unit.key, source: 'claude',

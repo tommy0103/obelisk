@@ -1,0 +1,2 @@
+{"type":"session.start","data":{"sessionId":"77777777-7777-4777-8777-777777777777","version":1,"producer":"copilot-agent","copilotVersion":"0.53.2026061005","vscodeVersion":"1.125.0-insider","startTime":"2026-01-03T00:00:00.000Z"},"id":"entry-1","timestamp":"2026-01-03T00:00:00.000Z","parentId":null}
+{"type":"future.event","data":{"opaque":"synthetic compatibility value"},"id":"entry-2","timestamp":"2026-01-03T00:00:01.000Z","parentId":"entry-1"}

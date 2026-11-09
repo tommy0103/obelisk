@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, shallowRef, computed, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { state } from '../store.js';
 import { fmtTokens, fmtDuration, fmtTooltipDate, positionTooltip, escapeHTML, formatProjectLabel } from '../utils.js';
@@ -18,6 +18,43 @@ const loading = ref(true);
 const usageData = reactive({ daily: [], totalTokens: 0, peakDay: null, longestTurn: null });
 const selectedDayKey = ref(null);
 const loadedMonths = ref(0);
+const activityPages = shallowRef(new Map());
+const dayPage = ref(null);
+let activityRevision = 0;
+
+async function fetchActivity(from, to, offset = 0) {
+  const revision = activityRevision;
+  const page = await window.obelisk.getActivitySessions({ from, to, offset });
+  if (revision !== activityRevision) return;
+  const next = new Map(activityPages.value);
+  next.delete(from);
+  next.set(from, { ...page, offset });
+  while (next.size > 7) next.delete(next.keys().next().value);
+  activityPages.value = next;
+  const selectedDay = daySessions.value;
+  if (selectedDay && from === selectedDay.from && to === selectedDay.to) dayPage.value = { ...page, offset };
+}
+
+function activityBlock(page, from, to, header) {
+  const classified = (page?.rows || []).map(session => ({
+    ...session,
+    kind: session.started_at >= from && session.started_at < to
+      ? session.has_earlier ? 'new-session' : 'new-workspace' : 'continued',
+  }));
+  return {
+    header,
+    sessionTotal: page?.total || 0,
+    offset: page?.offset || 0,
+    newWorkspaces: splitNoise(classified.filter(session => session.kind === 'new-workspace')),
+    newSessions: splitNoise(classified.filter(session => session.kind === 'new-session')),
+    continued: splitNoise(classified.filter(session => session.kind === 'continued')),
+    isEmpty: page?.total === 0,
+  };
+}
+
+function changeActivityPage(from, to, offset) {
+  void fetchActivity(from, to, offset).catch(error => console.error('Failed to load activity sessions:', error));
+}
 
 // Tooltip
 const tooltip = reactive({ text: '', show: false, x: 0, y: 0 });
@@ -226,59 +263,24 @@ const daySessions = computed(() => {
   if (!selectedDayKey.value) return null;
   const dateKey = selectedDayKey.value;
   const dayStart = dateKey + 'T00:00:00';
-  const dayEnd = dateKey + 'T23:59:59';
-
-  const sessions = state.sessions.filter(s => {
-    if (!s.started_at) return false;
-    const end = s.ended_at || s.started_at;
-    return s.started_at <= dayEnd && end >= dayStart;
-  });
-
-  const classified = sessions.map(s => {
-    const isNew = s.started_at.slice(0, 10) === dateKey;
-    let kind = 'continued';
-    if (isNew) {
-      const hasEarlierSession = state.sessions.some(
-        other => other.project === s.project && other.id !== s.id && other.started_at < s.started_at
-      );
-      kind = hasEarlierSession ? 'new-session' : 'new-workspace';
-    }
-    return { ...s, kind };
-  });
+  const dayEnd = new Date(Date.parse(`${dateKey}T00:00:00Z`) + DAY_MS).toISOString().slice(0, 10) + 'T00:00:00';
 
   return {
-    dateKey,
-    header: `${MONTHS_FULL[Number(dateKey.slice(5, 7)) - 1]} ${dateKey.slice(0, 4)}`,
+    ...activityBlock(dayPage.value, dayStart, dayEnd, `${MONTHS_FULL[Number(dateKey.slice(5, 7)) - 1]} ${dateKey.slice(0, 4)}`),
+    from: dayStart,
+    to: dayEnd,
     eventDate: `${MONTHS_SHORT[Number(dateKey.slice(5, 7)) - 1].toUpperCase()} ${Number(dateKey.slice(8, 10))}`,
-    sessionTotal: classified.length,
-    newWorkspaces: classified.filter(s => s.kind === 'new-workspace'),
-    newSessions: classified.filter(s => s.kind === 'new-session'),
-    continued: classified.filter(s => s.kind === 'continued'),
-    isEmpty: classified.length === 0
   };
 });
 
-const daySessionsSplit = computed(() => {
-  if (!daySessions.value) return null;
-  return {
-    ...daySessions.value,
-    newWorkspaces: splitNoise(daySessions.value.newWorkspaces),
-    newSessions: splitNoise(daySessions.value.newSessions),
-    continued: splitNoise(daySessions.value.continued),
-  };
-});
+const daySessionsSplit = daySessions;
 
 const monthBlocksSplit = computed(() =>
-  Array.from({ length: loadedMonths.value }, (_, offset) => {
+  Array.from({ length: Math.min(loadedMonths.value, 6) }, (_, index) => {
+    const offset = loadedMonths.value - Math.min(loadedMonths.value, 6) + index;
     const today = new Date();
     const targetDate = new Date(today.getFullYear(), today.getMonth() - offset, 1);
-    const block = buildMonthBlock(targetDate.getFullYear(), targetDate.getMonth());
-    return {
-      ...block,
-      newWorkspaces: splitNoise(block.newWorkspaces),
-      newSessions: splitNoise(block.newSessions),
-      continued: splitNoise(block.continued),
-    };
+    return buildMonthBlock(targetDate.getFullYear(), targetDate.getMonth());
   })
 );
 
@@ -303,6 +305,8 @@ function onCellLeave() {
 
 function onCellClick(cell) {
   selectedDayKey.value = cell.key;
+  dayPage.value = null;
+  changeActivityPage(daySessions.value.from, daySessions.value.to, 0);
 }
 
 function onBarEnter(bar, event) {
@@ -333,35 +337,20 @@ function buildMonthBlock(year, month) {
   const monthStart = `${year}-${String(month + 1).padStart(2, '0')}-01`;
   const nextMonth = month === 11 ? `${year + 1}-01-01` : `${year}-${String(month + 2).padStart(2, '0')}-01`;
 
-  const monthSessions = state.sessions.filter(s => {
-    if (!s.started_at) return false;
-    const end = s.ended_at || s.started_at;
-    return s.started_at < nextMonth && end >= monthStart;
-  });
-
-  const classified = monthSessions.map(s => {
-    const startedInMonth = s.started_at >= monthStart && s.started_at < nextMonth;
-    let kind = 'continued';
-    if (startedInMonth) {
-      const hasEarlierSession = state.sessions.some(
-        other => other.project === s.project && other.id !== s.id && other.started_at < s.started_at
-      );
-      kind = hasEarlierSession ? 'new-session' : 'new-workspace';
-    }
-    return { ...s, kind };
-  });
-
   return {
-    header: `${MONTHS_FULL[month]} ${year}`,
-    sessionTotal: classified.length,
-    newWorkspaces: classified.filter(s => s.kind === 'new-workspace'),
-    newSessions: classified.filter(s => s.kind === 'new-session'),
-    continued: classified.filter(s => s.kind === 'continued'),
-    isEmpty: classified.length === 0
+    ...activityBlock(activityPages.value.get(monthStart), monthStart, nextMonth, `${MONTHS_FULL[month]} ${year}`),
+    from: monthStart,
+    to: nextMonth,
   };
 }
 
 function showNextMonth() {
+  const target = new Date();
+  target.setDate(1);
+  target.setMonth(target.getMonth() - loadedMonths.value);
+  const from = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}-01`;
+  const next = new Date(target.getFullYear(), target.getMonth() + 1, 1);
+  changeActivityPage(from, `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}-01`, 0);
   loadedMonths.value++;
 }
 
@@ -383,6 +372,10 @@ let stopUsageUpdates = () => {};
 onMounted(async () => {
   stopUsageUpdates = window.obelisk?.onIndexUpdated?.(() => {
     void loadUsageStats();
+    activityRevision++;
+    activityPages.value = new Map();
+    for (const block of monthBlocksSplit.value) changeActivityPage(block.from, block.to, 0);
+    if (selectedDayKey.value) changeActivityPage(daySessions.value.from, daySessions.value.to, 0);
   }) || (() => {});
   await loadUsageStats();
   loading.value = false;
@@ -561,6 +554,11 @@ onUnmounted(() => stopUsageUpdates());
           @open-session="goToSession"
         />
         <div v-else class="activity-empty">No sessions on {{ daySessionsSplit.eventDate }}.</div>
+        <div v-if="daySessionsSplit.sessionTotal > 200" class="activity-pages">
+          <button :disabled="!daySessionsSplit.offset" @click="changeActivityPage(daySessionsSplit.from, daySessionsSplit.to, daySessionsSplit.offset - 200)">Previous</button>
+          <span>{{ daySessionsSplit.offset + 1 }}–{{ Math.min(daySessionsSplit.offset + 200, daySessionsSplit.sessionTotal) }} of {{ daySessionsSplit.sessionTotal }}</span>
+          <button :disabled="daySessionsSplit.offset + 200 >= daySessionsSplit.sessionTotal" @click="changeActivityPage(daySessionsSplit.from, daySessionsSplit.to, daySessionsSplit.offset + 200)">Next</button>
+        </div>
       </section>
 
       <section class="session-activity" v-else>
@@ -580,8 +578,14 @@ onUnmounted(() => stopUsageUpdates());
             @open-session="goToSession"
           />
           <div v-else class="activity-empty">No sessions this month.</div>
+          <div v-if="block.sessionTotal > 200" class="activity-pages">
+            <button :disabled="!block.offset" @click="changeActivityPage(block.from, block.to, block.offset - 200)">Previous</button>
+            <span>{{ block.offset + 1 }}–{{ Math.min(block.offset + 200, block.sessionTotal) }} of {{ block.sessionTotal }}</span>
+            <button :disabled="block.offset + 200 >= block.sessionTotal" @click="changeActivityPage(block.from, block.to, block.offset + 200)">Next</button>
+          </div>
         </section>
         <button class="show-more-btn" @click="showNextMonth">Show more activity</button>
+        <button v-if="loadedMonths > 6" class="show-more-btn" @click="loadedMonths = 0; showNextMonth()">Back to recent activity</button>
       </section>
 
       <!-- Tooltip -->
@@ -595,6 +599,9 @@ onUnmounted(() => stopUsageUpdates());
 </template>
 
 <style scoped>
+.activity-pages { display: flex; align-items: center; gap: 12px; margin: 12px 0; color: var(--muted); }
+.activity-pages button { color: var(--fg); cursor: pointer; }
+.activity-pages button:disabled { opacity: 0.4; cursor: default; }
 .usage-wrap { flex: 1; overflow-y: auto; min-height: 0; }
 .usage-header {
   display: flex; align-items: center; justify-content: space-between;

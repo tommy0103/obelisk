@@ -34,17 +34,39 @@ export function createProviderRegistry(providers: readonly ProviderAdapter[]): P
     get: (source) => byId.get(source),
     list,
     watchTargets: (configuredRoots = {}) => {
-      const seen = new Set<string>();
-      return list()
-        .flatMap((provider) =>
-          provider.watchTargets(configuredRoots[provider.name] ?? provider.descriptor.defaultRoot),
-        )
-        .filter((target) => {
+      const byKey = new Map<string, WatchTarget>();
+      for (const provider of list()) {
+        for (const target of provider.watchTargets(configuredRoots[provider.name] ?? provider.descriptor.defaultRoot)) {
           const key = `${target.kind}:${target.path}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
+          const previous = byKey.get(key);
+          if (previous === undefined) {
+            byKey.set(key, target);
+          } else if (target.kind === 'tree' && (previous.fileNames || target.fileNames || (previous as any).matches || (target as any).matches)) {
+            const prevMatches = (previous as any).matches;
+            const nextMatches = (target as any).matches;
+            const combinedMatches = prevMatches && nextMatches
+              ? (fn: string) => prevMatches(fn) || nextMatches(fn)
+              : (prevMatches ?? nextMatches);
+            const fileNames = previous.fileNames || target.fileNames
+              ? [...new Set([...(previous.fileNames ?? []), ...(target.fileNames ?? [])])].sort()
+              : undefined;
+            const mergedTarget: WatchTarget = {
+              ...previous,
+              ...(fileNames ? { fileNames } : {}),
+            };
+            if (combinedMatches) {
+              Object.defineProperty(mergedTarget, 'matches', {
+                value: combinedMatches,
+                enumerable: false,
+                writable: true,
+                configurable: true,
+              });
+            }
+            byKey.set(key, mergedTarget);
+          }
+        }
+      }
+      return [...byKey.values()];
     },
     raw: (input) => byId.get(input.source)?.raw(input) ?? null,
   };

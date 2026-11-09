@@ -38,6 +38,22 @@ function insertSession(db, id, projectPath) {
   `).run(`message-${id}`, id, `text-${id}`, `/work/${id}`);
 }
 
+function insertPathSession(db, id, project, projectPath = '/stale/project') {
+  db.prepare('INSERT INTO sessions (id, project, project_path, source) VALUES (?, ?, ?, ?)')
+    .run(id, project, projectPath, 'claude');
+}
+
+function insertCwd(db, id, sequence, cwd, timestamp = `2026-08-31T00:00:0${sequence}Z`) {
+  db.prepare(`
+    INSERT INTO messages (uuid, session_id, type, timestamp, role, text, content_type, cwd, source)
+    VALUES (?, ?, 'user', ?, 'user', ?, 'text', ?, 'claude')
+  `).run(`cwd-${id}-${sequence}`, id, timestamp, `text-${id}-${sequence}`, cwd);
+}
+
+function sessionProjectPath(db, id) {
+  return db.prepare('SELECT project_path FROM sessions WHERE id = ?').get(id).project_path;
+}
+
 function* sessionRecords(text) {
   yield {
     kind: 'message', uuid: 'persisted-message', session_id: 'persisted-session',
@@ -66,18 +82,98 @@ const PERSIST_UNIT = {
   project: '-work-persisted',
 };
 
-test('scoped project-path refresh touches affected sessions only', () => {
+test('ordinary scoped project-path refresh derives unresolved affected sessions only', () => {
   const db = freshDb();
-  insertSession(db, 'affected', '/stale/affected');
-  insertSession(db, 'unaffected', '/stale/unaffected');
-  insertSession(db, 'unresolved', null);
+  insertSession(db, 'affected', null);
+  insertSession(db, 'resolved', '/stable/resolved');
+  insertSession(db, 'unaffected', null);
 
-  refreshSessionProjectPaths(db, new Set(['affected']));
+  refreshSessionProjectPaths(db, new Set(['affected', 'resolved']));
 
-  const projectPath = id => db.prepare('SELECT project_path FROM sessions WHERE id = ?').get(id).project_path;
-  assert.equal(projectPath('affected'), normalize('/work/affected'));
-  assert.equal(projectPath('unresolved'), null);
-  assert.equal(projectPath('unaffected'), '/stale/unaffected');
+  assert.equal(sessionProjectPath(db, 'affected'), normalize('/work/affected'));
+  assert.equal(sessionProjectPath(db, 'resolved'), '/stable/resolved');
+  assert.equal(sessionProjectPath(db, 'unaffected'), null);
+  db.close();
+});
+
+test('force project-path refresh recomputes an already resolved stable root', () => {
+  const db = freshDb();
+  insertPathSession(db, 'repair', '-Users-me-quiet-zero', '/stale/project');
+  insertCwd(db, 'repair', 1, '/Users/me/quiet-zero');
+  insertCwd(db, 'repair', 2, '/Users/me/quiet-zero/apps');
+  insertCwd(db, 'repair', 3, '/Users/me/quiet-zero');
+
+  refreshSessionProjectPaths(db, new Set(['repair']), { recompute: true });
+
+  assert.equal(sessionProjectPath(db, 'repair'), normalize('/Users/me/quiet-zero'));
+  db.close();
+});
+
+test('project-path inference normalizes, filters, counts, and orders cwd observations', () => {
+  const db = freshDb();
+  insertPathSession(db, 'matrix', '-Users-me-repo', null);
+  insertCwd(db, 'matrix', 1, '/repo/ignored');
+  insertCwd(db, 'matrix', 2, '/repo/app/../app');
+  insertCwd(db, 'matrix', 3, null);
+  insertCwd(db, 'matrix', 4, 'relative/path');
+  insertCwd(db, 'matrix', 5, '');
+  insertCwd(db, 'matrix', 6, '/repo/app');
+  insertCwd(db, 'matrix', 7, '/repo/app');
+
+  refreshSessionProjectPaths(db, new Set(['matrix']));
+
+  assert.equal(sessionProjectPath(db, 'matrix'), normalize('/repo/app'));
+  db.close();
+});
+
+test('project-path inference uses first observation to break frequency ties', () => {
+  const db = freshDb();
+  insertPathSession(db, 'tie', '-Users-me-repo', null);
+  insertCwd(db, 'tie', 1, '/repo/first', '2026-08-31T00:00:02Z');
+  insertCwd(db, 'tie', 2, '/repo/second', '2026-08-31T00:00:01Z');
+  insertCwd(db, 'tie', 3, '/repo/first', '2026-08-31T00:00:03Z');
+  insertCwd(db, 'tie', 4, '/repo/second', '2026-08-31T00:00:04Z');
+  insertCwd(db, 'tie', 5, '/repo/late-null', null);
+
+  refreshSessionProjectPaths(db, new Set(['tie']));
+
+  assert.equal(sessionProjectPath(db, 'tie'), normalize('/repo/second'));
+  db.close();
+});
+
+test('project-path inference falls back to the legacy project slug when cwd is unusable', () => {
+  const db = freshDb();
+  insertPathSession(db, 'legacy', '-Users-me-repo', null);
+  insertCwd(db, 'legacy', 1, null);
+  insertCwd(db, 'legacy', 2, 'relative/path');
+  insertCwd(db, 'legacy', 3, '');
+
+  refreshSessionProjectPaths(db, new Set(['legacy']));
+
+  assert.equal(sessionProjectPath(db, 'legacy'), '/Users/me/repo');
+  db.close();
+});
+
+test('project-path inference leaves the existing path when cwd and slug are unusable', () => {
+  const db = freshDb();
+  insertPathSession(db, 'unknown', '', '/existing/unknown');
+  insertCwd(db, 'unknown', 1, 'relative/path');
+
+  refreshSessionProjectPaths(db, new Set(['unknown']));
+
+  assert.equal(sessionProjectPath(db, 'unknown'), '/existing/unknown');
+  db.close();
+});
+
+test('project-path inference gives non-null timestamps precedence over null timestamps', () => {
+  const db = freshDb();
+  insertPathSession(db, 'null-order', '-Users-me-repo', null);
+  insertCwd(db, 'null-order', 1, '/repo/null-first', null);
+  insertCwd(db, 'null-order', 2, '/repo/timestamped', '2026-08-31T00:00:01Z');
+
+  refreshSessionProjectPaths(db, new Set(['null-order']));
+
+  assert.equal(sessionProjectPath(db, 'null-order'), normalize('/repo/timestamped'));
   db.close();
 });
 

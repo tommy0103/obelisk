@@ -22,11 +22,12 @@ test('Activity requests usage across all indexed providers', () => {
   const source = readFileSync(new URL('../app/src/renderer/src/views/Activity.vue', import.meta.url), 'utf8');
   assert.match(source, /getUsageStats\(\{\s*source:\s*['"]all['"]\s*\}\)/);
   assert.match(source, /onIndexUpdated\?\.\(\(\)\s*=>\s*\{?\s*(?:void\s+)?loadUsageStats\(\)/s);
-  assert.match(source, /Array\.from\(\{\s*length:\s*loadedMonths\.value\s*\}/);
+  assert.match(source, /Array\.from\(\{\s*length:\s*Math\.min\(loadedMonths\.value,\s*6\)\s*\}/);
+  assert.match(source, /getActivitySessions\(\{\s*from,\s*to,\s*offset\s*\}\)/);
   assert.doesNotMatch(source, /monthBlocks\s*=\s*ref\(/);
 });
 
-test('preload forwards usage source options to the main process', async () => {
+test('preload forwards usage and catalogue source options to the main process', async () => {
   const calls = [];
   let api;
   const electron = mock.module(esmResolve('electron'), {
@@ -51,6 +52,16 @@ test('preload forwards usage source options to the main process', async () => {
     await import(`${preloadUrl.href}?activity-usage=${Date.now()}`);
     await api.getUsageStats({ source: 'all' });
     assert.deepEqual(calls.at(-1), ['db:getUsageStats', { source: 'all' }]);
+    await api.getProjects({ source: 'all' });
+    assert.deepEqual(calls.at(-1), ['db:getProjects', { source: 'all' }]);
+    await api.getStats({ source: 'all' });
+    assert.deepEqual(calls.at(-1), ['db:getStats', { source: 'all' }]);
+    await api.getSessionCatalogue({ source: 'all', query: 'old', limit: 100, offset: 1000 });
+    assert.deepEqual(calls.at(-1), ['db:getSessionCatalogue', { source: 'all', query: 'old', limit: 100, offset: 1000 }]);
+    await api.getActivitySessions({ from: '2026-01-01', to: '2026-02-01', offset: 200 });
+    assert.deepEqual(calls.at(-1), ['db:getActivitySessions', { from: '2026-01-01', to: '2026-02-01', offset: 200 }]);
+    await api.getSessions({ source: 'all', sessionId: 'older', limit: 1 });
+    assert.deepEqual(calls.at(-1), ['db:getSessions', { source: 'all', sessionId: 'older', limit: 1 }]);
   } finally {
     electron.restore();
     mock.reset();

@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { createSessionLiveReloadCoordinator } from '../app/src/renderer/src/session-live-reload.mjs';
 import { state } from '../app/src/renderer/src/store.js';
 import {
+  commitInitialData,
   fetchSessionDetailPatch,
   getCachedSessionDetail,
   loadSessionDetail,
@@ -112,6 +113,7 @@ test('a skipped live patch does not advance the visible patch baseline', async t
     { uuid: 'message-1', type: 'user', timestamp: '2026-07-14T00:00:01Z', text: 'one' },
   ];
   let patchCalls = 0;
+  const patchCursorTypes = [];
   let releaseFirstPatch;
   let firstPatchStarted;
   const firstPatchGate = new Promise(resolve => { releaseFirstPatch = resolve; });
@@ -119,13 +121,16 @@ test('a skipped live patch does not advance the visible patch baseline', async t
 
   globalThis.window = {
     obelisk: {
+      getSessions: async ({ sessionId: id }) => state.sessions.filter(session => session.id === id),
       getSessionMessages: async () => rows,
       getSessionToolCalls: async () => [],
       getSessionToolResults: async () => [],
       getSessionSubagents: async () => [],
       getSessionWorkflows: async () => [],
       getSessionSummaries: async () => [],
-      getSessionPatch: async (_id, cursor) => {
+      getSessionPatch: async (_id, encodedCursor) => {
+        patchCursorTypes.push(typeof encodedCursor);
+        const cursor = typeof encodedCursor === 'string' ? JSON.parse(encodedCursor) : encodedCursor;
         const snapshotAtCall = { messages: assembleSessionDetail({
           messages: rows,
           toolCalls: [],
@@ -175,6 +180,7 @@ test('a skipped live patch does not advance the visible patch baseline', async t
   releaseFirstPatch();
   await Promise.all([first, second]);
 
+  assert.deepEqual(patchCursorTypes, ['string', 'string'], 'the bridge receives primitives instead of the full fingerprint objects');
   assert.deepEqual(commits, [{
     messages: ['message-1', 'message-2', 'message-3'],
     changedIds: ['message-2', 'message-3'],
@@ -215,4 +221,33 @@ test('a skipped live patch does not advance the visible patch baseline', async t
     [],
     'an evicted session cannot fall back to stale initial messages and must reload',
   );
+});
+
+test('reopening an updated session refreshes metadata and retires its old title override', async t => {
+  const id = 'reopened-session';
+  const previous = { sessions: state.sessions, memories: state.memories, projects: state.projects,
+    stats: state.stats, loaded: state.loaded, catalogueVersion: state.catalogueVersion, window: globalThis.window };
+  t.after(() => {
+    Object.assign(state, { sessions: previous.sessions, memories: previous.memories, projects: previous.projects,
+      stats: previous.stats, loaded: previous.loaded, catalogueVersion: previous.catalogueVersion });
+    state.sessionTitleOverrides.delete(id);
+    if (previous.window === undefined) delete globalThis.window;
+    else globalThis.window = previous.window;
+  });
+  let metadata = { id, title: 'Before', git_branch: 'old', message_count: 1 };
+  globalThis.window = { obelisk: {
+    getSessions: async () => [{ ...metadata }],
+    getSessionMessages: async () => [], getSessionToolCalls: async () => [],
+    getSessionToolResults: async () => [], getSessionSubagents: async () => [],
+    getSessionWorkflows: async () => [], getSessionSummaries: async () => [],
+  } };
+  state.sessions = [];
+  assert.equal((await loadSessionDetail(id)).title, 'Before');
+  state.sessionTitleOverrides.set(id, 'Earlier live title');
+  metadata = { id, title: 'After', git_branch: 'new', message_count: 2 };
+  commitInitialData({ rawMemories: [], stats: { sessions: 1 }, projects: [] });
+  const reopened = await loadSessionDetail(id);
+  assert.deepEqual({ title: reopened.title, branch: reopened.git_branch, count: reopened.message_count },
+    { title: 'After', branch: 'new', count: 2 });
+  assert.equal(state.sessionTitleOverrides.has(id), false, 'fresh full metadata replaces an obsolete overlay');
 });

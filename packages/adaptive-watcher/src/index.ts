@@ -31,7 +31,14 @@
 import fs from 'node:fs';
 import parcelWatcher from '@parcel/watcher';
 
-export type WatchTarget = { kind: 'tree' | 'file'; path: string };
+export type WatchTarget = {
+  kind: 'tree' | 'file';
+  path: string;
+  /** Caller-side event filter hint; the watcher itself only uses kind and path. */
+  fileNames?: readonly string[];
+  /** Optional predicate matching descendant basenames beyond exact fileNames. */
+  matches?: (filename: string) => boolean;
+};
 
 export type WatchInvalidation =
   | { type: 'paths'; paths: string[] }

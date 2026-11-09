@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -100,12 +100,20 @@ test('app indexer records build success without claiming daemon ownership', () =
   const db2 = new TestDatabase(dbPath);
   assert.equal(db2.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'companion'").get().uuid, 'msg-app-2');
   assert.equal(db2.prepare('SELECT message_count FROM sessions WHERE id=?').get(sessionId).message_count, 2);
-  assert.equal(db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, normalize('/tmp/obelisk-app'));
+  assert.equal(
+    db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path,
+    '/tmp/stale-affected',
+    'ordinary incremental refresh preserves an already-resolved project root',
+  );
   assert.equal(
     db2.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
     '/tmp/stale-unaffected',
   );
   db2.close();
+
+  const unresolvedDb = new TestDatabase(dbPath);
+  unresolvedDb.prepare('UPDATE sessions SET project_path=NULL WHERE id=?').run('session-app-unaffected');
+  unresolvedDb.close();
 
   buildIndex({
     claudeDir,
@@ -114,6 +122,7 @@ test('app indexer records build success without claiming daemon ownership', () =
     changedPaths: [],
     retrySessionIds: ['session-app-unaffected'],
   });
+
   const retryDb = new TestDatabase(dbPath);
   assert.equal(
     retryDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
@@ -127,7 +136,8 @@ test('app indexer records build success without claiming daemon ownership', () =
   const repairedDb = new TestDatabase(dbPath);
   assert.equal(
     repairedDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
-    normalize('/tmp/unaffected'),
+    '/tmp/stale-unaffected',
+    'ordinary full-inventory refresh preserves an already-resolved project root',
   );
   repairedDb.close();
 });
@@ -179,6 +189,55 @@ test('app indexer refreshes unchanged Claude usage when input token semantics ch
   assert.equal(
     refreshed.prepare('SELECT input_tokens FROM messages WHERE uuid = ?').get('msg-token-semantics-1').input_tokens,
     60,
+  );
+  assert.ok(
+    refreshed.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
+      .get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER),
+  );
+  refreshed.close();
+});
+
+test('app indexer replays unchanged Claude transcripts when custom-title indexing becomes available', () => {
+  const home = makeTempDir('obelisk-app-indexer-custom-title-');
+  const claudeDir = join(home, '.claude');
+  const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
+  mkdirSync(projectDir, { recursive: true });
+  const sessionId = 'session-custom-title-1';
+  const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(jsonlPath, [
+    JSON.stringify({
+      type: 'custom-title',
+      customTitle: 'Desktop generated title',
+      sessionId,
+    }),
+    JSON.stringify({
+      uuid: 'msg-custom-title-1',
+      type: 'user',
+      timestamp: '2026-06-13T10:00:00Z',
+      cwd: '/tmp/obelisk-app',
+      message: { role: 'user', content: 'hello from a titled session' },
+    }),
+    '',
+  ].join('\n'));
+
+  const dbPath = join(claudeDir, 'obelisk.sqlite');
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const stale = new TestDatabase(dbPath);
+  stale.prepare('UPDATE sessions SET title = NULL WHERE id = ?').run(sessionId);
+  stale.prepare('DELETE FROM index_state WHERE jsonl_path = ?')
+    .run(CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
+  stale.prepare(
+    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, 0, 0)',
+  ).run('__claude_canonical_transcript_v2__');
+  stale.close();
+
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const refreshed = new TestDatabase(dbPath);
+  assert.equal(
+    refreshed.prepare('SELECT title FROM sessions WHERE id = ?').get(sessionId).title,
+    'Desktop generated title',
   );
   assert.ok(
     refreshed.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
@@ -589,6 +648,7 @@ test('app indexer re-plans a Codex file reported via changedPaths and updates th
     codexDir,
     dbPath,
     DatabaseImpl: TestDatabase,
+    reason: 'reconcile',
     changedPaths: [join('2026', '06', '15', filename)],
   });
 
@@ -905,3 +965,37 @@ test('app indexer maps Codex subagent threads onto parent sessions', () => {
   assert.equal(childResult.content, '/tmp/obelisk-app');
   db.close();
 });
+
+for (const configured of [false, true]) {
+  test(`app indexes Kiro history with a read-only database and bounded lock wait (${configured ? 'configured' : 'default'} registry)`, () => {
+    const home = makeTempDir('obelisk-app-kiro-');
+    const root = join(home, '.kiro');
+    mkdirSync(root, { recursive: true });
+    const sourcePath = join(root, 'data.sqlite3');
+    const fixture = JSON.parse(readFileSync(new URL('./fixtures/kiro/conversation.json', import.meta.url), 'utf8'));
+    const source = new DatabaseSync(sourcePath);
+    source.exec('CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT, created_at INTEGER, updated_at INTEGER)');
+    source.prepare('INSERT INTO conversations_v2 VALUES (?, ?, ?, ?, ?)').run(
+      fixture.key, fixture.conversation_id, JSON.stringify(fixture.value), fixture.created_at, fixture.updated_at,
+    );
+    source.close();
+    const opens = [];
+    class KiroTestDatabase extends TestDatabase {
+      constructor(path, options) {
+        super(path);
+        if (path === sourcePath) opens.push(options);
+      }
+    }
+    const dbPath = join(home, 'index.sqlite');
+    buildIndex({
+      claudeDir: join(home, '.claude'), codexDir: join(home, '.codex'), dbPath,
+      providerRoots: { kiro: root }, DatabaseImpl: KiroTestDatabase,
+      ...(configured ? { providerSettings: { providerRoots: { kiro: root } } } : {}),
+    });
+    assert.ok(opens.length > 0, 'the native Kiro store was actually opened');
+    assert.ok(opens.every(options => options.readonly === true && options.fileMustExist === true && options.timeout === 500));
+    const db = new TestDatabase(dbPath);
+    assert.ok(db.prepare("SELECT text FROM messages WHERE source='kiro' AND text='Example content'").get());
+    db.close();
+  });
+}

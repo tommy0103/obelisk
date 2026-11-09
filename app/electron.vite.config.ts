@@ -17,6 +17,9 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve('src/main/index.ts'),
+          'update-service': resolve('src/main/update-service.ts'),
+          'update-backends': resolve('src/main/update-backends.ts'),
+          'update-lifecycle': resolve('src/main/update-lifecycle.ts'),
           'file-reference': resolve('src/main/file-reference.ts'),
           indexer: resolve('src/main/indexer.ts'),
           'indexer-service': resolve('src/main/indexer-service.ts'),
