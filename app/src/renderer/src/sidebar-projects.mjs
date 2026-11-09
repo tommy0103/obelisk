@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 function countByProject(items) {
   const counts = {};
   for (const item of items) {
@@ -36,7 +39,9 @@ export function buildSidebarProjects({
   const items = routeType === 'sessions'
     ? sessions
     : memories.filter(memory => view === 'archived' ? memory.archived : !memory.archived);
-  const counts = countByProject(items);
+  const counts = routeType === 'sessions'
+    ? Object.fromEntries(projects.map(project => [project.project, project.session_count]))
+    : countByProject(items);
   const q = search.trim().toLowerCase();
 
   return orderedProjectSlugs(counts, projects, formatProjectLabel)

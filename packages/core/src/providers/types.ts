@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Core provider contract (see docs/adr/0001).
 //
 // The indexing layer splits along two orthogonal axes:
@@ -28,7 +31,7 @@ export type Cursor = string | null;
 export interface IndexUnit {
   /** Stable identity used as the index_state cursor key. */
   key: string;
-  /** Session id this unit indexes into. */
+  /** Session id this unit indexes into; empty for recordless source-control units. */
   sessionId: string;
   /** Project slug (dash-encoded path), when the source exposes one. */
   project?: string;
@@ -37,14 +40,58 @@ export interface IndexUnit {
   agentId?: string;
   /** Adapter-private payload, opaque to the orchestration. */
   meta?: unknown;
+  /** Previously indexed sessions atomically retracted by persist before this unit is written. */
+  retractSessionIds?: readonly string[];
+  /** Cursor prerequisites checked inside this unit's destination transaction.
+   * Used when source observation/pending work must be durable before replacement.
+   * A prerequisite is observed state, not proof that its dependent units finished. */
+  requiresCursors?: readonly { key: string; cursor: string }[];
+  /** Provider-scoped publication set. Every planned unit with this key commits
+   * together; the adapter must withhold the set if discovery cannot supply it. */
+  atomicGroup?: string;
+}
+
+/** Read-only source provenance exposed to one provider during discovery. */
+export interface IndexedSession {
+  sessionId: string;
+  jsonlPath: string;
+  /** Canonical subagent identities previously owned by this session. */
+  memberSessionIds?: readonly string[];
+}
+
+/** One source location that prevented a provider from certifying its inventory. */
+export interface InventoryIssue {
+  readonly path: string;
+  readonly error: string;
 }
 
 /** Context the orchestration provides to discovery. */
 export interface DiscoverContext {
+  /** Require a complete projection: an unstable unit must fail, not return a no-op. */
+  snapshotRequired?: boolean;
   /** Look up the cursor persisted for a unit key on a previous run. */
   lastCursor(key: string): Cursor;
   /** When set (daemon changed-path mode), restrict discovery to these paths. */
   changedPaths?: string[];
+  /** Sessions already indexed for this provider, keyed by their canonical source path. */
+  indexedSessions?(): readonly IndexedSession[];
+  /** Historical checkpoint for identity/membership evidence, even during replay.
+   * Unlike lastCursor, this must never be used to skip or resume projection. */
+  previousCursor?(key: string): Cursor;
+  /** Keep this indexed canonical session unchanged when it cannot be rebuilt. */
+  retainSession?(sessionId: string): void;
+  /** Report that the source inventory could not be enumerated completely. */
+  reportIncompleteInventory?(issue?: InventoryIssue): void;
+  /**
+   * Report an artifact whose identity is known but whose content this adapter
+   * version cannot project (for example a session file carrying a format
+   * version newer than the adapter supports).
+   *
+   * This records diagnostics without withholding unrelated publication. The
+   * adapter must also retainSession for affected indexed trees and withhold
+   * their projection/retraction; a diagnostic alone never protects old rows.
+   */
+  reportSkippedArtifact?(issue?: InventoryIssue): void;
 }
 
 /** Canonical language emitted by every provider adapter. Persist serializes it;
@@ -62,7 +109,7 @@ export type TranscriptRecord =
   | MessageTurnDurationRecord
   | DeleteSessionRecord;
 
-export type MessageVisibility = 'visible' | 'hidden';
+export type MessageVisibility = 'visible' | 'inactive' | 'hidden';
 
 export interface MessageRecord {
   kind: 'message';
@@ -75,7 +122,10 @@ export interface MessageRecord {
   text: string | null;
   content_type: string | null;
   is_meta: 0 | 1;
-  /** Provider-normalized display eligibility. Assemblers never infer this from text. */
+  /**
+   * Provider-attested evidence state. `inactive` requires an explicit source
+   * supersession signal; assemblers never infer it from text or tree shape.
+   */
   visibility: MessageVisibility;
   model: string | null;
   is_sidechain: 0 | 1;
@@ -116,6 +166,11 @@ export interface SummaryRecord {
   timestamp: string | null;
   source: string;
   content: string;
+  /** Provider-attested evidence state. Aggregate accounting may include non-visible usage. */
+  visibility?: MessageVisibility;
+  /** Provider-normalized total input, including provider-reported cached input. */
+  input_tokens?: number | null;
+  output_tokens?: number | null;
 }
 
 // One codex subagent. Like workflow_agent, a row can be contributed by more than
@@ -182,9 +237,9 @@ export interface MessageTurnDurationRecord {
   turn_duration_ms: number | null;
 }
 
-// Retraction op (not a table). The adapter emits this when a previously-indexed
-// session must be removed — e.g. a Codex guardian/auto-review thread. Persist
-// executes the cascade delete across all tables for that session.
+// Retraction op (not a table). An adapter emits this when removal is discovered
+// during parsing, e.g. a Codex guardian thread. Discovery-known retractions use
+// IndexUnit.retractSessionIds instead. Persist cascades either form.
 export interface DeleteSessionRecord {
   kind: 'delete-session';
   sessionId: string;
@@ -195,14 +250,17 @@ export interface DeleteSessionRecord {
 // title/ended_at may be enriched by the adapter from source-specific auxiliary
 // files (claude history.jsonl, codex session_index.jsonl); persist upserts with
 // fill-if-null (COALESCE) so those never clobber a value already present.
-// project_path is NOT set here — the orchestration's global pass derives it from
-// persisted message cwds (refreshSessionProjectPaths).
+// project_path is NOT set here — the orchestration derives it from persisted
+// message cwds when a session is first created or still unresolved
+// (refreshSessionProjectPaths). Resolved paths remain stable during ordinary
+// incremental indexing; explicit force/repair passes may recompute them.
 //
 // countMode tells persist how to treat message_count, because providers differ:
 // a line-incremental adapter (claude) yields only new messages ('delta', persist
 // accumulates onto the existing row); a full-reparse adapter (codex) yields every
 // message each run ('total', persist replaces). A 'delta' parse from an empty
-// cursor is equivalent to 'total'.
+// cursor is equivalent to 'total'. The count describes the standard visible
+// transcript surface; records behind inactive/hidden visibility do not contribute.
 export interface SessionRecord {
   kind: 'session';
   id: string;
@@ -238,6 +296,10 @@ export interface ProviderDescriptor {
   readonly vendor: string;
   readonly defaultRoot: string;
   readonly color: string;
+  /** The automatic root is ambiguous; callers must preserve omission until the user chooses one. */
+  readonly requiresExplicitRoot?: boolean;
+  /** User-facing explanation for an unavailable automatic root. */
+  readonly rootResolutionReason?: string;
 }
 
 export interface RawLookup {
@@ -245,6 +307,8 @@ export interface RawLookup {
   readonly messageUuid: string;
   readonly session: Record<string, unknown> | null;
   readonly agentId: string | null;
+  /** Cursor committed for this session's source unit, when available. */
+  readonly cursor?: Cursor;
   readonly subagent?: Record<string, unknown> | null;
   readonly workflowAgent?: Record<string, unknown> | null;
 }
@@ -259,11 +323,38 @@ export interface RawRecord {
   readonly messageText?: string | null;
 }
 
+/**
+ * A watchable provider source: a directory `tree` (recursive subscription)
+ * or an exact `file` (metadata polling). Structurally identical to the
+ * adaptive-watcher package's WatchTarget (ADR-0009); duplicated here so
+ * @obelisk/core carries no watcher dependency.
+ */
+export interface WatchTarget {
+  readonly kind: 'tree' | 'file';
+  readonly path: string;
+  /** Exact descendant basenames that the app should forward from this tree, beyond JSON transcripts. */
+  readonly fileNames?: readonly string[];
+  /** Optional predicate matching descendant basenames beyond exact fileNames. */
+  readonly matches?: (filename: string) => boolean;
+}
+
 /** Complete adapter interface used by every indexing and presentation caller. */
 export interface ProviderAdapter extends Provider {
   readonly descriptor: ProviderDescriptor;
   /** Optional index semantics marker; absence forces one provider-owned replay. */
   readonly indexVersionMarker?: string;
-  watchRoots(configuredRoot: string): string[];
+  /**
+   * Recover the IndexUnit key for a persisted session when it differs from the
+   * canonical source path. File-backed providers normally omit this.
+   */
+  sessionUnitKey?(session: IndexedSession): string;
+  /**
+   * Expand a provider-owned virtual unit key into real files for bounded
+   * startup/reconcile hot polling. Return [] for keys this adapter does not own.
+   * Called in the indexing worker; no source reads belong in the main process.
+   * Files may be absent temporarily (for example, a checkpointed WAL).
+   */
+  watchHints?(unitKey: string): readonly string[];
+  watchTargets(configuredRoot: string): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }

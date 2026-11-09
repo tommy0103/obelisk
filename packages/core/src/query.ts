@@ -1,32 +1,71 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Query and attune sandbox helpers for the Core package.
-import { fs, path } from './db.ts';
+import { statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { isAbsolute, normalize, resolve, sep } from 'node:path';
+import { constants as sqliteConstants } from 'node:sqlite';
+import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
+import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { SqliteDb, SqliteRow, SqliteStatement } from './sqlite-types.ts';
+import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
+import { openOpencodeDatabaseWithNodeSqlite } from './providers/opencode-node.ts';
 
 type DbRow = SqliteRow;
+
+// SQLite extended result code for a primary-key uniqueness violation.
+const SQLITE_CONSTRAINT_PRIMARYKEY = 1555;
 
 interface QueryOptions extends Record<string, any> {
   limit?: number;
   sessionId?: string;
-  sessions?: string[];
   excludeSession?: string | string[];
+  sessions?: string[];
   project?: string;
+  projectPath?: string;
   after?: string;
   before?: string;
   cwd?: string;
   branch?: string;
   source?: string;
   includeMeta?: boolean;
+  includeInactive?: boolean;
+  fallback?: 'or';
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
+  contextLimit?: number;
+  snippetTokens?: number;
+}
+
+interface MessageQueryOptions {
+  uuid?: string;
+  around?: string;
+  sessionId?: string;
+  relation?: 'timeline' | 'parents';
+  beforeCount?: number;
+  afterCount?: number;
+  after?: string;
+  before?: string;
+  limit?: number;
+  cursor?: { timestamp: string | null; uuid: string };
+  agentId?: string | null;
+  contentTypes?: string[];
+  includeMeta?: boolean;
+  includeInactive?: boolean;
+  includeSession?: boolean;
 }
 
 interface ColumnAliases {
   sessionId: string;
   project: string;
   timestamp: string;
+  /** Optional per-direction overrides for range-typed rows (activity intervals). */
+  timestampAfter?: string;
+  timestampBefore?: string;
   branch: string;
   source?: string;
 }
@@ -53,6 +92,10 @@ function normalizeOpts(optsOrScalar: QueryOptions | string | number | null | und
   return optsOrScalar;
 }
 
+function assertNonNegativeLimit(value: number, label: string): void {
+  if (value < 0) throw new RangeError(`${label} must be non-negative (got ${value})`);
+}
+
 function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
   const clauses: string[] = [];
   const params: any[] = [];
@@ -62,8 +105,8 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
     params.push(...opts.sessions);
   }
   if (opts.project) { clauses.push(`${aliases.project} LIKE ?`); params.push(opts.project); }
-  if (opts.after) { clauses.push(`${aliases.timestamp} > ?`); params.push(opts.after); }
-  if (opts.before) { clauses.push(`${aliases.timestamp} < ?`); params.push(opts.before); }
+  if (opts.after) { clauses.push(`${aliases.timestampAfter ?? aliases.timestamp} > ?`); params.push(opts.after); }
+  if (opts.before) { clauses.push(`${aliases.timestampBefore ?? aliases.timestamp} < ?`); params.push(opts.before); }
   if (opts.branch) { clauses.push(`${aliases.branch} = ?`); params.push(opts.branch); }
   if (opts.source && opts.source !== 'all' && aliases.source) {
     clauses.push(`COALESCE(${aliases.source}, 'claude') = ?`);
@@ -72,32 +115,164 @@ function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
   return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
 }
 
-// Most sessions carry no title: current Claude Code versions stopped writing
-// `ai-title` transcript rows and dropped `title` from history.jsonl, so the two
-// upstream title sources are usually absent (96% null on a real index). Derive a
-// navigable label from the opening user message instead of returning null.
-// Command envelopes (`<command-message>…`) are skipped: they name the slash
-// command, not the task.
-function titleExpr(alias: string): string {
-  return `COALESCE(NULLIF(${alias}.title, ''), (
-    SELECT substr(replace(replace(m_t.text, char(10), ' '), char(13), ' '), 1, 80)
-    FROM messages m_t
-    WHERE m_t.session_id = ${alias}.id AND m_t.role = 'user' AND m_t.content_type = 'text'
-      AND COALESCE(m_t.is_meta, 0) = 0 AND m_t.text IS NOT NULL AND m_t.text <> ''
-      AND m_t.text NOT LIKE '<command-%'
-    ORDER BY m_t.timestamp LIMIT 1))`;
-}
-
 const BASH_EXIT_PAT = 'Exit code %';
 
-function assertReadOnlySql(sql: unknown): void {
-  const text = String(sql || '').trim();
-  if (!/^(SELECT|WITH)\b/i.test(text)) {
-    throw new Error('sql() only supports read-only SELECT/WITH queries');
+type QueryVisibility = 'visible' | 'inactive' | 'hidden';
+
+function normalizedVisibility(value: unknown): QueryVisibility {
+  if (value === null || value === undefined || value === 'visible') return 'visible';
+  if (value === 'inactive') return 'inactive';
+  return 'hidden';
+}
+
+function withVisibility(row: DbRow): DbRow {
+  return { ...row, visibility: normalizedVisibility(row.visibility) };
+}
+
+// Subagent total tokens (ADR-0010): a provider-stored value wins; when the
+// provider did not store one (deepseek's incremental adapter cannot), derive
+// it from the sidechain messages' usage as a presentation-layer null-fill.
+function deriveSubagentTokens(db: SqliteDb, agentId: unknown): number | null {
+  // Null only means "no usage-bearing messages"; a legitimate 0 stays 0.
+  const row = db.prepare('SELECT SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) AS t, COUNT(*) AS n FROM messages WHERE agent_id=? AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)').get(agentId);
+  return row && typeof row.n === 'number' && row.n > 0 && typeof row.t === 'number' ? row.t : null;
+}
+
+function isQueryableMessage(
+  row: DbRow | undefined,
+  includeInactive = false,
+): row is DbRow {
+  if (row === undefined) return false;
+  const visibility = normalizedVisibility(row.visibility);
+  return visibility === 'visible' || (includeInactive && visibility === 'inactive');
+}
+
+function visibilitySql(alias: string, includeInactive = false): string {
+  const column = `${alias}.visibility`;
+  return includeInactive
+    ? `COALESCE(${column},'visible') IN ('visible','inactive')`
+    : `COALESCE(${column},'visible')='visible'`;
+}
+
+// #107: the read-only contract follows the statement's actual database
+// effects instead of scanning the SQL text for mutation keywords (which
+// false-positive on literals, comments, and quoted identifiers).
+const READ_ONLY_SQL_MESSAGE = 'sql() only supports read-only SELECT/WITH queries';
+const MULTI_STATEMENT_SQL_MESSAGE =
+  'sql() accepts exactly one SQL statement per call; split multiple statements into separate sql() calls';
+
+// The lexical prefix check stays: it is the cheap, stable entry contract and
+// it keeps statement-level PRAGMA (allowed by the authorizer for pragma
+// table-valued functions) out of the sandbox.
+function assertReadOnlySqlPrefix(text: string): void {
+  if (!/^\s*(SELECT|WITH)\b/i.test(text)) {
+    throw new Error(READ_ONLY_SQL_MESSAGE);
   }
-  if (/\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM|ATTACH|DETACH)\b/i.test(text)) {
-    throw new Error('sql() only supports read-only SELECT/WITH queries');
+}
+
+// Write and schema-mutation action codes from SQLite's authorizer API
+// (sqlite3_set_authorizer). Everything not listed — SELECT, READ, FUNCTION,
+// TRANSACTION, PRAGMA, RECURSIVE, and any future read action — is allowed by
+// default: a denylist cannot false-positive on read syntax the way the old
+// keyword scan did, and the read-only connection opened by openReadDb()
+// remains the final mutation boundary for anything missed here. DENY is the
+// only correct rejection code: SQLITE_IGNORE on SQLITE_READ would silently
+// null out columns instead of failing.
+const DENIED_SQLITE_ACTIONS: ReadonlySet<number> = new Set([
+  sqliteConstants.SQLITE_INSERT,
+  sqliteConstants.SQLITE_UPDATE,
+  sqliteConstants.SQLITE_DELETE,
+  sqliteConstants.SQLITE_CREATE_INDEX,
+  sqliteConstants.SQLITE_CREATE_TABLE,
+  sqliteConstants.SQLITE_CREATE_TEMP_INDEX,
+  sqliteConstants.SQLITE_CREATE_TEMP_TABLE,
+  sqliteConstants.SQLITE_CREATE_TEMP_TRIGGER,
+  sqliteConstants.SQLITE_CREATE_TEMP_VIEW,
+  sqliteConstants.SQLITE_CREATE_TRIGGER,
+  sqliteConstants.SQLITE_CREATE_VIEW,
+  sqliteConstants.SQLITE_CREATE_VTABLE,
+  sqliteConstants.SQLITE_DROP_INDEX,
+  sqliteConstants.SQLITE_DROP_TABLE,
+  sqliteConstants.SQLITE_DROP_TEMP_INDEX,
+  sqliteConstants.SQLITE_DROP_TEMP_TABLE,
+  sqliteConstants.SQLITE_DROP_TEMP_TRIGGER,
+  sqliteConstants.SQLITE_DROP_TEMP_VIEW,
+  sqliteConstants.SQLITE_DROP_TRIGGER,
+  sqliteConstants.SQLITE_DROP_VIEW,
+  sqliteConstants.SQLITE_DROP_VTABLE,
+  sqliteConstants.SQLITE_ALTER_TABLE,
+  sqliteConstants.SQLITE_REINDEX,
+  sqliteConstants.SQLITE_ANALYZE,
+  sqliteConstants.SQLITE_ATTACH,
+  sqliteConstants.SQLITE_DETACH,
+  sqliteConstants.SQLITE_SAVEPOINT,
+]);
+
+// Prepare-time semantic classification. node:sqlite exposes the authorizer
+// (setAuthorizer, Node 24.10+); on older supported runtimes and on drivers
+// without it, classification degrades to the read-only connection, which
+// still fails every write at execute time — the boundary never fails open.
+// better-sqlite3 has no authorizer either; there statement classification
+// happens through the statement's readonly flag in assertReadOnlyStatement.
+function installWriteDenylist(db: SqliteDb): void {
+  if (typeof db.setAuthorizer !== 'function') return;
+  db.setAuthorizer((action) =>
+    DENIED_SQLITE_ACTIONS.has(action) ? sqliteConstants.SQLITE_DENY : sqliteConstants.SQLITE_OK);
+}
+
+// better-sqlite3 path: no authorizer, but prepare() already rejected
+// multi-statement input and the readonly flag classifies write effects.
+function assertReadOnlyStatement(stmt: SqliteStatement): void {
+  if (stmt.readonly === false) throw new Error(READ_ONLY_SQL_MESSAGE);
+}
+
+// A tail is inert only when it is whitespace and comments — no quotes to
+// track, because anything else is a second statement SQLite never compiled
+// (node:sqlite prepare compiles the first statement and silently ignores the
+// rest, so this check is what makes multi-statement input fail clearly).
+function isBlankOrCommentTail(text: string): boolean {
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') { i += 1; continue; }
+    if (ch === '-' && text[i + 1] === '-') {
+      const end = text.indexOf('\n', i + 2);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      if (end === -1) return false;
+      i = end + 2;
+      continue;
+    }
+    return false;
   }
+  return true;
+}
+
+function assertSingleStatement(sqlText: string, stmt: SqliteStatement): void {
+  if (typeof stmt.sourceSQL !== 'string') return;
+  if (!isBlankOrCommentTail(sqlText.slice(stmt.sourceSQL.length))) {
+    throw new Error(MULTI_STATEMENT_SQL_MESSAGE);
+  }
+}
+
+function prepareReadOnlyStatement(db: SqliteDb, sqlText: string): SqliteStatement {
+  let stmt: SqliteStatement;
+  try {
+    stmt = db.prepare(sqlText);
+  } catch (error) {
+    // node:sqlite reports an authorizer denial as SQLITE_AUTH ("not
+    // authorized"); surface the sandbox contract instead of the raw code.
+    if (error instanceof Error && /not authorized/i.test(error.message)) {
+      throw new Error(READ_ONLY_SQL_MESSAGE, { cause: error });
+    }
+    throw error;
+  }
+  assertReadOnlyStatement(stmt);
+  assertSingleStatement(sqlText, stmt);
+  return stmt;
 }
 
 const CJK_TEXT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -111,21 +286,30 @@ function assertEnglishMemoryText(value: unknown, label: string): void {
   }
 }
 
-function buildSafeFtsQuery(text: unknown): string {
+function buildSafeFtsQuery(text: unknown, separator = ' '): string {
   const tokens = String(text || '').match(/[\p{Letter}\p{Number}]+/gu) || [];
   return tokens
     .slice(0, 12)
     .map(token => `"${token}"`)
-    .join(' ');
+    .join(separator);
 }
 
 function createQueryApi(
   db: SqliteDb,
-  { providerRegistry = createBuiltinProviderRegistry() }: { providerRegistry?: ProviderRegistry } = {},
+  {
+    providerRegistry = createBuiltinProviderRegistry({}, {
+      openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+      openHermesStore: openHermesStoreWithNodeSqlite,
+      openOpencodeDatabase: openOpencodeDatabaseWithNodeSqlite,
+    }),
+    invokingSessionId = null,
+  }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
 ) {
+  installWriteDenylist(db);
   const q = (sql: string, ...p: any[]) => {
-    assertReadOnlySql(sql);
-    return db.prepare(sql).all(...p);
+    const text = String(sql || '');
+    assertReadOnlySqlPrefix(text);
+    return prepareReadOnlyStatement(db, text).all(...p);
   };
 
   const normalizeOverviewOpts = (optsOrScalar: QueryOptions | string | number | null | undefined): QueryOptions => {
@@ -136,27 +320,57 @@ function createQueryApi(
   };
 
   const search = (text: string, opts: QueryOptions = {}) => {
-    const { limit = 20, sessionId, excludeSession, project, after, before, cwd, source, includeMeta = false } = opts;
+    const {
+      limit = 20,
+      sessionId,
+      excludeSession,
+      project,
+      projectPath,
+      after,
+      before,
+      cwd,
+      source,
+      includeMeta = false,
+      includeInactive = false,
+      contextLimit = 6,
+      snippetTokens,
+      fallback,
+    } = opts;
+    assertNonNegativeLimit(limit, 'search() limit');
+    if (!Number.isInteger(contextLimit) || contextLimit < 0 || contextLimit > 6) {
+      throw new RangeError('search() contextLimit must be an integer from 0 to 6');
+    }
+    if (snippetTokens !== undefined && (!Number.isInteger(snippetTokens) || snippetTokens < 1 || snippetTokens > 64)) {
+      throw new RangeError('search() snippetTokens must be an integer from 1 to 64');
+    }
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
-    // Searching history from inside a session almost always hits that session's
-    // own prompt, because the query terms came from it. Excluding in SQL keeps
-    // `limit` spent on other sessions; a post-filter in the script would not.
-    const excluded = typeof excludeSession === 'string' ? [excludeSession] : (excludeSession ?? []);
+    const excluded = excludeSession === undefined ? []
+      : typeof excludeSession === 'string' ? [excludeSession] : excludeSession;
+    if (!Array.isArray(excluded) || excluded.some(id => typeof id !== 'string' || id.length === 0)) {
+      throw new TypeError('search() excludeSession must be a session ID or an array of session IDs');
+    }
     if (excluded.length) {
-      where += ` AND mf.session_id NOT IN (${excluded.map(() => '?').join(',')})`;
-      filterParams.push(...excluded);
+      const ids = [...new Set(excluded)];
+      where += ` AND mf.session_id NOT IN (${ids.map(() => '?').join(',')})`;
+      filterParams.push(...ids);
     }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
+    if (projectPath) { where += ' AND s.project_path=?'; filterParams.push(projectPath); }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
     if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
     if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
+    where += ` AND ${visibilitySql('m', includeInactive)}`;
+    const hitText = snippetTokens === undefined ? 'm.text' : `snippet(messages_fts, 2, '', '', '…', ${snippetTokens})`;
     const stmt = db.prepare(`
-      SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,m.source as m_source,
-             s.id as s_id,${titleExpr('s')} as s_title,s.project as s_project,s.started_at as s_started,
+      SELECT m.uuid,m.session_id,${hitText} AS text,
+             ${snippetTokens === undefined ? 'NULL' : 'length(m.text)'} AS text_length,
+             m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
+             COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
+             s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source,
              rank
       FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
@@ -172,66 +386,298 @@ function createQueryApi(
       const safe = buildSafeFtsQuery(text);
       rows = safe ? runMatch(safe) : [];
     }
+    if (rows.length === 0 && fallback === 'or') {
+      const broad = buildSafeFtsQuery(text, ' OR ');
+      rows = broad ? runMatch(broad) : [];
+    }
+    const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
+    const contextWhere = `
+      session_id=$sessionId AND uuid!=$messageUuid ${metaClause}
+        AND ${visibilitySql('messages', includeInactive)}
+    `;
+    // Correctness relies on an ingest-convention invariant: every timestamp in
+    // the session is canonical YYYY-MM-DDTHH:mm:ss.sssZ, so text order is
+    // chronological. pi/kimi/deepseek normalize via toISOString(); claude and
+    // codex pass provider strings through, which are canonical in practice.
+    // Only the hit's own format is verified (below); neighbor rows are
+    // trusted. Pull at most six candidates from each side via idx_messages_ts,
+    // then preserve the old JULIANDAY distance ordering.
+    const indexedContext = db.prepare(`
+      WITH
+        null_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp IS NULL
+          ORDER BY rowid LIMIT 6
+        ),
+        before_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp<=$timestamp
+          ORDER BY timestamp DESC, rowid ASC LIMIT 6
+        ),
+        after_rows AS (
+          SELECT rowid AS message_rowid FROM messages
+          WHERE ${contextWhere} AND timestamp>$timestamp
+          ORDER BY timestamp ASC, rowid ASC LIMIT 6
+        ),
+        candidates AS (
+          SELECT * FROM null_rows UNION ALL SELECT * FROM before_rows
+          UNION ALL SELECT * FROM after_rows
+        )
+      SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+             COALESCE(visibility,'visible') AS visibility,
+             COALESCE(source, 'claude') AS source
+      FROM candidates JOIN messages ON messages.rowid=candidates.message_rowid
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp)), message_rowid
+      LIMIT 6
+    `);
+    // Null or non-canonical hits have no safe lexical ordering; retain the
+    // original scan instead of forcing them through the indexed path.
+    const scanContext = db.prepare(`
+      SELECT uuid,text,content_type,is_meta,role,timestamp,model,
+             COALESCE(visibility,'visible') AS visibility,
+             COALESCE(source, 'claude') AS source
+      FROM messages
+      WHERE ${contextWhere}
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp))
+      LIMIT 6
+    `);
     return rows.map((r: DbRow) => {
-      const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
-      const ctx = db.prepare(
-        `SELECT uuid,text,content_type,is_meta,role,timestamp,model,COALESCE(source, 'claude') as source FROM messages WHERE session_id=? AND uuid!=? ${metaClause} ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY(?)) LIMIT 6`
-      ).all(r.session_id, r.uuid, r.timestamp).sort((a: DbRow, b: DbRow) => a.timestamp < b.timestamp ? -1 : 1);
+      const contextParams = {
+        $sessionId: r.session_id,
+        $messageUuid: r.uuid,
+        $timestamp: r.timestamp,
+      };
+      const indexedTimestamp = typeof r.timestamp === 'string'
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.timestamp);
+      const ctx = contextLimit === 0 ? [] : (indexedTimestamp ? indexedContext : scanContext)
+        .all(contextParams)
+        .slice(0, contextLimit)
+        .map(withVisibility)
+        .sort((a: DbRow, b: DbRow) => {
+          if (a.timestamp === b.timestamp) return 0;
+          if (a.timestamp == null) return -1;
+          if (b.timestamp == null) return 1;
+          return a.timestamp < b.timestamp ? -1 : 1;
+        });
       const sourceValue = r.m_source || r.s_source || 'claude';
+      const session: DbRow = { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue };
+      // is_invoking marks the session that ran this query; it is the agent's
+      // own live context, not independent historical evidence.
+      if (invokingSessionId && r.s_id === invokingSessionId) session.is_invoking = true;
       return {
-        message: { uuid: r.uuid, text: r.text, content_type: r.content_type, is_meta: r.is_meta || 0, role: r.role, timestamp: r.timestamp, model: r.model, cwd: r.cwd, source: sourceValue },
-        session: { id: r.s_id, title: r.s_title, project: r.s_project, started_at: r.s_started, source: r.s_source || sourceValue },
+        message: {
+          uuid: r.uuid,
+          text: r.text,
+          ...(snippetTokens === undefined ? {} : { textLength: r.text_length, isSnippet: true }),
+          content_type: r.content_type,
+          is_meta: r.is_meta || 0,
+          role: r.role,
+          timestamp: r.timestamp,
+          model: r.model,
+          cwd: r.cwd,
+          visibility: normalizedVisibility(r.visibility),
+          source: sourceValue,
+        },
+        session,
         rank: r.rank,
         context: ctx,
       };
     });
   };
 
-  const context = (uuid: string) => {
+  const messages = (input: MessageQueryOptions | string) => {
+    const opts = typeof input === 'string' ? { uuid: input } : input;
+    if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError('messages() requires uuid, around, or sessionId');
+    }
+    const allowed = new Set(['uuid', 'around', 'sessionId', 'relation', 'beforeCount', 'afterCount',
+      'after', 'before', 'limit', 'cursor', 'agentId', 'contentTypes', 'includeMeta', 'includeInactive', 'includeSession']);
+    for (const key of Object.keys(opts)) {
+      if (!allowed.has(key)) throw new TypeError(`messages() does not support option ${key}`);
+    }
+    const locators = ['uuid', 'around', 'sessionId'].filter(key => key in opts);
+    if (locators.length !== 1) throw new TypeError('messages() requires exactly one of uuid, around, or sessionId');
+    const mode = locators[0];
+    const locator = opts[mode as 'uuid' | 'around' | 'sessionId'];
+    if (typeof locator !== 'string' || !locator.trim()) throw new TypeError(`messages() ${mode} must be a non-empty string`);
+    for (const key of ['includeMeta', 'includeInactive', 'includeSession'] as const) {
+      if (opts[key] !== undefined && typeof opts[key] !== 'boolean') throw new TypeError(`messages() ${key} must be boolean`);
+    }
+    const rangeKeys = ['after', 'before', 'limit', 'cursor', 'agentId'];
+    const windowKeys = ['relation', 'beforeCount', 'afterCount'];
+    for (const key of [...(mode !== 'sessionId' ? rangeKeys : []), ...(mode !== 'around' ? windowKeys : [])]) {
+      if (key in opts) throw new TypeError(`messages() ${key} is not supported with ${mode}`);
+    }
+    const boundedCount = (value: number | undefined, fallback: number, key: string) => {
+      const count = value === undefined ? fallback : value;
+      if (!Number.isSafeInteger(count) || count < 0 || count > 500) throw new RangeError(`messages() ${key} must be an integer from 0 to 500`);
+      return count;
+    };
+    const relation = opts.relation === undefined ? 'timeline' : opts.relation;
+    if (relation !== 'timeline' && relation !== 'parents') throw new TypeError('messages() relation must be timeline or parents');
+    const beforeCount = mode === 'around' ? boundedCount(opts.beforeCount, 3, 'beforeCount') : 0;
+    const afterCount = mode === 'around' ? boundedCount(opts.afterCount, relation === 'parents' ? 0 : 3, 'afterCount') : 0;
+    if (relation === 'parents' && afterCount !== 0) throw new RangeError('messages() parents relation requires afterCount: 0');
+    if (beforeCount + afterCount + 1 > 500) throw new RangeError('messages() window must contain at most 500 messages including the anchor');
+    const limit = mode === 'sessionId' ? boundedCount(opts.limit, 20, 'limit') : 0;
+    if (opts.contentTypes !== undefined && (!Array.isArray(opts.contentTypes) || !opts.contentTypes.length
+      || opts.contentTypes.some(value => typeof value !== 'string' || !value.trim()))) {
+      throw new TypeError('messages() contentTypes must be a non-empty array of strings');
+    }
+    for (const key of ['after', 'before'] as const) {
+      if (opts[key] !== undefined && (typeof opts[key] !== 'string' || !opts[key].trim())) throw new TypeError(`messages() ${key} must be a non-empty timestamp string`);
+    }
+    if (opts.agentId !== undefined && opts.agentId !== null && typeof opts.agentId !== 'string') throw new TypeError('messages() agentId must be a string or null');
+    const cursor = opts.cursor;
+    if (cursor !== undefined && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)
+      || typeof cursor.uuid !== 'string' || !cursor.uuid.trim() || (cursor.timestamp !== null && typeof cursor.timestamp !== 'string'))) {
+      throw new TypeError('messages() cursor requires timestamp (string or null) and uuid');
+    }
+    const predicate = `${visibilitySql('m', opts.includeInactive === true)}${opts.includeMeta === true ? '' : ' AND COALESCE(m.is_meta,0)=0'}${opts.contentTypes ? ` AND m.content_type IN (${opts.contentTypes.map(() => '?').join(',')})` : ''}`;
+    const filterParams = opts.contentTypes ?? [];
+    const sessionFor = (id: unknown) => opts.includeSession === true
+      ? db.prepare('SELECT * FROM sessions WHERE id=?').get(id) ?? null : null;
+    if (mode === 'sessionId') {
+      const clauses = ['m.session_id=?', predicate];
+      const params: any[] = [locator, ...filterParams];
+      if (opts.agentId !== undefined) { clauses.push('m.agent_id IS ?'); params.push(opts.agentId); }
+      if (opts.after !== undefined) { clauses.push('m.timestamp > ?'); params.push(opts.after); }
+      if (opts.before !== undefined) { clauses.push('m.timestamp < ?'); params.push(opts.before); }
+      if (cursor) {
+        clauses.push("(COALESCE(m.timestamp,'') > ? OR (COALESCE(m.timestamp,'')=? AND m.uuid > ?))");
+        params.push(cursor.timestamp ?? '', cursor.timestamp ?? '', cursor.uuid);
+      }
+      const rows = db.prepare(`SELECT m.* FROM messages m WHERE ${clauses.join(' AND ')} ORDER BY COALESCE(m.timestamp,''),m.uuid LIMIT ?`).all(...params, limit + 1);
+      const hasMore = rows.length > limit;
+      const selected = rows.slice(0, limit).map(withVisibility);
+      const last = selected[selected.length - 1];
+      return { anchor: null, messages: selected, session: sessionFor(locator), hasMore,
+        nextCursor: hasMore && last ? { timestamp: last.timestamp as string | null, uuid: last.uuid as string } : null };
+    }
+    // An explicit anchor is selected by visibility, independently of neighbor content/meta filters.
+    const row = db.prepare(`SELECT * FROM messages WHERE uuid=? AND ${visibilitySql('messages', opts.includeInactive === true)}`).get(locator);
+    if (!isQueryableMessage(row, opts.includeInactive === true)) return null;
+    const anchor = withVisibility(row);
+    let preceding: DbRow[] = [];
+    let following: DbRow[] = [];
+    let hasMore = false;
+    if (mode === 'around' && relation === 'parents' && beforeCount > 0) {
+      // Traverse only structure until N+1 qualifying ancestors; load body fields at the final join.
+      // Hidden/inactive bridge rows are traversable, but never projected unless eligible.
+      const ancestors = db.prepare(`WITH RECURSIVE path(uuid,parent_uuid,depth,n,eligible,visited,cycle) AS (
+        SELECT uuid,parent_uuid,0,0,0,json_array(uuid),0 FROM messages WHERE uuid=?
+        UNION ALL
+        SELECT m.uuid,m.parent_uuid,p.depth+1,p.n+CASE WHEN ${predicate} THEN 1 ELSE 0 END,
+          CASE WHEN ${predicate} THEN 1 ELSE 0 END,json_insert(p.visited,'$[#]',m.uuid),
+          EXISTS(SELECT 1 FROM json_each(p.visited) WHERE value=m.uuid)
+        FROM path p JOIN messages m ON m.uuid=p.parent_uuid
+        WHERE p.n < ? AND p.depth < 10000 AND p.cycle=0
+      ) SELECT m.*,p.depth AS __depth,p.cycle AS __cycle,p.n AS __n,
+        EXISTS(SELECT 1 FROM messages parent WHERE parent.uuid=p.parent_uuid) AS __continues
+        FROM path p LEFT JOIN messages m ON m.uuid=p.uuid AND p.eligible=1 AND p.cycle=0
+        WHERE p.depth>0 AND (p.eligible=1 OR p.cycle=1 OR p.depth=10000) ORDER BY p.depth`)
+        .all(locator, ...filterParams, ...filterParams, beforeCount + 1);
+      if (ancestors.some(value => value.__cycle === 1)) throw new Error('messages() found a cyclic parent path');
+      if (ancestors.some(value => value.__depth === 10000 && value.__continues === 1 && Number(value.__n) < beforeCount + 1)) {
+        throw new Error('messages() parent traversal exceeded 10000 records');
+      }
+      const eligible = ancestors.filter(value => value.uuid !== null);
+      hasMore = eligible.length > beforeCount;
+      preceding = eligible.slice(0, beforeCount).reverse().map(value => {
+        const { __depth, __cycle, __n, __continues, ...message } = value;
+        return withVisibility(message);
+      });
+    } else if (mode === 'around' && relation === 'timeline') {
+      const neighbors = (count: number, direction: 'before' | 'after') => {
+        if (count === 0) return [];
+        const comparison = direction === 'before' ? '<' : '>';
+        const order = direction === 'before' ? 'DESC' : 'ASC';
+        const rows = db.prepare(`SELECT m.* FROM messages m WHERE m.session_id=? AND m.agent_id IS ? AND ${predicate}
+          AND (COALESCE(m.timestamp,'') ${comparison} ? OR (COALESCE(m.timestamp,'')=? AND m.uuid ${comparison} ?))
+          ORDER BY COALESCE(m.timestamp,'') ${order},m.uuid ${order} LIMIT ?`)
+          .all(row.session_id, row.agent_id, ...filterParams, row.timestamp ?? '', row.timestamp ?? '', row.uuid, count + 1);
+        hasMore = hasMore || rows.length > count;
+        const selected = rows.slice(0, count).map(withVisibility);
+        return direction === 'before' ? selected.reverse() : selected;
+      };
+      preceding = neighbors(beforeCount, 'before');
+      following = neighbors(afterCount, 'after');
+    }
+    return { anchor, messages: [...preceding, anchor, ...following], session: sessionFor(row.session_id), hasMore, nextCursor: null };
+  };
+
+  // Compatibility helpers retain their full-chain/full-session behavior.
+  const context = (uuid: string, opts: QueryOptions = {}) => {
+    const includeInactive = opts.includeInactive === true;
     const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-    if (!msg) return null;
+    if (!isQueryableMessage(msg, includeInactive)) return null;
+    const message = withVisibility(msg);
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id);
     const chain: DbRow[] = [];
     let cur: DbRow | undefined = msg;
-    while (cur?.parent_uuid) { cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid); if (cur) chain.unshift(cur); }
+    while (cur?.parent_uuid) {
+      cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid);
+      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
+    }
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
+    if (subagent) subagent.total_tokens = subagent.total_tokens ?? deriveSubagentTokens(db, msg.agent_id);
     let workflow = null;
     if (msg.agent_id) {
       const wa = db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id);
       if (wa) workflow = db.prepare('SELECT * FROM workflows WHERE run_id=?').get(wa.run_id);
     }
-    return { message: msg, parentChain: chain, session, subagent, workflow };
+    return { message, parentChain: chain, session, subagent, workflow };
   };
 
-  const trace = (uuid: string) => {
+  const trace = (uuid: string, opts: QueryOptions = {}) => {
+    const includeInactive = opts.includeInactive === true;
     const chain: DbRow[] = [];
     let cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-    while (cur) { chain.unshift(cur); cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined; }
+    if (!isQueryableMessage(cur, includeInactive)) return chain;
+    while (cur) {
+      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
+      cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined;
+    }
     return chain;
   };
 
   const thread = (sid: string, opts: QueryOptions = {}) => {
     const includeMeta = opts?.includeMeta === true;
+    const includeInactive = opts?.includeInactive === true;
     const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
-    return db.prepare(`SELECT * FROM messages WHERE session_id=? ${metaClause} ORDER BY timestamp`).all(sid);
+    return db.prepare(`
+      SELECT * FROM messages
+      WHERE session_id=? ${metaClause}
+        AND ${visibilitySql('messages', includeInactive)}
+      ORDER BY timestamp
+    `).all(sid).map(withVisibility);
   };
 
   const subagents = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    assertNonNegativeLimit(limit, 'subagents() limit');
     const needsJoin = opts.project || opts.branch || opts.source;
-    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: 'sa.session_id', branch: 's.git_branch', source: 's.source' });
+    // The subagents table has no timestamp column; scope time filters by the
+    // subagent's activity interval instead of comparing session IDs. `after`
+    // matches agents still active past the bound (latest message), `before`
+    // matches agents already started by the bound (earliest message), so
+    // combined bounds select every agent active during the window.
+    const firstMessageAt = '(SELECT MIN(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
+    const lastMessageAt = '(SELECT MAX(m.timestamp) FROM messages m WHERE m.agent_id = sa.agent_id)';
+    const { where, params } = buildWhere(opts, { sessionId: 'sa.session_id', project: 's.project', timestamp: firstMessageAt, timestampAfter: lastMessageAt, timestampBefore: firstMessageAt, branch: 's.git_branch', source: 's.source' });
     params.push(limit);
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=sa.session_id' : '';
     return db.prepare(`SELECT sa.* FROM subagents sa ${join} WHERE ${where} LIMIT ?`).all(...params).map((r: DbRow) => {
       const c = db.prepare('SELECT COUNT(*) as c FROM messages WHERE agent_id=?').get(r.agent_id);
-      return { ...r, messageCount: c?.c || 0 };
+      return { ...r, messageCount: c?.c || 0, total_tokens: r.total_tokens ?? deriveSubagentTokens(db, r.agent_id) };
     });
   };
 
   const workflows = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    assertNonNegativeLimit(limit, 'workflows() limit');
     const needsJoin = opts.project || opts.branch || opts.source;
     const { where, params } = buildWhere(opts, { sessionId: 'w.session_id', project: 's.project', timestamp: 'w.timestamp', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
@@ -252,46 +698,102 @@ function createQueryApi(
   };
 
   const fileHistory = (fp: string, opts: QueryOptions = {}) => {
-    const { limit = 200, after, before, source } = opts;
-    let where = 'tc.file_path=?';
+    const { limit = 200, after, before, source, includeInactive = false } = opts;
+    assertNonNegativeLimit(limit, 'fileHistory() limit');
+    let where = `tc.file_path=? AND ${visibilitySql('m', includeInactive)}`;
     const params: any[] = [fp];
     if (after)  { where += ' AND m.timestamp > ?'; params.push(after); }
     if (before) { where += ' AND m.timestamp < ?'; params.push(before); }
     if (source && source !== 'all') { where += " AND COALESCE(s.source, 'claude') = ?"; params.push(source); }
     params.push(limit);
     return db.prepare(
-      `SELECT tc.*,s.title as s_title,s.project as s_project,m.timestamp as ts FROM tool_calls tc LEFT JOIN sessions s ON s.id=tc.session_id LEFT JOIN messages m ON m.uuid=tc.message_uuid WHERE ${where} ORDER BY m.timestamp LIMIT ?`
+      `SELECT tc.*,s.title as s_title,s.project as s_project,m.timestamp as ts,
+              COALESCE(m.visibility,'visible') AS visibility
+       FROM tool_calls tc
+       LEFT JOIN sessions s ON s.id=tc.session_id
+       LEFT JOIN messages m ON m.uuid=tc.message_uuid
+       WHERE ${where}
+       ORDER BY m.timestamp, m.uuid, tc.rowid
+       LIMIT ?`
     ).all(...params).map((r: DbRow) => ({
       toolCall: { id: r.id, message_uuid: r.message_uuid, name: r.name, input_json: r.input_json },
       session: { id: r.session_id, title: r.s_title, project: r.s_project },
       timestamp: r.ts,
+      visibility: normalizedVisibility(r.visibility),
     }));
   };
 
   const failures = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50 } = opts;
+    assertNonNegativeLimit(limit, 'failures() limit');
+    const includeInactive = opts.includeInactive === true;
     const needsJoin = opts.project || opts.branch || opts.source;
     const { where, params: filterParams } = buildWhere(opts, { sessionId: 'tr.session_id', project: 's.project', timestamp: 'rm.timestamp', branch: 's.git_branch', source: 's.source' });
     const join = needsJoin ? 'LEFT JOIN sessions s ON s.id=tr.session_id' : '';
-    const errorCond = `(tr.is_error = 1 OR tr.content LIKE '${BASH_EXIT_PAT}')`;
+    const errorCond = [
+      `(tr.is_error = 1 OR tr.content LIKE '${BASH_EXIT_PAT}')`,
+      visibilitySql('rm', includeInactive),
+      visibilitySql('cm', includeInactive),
+    ].join(' AND ');
     const allParams = [...filterParams, limit];
-    const rows = db.prepare(`SELECT tr.* FROM tool_results tr ${join} LEFT JOIN messages rm ON rm.uuid=tr.message_uuid WHERE ${errorCond} AND ${where} ORDER BY rm.timestamp DESC LIMIT ?`).all(...allParams);
+    const rows = db.prepare(`
+      SELECT tr.*,
+        CASE
+          WHEN COALESCE(rm.visibility,'visible') = 'inactive'
+            OR COALESCE(cm.visibility,'visible') = 'inactive'
+          THEN 'inactive'
+          ELSE 'visible'
+        END AS visibility
+      FROM tool_results tr
+      LEFT JOIN messages rm ON rm.uuid=tr.message_uuid
+      LEFT JOIN tool_calls tc ON tc.id=tr.tool_use_id
+      LEFT JOIN messages cm ON cm.uuid=tc.message_uuid
+      ${join}
+      WHERE ${errorCond} AND ${where}
+      ORDER BY rm.timestamp DESC
+      LIMIT ?
+    `).all(...allParams);
     return rows.map((r: DbRow) => {
       const tc = db.prepare('SELECT * FROM tool_calls WHERE id=?').get(r.tool_use_id);
       const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(r.session_id);
-      const rm = db.prepare('SELECT * FROM messages WHERE uuid=?').get(r.message_uuid);
-      const next = rm?.timestamp ? db.prepare('SELECT * FROM messages WHERE session_id=? AND timestamp>? ORDER BY timestamp LIMIT 3').all(r.session_id, rm.timestamp) : [];
-      return { toolCall: tc, result: r, session, nextMessages: next };
+      const rmRow = db.prepare('SELECT * FROM messages WHERE uuid=?').get(r.message_uuid);
+      const rm = rmRow === undefined ? undefined : withVisibility(rmRow);
+      const next = rm?.timestamp ? db.prepare(`
+        SELECT * FROM messages
+        WHERE session_id=? AND timestamp>?
+          AND ${visibilitySql('messages', includeInactive)}
+        ORDER BY timestamp
+        LIMIT 3
+      `).all(r.session_id, rm.timestamp).map(withVisibility) : [];
+      return {
+        toolCall: tc,
+        result: withVisibility(r),
+        session,
+        nextMessages: next,
+        visibility: normalizedVisibility(r.visibility),
+      };
     });
   };
 
   const sessions = (optsOrN?: QueryOptions | number | string) => {
     const opts = normalizeOpts(optsOrN, 'sessionId');
-    const { limit = 50 } = opts;
-    const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const { limit = 50, sessionId, sessions: sessionIds, ...filters } = opts;
+    assertNonNegativeLimit(limit, 'sessions() limit');
+    const { where, params } = buildWhere(filters, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const refs = [...(sessionId ? [sessionId] : []), ...(sessionIds ?? [])];
+    // Resolve within the requested scope, retaining exact-ID precedence globally.
+    const resolvedWhere = refs.length ? `${where} AND s.id IN (
+      WITH refs(id) AS (VALUES ${refs.map(() => '(?)').join(',')})
+      SELECT id FROM refs UNION ALL
+      SELECT hit.id FROM refs JOIN sessions hit ON hit.id IN (
+        SELECT s.id FROM sessions s WHERE ${where} AND instr(s.id, refs.id) > 0
+        ORDER BY s.ended_at DESC LIMIT 10)
+      WHERE refs.id <> '' AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = refs.id))` : where;
+    if (refs.length) params.push(...refs, ...params);
     params.push(limit);
-    return db.prepare(`SELECT s.*, ${titleExpr('s')} AS title FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params);
+    return db.prepare(`SELECT * FROM sessions s WHERE ${resolvedWhere} ORDER BY ended_at DESC LIMIT ?`).all(...params)
+      .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
   };
 
   const recent = (n = 10) => sessions({ limit: n });
@@ -299,9 +801,18 @@ function createQueryApi(
   const summaries = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    assertNonNegativeLimit(limit, 'summaries() limit');
+    const includeInactive = opts.includeInactive === true;
     const { where, params } = buildWhere(opts, { sessionId: 'su.session_id', project: 's.project', timestamp: 'su.timestamp', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
-    return db.prepare(`SELECT su.*, s.title as session_title, s.project FROM summaries su LEFT JOIN sessions s ON s.id=su.session_id WHERE ${where} ORDER BY su.timestamp DESC LIMIT ?`).all(...params);
+    return db.prepare(`
+      SELECT su.*, s.title as session_title, s.project
+      FROM summaries su
+      LEFT JOIN sessions s ON s.id=su.session_id
+      WHERE ${where} AND ${visibilitySql('su', includeInactive)}
+      ORDER BY su.timestamp DESC
+      LIMIT ?
+    `).all(...params).map(withVisibility);
   };
 
   const overview = (optsOrScalar?: QueryOptions | string | number) => {
@@ -310,6 +821,9 @@ function createQueryApi(
     const sessionLimit = opts.limit ?? 8;
     const projectLimit = opts.projectLimit ?? 20;
     const memoryLimit = opts.memoryLimit ?? 100;
+    assertNonNegativeLimit(sessionLimit, 'overview() limit');
+    assertNonNegativeLimit(projectLimit, 'overview() projectLimit');
+    assertNonNegativeLimit(memoryLimit, 'overview() memoryLimit');
 
     const projectDescriptor = (row: DbRow | null, source: string, confidence: string) => row ? ({
       project: row.project,
@@ -350,7 +864,7 @@ function createQueryApi(
         GROUP BY project, project_path
       `).all();
       const byProjectPath = paths
-        .filter((r: DbRow) => cwd === r.project_path || cwd.startsWith(r.project_path + path.sep))
+        .filter((r: DbRow) => cwd === r.project_path || cwd.startsWith(r.project_path + sep))
         .sort((a: DbRow, b: DbRow) => b.project_path.length - a.project_path.length || String(b.last_seen || '').localeCompare(String(a.last_seen || '')))[0];
       if (byProjectPath) return projectDescriptor(byProjectPath, 'cwd_project_path', 'exact');
 
@@ -421,7 +935,7 @@ function createQueryApi(
     if (currentProject?.project) {
       const sessionTotal = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE project = ?').get(currentProject.project)?.c || 0;
       const sessionsForProject = db.prepare(`
-        SELECT id, ${titleExpr('sessions')} AS title, project, project_path, started_at, ended_at, git_branch, message_count, COALESCE(source, 'claude') AS source
+        SELECT id, title, project, project_path, started_at, ended_at, git_branch, message_count, COALESCE(source, 'claude') AS source
         FROM sessions
         WHERE project = ?
         ORDER BY COALESCE(ended_at, started_at) DESC
@@ -468,6 +982,9 @@ function createQueryApi(
       current: {
         cwd,
         project: currentProject,
+        // The session that invoked this query, when the invocation nonce
+        // resolved to exactly one indexed session; null when unknown.
+        session_id: invokingSessionId || null,
       },
       current_project,
       projects,
@@ -480,10 +997,15 @@ function createQueryApi(
     };
   };
 
-  const raw = (messageUuid: string, opts: { offset?: number; limit?: number } = {}) => {
-    const { offset = 0, limit = 10000 } = opts;
+  const raw = (
+    messageUuid: string,
+    opts: { offset?: number; limit?: number; includeInactive?: boolean } = {},
+  ) => {
+    const { offset = 0, limit = 10000, includeInactive = false } = opts;
+    assertNonNegativeLimit(limit, 'raw() limit');
+    assertNonNegativeLimit(offset, 'raw() offset');
     const message = db.prepare('SELECT * FROM messages WHERE uuid=?').get(messageUuid);
-    if (!message) return null;
+    if (!isQueryableMessage(message, includeInactive)) return null;
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(message.session_id) ?? null;
     const subagent = message.agent_id
       ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(message.agent_id) ?? null
@@ -497,6 +1019,7 @@ function createQueryApi(
       messageUuid,
       session,
       agentId: message.agent_id || null,
+      cursor: storedSessionCursor(db, providerRegistry, session),
       subagent,
       workflowAgent,
     });
@@ -508,12 +1031,14 @@ function createQueryApi(
       offset,
       limit,
       hasMore: offset + limit < totalLength,
+      visibility: normalizedVisibility(message.visibility),
     };
   };
 
   const memories = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50, query } = opts;
+    assertNonNegativeLimit(limit, 'memories() limit');
     assertEnglishMemoryText(query, 'memories() query');
     const needsJoin = opts.branch || opts.source;
     const { where: baseWhere, params } = buildWhere(opts, {
@@ -545,21 +1070,21 @@ function createQueryApi(
     `).all(...params);
   };
 
-  return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
+  return { sql: q, search, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
-function createAttuneApi(db: SqliteDb) {
+function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {
   const resolveMemoryPath = (memoryPath: string, sessionId?: string): string => {
     let base = null;
     if (sessionId) {
       base = db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId)?.project_path || null;
     }
-    const resolved = path.isAbsolute(memoryPath)
-      ? path.normalize(memoryPath)
-      : path.resolve(base || process.cwd(), memoryPath);
+    const resolved = isAbsolute(memoryPath)
+      ? normalize(memoryPath)
+      : resolve(base || process.cwd(), memoryPath);
     let stat;
     try {
-      stat = fs.statSync(resolved);
+      stat = statSync(resolved);
     } catch {
       throw new Error(`remember() memory file does not exist: ${resolved}`);
     }
@@ -593,28 +1118,51 @@ function createAttuneApi(db: SqliteDb) {
     assertEnglishMemoryText(summary, 'remember() summary');
     const normalizedPath = resolveMemoryPath(memoryPath, session_id);
     const normalizedAnchors = normalizeAnchors(anchors);
-    const id = `mem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const proj = project || db.prepare('SELECT project FROM sessions WHERE id=?').get(session_id)?.project || null;
     const created_at = new Date().toISOString();
-    db.prepare('INSERT OR REPLACE INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
-      id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
+    // Plain INSERT, never OR REPLACE: a memory id must not silently overwrite
+    // an existing memory. Collisions regenerate instead of losing data.
+    let id = `mem-${randomUUID()}`;
+    runMutation(() => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          db.prepare('INSERT INTO memories (id, session_id, project, message_start, message_end, path, anchors, summary, created_at) VALUES (?,?,?,?,?,?,?,?,?)').run(
+            id, session_id || null, proj, message_start || null, message_end || null, normalizedPath, normalizedAnchors, summary, created_at);
+          return;
+        } catch (error) {
+          // Primary-key collision: regenerate the id and retry. Any other
+          // constraint or error propagates unchanged.
+          const errcode = (error as { errcode?: unknown })?.errcode;
+          if (attempt < 2 && errcode === SQLITE_CONSTRAINT_PRIMARYKEY) {
+            id = `mem-${randomUUID()}`;
+            continue;
+          }
+          throw error;
+        }
+      }
+    });
     return { id, path: normalizedPath, project: proj, anchors: normalizedAnchors, created_at };
   };
 
   const forget = ({ id, reason }: ForgetInput) => {
     const deletionReason = String(reason || '').trim();
     if (!id || !deletionReason) throw new Error('forget() requires id and reason');
-    const row = db.prepare('SELECT id, deleted_at, deleted_reason FROM memories WHERE id=?').get(id);
-    if (!row) throw new Error(`forget() memory not found: ${id}`);
-    if (row.deleted_at) {
-      return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
-    }
-    const deleted_at = new Date().toISOString();
-    db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id);
-    return { id, deleted_at, deleted_reason: deletionReason };
+    // Read, decide, and update in one write transaction: a concurrent forget
+    // must observe the deleted state, not overwrite another forget's reason.
+    return runMutation(() => {
+      const row = db.prepare('SELECT id, deleted_at, deleted_reason FROM memories WHERE id=?').get(id);
+      if (!row) throw new Error(`forget() memory not found: ${id}`);
+      if (row.deleted_at) {
+        return { id, deleted_at: row.deleted_at, deleted_reason: row.deleted_reason, already_deleted: true };
+      }
+      const deleted_at = new Date().toISOString();
+      db.prepare('UPDATE memories SET deleted_at=?, deleted_reason=? WHERE id=?').run(deleted_at, deletionReason, id);
+      return { id, deleted_at, deleted_reason: deletionReason };
+    });
   };
 
   return { remember, forget };
 }
 
 export { createQueryApi, createAttuneApi };
+export type { MessageQueryOptions };

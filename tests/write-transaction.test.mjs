@@ -1,12 +1,14 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { nodeSqliteTransactionAdapter, runWriteTransaction } from '../packages/core/src/tx.ts';
-import { hasUnusableTransaction, isBeginBusyFailure, isRetryableWriteFailure } from '../packages/core/src/write-coordinator.ts';
+import { hasUnusableTransaction, isBeginBusyFailure, isRetryableWriteFailure, runRetryableWriteTransaction } from '../packages/core/src/write-coordinator.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -124,7 +126,7 @@ test('node:sqlite generic error codes preserve BUSY classification from the mess
 });
 
 test('a real node:sqlite BEGIN lock is classified as a deferrable BUSY', () => {
-  const dbPath = join(mkdtempSync(join(tmpdir(), 'obelisk-node-sqlite-busy-')), 'index.sqlite');
+  const dbPath = join(makeTempDir('obelisk-node-sqlite-busy-'), 'index.sqlite');
   const holder = new DatabaseSync(dbPath);
   const contender = new DatabaseSync(dbPath);
   holder.exec('PRAGMA busy_timeout=0; CREATE TABLE test (value TEXT); BEGIN IMMEDIATE');
@@ -163,4 +165,38 @@ test('a BEGIN failure with an active transaction is not deferrable', () => {
   assert.equal(primary.obelisk.transactionActive, true);
   assert.equal(hasUnusableTransaction(primary), true);
   assert.equal(isBeginBusyFailure(primary), false);
+});
+
+test('BEGIN-busy is retried only when explicitly opted in', () => {
+  const dbPath = join(makeTempDir('obelisk-begin-retry-'), 'index.sqlite');
+  const holder = new DatabaseSync(dbPath);
+  holder.exec('PRAGMA busy_timeout=0; CREATE TABLE t (value TEXT); BEGIN IMMEDIATE');
+  const contender = new DatabaseSync(dbPath);
+  contender.exec('PRAGMA busy_timeout=0');
+  const txDb = nodeSqliteTransactionAdapter(contender);
+
+  try {
+    // Default policy: BEGIN contention is deferred to the caller, not retried.
+    let workCalls = 0;
+    assert.throws(
+      () => runRetryableWriteTransaction(txDb, () => { workCalls += 1; }),
+      error => isBeginBusyFailure(error) && error.obelisk.attempts === 1,
+    );
+    assert.equal(workCalls, 0);
+
+    // Opted in: the retry runs the work once the holder releases (the injected
+    // sleep releases the lock between attempts).
+    const result = runRetryableWriteTransaction(
+      txDb,
+      () => { contender.exec("INSERT INTO t VALUES ('x')"); return 'done'; },
+      {},
+      { retryOnBeginBusy: true, sleep: () => holder.exec('ROLLBACK') },
+    );
+    assert.equal(result, 'done');
+    assert.equal(contender.prepare('SELECT COUNT(*) AS c FROM t').get().c, 1);
+  } finally {
+    try { holder.exec('ROLLBACK'); } catch { /* already released by the retry sleep */ }
+    holder.close();
+    contender.close();
+  }
 });

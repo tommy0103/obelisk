@@ -1,18 +1,21 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease, writerLockPathFor } from '../packages/core/src/writer-lease.ts';
 import { runCli } from './cli-test-helpers.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
 
 test('a passive query does not mutate the index while a fresh daemon owns writes', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-arbitration-'));
+  const home = makeTempDir('obelisk-daemon-arbitration-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -36,32 +39,312 @@ test('a passive query does not mutate the index while a fresh daemon owns writes
   assert.deepEqual(tables, ['index_state']);
 });
 
-test('attune refuses to mutate the index while a fresh daemon owns writes', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-attune-'));
+test('a passive query reports when a daemon blocks its schema upgrade', () => {
+  const home = makeTempDir('obelisk-daemon-schema-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(
+    new URL('../packages/core/src/schema.sql', import.meta.url),
+    'utf8',
+  )
+    .replace(', cursor TEXT);', ');')
+    .replace(
+      ", visibility TEXT DEFAULT 'visible',\n  input_tokens INTEGER, output_tokens INTEGER);",
+      ');',
+    );
   const db = new DatabaseSync(dbPath);
-  db.exec('CREATE TABLE index_state (jsonl_path TEXT PRIMARY KEY, mtime REAL, lines_processed INTEGER)');
-  const marker = db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)');
-  const now = Date.now();
-  marker.run('__app_heartbeat__', now);
+  db.exec(schema);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run('daemon-legacy', 'Daemon legacy', 'claude');
+  db.prepare(`
+    INSERT INTO summaries (id,session_id,timestamp,source,content)
+    VALUES (?,?,?,?,?)
+  `).run('daemon-summary', 'daemon-legacy', '2026-08-05T00:00:00Z', 'compaction', 'summary');
+  db.prepare(`
+    INSERT INTO index_state (jsonl_path,mtime,lines_processed)
+    VALUES ('__app_heartbeat__',?,0)
+  `).run(Date.now());
   db.close();
+
+  const queryPath = join(home, 'query.mjs');
+  writeFileSync(queryPath, "return summaries('daemon-legacy');");
+  const result = runCli(['--query', queryPath], { home });
+
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /schema upgrade is blocked by daemon_active/i);
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  assert.equal(check.prepare('PRAGMA table_info(index_state)').all().some(row => row.name === 'cursor'), false);
+  assert.equal(check.prepare('PRAGMA table_info(summaries)').all().some(row => row.name === 'visibility'), false);
+  check.close();
+});
+
+test('attune writes memories while a fresh daemon owns index writes', () => {
+  const home = makeTempDir('obelisk-daemon-attune-');
+  const obeliskDir = join(home, '.obelisk');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)')
+    .run('__app_heartbeat__', Date.now());
+  db.close();
+
+  // A live transcript that an index build would pick up: attune must not
+  // trigger any indexing while the daemon owns writes.
+  const projectDir = join(home, '.claude', 'projects', '-proj');
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, 'sid-live.jsonl'), `${JSON.stringify({
+    uuid: 'msg-live', type: 'user', timestamp: '2026-06-10T10:00:00Z',
+    message: { role: 'user', content: 'must stay unindexed' },
+  })}\n`);
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Daemon-time memory\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'daemon-test',
+      summary: 'Decision: memory writes stay available while the daemon owns index writes.'
+    });
+  `);
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.project, 'daemon-test');
+  assert.ok(payload.id);
+
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  const memory = check.prepare('SELECT summary, deleted_at FROM memories WHERE id=?').get(payload.id);
+  assert.match(memory.summary, /memory writes stay available/);
+  assert.equal(memory.deleted_at, null);
+  // The FTS trigger fired, so recall sees the memory immediately.
+  assert.ok(check.prepare("SELECT id FROM memories_fts WHERE memories_fts MATCH 'daemon'").all().some(row => row.id === payload.id));
+  // No index build ran as a side effect of attune.
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM messages').get().c, 0);
+  check.close();
+});
+
+test('attune reports honestly when the index is not initialized', () => {
+  const home = makeTempDir('obelisk-daemon-attune-empty-');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(attunePath, 'return true;');
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /index is not initialized/i);
+});
+
+test('attune reports honestly when the memory layer is incomplete', () => {
+  const home = makeTempDir('obelisk-daemon-attune-partial-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  // A database with a full-column memories table but no memories_fts or
+  // maintenance triggers: writes would "succeed" yet never be recallable.
+  const db = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'));
+  db.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+      message_start TEXT, message_end TEXT,
+      path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
+      deleted_at TEXT, deleted_reason TEXT
+    );
+  `);
+  db.close();
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Unreachable memory\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'partial-test',
+      summary: 'Decision: this write must be refused, not silently unrecallable.'
+    });
+  `);
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+  const check = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'), { readOnly: true });
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
+  check.close();
+});
+
+test('attune rejects a forged memory layer with hollow lookalikes', () => {
+  const home = makeTempDir('obelisk-daemon-attune-forged-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  // A REAL FTS5 table plus triggers whose bodies only *mention* memories_fts
+  // without maintaining it: passes name- and DDL-level checks, but a probe
+  // write can never be recalled. Attune must refuse.
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+      message_start TEXT, message_end TEXT,
+      path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
+      deleted_at TEXT, deleted_reason TEXT
+    );
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+      id UNINDEXED, path, summary,
+      content=memories, content_rowid=rowid,
+      tokenize='unicode61 remove_diacritics 1');
+    CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN SELECT 'memories_fts'; END;
+    CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN SELECT 'memories_fts'; END;
+    CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN SELECT 'memories_fts'; END;
+  `);
+  db.close();
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Forged layer\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'forged-test',
+      summary: 'Decision: this write must be refused, not silently unrecallable.'
+    });
+  `);
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
+  check.close();
+});
+
+test('attune rejects a layer whose UPDATE trigger does not maintain the FTS', () => {
+  const home = makeTempDir('obelisk-daemon-attune-hollow-au-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  // Real INSERT/DELETE triggers from the schema, but a hollow UPDATE trigger:
+  // only a probe with an UPDATE leg can catch this.
+  const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+  const realTrigger = (name) => schema.match(new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}[\\s\\S]+?END;`))?.[0];
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
+      message_start TEXT, message_end TEXT,
+      path TEXT, anchors TEXT, summary TEXT, created_at TEXT,
+      deleted_at TEXT, deleted_reason TEXT
+    );
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+      id UNINDEXED, path, summary,
+      content=memories, content_rowid=rowid,
+      tokenize='unicode61 remove_diacritics 1');
+    ${realTrigger('memories_fts_ai')}
+    ${realTrigger('memories_fts_ad')}
+    CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN SELECT 'memories_fts'; END;
+  `);
+  db.close();
+
+  const memoryPath = join(home, 'memory.md');
+  const attunePath = join(home, 'attune.mjs');
+  writeFileSync(memoryPath, '# Hollow update trigger\n');
+  writeFileSync(attunePath, `
+    return remember({
+      path: ${JSON.stringify(memoryPath)},
+      project: 'hollow-au-test',
+      summary: 'Decision: this write must be refused while the update trigger is hollow.'
+    });
+  `);
+
+  const result = runCli(['--attune', attunePath], { home });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+  const check = new DatabaseSync(dbPath, { readOnly: true });
+  assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0);
+  check.close();
+});
+
+test('attune rejects a memories table whose id is not the sole primary key', () => {
+  const variants = {
+    // id is plain TEXT: no uniqueness at all.
+    'no-pk': 'CREATE TABLE IF NOT EXISTS memories (\n  id TEXT,',
+    // PRIMARY KEY (id, project): id.pk > 0 yet duplicate ids still allowed.
+    'composite-pk': 'CREATE TABLE IF NOT EXISTS memories (\n  id TEXT, session_id TEXT, project TEXT,\n  message_start TEXT, message_end TEXT,\n  path TEXT, anchors TEXT, summary TEXT, created_at TEXT,\n  deleted_at TEXT, deleted_reason TEXT,\n  PRIMARY KEY (id, project));',
+  };
+  for (const [name, memoriesDdl] of Object.entries(variants)) {
+    const home = makeTempDir(`obelisk-daemon-attune-${name}-`);
+    const obeliskDir = join(home, '.obelisk');
+    mkdirSync(obeliskDir, { recursive: true });
+    // Full columns, real FTS, real triggers — only the memories table's
+    // primary key deviates. Without id as the sole key, remember ids lose
+    // uniqueness and forget() can update several rows at once.
+    const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+    const dbPath = join(obeliskDir, 'obelisk.sqlite');
+    const db = new DatabaseSync(dbPath);
+    if (name === 'no-pk') {
+      db.exec(schema.replace('CREATE TABLE IF NOT EXISTS memories (\n  id TEXT PRIMARY KEY,', memoriesDdl));
+    } else {
+      const memoriesBlock = schema.match(/CREATE TABLE IF NOT EXISTS memories \([\s\S]+?\);/)[0];
+      db.exec(schema.replace(memoriesBlock, memoriesDdl));
+    }
+    db.close();
+
+    const memoryPath = join(home, 'memory.md');
+    const attunePath = join(home, 'attune.mjs');
+    writeFileSync(memoryPath, '# Bad primary key\n');
+    writeFileSync(attunePath, `
+      return remember({
+        path: ${JSON.stringify(memoryPath)},
+        project: '${name}-test',
+        summary: 'Decision: this write must be refused without a sole primary key.'
+      });
+    `);
+
+    const result = runCli(['--attune', attunePath], { home });
+    assert.equal(result.status, 1, `${name}: ${result.stderr || result.stdout}`);
+    assert.match(JSON.parse(result.stdout).error, /predates the memory layer/i);
+
+    const check = new DatabaseSync(dbPath, { readOnly: true });
+    assert.equal(check.prepare('SELECT COUNT(*) AS c FROM memories').get().c, 0, name);
+    check.close();
+  }
+});
+
+test('an attune probe leaves no persistent state behind', () => {
+  const home = makeTempDir('obelisk-daemon-attune-clean-');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+  const dbPath = join(obeliskDir, 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec(schema);
+  db.prepare("INSERT INTO memories (id, path, summary, created_at) VALUES ('mem-1', '/m.md', 'existing memory', '2026-01-01T00:00:00Z')").run();
+  db.close();
+
+  const dumpMemoryTables = () => {
+    const reader = new DatabaseSync(dbPath, { readOnly: true });
+    const tables = reader.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'memories%' ORDER BY name").all().map(row => row.name);
+    const dump = Object.fromEntries(tables.map(table => [table, reader.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()]));
+    reader.close();
+    return dump;
+  };
+  const before = dumpMemoryTables();
 
   const attunePath = join(home, 'attune.mjs');
   writeFileSync(attunePath, 'return true;');
   const result = runCli(['--attune', attunePath], { home });
-  assert.equal(result.status, 1);
-  assert.match(JSON.parse(result.stdout).error, /daemon owns index writes/i);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
 
-  const check = new DatabaseSync(dbPath, { readOnly: true });
-  const tables = check.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(row => row.name);
-  check.close();
-  assert.deepEqual(tables, ['index_state']);
+  // Not just the logical rows: the FTS5 shadow tables must be untouched too
+  // (the probe rolls its writes back via SAVEPOINT, never committing churn).
+  assert.deepEqual(dumpMemoryTables(), before);
 });
 
 test('a passive query stays read-only when another process holds the writer lease', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-writer-owned-'));
+  const home = makeTempDir('obelisk-writer-owned-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
@@ -91,7 +374,7 @@ test('a passive query stays read-only when another process holds the writer leas
 });
 
 test('a passive query fails closed when daemon ownership cannot be read', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-daemon-ownership-error-'));
+  const home = makeTempDir('obelisk-daemon-ownership-error-');
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });

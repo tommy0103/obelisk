@@ -1,0 +1,2 @@
+{"type":"session.start","data":{"sessionId":"33333333-3333-4333-8333-333333333333","version":99,"producer":"copilot-agent","copilotVersion":"99.0.0","vscodeVersion":"99.0.0","startTime":"2026-09-16T09:00:00.000Z"},"id":"unknown-start","timestamp":"2026-09-16T09:00:00.000Z","parentId":null}
+{"type":"user.message","data":{"content":"This newer format must not be interpreted as version one","attachments":[]},"id":"unknown-user","timestamp":"2026-09-16T09:00:01.000Z","parentId":"unknown-start"}

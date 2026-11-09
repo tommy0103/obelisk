@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { assembleSessionDetail } from '../app/src/shared/session-detail-assembly.mjs';
@@ -34,6 +37,32 @@ test('session assembly preserves thinking and attaches tool result and subagent 
   assert.equal(assembled[0]._thinking, 'reasoning');
   assert.deepEqual(assembled[0].tool_calls[0].result.content, 'done');
   assert.equal(assembled[0].tool_calls[0].subagent.agent_id, 'agent-1');
+});
+
+test('orphan tool results stay out of the timeline and do not break assistant merging', () => {
+  const assembled = assembleSessionDetail({
+    messages: [
+      { uuid: 'answer', type: 'assistant', content_type: 'text', text: 'answer' },
+      { uuid: 'orphan-result', type: 'user', content_type: 'tool_result', text: '' },
+      { uuid: 'tool', type: 'assistant', content_type: 'tool_use', text: '' },
+    ],
+    toolCalls: [{
+      id: 'call',
+      message_uuid: 'tool',
+      name: 'Read',
+      input_json: '{"path":"/tmp/file"}',
+    }],
+    toolResults: [{
+      tool_use_id: 'missing-call',
+      message_uuid: '',
+      content: 'orphaned failure',
+      is_error: 1,
+    }],
+  }).messages;
+
+  assert.equal(assembled.length, 1);
+  assert.equal(assembled[0].uuid, 'answer');
+  assert.deepEqual(assembled[0].tool_calls.map(call => call.id), ['call']);
 });
 
 test('session assembly keeps Skill evidence standalone and embeds matching workflow agents', () => {
@@ -101,6 +130,68 @@ test('canonical ordering is stable across provider and SQLite iteration order', 
   ]);
 
   assert.deepEqual(detail.messages.map(message => message.uuid), ['a', 'b']);
+});
+
+test('session detail remains active-only across direct and persisted visibility values', () => {
+  const message = (uuid, visibility) => ({
+    kind: 'message',
+    uuid,
+    session_id: 'session',
+    type: 'user',
+    parent_uuid: null,
+    timestamp: `2026-06-10T10:00:0${uuid.length}Z`,
+    role: 'user',
+    text: uuid,
+    content_type: 'text',
+    is_meta: 0,
+    visibility,
+    model: null,
+    is_sidechain: 0,
+    agent_id: null,
+    input_tokens: null,
+    output_tokens: null,
+    cwd: null,
+    skill: null,
+    source: 'pi',
+  });
+  const summary = (id, visibility) => ({
+    kind: 'summary',
+    id,
+    session_id: 'session',
+    timestamp: null,
+    source: 'pi:branch_summary',
+    content: id,
+    visibility,
+    input_tokens: null,
+    output_tokens: null,
+  });
+  const direct = assembleSessionDetail([
+    message('visible', 'visible'),
+    message('inactive', 'inactive'),
+    message('hidden', 'hidden'),
+    summary('visible-summary', 'visible'),
+    summary('inactive-summary', 'inactive'),
+    summary('hidden-summary', 'hidden'),
+  ]);
+  assert.deepEqual(direct.messages.map(row => row.text), ['visible']);
+  assert.deepEqual(direct.summaries.map(row => row.content), ['visible-summary']);
+
+  const persisted = assembleSessionDetail({
+    messages: [
+      { ...message('visible', 'visible'), kind: undefined },
+      { ...message('inactive', 'inactive'), kind: undefined },
+      { ...message('hidden', 'hidden'), kind: undefined },
+      { ...message('unknown', 'future-state'), kind: undefined },
+    ],
+    summaries: [
+      { ...summary('visible-summary', 'visible'), kind: undefined },
+      { ...summary('inactive-summary', 'inactive'), kind: undefined },
+      { ...summary('hidden-summary', 'hidden'), kind: undefined },
+      { ...summary('unknown-summary', 'future-state'), kind: undefined },
+    ],
+  });
+  assert.deepEqual(persisted.messages.map(row => row.text), ['visible']);
+  assert.deepEqual(persisted.summaries.map(row => row.content), ['visible-summary']);
 });
 
 test('direct session assembly rejects an incomplete provider delta', () => {

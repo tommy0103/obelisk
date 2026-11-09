@@ -14,11 +14,26 @@ exist.
 
 ## Source Model
 
-Obelisk stores Claude Code and Codex transcripts in the same schema.
+Obelisk stores Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi transcripts in the same
+schema.
 
 - Claude rows use `source='claude'`.
 - Codex rows use `source='codex'`; root session and message IDs are prefixed
   with `codex:`.
+- Kimi Code rows use `source='kimi'`.
+- OMP rows use `source='omp'`; session IDs are prefixed with `omp:`.
+- Pi rows use `source='pi'`; session IDs are prefixed with `pi:`.
+- OpenCode rows use `source='opencode'`; session IDs are prefixed with
+  `opencode:`. Obelisk indexes V1 and V2 SQLite databases (`opencode.db` and
+  channel stores; earlier JSON formats are not indexed). Canonical token
+  accounting folds provider breakdowns: V2 combines input + cache read/write
+  into `input_tokens` and output + reasoning into `output_tokens`; V1 uses
+  per-step `step-finish` usage with assistant-level fallback.
+- DeepSeek Harness rows use `source='deepseek'`; session IDs are prefixed with
+  `deepseek:`. Subagent logs fold into their root parent session as sidechain
+  messages (`is_sidechain=1`, `agent_id` = the subagent's `deepseek:` id), and
+  their `total_tokens` are derived at query time from sidechain message usage
+  (ADR-0010) rather than stored.
 - Omit `source` filters unless provider provenance matters.
 - Codex child threads are represented through `subagents`; Codex may not have
   Claude-style workflow rows.
@@ -59,9 +74,9 @@ One row per root session.
 | `started_at`, `ended_at` | ISO timestamps |
 | `git_branch` | Branch at session time |
 | `version` | Provider CLI/app version |
-| `message_count` | Indexed user + assistant messages |
+| `message_count` | Visible canonical messages; inactive and hidden records are excluded |
 | `jsonl_path` | Source JSONL path |
-| `source` | `claude` or `codex` |
+| `source` | Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi` |
 
 ### `messages`
 
@@ -77,6 +92,7 @@ Core evidence table.
 | `text` | Extracted text, truncated to 10k chars |
 | `content_type` | `text`, `thinking`, `tool_use`, `tool_result`, or `unknown` |
 | `is_meta` | 1 for injected/control-plane messages |
+| `visibility` | `visible` for current evidence, `inactive` for provider-attested superseded history, `hidden` for display-suppressed or transport-only material. Pi and OMP emit `inactive` |
 | `model` | Assistant model name |
 | `is_sidechain` | Retry/branch marker |
 | `agent_id` | Subagent/workflow agent ID |
@@ -84,7 +100,7 @@ Core evidence table.
 | `cwd` | Working directory at message time |
 | `skill` | Skill that generated the response, if known |
 | `turn_duration_ms` | Wall-clock duration for the turn |
-| `source` | `claude` or `codex` |
+| `source` | Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi` |
 
 `content_type='tool_use'` is only a marker. Tool-call details live in
 `tool_calls`. `content_type='tool_result'` marks provider-emitted tool-result
@@ -131,6 +147,8 @@ Session summary rows.
 | `timestamp` | Summary timestamp |
 | `source` | Summary kind, such as `away_summary`; not provider source |
 | `content` | Summary text |
+| `visibility` | Same `visible` / `inactive` / `hidden` contract as messages |
+| `input_tokens`, `output_tokens` | Model usage when summary generation was a separate provider call |
 
 ### `subagents`
 
@@ -207,6 +225,7 @@ Indexer progress and sentinel state.
 | `jsonl_path` | Source path or synthetic sentinel key |
 | `mtime` | Last indexed mtime |
 | `lines_processed` | Incremental line cursor |
+| `cursor` | Exact opaque provider cursor; legacy rows fall back to `mtime:lines_processed` |
 
 Sentinel keys include `__last_build__`, `__app_heartbeat__`,
 `__app_last_successful_build__`, `__indexer_owner_app__`, and
@@ -250,6 +269,7 @@ FROM tool_calls tc
 JOIN messages m ON m.uuid = tc.message_uuid
 JOIN sessions s ON s.id = tc.session_id
 WHERE s.project LIKE ?
+  AND COALESCE(m.visibility, 'visible') = 'visible'
 ORDER BY m.timestamp DESC
 LIMIT 20;
 ```
@@ -262,6 +282,7 @@ FROM tool_results tr
 JOIN tool_calls tc ON tc.id = tr.tool_use_id
 JOIN messages m ON m.uuid = tr.message_uuid
 WHERE tr.is_error = 1
+  AND COALESCE(m.visibility, 'visible') = 'visible'
 ORDER BY m.timestamp DESC
 LIMIT 20;
 ```
@@ -274,6 +295,7 @@ FROM messages m
 JOIN sessions s ON s.id = m.session_id
 WHERE s.project LIKE ?
   AND COALESCE(m.is_meta, 0) = 0
+  AND COALESCE(m.visibility, 'visible') = 'visible'
 ORDER BY m.timestamp DESC
 LIMIT 20;
 ```
@@ -322,7 +344,6 @@ Common indexed filters:
   absolute path when known; `messages.cwd` is per-message working directory.
 - Memory rows are archived with `deleted_at`; do not recall archived memories.
 - Indexed text and JSON fields are truncated to 10k chars. Use `raw()` from
-  `references/api-reference.md` when a specific message needs the original JSONL
-  line.
+  `references/api-reference.md` when a specific message needs its source record.
 - Prefer SQL-side `COUNT`, `GROUP BY`, `MAX`, `ORDER BY`, and `LIMIT` over
   returning large row sets and hand-counting in the final answer.

@@ -1,13 +1,18 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { defaultKiroDatabasePath } from '../packages/core/src/providers/kiro.ts';
+import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -19,6 +24,7 @@ class SqliteCompatDatabase {
   pragma(statement) { this.db.exec(`PRAGMA ${statement}`); }
   exec(sql) { return this.db.exec(sql); }
   close() { return this.db.close(); }
+  function(name, options, callback) { this.db.function(name, options, callback); }
   prepare(sql) {
     const stmt = this.db.prepare(sql);
     return {
@@ -37,8 +43,8 @@ class SqliteCompatDatabase {
 // `mock.module` keys mocks by the *resolved* module URL. The app's dependencies
 // live in `app/node_modules`, so they are NOT resolvable from this test file's
 // directory, and bare specifiers ('electron', ...) would either fail to resolve
-// here or resolve to the wrong ESM entry (e.g. chokidar exposes esm/index.js via
-// its "exports" map, which differs from require.resolve's CJS entry). We instead
+// here or resolve to a different entry than the main module sees (a package's
+// "exports" map can give ESM and CJS importers different files). We instead
 // resolve each bare specifier exactly as the main module sees it (ESM resolution
 // relative to the main module's directory) and mock that URL. Relative deps are
 // resolved against the main module URL directly.
@@ -56,7 +62,7 @@ function esmResolve(specifier) {
 
 const ELECTRON_URL = esmResolve('electron');
 const DATABASE_URL = esmResolve('better-sqlite3');
-const CHOKIDAR_URL = esmResolve('chokidar');
+const WATCHER_URL = new URL('../../../packages/adaptive-watcher/src/index.ts', mainUrl).href;
 const INDEXER_URL = new URL('./indexer.ts', mainUrl).href;
 const INDEXER_SERVICE_URL = new URL('./indexer-service.ts', mainUrl).href;
 const INDEXER_WORKER_URL = new URL('./indexer-worker-client.ts', mainUrl).href;
@@ -83,7 +89,7 @@ async function importMain() {
 // 'dialog', 'nativeImage', 'shell') must be present, even if unused by a test.
 function electronNamespace({ app, BrowserWindow, ipcMain }) {
   return {
-    app: app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} },
+    app: { isPackaged: false, getVersion: () => '0.2.3', ...(app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} }) },
     BrowserWindow,
     ipcMain: ipcMain ?? { handle() {} },
     clipboard: {},
@@ -93,8 +99,36 @@ function electronNamespace({ app, BrowserWindow, ipcMain }) {
   };
 }
 
-function noopChokidar() {
-  return { watch: () => ({ on() { return this; }, close() {} }) };
+// Assigning undefined to process.env leaves the literal string "undefined"
+// instead of removing the variable — restore must delete in that case.
+function restoreEnvVar(name, value) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+// Captures app event handlers so a test can fire window-all-closed, which is
+// what makes the main module close its database handle.
+function captureAppHandlers(map) {
+  return {
+    whenReady: () => Promise.resolve(),
+    on(event, handler) { map.set(event, handler); },
+    quit() {},
+  };
+}
+
+// Windows refuses to unlink an open SQLite file; fire window-all-closed and
+// let the async close land before removing the temp home.
+async function closeMainProcessDb(appHandlers) {
+  appHandlers.get('window-all-closed')?.();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+function noopWatcher() {
+  return {
+    createAdaptiveWatcher: () => ({
+      close() { return Promise.resolve(); },
+    }),
+  };
 }
 
 function defaultIndexerService() {
@@ -112,23 +146,31 @@ function defaultIndexerWorkerClient() {
   return {
     createWorkerBuildIndex: () => ({
       buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
+      readHermesMessageText: async () => null,
+      readKiroMessageText: async () => null,
       stop() {},
     }),
   };
 }
 
-async function loadMainForWindowFlags(flags) {
+async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const originalArgv = process.argv;
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-window-flags-${Date.now()}-${Math.random()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-window-flags-${Date.now()}-${Math.random()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  if (settingsText !== undefined) {
+    writeFileSync(join(home, '.obelisk', 'settings.json'), settingsText);
+  }
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   process.argv = [originalArgv[0] || 'node', originalArgv[1] || 'electron', ...flags];
 
   const windows = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -145,6 +187,8 @@ async function loadMainForWindowFlags(flags) {
       this.devToolsOpened = false;
       this.webContents = {
         on() {},
+        setWindowOpenHandler() {},
+        getURL() { return ''; },
         setZoomLevel() {},
         openDevTools: () => { this.devToolsOpened = true; },
         send() {},
@@ -152,6 +196,7 @@ async function loadMainForWindowFlags(flags) {
       windows.push(this);
     }
     loadFile(filePath) { this.loadedFile = filePath; }
+    on() {}
     loadURL(url) { this.loadedURL = url; return Promise.resolve(); }
     close() {}
     static getAllWindows() { return windows; }
@@ -161,7 +206,7 @@ async function loadMainForWindowFlags(flags) {
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -173,7 +218,8 @@ async function loadMainForWindowFlags(flags) {
   } finally {
     restore();
     process.argv = originalArgv;
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 }
@@ -197,9 +243,18 @@ test('dev mode does not open DevTools unless explicitly requested', async () => 
   assert.equal(devtoolsWindows[0].devToolsOpened, true);
 });
 
+test('malformed settings keep the desktop recovery window available', async () => {
+  const windows = await loadMainForWindowFlags([], { settingsText: '{broken' });
+  assert.equal(windows.length, 1);
+});
+
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-watch-dirs-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const originalAppData = process.env.APPDATA;
+  const originalXdgConfig = process.env.XDG_CONFIG_HOME;
+  const originalHermesHome = process.env.HERMES_HOME;
+  const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   mkdirSync(join(claudeDir, 'projects'), { recursive: true });
@@ -208,23 +263,38 @@ test('main process watches every root declared by the built-in provider registry
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+  process.env.APPDATA = join(home, 'AppData', 'Roaming');
+  process.env.XDG_CONFIG_HOME = join(home, '.config');
+  process.env.HERMES_HOME = join(home, '.hermes');
+  const [stableCopilotRoot, insidersCopilotRoot] = defaultCopilotUserDataRoots();
 
   const serviceOptions = [];
+  const workerCalls = [];
+  const ipcHandlers = new Map();
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
-    prepare() {
-      return { get: () => null, all: () => [], run: () => ({}) };
+    prepare(sql) {
+      return {
+        get: () => null,
+        all: () => sql.includes("GROUP BY COALESCE(source")
+          ? [{ source: 'copilot', session_count: 2, last_indexed: '2026-10-08' }]
+          : [],
+        run: () => ({}),
+      };
     }
   }
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -232,9 +302,12 @@ test('main process watches every root declared by the built-in provider registry
   }
 
   const restore = registerMocks([
-    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -249,43 +322,103 @@ test('main process watches every root declared by the built-in provider registry
         },
       },
     }],
-    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+    [INDEXER_WORKER_URL, {
+      namedExports: {
+        createWorkerBuildIndex: () => ({
+          buildIndex: async (args) => {
+            workerCalls.push(args);
+            return { files: 0, affectedSessionIds: [], complete: true };
+          },
+          stop() {},
+        }),
+      },
+    }],
   ]);
 
   try {
     await importMain();
 
     assert.equal(serviceOptions.length, 1);
-    assert.deepEqual(serviceOptions[0].watchDirs, [
-      join(claudeDir, 'projects'),
-      join(claudeDir, 'history.jsonl'),
-      join(codexDir, 'sessions'),
-      join(codexDir, 'session_index.jsonl'),
-      join(home, '.kimi-code', 'sessions'),
-      join(home, '.kimi-code', 'session_index.jsonl'),
+    assert.deepEqual(serviceOptions[0].watchTargets, [
+      { kind: 'tree', path: join(claudeDir, 'projects') },
+      { kind: 'file', path: join(claudeDir, 'history.jsonl') },
+      { kind: 'tree', path: join(codexDir, 'sessions') },
+      { kind: 'tree', path: join(codexDir, 'archived_sessions') },
+      { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+      { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+      { kind: 'tree', path: join(stableCopilotRoot, 'workspaceStorage') },
+      { kind: 'file', path: join(insidersCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+      { kind: 'file', path: join(insidersCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+      { kind: 'tree', path: join(insidersCopilotRoot, 'workspaceStorage') },
+      { kind: 'tree', path: join(home, '.dsh', 'sessions') },
+      { kind: 'file', path: join(home, '.hermes', 'state.db') },
+      { kind: 'file', path: join(home, '.hermes', 'state.db-wal') },
+      { kind: 'tree', path: join(home, '.hermes', 'profiles'), fileNames: ['state.db', 'state.db-wal'] },
+      { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
+      { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.kiro', 'sessions') },
+      { kind: 'file', path: defaultKiroDatabasePath({ homeDir: home }) },
+      { kind: 'file', path: `${defaultKiroDatabasePath({ homeDir: home })}-wal` },
+      { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db') },
+      { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db-wal') },
+      {
+        kind: 'tree',
+        path: join(home, '.local', 'share', 'opencode'),
+        fileNames: ['opencode-next.db', 'opencode-next.db-wal', 'opencode.db', 'opencode.db-wal'],
+      },
+      { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite-wal') },
     ]);
-    assert.equal(serviceOptions[0].watchDirs.includes(codexDir), false);
+    assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
+    await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
+    assert.deepEqual(workerCalls[0].providerSettings, {});
+    mkdirSync(insidersCopilotRoot, { recursive: true });
+    const defaultSettings = await ipcHandlers.get('settings:get')();
+    assert.deepEqual(defaultSettings.copilotEditions.map((edition) => edition.enabled), [true, true]);
+    const copilotSource = defaultSettings.sources.find((source) => source.id === 'copilot');
+    assert.equal(copilotSource.exists, true);
+    assert.equal(copilotSource.sessionCount, 2);
+    assert.equal(copilotSource.status, 'ok', 'Insiders-only indexed history is connected without a warning');
+    assert.equal(copilotSource.statusText, 'Connected');
+    await ipcHandlers.get('settings:set')(null, 'copilotEditions.stable', false);
+    assert.deepEqual((await ipcHandlers.get('settings:get')()).copilotEditions.map((edition) => edition.enabled), [false, true]);
+    assert.equal(serviceOptions.length, 2);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(stableCopilotRoot)), false);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(insidersCopilotRoot)), true);
+    await serviceOptions[1].buildIndex({ reason: 'settings-transfer' });
+    assert.deepEqual(workerCalls[1].providerSettings.copilotEditions, { stable: false });
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    restoreEnvVar('APPDATA', originalAppData);
+    restoreEnvVar('XDG_CONFIG_HOME', originalXdgConfig);
+    restoreEnvVar('HERMES_HOME', originalHermesHome);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process forwards committed IDs without reopening after a deferred build', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-deferred-build-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-deferred-build-${Date.now()}`);
   mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
   mkdirSync(join(home, '.codex', 'sessions'), { recursive: true });
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   let databaseOpens = 0;
   let serviceOptions;
   let notifications = 0;
+  const sent = [];
 
   class FakeDatabase {
+    function() {}
     constructor() { databaseOpens += 1; }
     pragma() {}
     exec() {}
@@ -295,19 +428,29 @@ test('main process forwards committed IDs without reopening after a deferred bui
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() { notifications += 1; } };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() { notifications += 1; } };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
-    static getAllWindows() { return [{ webContents: { send() { notifications += 1; } } }]; }
+    static getAllWindows() {
+      return [{
+        webContents: {
+          send(channel, payload) {
+            notifications += 1;
+            sent.push({ channel, payload });
+          },
+        },
+      }];
+    }
     static fromWebContents() { return null; }
   }
 
   const restore = registerMocks([
     [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -320,7 +463,19 @@ test('main process forwards committed IDs without reopening after a deferred bui
     [INDEXER_WORKER_URL, {
       namedExports: {
         createWorkerBuildIndex: () => ({
-          buildIndex: async () => ({ deferred: true, reason: 'database_busy', affectedSessionIds: ['session-1'] }),
+          buildIndex: async ({ reason }) => reason === 'inventory'
+            ? {
+                deferred: true,
+                complete: false,
+                reason: 'database_busy',
+                affectedSessionIds: [],
+                inventoryIssues: [{
+                  provider: 'pi',
+                  path: '/tmp/pi/locked',
+                  error: 'EACCES: permission denied',
+                }],
+              }
+            : { deferred: true, reason: 'database_busy', affectedSessionIds: ['session-1'] },
           stop() {},
         }),
       },
@@ -336,24 +491,44 @@ test('main process forwards committed IDs without reopening after a deferred bui
     assert.equal(result.deferred, true);
     assert.equal(databaseOpens, opensBeforeBuild);
     assert.equal(notifications, notificationsBeforeBuild + 2);
+
+    const beforeInventoryNotification = notifications;
+    await serviceOptions.buildIndex({ reason: 'inventory' });
+    assert.equal(databaseOpens, opensBeforeBuild);
+    assert.equal(notifications, beforeInventoryNotification + 1);
+    assert.deepEqual(sent.at(-1), {
+      channel: 'obelisk:index-updated',
+      payload: {
+        affectedSessionIds: [],
+        sourceIssues: [{
+          provider: 'pi',
+          path: '/tmp/pi/locked',
+          error: 'EACCES: permission denied',
+        }],
+      },
+    });
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('session IPC hides Codex rows by default and supports explicit source opt-in', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-source-filter-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-source-filter-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const queries = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -374,9 +549,10 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -386,6 +562,12 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: {
+          whenReady: () => Promise.resolve(),
+          on() {},
+          quit() {},
+          getVersion: () => '9.8.7-test',
+        },
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -395,7 +577,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -417,23 +599,35 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
     assert.match(queries.at(-1).sql, /COALESCE\(source, 'claude'\) = \?/);
     assert.ok(queries.at(-1).params.includes('codex'));
 
-    await ipcHandlers.get('settings:get')();
+    // ADR-0007: a message's calls are persisted in the provider's order, so both reads have to
+    // ask for that order rather than leave it to the `(session_id, name)` index.
+    ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session');
+    assert.match(queries.at(-1).sql, /ORDER BY tc\.rowid/);
+
+    ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:visible-agent');
+    assert.match(queries.at(-1).sql, /ORDER BY tc\.rowid/);
+
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.equal(settings.version, '9.8.7-test');
     assert.ok(
       queries.some(q => /GROUP BY COALESCE\(source, 'claude'\)/.test(q.sql)),
     );
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('usage IPC aggregates normalized tokens across all indexed providers', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-usage-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-usage-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   const setup = new DatabaseSync(dbPath);
@@ -450,15 +644,102 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       input_tokens, output_tokens, source
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run('codex-message', 'codex:session', 'assistant', '2026-07-10T11:00:00Z', 'assistant', 'ok', 100, 10, 'codex');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text,
+      input_tokens, output_tokens, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('claude-undated-message', 'claude-session', 'assistant', 'assistant', 'ok', 7, 0, 'claude');
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
+    .run('pi:session', 'pi');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('zcode:session', 'zcode', '/tmp/zcode/db/db.sqlite#z:session');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('zcode:full-text', 'zcode:session', 'assistant', 'assistant', 'truncated text', 'zcode');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('hermes:session', 'hermes', '/tmp/hermes/state.db#session:source');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('hermes:full-text', 'hermes:session', 'assistant', 'assistant', 'truncated Hermes text', 'hermes');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('kiro:session', 'kiro', '/workspace/kiro/sessions/cli/example.jsonl');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('kiro:full-text', 'kiro:session', 'assistant', 'assistant', 'truncated Kiro text', 'kiro');
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
+    .run('zcode:child', 'zcode');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,visibility,source,agent_id) VALUES (?,?,?,?,?,?,?,?)')
+    .run('zcode:child:message', 'zcode:child', 'assistant', 'assistant', 'child response', 'visible', 'zcode', 'zcode:child');
+  setup.prepare('INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json) VALUES (?,?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'Read', '{}');
+  setup.prepare('INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content) VALUES (?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'read result');
+  setup.prepare(`
+    INSERT INTO summaries (
+      id, session_id, timestamp, source, content, visibility, input_tokens, output_tokens
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-summary', 'pi:session', '2026-07-10T12:00:00Z', 'pi:compaction', 'summary', 'inactive', 30, 5);
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-hidden-main', 'pi:session', 'assistant', 'assistant', 'inactive main', '2026-07-10T12:01:00Z', 'inactive', 'pi');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source, agent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-hidden-agent', 'pi:session', 'assistant', 'assistant', 'inactive agent', '2026-07-10T12:02:00Z', 'inactive', 'pi', 'pi:hidden-agent');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-visible-main', 'pi:session', 'assistant', 'assistant', 'visible main', '2026-07-10T12:03:00Z', 'visible', 'pi');
+  setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source, agent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('pi-visible-agent', 'pi:session', 'assistant', 'assistant', 'visible agent', '2026-07-10T12:04:00Z', 'visible', 'pi', 'pi:visible-agent');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-hidden-main-call', 'pi-hidden-main', 'pi:session', 'read', '{"path":"secret"}');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-hidden-agent-call', 'pi-hidden-agent', 'pi:session', 'read', '{"path":"secret"}');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-visible-main-call', 'pi-visible-main', 'pi:session', 'read', '{"path":"main"}');
+  setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('pi-visible-agent-call', 'pi-visible-agent', 'pi:session', 'read', '{"path":"agent"}');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-hidden-main-call', 'pi-hidden-main', 'pi:session', 'hidden result');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-hidden-agent-call', 'pi-hidden-agent', 'pi:session', 'hidden result');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-visible-main-call', 'pi-visible-main', 'pi:session', 'main result');
+  setup.prepare(`
+    INSERT INTO tool_results (tool_use_id, message_uuid, session_id, content)
+    VALUES (?, ?, ?, ?)
+  `).run('pi-visible-agent-call', 'pi-visible-agent', 'pi:session', 'agent result');
   setup.close();
 
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -468,6 +749,7 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -477,7 +759,166 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: {
+      createWorkerBuildIndex: () => ({
+        buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
+        readZcodeMessageText: async lookup => {
+          assert.equal(lookup.source, 'zcode');
+          assert.equal(lookup.messageUuid, 'zcode:full-text');
+          return 'complete ZCode text from worker';
+        },
+        readHermesMessageText: async lookup => {
+          assert.equal(lookup.source, 'hermes');
+          assert.equal(lookup.messageUuid, 'hermes:full-text');
+          return 'complete Hermes text from worker';
+        },
+        readKiroMessageText: async lookup => {
+          assert.equal(lookup.source, 'kiro');
+          assert.equal(lookup.messageUuid, 'kiro:full-text');
+          assert.equal(lookup.rootDir, join(home, '.kiro'));
+          return 'complete Kiro text from worker';
+        },
+        stop() {},
+      }),
+    } }],
+  ]);
+
+  try {
+    await importMain();
+
+    assert.deepEqual(ipcHandlers.get('db:getSessionSummaries')(null, 'pi:session'), []);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionMessages')(null, 'pi:session').map(row => row.uuid),
+      ['pi-visible-main'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session').map(row => row.id),
+      ['pi-visible-main-call'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session').map(row => row.tool_use_id),
+      ['pi-visible-main-call'],
+    );
+    assert.deepEqual(ipcHandlers.get('db:getSessionMessages')(null, 'zcode:child').map(row => row.uuid),
+      ['zcode:child:message'], 'first-class child detail includes its self-agent message');
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolCalls')(null, 'zcode:child').map(row => row.id),
+      ['zcode:child:call']);
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolResults')(null, 'zcode:child').map(row => row.tool_use_id),
+      ['zcode:child:call']);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentMessages')(null, 'pi:visible-agent').map(row => row.uuid),
+      ['pi-visible-agent'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:visible-agent').map(row => row.id),
+      ['pi-visible-agent-call'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:visible-agent').map(row => row.tool_use_id),
+      ['pi-visible-agent-call'],
+    );
+    const patch = ipcHandlers.get('db:getSessionPatch')(null, 'pi:session', {});
+    assert.equal(patch.changes.messages[0].tool_calls[0].result.content, 'main result');
+    assert.equal(JSON.stringify(patch).includes('agent result'), false);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'zcode:full-text'),
+      'complete ZCode text from worker');
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'hermes:full-text'),
+      'complete Hermes text from worker');
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'kiro:full-text'),
+      'complete Kiro text from worker');
+
+    const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
+    assert.equal(claudeOnly.totalTokens, 72);
+    assert.equal(claudeOnly.daily[0].tokens, 65);
+
+    const allSources = ipcHandlers.get('db:getUsageStats')(null, { source: 'all' });
+    assert.equal(allSources.totalTokens, 217);
+    assert.equal(allSources.daily[0].tokens, 210);
+    assert.equal(allSources.peakDay.tokens, 210);
+
+    const piOnly = ipcHandlers.get('db:getUsageStats')(null, { source: 'pi' });
+    assert.equal(piOnly.totalTokens, 35);
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ADR-0007 has to hold in the product and not only in the round-trip fixture: session detail reads
+// a message's calls back through these two queries, and `tool_calls` carries a `(session_id, name)`
+// index, so a read that leaves the order to the planner can return a message's calls sorted by
+// tool name instead of by the order the provider emitted them. On a store this small the planner
+// still picks the message index, so the explicit order those queries carry is pinned by the SQL
+// assertion in the Codex-rows test above; this one covers what the rows mean to the detail path.
+test('session IPC keeps a message tool calls in insertion order', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-call-order-${Date.now()}`);
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const setup = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)').run('order:session', 'claude');
+  const insertMessage = setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source, agent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCall = setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  insertMessage.run('order-main', 'order:session', 'assistant', 'assistant', 'two calls', '2026-07-10T12:00:00Z', 'visible', 'claude', null);
+  insertMessage.run('order-agent', 'order:session', 'assistant', 'assistant', 'agent calls', '2026-07-10T12:01:00Z', 'visible', 'claude', 'order:agent');
+  // Both pairs are inserted in an order the `(session_id, name)` index would reverse.
+  insertCall.run('order-main-call-1', 'order-main', 'order:session', 'browser_snapshot', '{}');
+  insertCall.run('order-main-call-2', 'order-main', 'order:session', 'browser_console', '{}');
+  insertCall.run('order-agent-call-1', 'order-agent', 'order:session', 'write_file', '{}');
+  insertCall.run('order-agent-call-2', 'order-agent', 'order:session', 'read_file', '{}');
+  setup.close();
+
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -486,27 +927,143 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   try {
     await importMain();
 
-    const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
-    assert.equal(claudeOnly.totalTokens, 65);
-    assert.equal(claudeOnly.daily[0].tokens, 65);
-
-    const allSources = ipcHandlers.get('db:getUsageStats')(null, { source: 'all' });
-    assert.equal(allSources.totalTokens, 175);
-    assert.equal(allSources.daily[0].tokens, 175);
-    assert.equal(allSources.peakDay.tokens, 175);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolCalls')(null, 'order:session').map(row => row.id),
+      ['order-main-call-1', 'order-main-call-2'],
+      'a session detail read keeps the calls of one message in source order',
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolCalls')(null, 'order:agent').map(row => row.id),
+      ['order-agent-call-1', 'order-agent-call-2'],
+      'and so does a subagent detail read',
+    );
+    const patch = ipcHandlers.get('db:getSessionPatch')(null, 'order:session', {});
+    const message = patch.changes.messages.find(candidate => candidate.uuid === 'order-main');
+    assert.deepEqual(
+      message.tool_calls.map(toolCall => toolCall.name),
+      ['browser_snapshot', 'browser_console'],
+      'which is the order the assembled session detail carries',
+    );
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('session catalogue includes older sessions beyond 1000 across providers and resolves exact IDs', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-catalogue-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const setup = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  const insert = setup.prepare('INSERT INTO sessions (id, title, project, source, started_at) VALUES (?, ?, ?, ?, ?)');
+  setup.exec('BEGIN');
+  for (let i = 0; i < 1105; i++) {
+    insert.run(`catalogue-${i}`, `Session ${i}`, i < 5 ? 'older-only' : 'active',
+      i % 2 ? 'codex' : 'claude', new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString());
+  }
+  setup.exec('COMMIT');
+  setup.exec("UPDATE sessions SET started_at = '2026-01-01T00:00:00.000Z' WHERE CAST(SUBSTR(id, 11) AS INTEGER) < 10");
+  setup.exec("UPDATE sessions SET git_branch = 'old-release' WHERE id = 'catalogue-1'");
+  setup.close();
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      app: captureAppHandlers(appHandlers), BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+  try {
+    await importMain();
+    const sessions = opts => ipcHandlers.get('db:getSessions')(null, opts);
+    const catalogue = sessions({ source: 'all', limit: null });
+    assert.equal(catalogue.length, 1105);
+    assert.equal(catalogue[0].id, 'catalogue-1104');
+    assert.equal(catalogue.at(-1).id, 'catalogue-0');
+    assert.equal(sessions({ source: 'all' }).length, 200, 'default bounded callers remain bounded');
+    assert.equal(sessions({ source: 'all', limit: 0 }).length, 0);
+    assert.equal(sessions({ source: 'codex', limit: null }).length, 552);
+    assert.equal(sessions({ source: 'all', project: 'older-only', limit: null }).length, 5);
+    assert.deepEqual(sessions({ source: 'all', sessionId: 'catalogue-1', limit: 1 }).map(s => s.id), ['catalogue-1']);
+    assert.equal(sessions({ source: 'claude', sessionId: 'catalogue-1' }).length, 0);
+    assert.equal(sessions({ source: 'all', sessionId: 'missing' }).length, 0);
+    assert.equal(ipcHandlers.get('db:getStats')(null, { source: 'all' }).sessions, 1105);
+    const projects = ipcHandlers.get('db:getProjects')(null, { source: 'all' });
+    assert.equal(projects.find(p => p.project === 'older-only').session_count, 5);
+    assert.equal(projects.reduce((sum, p) => sum + p.session_count, 0), 1105);
+    const page = opts => ipcHandlers.get('db:getSessionCatalogue')(null, { source: 'all', ...opts });
+    assert.equal(page({ limit: 1000 }).rows.length, 100, 'untrusted IPC cannot request an unbounded page');
+    assert.equal(page({ offset: 1000, limit: 100 }).rows[0].id, 'catalogue-104');
+    assert.equal(page({ offset: 1100 }).rows.at(-1).id, 'catalogue-0');
+    assert.deepEqual(page({ query: 'session 1', project: 'older-only', descending: false }).rows.map(s => s.id), ['catalogue-1']);
+    assert.equal(page({ source: 'codex', project: 'older-only' }).total, 2);
+    assert.deepEqual(page({ query: 'old-release' }).rows.map(s => s.id), ['catalogue-1']);
+    const lastPage = page({ offset: 1100, limit: 5 }).rows.map(s => s.id);
+    const previousPage = page({ offset: 1095, limit: 5 }).rows.map(s => s.id);
+    assert.equal(new Set([...previousPage, ...lastPage]).size, 10, 'tied timestamps across pages have no duplicates');
+    assert.equal(previousPage.at(-1), 'catalogue-5');
+    assert.equal(lastPage[0], 'catalogue-4');
+    assert.deepEqual([...lastPage].slice(-2), ['catalogue-1', 'catalogue-0']);
+    assert.deepEqual(page({ offset: 1105, limit: 5, descending: false }).rows, []);
+    assert.deepEqual(page({ offset: 0, limit: 2, descending: false }).rows.map(s => s.id), ['catalogue-0', 'catalogue-1']);
+    const activity = ipcHandlers.get('db:getActivitySessions')(null, { from: '2026-01-01', to: '2026-01-02' });
+    assert.ok(activity.total >= 2);
+    assert.equal(activity.rows.length, Math.min(200, activity.total));
+    const update = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+    try {
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('École', 'catalogue-0');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('ÜBER', 'catalogue-2');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Συνάντηση', 'catalogue-4');
+      update.prepare('UPDATE sessions SET project = ?, git_branch = ? WHERE id = ?').run('ÉQUIPE', 'DÉVELOP', 'catalogue-3');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('100%_literal\\path', 'catalogue-6');
+    } finally { update.close(); }
+    for (const [query, id] of [['école', 'catalogue-0'], ['über', 'catalogue-2'], ['συνάντηση', 'catalogue-4'], ['équipe', 'catalogue-3'], ['dévelop', 'catalogue-3'], ['%_literal\\path', 'catalogue-6']]) {
+      assert.deepEqual(page({ query }).rows.map(row => row.id), [id],
+        'database catalogue search preserves Unicode case-insensitive literal matching');
+      assert.equal(page({ query }).total, 1, 'search counts use the same matching semantics');
+    }
+    assert.equal(page({ query: 'session_' }).total, 0, 'underscore is literal, not a wildcard');
+
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process migrates an existing app database before source-filtered IPC queries', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-db-migration-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-db-migration-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const { DatabaseSync } = require('node:sqlite');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
@@ -537,12 +1094,14 @@ test('main process migrates an existing app database before source-filtered IPC 
   legacy.close();
 
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -552,6 +1111,7 @@ test('main process migrates an existing app database before source-filtered IPC 
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) {
@@ -561,7 +1121,7 @@ test('main process migrates an existing app database before source-filtered IPC 
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -578,20 +1138,30 @@ test('main process migrates an existing app database before source-filtered IPC 
       memories: 0,
       memoriesArchived: 0,
     });
+    const migrated = new DatabaseSync(dbPath);
+    assert.ok(migrated.prepare('PRAGMA index_list(sessions)').all().some(index => index.name === 'idx_sessions_catalogue_order'));
+    assert.ok(migrated.prepare(`EXPLAIN QUERY PLAN SELECT id FROM sessions
+      ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 100`).all()
+      .some(step => step.detail.includes('idx_sessions_catalogue_order')));
+    migrated.close();
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('main process keeps schema and memory mutations behind the writer lease', async () => {
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-migration-lease-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-migration-lease-${Date.now()}`);
   const obeliskDir = join(home, '.obelisk');
   const dbPath = join(obeliskDir, 'obelisk.sqlite');
   mkdirSync(obeliskDir, { recursive: true });
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const legacy = new DatabaseSync(dbPath);
   legacy.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY)');
@@ -603,12 +1173,14 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   });
   assert.ok(holder);
   const ipcHandlers = new Map();
+  const appHandlers = new Map();
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -618,6 +1190,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   const restore = registerMocks([
     [ELECTRON_URL, {
       namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
         BrowserWindow: FakeBrowserWindow,
         ipcMain: {
           handle(channel, handler) { ipcHandlers.set(channel, handler); },
@@ -625,7 +1198,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
       }),
     }],
     [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
     [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
@@ -644,7 +1217,9 @@ test('main process keeps schema and memory mutations behind the writer lease', a
   } finally {
     restore();
     holder.release();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -652,10 +1227,12 @@ test('main process keeps schema and memory mutations behind the writer lease', a
 test('closing the last macOS window releases background resources until activation', async () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
   const originalHome = process.env.HOME;
-  const home = join(tmpdir(), `obelisk-main-window-${Date.now()}`);
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-window-${Date.now()}`);
   mkdirSync(join(home, '.obelisk'), { recursive: true });
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   Object.defineProperty(process, 'platform', { value: 'darwin' });
 
   const appHandlers = new Map();
@@ -666,6 +1243,7 @@ test('closing the last macOS window releases background resources until activati
   let quitCalled = false;
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() { serviceEvents.push('db-close'); }
@@ -676,10 +1254,11 @@ test('closing the last macOS window releases background resources until activati
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
       windows.push(this);
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return windows; }
@@ -698,10 +1277,12 @@ test('closing the last macOS window releases background resources until activati
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, {
-      defaultExport: {
-        watch: () => {
-          const watcher = { on() { return this; }, close() { serviceEvents.push('watcher-close'); } };
+    [WATCHER_URL, {
+      namedExports: {
+        createAdaptiveWatcher: () => {
+          const watcher = {
+            close() { serviceEvents.push('watcher-close'); return Promise.resolve(); },
+          };
           watchers.push(watcher);
           return watcher;
         },
@@ -755,14 +1336,15 @@ test('closing the last macOS window releases background resources until activati
     assert.equal(serviceEvents.filter(e => e === 'service-start').length, 2);
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('settings rebuild reopens the database from the configured Claude path', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-${Date.now()}`);
   const defaultClaudeDir = join(home, '.claude');
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
@@ -778,15 +1360,22 @@ test('settings rebuild reopens the database from the configured Claude path', as
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const openedDbPaths = [];
   const buildCalls = [];
   const serviceEvents = [];
+  const sent = [];
+  const promotedHints = [];
   let competingLeaseDuringBuild;
+  let publishRebuild = false;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
       openedDbPaths.push(dbPath);
@@ -801,12 +1390,20 @@ test('settings rebuild reopens the database from the configured Claude path', as
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = {
+        on() {},
+        setWindowOpenHandler() {},
+        getURL() { return ''; },
+        setZoomLevel() {},
+        openDevTools() {},
+        send(channel, payload) { sent.push({ channel, payload }); },
+      };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
-    static getAllWindows() { return []; }
+    static getAllWindows() { return [new FakeBrowserWindow()]; }
     static fromWebContents() { return null; }
   }
 
@@ -822,7 +1419,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -831,6 +1428,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
           stop() { serviceEvents.push('stop'); },
           idle: async () => { serviceEvents.push('idle'); },
           runBuildNow() { serviceEvents.push('runBuildNow'); return Promise.resolve(); },
+          promoteWatchHints(hints) { promotedHints.push(hints); },
         }),
       },
     }],
@@ -847,7 +1445,21 @@ test('settings rebuild reopens the database from the configured Claude path', as
             competingLeaseDuringBuild = Boolean(competingLease);
             competingLease?.release();
             writeFileSync(args.dbPath, 'rebuilt temp db');
-            return { files: 2, affectedSessionIds: ['session-1', 'session-2'] };
+            return {
+              files: 2,
+              affectedSessionIds: ['session-1', 'session-2'],
+              complete: publishRebuild,
+              reason: publishRebuild ? undefined : 'incomplete_snapshot',
+              inventoryIssues: [],
+              skippedFiles: publishRebuild
+                ? []
+                : [{
+                    provider: 'pi',
+                    path: '/tmp/pi/structurally-invalid.jsonl',
+                    error: 'Malformed Pi message at line 2',
+                  }],
+              watchHints: publishRebuild ? ['/hint/live-session.jsonl'] : [],
+            };
           },
           stop() { return Promise.resolve(); },
         }),
@@ -860,22 +1472,54 @@ test('settings rebuild reopens the database from the configured Claude path', as
 
     const rebuild = ipcHandlers.get('settings:rebuildIndex');
     assert.equal(typeof rebuild, 'function');
+    const liveDbPath = join(home, '.obelisk', 'obelisk.sqlite');
+    const beforeIncomplete = require('node:fs').readFileSync(liveDbPath, 'utf8');
+    const incomplete = await rebuild();
+    assert.equal(incomplete.complete, false);
+    assert.ok(
+      serviceEvents.includes('runBuildNow'),
+      'a rebuild without hints schedules a reconciling build to reseed the hot set',
+    );
+    assert.deepEqual(sent.findLast(message => message.channel === 'obelisk:index-updated'), {
+      channel: 'obelisk:index-updated',
+      payload: {
+        affectedSessionIds: ['session-1', 'session-2'],
+        sourceIssues: [{
+          provider: 'pi',
+          path: '/tmp/pi/structurally-invalid.jsonl',
+          error: 'Malformed Pi message at line 2',
+        }],
+      },
+    });
+    assert.equal(
+      require('node:fs').readFileSync(liveDbPath, 'utf8'),
+      beforeIncomplete,
+      'an incomplete temp database must not replace the live database',
+    );
+
+    publishRebuild = true;
     await rebuild();
+    assert.deepEqual(
+      sent.findLast(message => message.channel === 'obelisk:index-updated').payload.sourceIssues,
+      [],
+    );
 
     assert.equal(buildCalls.at(-1).claudeDir, customClaudeDir);
     assert.equal(buildCalls.at(-1).projectsDir, join(customClaudeDir, 'projects'));
     assert.equal(buildCalls.at(-1).codexDir, customCodexDir);
-    assert.notEqual(buildCalls.at(-1).dbPath, join(home, '.obelisk', 'obelisk.sqlite'));
-    assert.equal(buildCalls.at(-1).preserveDbPath, join(home, '.obelisk', 'obelisk.sqlite'));
+    assert.notEqual(buildCalls.at(-1).dbPath, liveDbPath);
+    assert.equal(buildCalls.at(-1).preserveDbPath, liveDbPath);
     assert.equal(buildCalls.at(-1).writerLeasePath, join(home, '.obelisk', 'writer.lock.sqlite'));
     assert.equal(buildCalls.at(-1).writerLeaseMode, 'caller-held');
     assert.equal(competingLeaseDuringBuild, false);
-    assert.equal(openedDbPaths.at(-1), join(home, '.obelisk', 'obelisk.sqlite'));
+    assert.equal(openedDbPaths.at(-1), liveDbPath);
     assert.equal(
-      require('node:fs').readFileSync(join(home, '.obelisk', 'obelisk.sqlite'), 'utf8'),
+      require('node:fs').readFileSync(liveDbPath, 'utf8'),
       'rebuilt temp db',
     );
     assert.ok(serviceEvents.indexOf('build') > serviceEvents.indexOf('stop'));
+    assert.deepEqual(promotedHints, [['/hint/live-session.jsonl']],
+      'a successful rebuild seeds the recreated watcher with its watch hints');
     const postRebuildLease = acquireWriterLease({
       lockPath: join(home, '.obelisk', 'writer.lock.sqlite'),
       openDb: lockPath => new DatabaseSync(lockPath),
@@ -884,13 +1528,14 @@ test('settings rebuild reopens the database from the configured Claude path', as
     postRebuildLease.release();
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('settings rebuild keeps the existing database after a worker failure', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-failure-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-failure-${Date.now()}`);
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
   mkdirSync(customClaudeDir, { recursive: true });
@@ -903,7 +1548,10 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const openedDbPaths = [];
@@ -911,6 +1559,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   const serviceEvents = [];
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.dbPath = dbPath;
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
@@ -929,9 +1578,10 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -950,7 +1600,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -994,13 +1644,14 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
     assert.ok(serviceEvents.lastIndexOf('start') > serviceEvents.indexOf('build'));
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('settings rebuild cancels an in-flight background build instead of waiting for it', async () => {
-  const home = join(tmpdir(), `obelisk-main-settings-rebuild-cancel-${Date.now()}`);
+  const home = makeTempDir(`obelisk-main-settings-rebuild-cancel-${Date.now()}`);
   const customClaudeDir = join(home, 'custom-claude');
   const customCodexDir = join(home, 'custom-codex');
   mkdirSync(customClaudeDir, { recursive: true });
@@ -1013,13 +1664,17 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   }));
 
   const originalHome = process.env.HOME;
+
+  const originalProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
 
   const ipcHandlers = new Map();
   const serviceEvents = [];
   let buildIndexCalls = 0;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1033,9 +1688,10 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
 
   class FakeBrowserWindow {
     constructor() {
-      this.webContents = { on() {}, setZoomLevel() {}, openDevTools() {}, send() {} };
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1054,7 +1710,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
       }),
     }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
-    [CHOKIDAR_URL, { defaultExport: noopChokidar() }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
     [INDEXER_SERVICE_URL, {
       namedExports: {
@@ -1072,7 +1728,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
           buildIndex: async (args) => {
             serviceEvents.push(`build-${++buildIndexCalls}`);
             writeFileSync(args.dbPath, 'rebuilt temp db');
-            return { files: 2, affectedSessionIds: [] };
+            return { files: 2, affectedSessionIds: [], complete: true };
           },
           stop() {
             serviceEvents.push('worker-stop');
@@ -1097,7 +1753,304 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
     assert.ok(serviceEvents.some(event => event.startsWith('build-')));
   } finally {
     restore();
-    process.env.HOME = originalHome;
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('settings changes during rebuild keep one watcher and re-enable with a catch-up build', async () => {
+  const home = makeTempDir(`obelisk-main-settings-rebuild-race-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({ autoRefresh: true }));
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+  const services = [];
+  let finishRebuild;
+
+  class FakeDatabase {
+    function() {}
+    constructor(dbPath) {
+      this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
+    }
+    pragma() {}
+    exec(sql) { return this.lockDb?.exec(sql); }
+    close() { this.lockDb?.close(); }
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, {
+      namedExports: {
+        createIndexerService: () => {
+          const service = {
+            starts: [],
+            stops: 0,
+            start(options) { this.starts.push(options); },
+            stop() { this.stops += 1; },
+            idle: async () => {},
+            runBuildNow() { return Promise.resolve(); },
+          };
+          services.push(service);
+          return service;
+        },
+      },
+    }],
+    [INDEXER_WORKER_URL, {
+      namedExports: {
+        createWorkerBuildIndex: () => ({
+          buildIndex: () => new Promise(resolve => {
+            finishRebuild = () => resolve({
+              files: 0,
+              affectedSessionIds: [],
+              complete: false,
+              deferred: false,
+              inventoryIssues: [],
+              skippedFiles: [],
+              reason: 'incomplete_snapshot',
+            });
+          }),
+          stop() { return Promise.resolve(); },
+        }),
+      },
+    }],
+  ]);
+
+  try {
+    await importMain();
+    assert.equal(services.length, 1);
+
+    const rebuildPromise = ipcHandlers.get('settings:rebuildIndex')();
+    await new Promise(resolve => setImmediate(resolve));
+    await ipcHandlers.get('settings:set')(null, 'autoRefresh', false);
+    await ipcHandlers.get('settings:set')(null, 'autoRefresh', true);
+
+    assert.equal(services.length, 2);
+    assert.deepEqual(services[1].starts, [{ buildOnStart: true }]);
+    finishRebuild();
+    await rebuildPromise;
+
+    assert.equal(services.length, 2, 'the rebuild finally block reused the current service');
+    assert.equal(services[0].stops, 1);
+    assert.equal(services[1].stops, 0);
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+test('main process watches OBELISK_DIR as a tree target and debounces recap notifications', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-watch-retry-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  let watcherOptions = null;
+  const windows = [];
+  const sent = [];
+
+  class FakeDatabase {
+    function() {}
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {},
+        send(channel, payload) { sent.push({ channel, payload }); },
+      };
+      windows.push(this);
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return windows; }
+    static fromWebContents() { return null; }
+  }
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, {
+      namedExports: {
+        createAdaptiveWatcher: (options) => {
+          watcherOptions = options;
+          return { close() { return Promise.resolve(); } };
+        },
+      },
+    }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+    assert.ok(watcherOptions, 'the OBELISK_DIR watcher was created');
+    // Retry/recovery lives inside the package now; the app only declares the
+    // target. The package's own tests prove the retry loop repeats.
+    assert.deepEqual(watcherOptions.targets, [{ kind: 'tree', path: join(home, '.obelisk') }]);
+
+    // A recap markdown invalidation notifies windows after the writes settle:
+    // true trailing debounce — the timer resets on every event.
+    const recapFile = join(home, '.obelisk', 'recap', 'week.md');
+    watcherOptions.onInvalidate({ type: 'paths', paths: [recapFile] });
+    mock.timers.tick(200);
+    watcherOptions.onInvalidate({ type: 'paths', paths: [recapFile] });
+    mock.timers.tick(299);
+    assert.equal(sent.length, 0, 'a continuous write burst has not notified yet');
+    mock.timers.tick(1);
+    assert.equal(sent.length, 1, 'notification fires 300 ms after the LAST event, not the first');
+    assert.equal(sent[0].channel, 'obelisk:recap-updated');
+    assert.equal(sent[0].payload, recapFile);
+
+    // Non-recap extensions never notify.
+    watcherOptions.onInvalidate({ type: 'paths', paths: [join(home, '.obelisk', 'notes.txt')] });
+    mock.timers.tick(1000);
+    assert.equal(sent.length, 1, 'a .txt change does not notify');
+  } finally {
+    restore();
+    mock.timers.reset();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the win:control IPC applies only whitelisted window actions to the sender window', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-window-control-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+  const windowCalls = [];
+  const windows = [];
+  let maximized = false;
+
+  class FakeDatabase {
+    function() {}
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {},
+      };
+      windows.push(this);
+    }
+    on() {}
+    loadFile() {}
+    loadURL() {}
+    close() { windowCalls.push('close'); }
+    minimize() { windowCalls.push('minimize'); }
+    maximize() { windowCalls.push('maximize'); maximized = true; }
+    unmaximize() { windowCalls.push('unmaximize'); maximized = false; }
+    isMaximized() { return maximized; }
+    static getAllWindows() { return windows; }
+    static fromWebContents() { return windows[0] ?? null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+
+    const handler = ipcHandlers.get('win:control');
+    assert.equal(typeof handler, 'function', 'the main process registers one win:control handler');
+
+    // The window always comes from the sender; a renderer-supplied argument is ignored.
+    assert.equal(handler({ sender: {} }, 'minimize', 'window-from-the-renderer'), null);
+    assert.deepEqual(windowCalls, ['minimize']);
+
+    assert.equal(handler({ sender: {} }, 'toggle-maximize'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize'], 'an unmaximized window maximizes');
+    assert.equal(handler({ sender: {} }, 'toggle-maximize'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize'], 'a maximized window restores');
+
+    assert.equal(handler({ sender: {} }, 'close'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize', 'close'], 'close stays win.close()');
+
+    assert.throws(
+      () => handler({ sender: {} }, 'explode'),
+      /win:control accepts 'minimize', 'toggle-maximize', or 'close'/,
+    );
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize', 'close'], 'an unknown action changes nothing');
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
   }
 });

@@ -1,3 +1,6 @@
+/* Copyright (C) 2026 tommy0103 and contributors. */
+/* SPDX-License-Identifier: AGPL-3.0-only */
+
 .detail { max-width: 720px; margin: 0 auto; padding: 32px 32px 60px; }
 .detail-wide { max-width: 860px; margin: 0 auto; padding: 28px 32px 60px; }
 
@@ -363,6 +366,11 @@
 .markdown-msg th, .markdown-msg td { border: 1px solid var(--hairline); padding: 5px 9px; text-align: left; }
 .markdown-msg th { background: rgba(255,255,255,0.04); font-weight: 600; }
 .markdown-msg mark { background: var(--accent-soft); color: var(--accent-2); padding: 0 2px; border-radius: 2px; }
+
+/* Session images cap themselves against the reading column. Compact Markdown
+   renders in much smaller surfaces (subagent panes, memory rows, tool results),
+   where a viewport-sized image would swamp the block it belongs to. */
+.markdown-compact { --session-image-max-block: 240px; }
 
 .detail-section-divider {
   display: flex; align-items: center; gap: 10px;
@@ -1342,3 +1350,12 @@
   font-variant-numeric: tabular-nums;
 }
 .msg-nav-pos .msg-nav-current { color: var(--fg-2); font-weight: 500; }
+
+.file-ref {
+  color: var(--accent-2); cursor: pointer;
+  text-decoration: underline; text-decoration-color: var(--accent-soft);
+  text-underline-offset: 3px; transition: all 0.1s;
+}
+.file-ref:hover { color: var(--accent-2); text-decoration-color: var(--accent-2); }
+code > .file-ref { color: inherit; text-decoration-color: var(--muted-2); }
+code > .file-ref:hover { color: var(--accent-2); text-decoration-color: var(--accent-2); }

@@ -1,7 +1,11 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Utility functions ported from the vanilla JS utils.js.
 // Pure helpers with no side-effects on global state (except formatProjectLabel which reads store).
 
 import { state } from './store.js';
+import { markFileReferences, mayContainFileReference } from './file-references.mjs';
 
 // --- Time / formatting ---
 
@@ -94,7 +98,7 @@ export function highlightTextNodes(rootEl, query) {
 
 export function renderMarkdown(text, opts = {}) {
   if (text == null) return '';
-  // marked is loaded globally via CDN in index.html
+  // marked is loaded globally via CDN in index.html and configured at startup.
   const html = sanitizeMarkdown(window.marked.parse(text));
   const cls = opts.variant === 'msg' ? 'markdown-msg'
             : opts.variant === 'compact' ? 'markdown-compact'
@@ -102,6 +106,11 @@ export function renderMarkdown(text, opts = {}) {
   const container = document.createElement('div');
   container.className = cls;
   container.innerHTML = html;
+  // Without a cwd or session to resolve against, a reference could never be opened — leaving it
+  // unmarked keeps it from looking actionable.
+  if ((opts.cwd || opts.sessionId) && mayContainFileReference(html)) {
+    markFileReferences(container, { cwd: opts.cwd, sessionId: opts.sessionId });
+  }
   if (opts.query) highlightTextNodes(container, opts.query.trim());
   return container.outerHTML;
 }
@@ -154,11 +163,9 @@ export function positionTooltip(el, x, y) {
 
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';
-  // Find the shortest project_path for this slug (most likely the project root)
-  const sessions = state.sessions.filter(s => s.project === slug && s.project_path);
-  if (sessions.length) {
-    const shortest = sessions.reduce((a, b) => a.project_path.length <= b.project_path.length ? a : b);
-    const parts = shortest.project_path.split('/');
+  const projectPath = state.projects.find(project => project.project === slug)?.project_path;
+  if (projectPath) {
+    const parts = projectPath.split('/');
     return parts[parts.length - 1];
   }
   return slug.replace(/^-/, '');

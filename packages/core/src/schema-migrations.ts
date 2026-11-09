@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import type { SqliteDb } from './sqlite-types.ts';
 
 const COLUMN_MIGRATIONS = [
@@ -8,6 +11,11 @@ const COLUMN_MIGRATIONS = [
   ['messages', 'source', "TEXT DEFAULT 'claude'"],
   ['tool_calls', 'presentation', "TEXT DEFAULT 'default'"],
   ['workflows', 'parent_tool_use_id', 'TEXT'],
+  ['index_state', 'cursor', 'TEXT'],
+  ['index_state', 'replay_required', 'INTEGER NOT NULL DEFAULT 0'],
+  ['summaries', 'visibility', "TEXT DEFAULT 'visible'"],
+  ['summaries', 'input_tokens', 'INTEGER'],
+  ['summaries', 'output_tokens', 'INTEGER'],
   ['memories', 'anchors', 'TEXT'],
   ['memories', 'deleted_at', 'TEXT'],
   ['memories', 'deleted_reason', 'TEXT'],
@@ -15,6 +23,20 @@ const COLUMN_MIGRATIONS = [
 
 function tableExists(db: SqliteDb, table: string): boolean {
   return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table));
+}
+
+export function coreSchemaNeedsMigration(db: SqliteDb): boolean {
+  const columnsByTable = new Map<string, Set<string>>();
+  for (const [table, column] of COLUMN_MIGRATIONS) {
+    if (!tableExists(db, table)) return true;
+    let columns = columnsByTable.get(table);
+    if (!columns) {
+      columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => String(row.name)));
+      columnsByTable.set(table, columns);
+    }
+    if (!columns.has(column)) return true;
+  }
+  return false;
 }
 
 /** Binding-agnostic additive migrations shared by the CLI and desktop app. */

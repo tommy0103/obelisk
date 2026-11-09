@@ -1,9 +1,12 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdtempSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync, appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { join, normalize } from 'node:path';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -33,7 +36,7 @@ class TestDatabase {
 }
 
 test('app indexer records build success without claiming daemon ownership', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-'));
+  const home = makeTempDir('obelisk-app-indexer-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -60,7 +63,17 @@ test('app indexer records build success without claiming daemon ownership', () =
   assert.equal(db.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'hello'").get().uuid, 'msg-app-1');
   assert.equal(db.prepare("SELECT jsonl_path FROM index_state WHERE jsonl_path='__app_heartbeat__'").get(), undefined);
   assert.equal(db.prepare("SELECT jsonl_path FROM index_state WHERE jsonl_path='__app_last_successful_build__'").get().jsonl_path, '__app_last_successful_build__');
-  assert.equal(db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, '/tmp/obelisk-app');
+  assert.equal(db.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path, normalize('/tmp/obelisk-app'));
+  db.prepare('UPDATE sessions SET project_path=? WHERE id=?').run('/tmp/stale-affected', sessionId);
+  db.prepare('INSERT INTO sessions (id,project,project_path,source) VALUES (?,?,?,?)')
+    .run('session-app-unaffected', '-tmp-unaffected', '/tmp/stale-unaffected', 'claude');
+  db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,timestamp,role,text,content_type,cwd,source)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `).run(
+    'msg-app-unaffected', 'session-app-unaffected', 'user', '2026-06-13T09:00:00Z',
+    'user', 'unrelated session', 'text', '/tmp/unaffected', 'claude',
+  );
   db.close();
 
   appendFileSync(jsonlPath, [
@@ -87,11 +100,50 @@ test('app indexer records build success without claiming daemon ownership', () =
   const db2 = new TestDatabase(dbPath);
   assert.equal(db2.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'companion'").get().uuid, 'msg-app-2');
   assert.equal(db2.prepare('SELECT message_count FROM sessions WHERE id=?').get(sessionId).message_count, 2);
+  assert.equal(
+    db2.prepare('SELECT project_path FROM sessions WHERE id=?').get(sessionId).project_path,
+    '/tmp/stale-affected',
+    'ordinary incremental refresh preserves an already-resolved project root',
+  );
+  assert.equal(
+    db2.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
+    '/tmp/stale-unaffected',
+  );
   db2.close();
+
+  const unresolvedDb = new TestDatabase(dbPath);
+  unresolvedDb.prepare('UPDATE sessions SET project_path=NULL WHERE id=?').run('session-app-unaffected');
+  unresolvedDb.close();
+
+  buildIndex({
+    claudeDir,
+    dbPath,
+    DatabaseImpl: TestDatabase,
+    changedPaths: [],
+    retrySessionIds: ['session-app-unaffected'],
+  });
+
+  const retryDb = new TestDatabase(dbPath);
+  assert.equal(
+    retryDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
+    normalize('/tmp/unaffected'),
+  );
+  retryDb.prepare('UPDATE sessions SET project_path=? WHERE id=?')
+    .run('/tmp/stale-unaffected', 'session-app-unaffected');
+  retryDb.close();
+
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+  const repairedDb = new TestDatabase(dbPath);
+  assert.equal(
+    repairedDb.prepare('SELECT project_path FROM sessions WHERE id=?').get('session-app-unaffected').project_path,
+    '/tmp/stale-unaffected',
+    'ordinary full-inventory refresh preserves an already-resolved project root',
+  );
+  repairedDb.close();
 });
 
 test('app indexer refreshes unchanged Claude usage when input token semantics change', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-token-semantics-'));
+  const home = makeTempDir('obelisk-app-indexer-token-semantics-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -145,8 +197,57 @@ test('app indexer refreshes unchanged Claude usage when input token semantics ch
   refreshed.close();
 });
 
+test('app indexer replays unchanged Claude transcripts when custom-title indexing becomes available', () => {
+  const home = makeTempDir('obelisk-app-indexer-custom-title-');
+  const claudeDir = join(home, '.claude');
+  const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
+  mkdirSync(projectDir, { recursive: true });
+  const sessionId = 'session-custom-title-1';
+  const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
+  writeFileSync(jsonlPath, [
+    JSON.stringify({
+      type: 'custom-title',
+      customTitle: 'Desktop generated title',
+      sessionId,
+    }),
+    JSON.stringify({
+      uuid: 'msg-custom-title-1',
+      type: 'user',
+      timestamp: '2026-06-13T10:00:00Z',
+      cwd: '/tmp/obelisk-app',
+      message: { role: 'user', content: 'hello from a titled session' },
+    }),
+    '',
+  ].join('\n'));
+
+  const dbPath = join(claudeDir, 'obelisk.sqlite');
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const stale = new TestDatabase(dbPath);
+  stale.prepare('UPDATE sessions SET title = NULL WHERE id = ?').run(sessionId);
+  stale.prepare('DELETE FROM index_state WHERE jsonl_path = ?')
+    .run(CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
+  stale.prepare(
+    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, 0, 0)',
+  ).run('__claude_canonical_transcript_v2__');
+  stale.close();
+
+  buildIndex({ claudeDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const refreshed = new TestDatabase(dbPath);
+  assert.equal(
+    refreshed.prepare('SELECT title FROM sessions WHERE id = ?').get(sessionId).title,
+    'Desktop generated title',
+  );
+  assert.ok(
+    refreshed.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
+      .get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER),
+  );
+  refreshed.close();
+});
+
 test('force rebuild ignores stale JSONL index_state rows after session tables were cleared', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-force-'));
+  const home = makeTempDir('obelisk-app-indexer-force-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -181,7 +282,7 @@ test('force rebuild ignores stale JSONL index_state rows after session tables we
 });
 
 test('force rebuild bypasses stale message FTS delete triggers', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-force-fts-'));
+  const home = makeTempDir('obelisk-app-indexer-force-fts-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -223,7 +324,7 @@ test('force rebuild bypasses stale message FTS delete triggers', () => {
 });
 
 test('force rebuild into a new database preserves existing memories', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-force-preserve-'));
+  const home = makeTempDir('obelisk-app-indexer-force-preserve-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -279,7 +380,7 @@ test('force rebuild into a new database preserves existing memories', () => {
 });
 
 test('app indexer reports changed workflow JSON as an affected session', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-workflow-'));
+  const home = makeTempDir('obelisk-app-indexer-workflow-');
   const claudeDir = join(home, '.claude');
   const project = '-tmp-obelisk-app';
   const sessionId = 'session-workflow-1';
@@ -319,7 +420,7 @@ test('app indexer reports changed workflow JSON as an affected session', () => {
 });
 
 test('app indexer marks UI-fallback control messages as meta at ingest time', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-meta-'));
+  const home = makeTempDir('obelisk-app-indexer-meta-');
   const claudeDir = join(home, '.claude');
   const projectDir = join(claudeDir, 'projects', '-tmp-obelisk-app');
   mkdirSync(projectDir, { recursive: true });
@@ -358,7 +459,7 @@ test('app indexer marks UI-fallback control messages as meta at ingest time', ()
 });
 
 test('app indexer loads Codex root sessions into the shared schema', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -423,7 +524,7 @@ test('app indexer loads Codex root sessions into the shared schema', () => {
   const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(`codex:${codexId}`);
   assert.equal(session.source, 'codex');
   assert.equal(session.project, '-tmp-obelisk-app');
-  assert.equal(session.project_path, '/tmp/obelisk-app');
+  assert.equal(session.project_path, normalize('/tmp/obelisk-app'));
   assert.equal(session.git_branch, 'feat/codex');
   assert.equal(session.version, '0.135.0-alpha.1');
   assert.equal(session.message_count, 3);
@@ -449,7 +550,7 @@ test('app indexer loads Codex root sessions into the shared schema', () => {
 });
 
 test('app indexer accepts Codex changed paths relative to the sessions directory', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-sessions-change-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-sessions-change-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -496,8 +597,71 @@ test('app indexer accepts Codex changed paths relative to the sessions directory
   db.close();
 });
 
+// A changedPaths report must re-plan the file even when the cursor could not
+// prove it changed — this is the path watchers actually use. (Exact
+// matching-signature precedence is covered by the discovery unit tests; a
+// real rewrite always moves ctime, so this end-to-end case verifies the
+// database converges through the changedPaths path.)
+test('app indexer re-plans a Codex file reported via changedPaths and updates the database', () => {
+  const home = makeTempDir('obelisk-app-indexer-codex-changedpath-mtime-');
+  const claudeDir = join(home, '.claude');
+  const codexDir = join(home, '.codex');
+  const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
+  mkdirSync(join(claudeDir, 'projects'), { recursive: true });
+  mkdirSync(codexSessionDir, { recursive: true });
+
+  const codexId = '019ec6ee-cebd-7431-9c93-ceec89a98a60';
+  const filename = `rollout-2026-06-15T00-19-59-${codexId}.jsonl`;
+  const jsonlPath = join(codexSessionDir, filename);
+  const rollout = (message) => [
+    JSON.stringify({
+      timestamp: '2026-06-14T16:19:59.842Z',
+      type: 'session_meta',
+      payload: {
+        id: codexId,
+        timestamp: '2026-06-14T16:19:59.842Z',
+        cwd: '/tmp/obelisk-app',
+        cli_version: '0.135.0-alpha.1',
+        thread_source: 'user',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-14T16:20:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message, images: [], local_images: [], text_elements: [] },
+    }),
+    '',
+  ].join('\n');
+
+  // 'alpha' and 'omega' are equal length, and the rewrite is forced back to
+  // the original mtime, so the mtime+size legs alone could not catch it.
+  writeFileSync(jsonlPath, rollout('codex alpha value'));
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  buildIndex({ claudeDir, codexDir, dbPath, DatabaseImpl: TestDatabase });
+
+  const orig = statSync(jsonlPath).mtimeMs / 1000;
+  writeFileSync(jsonlPath, rollout('codex omega value'));
+  utimesSync(jsonlPath, orig, orig);
+
+  buildIndex({
+    claudeDir,
+    codexDir,
+    dbPath,
+    DatabaseImpl: TestDatabase,
+    reason: 'reconcile',
+    changedPaths: [join('2026', '06', '15', filename)],
+  });
+
+  const db = new TestDatabase(dbPath);
+  assert.equal(
+    db.prepare('SELECT text FROM messages WHERE session_id=?').get(`codex:${codexId}`).text,
+    'codex omega value',
+  );
+  db.close();
+});
+
 test('app indexer uses Codex response_item messages only when no visible event message exists', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-response-message-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-response-message-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -567,7 +731,7 @@ test('app indexer uses Codex response_item messages only when no visible event m
 });
 
 test('app indexer skips Codex guardian review threads', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-guardian-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-guardian-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -618,8 +782,8 @@ test('app indexer skips Codex guardian review threads', () => {
   db.close();
 });
 
-test('app indexer removes stale Codex guardian rows when the JSONL was already indexed', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-guardian-stale-'));
+test('app indexer retracts stale Codex guardian rows via the marker-driven replay', () => {
+  const home = makeTempDir('obelisk-app-indexer-codex-guardian-stale-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -664,6 +828,10 @@ test('app indexer removes stale Codex guardian rows when the JSONL was already i
   db.prepare('INSERT INTO subagents (agent_id,session_id) VALUES (?,?)').run(guardianSessionId, guardianSessionId);
   db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path,mtime,lines_processed) VALUES (?,?,?)')
     .run(jsonlPath, statSync(jsonlPath).mtimeMs, 2);
+  // Simulate a pre-fix database: the old marker is present and the current
+  // one is absent, so the next build runs one marker-driven full replay.
+  db.prepare("DELETE FROM index_state WHERE jsonl_path LIKE '\\_\\_codex\\_canonical\\_transcript%' ESCAPE '\\'").run();
+  db.prepare("INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__codex_canonical_transcript_v2__', 0, 0)").run();
   db.close();
 
   buildIndex({ claudeDir, codexDir, dbPath, DatabaseImpl: TestDatabase });
@@ -679,7 +847,7 @@ test('app indexer removes stale Codex guardian rows when the JSONL was already i
 });
 
 test('app indexer maps Codex subagent threads onto parent sessions', () => {
-  const home = mkdtempSync(join(tmpdir(), 'obelisk-app-indexer-codex-subagent-'));
+  const home = makeTempDir('obelisk-app-indexer-codex-subagent-');
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
   const codexSessionDir = join(codexDir, 'sessions', '2026', '06', '15');
@@ -797,3 +965,37 @@ test('app indexer maps Codex subagent threads onto parent sessions', () => {
   assert.equal(childResult.content, '/tmp/obelisk-app');
   db.close();
 });
+
+for (const configured of [false, true]) {
+  test(`app indexes Kiro history with a read-only database and bounded lock wait (${configured ? 'configured' : 'default'} registry)`, () => {
+    const home = makeTempDir('obelisk-app-kiro-');
+    const root = join(home, '.kiro');
+    mkdirSync(root, { recursive: true });
+    const sourcePath = join(root, 'data.sqlite3');
+    const fixture = JSON.parse(readFileSync(new URL('./fixtures/kiro/conversation.json', import.meta.url), 'utf8'));
+    const source = new DatabaseSync(sourcePath);
+    source.exec('CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT, created_at INTEGER, updated_at INTEGER)');
+    source.prepare('INSERT INTO conversations_v2 VALUES (?, ?, ?, ?, ?)').run(
+      fixture.key, fixture.conversation_id, JSON.stringify(fixture.value), fixture.created_at, fixture.updated_at,
+    );
+    source.close();
+    const opens = [];
+    class KiroTestDatabase extends TestDatabase {
+      constructor(path, options) {
+        super(path);
+        if (path === sourcePath) opens.push(options);
+      }
+    }
+    const dbPath = join(home, 'index.sqlite');
+    buildIndex({
+      claudeDir: join(home, '.claude'), codexDir: join(home, '.codex'), dbPath,
+      providerRoots: { kiro: root }, DatabaseImpl: KiroTestDatabase,
+      ...(configured ? { providerSettings: { providerRoots: { kiro: root } } } : {}),
+    });
+    assert.ok(opens.length > 0, 'the native Kiro store was actually opened');
+    assert.ok(opens.every(options => options.readonly === true && options.fileMustExist === true && options.timeout === 500));
+    const db = new TestDatabase(dbPath);
+    assert.ok(db.prepare("SELECT text FROM messages WHERE source='kiro' AND text='Example content'").get());
+    db.close();
+  });
+}

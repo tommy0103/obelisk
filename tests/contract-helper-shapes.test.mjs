@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Tier 2 contract golden tests (see docs/adr/0002-two-tier-runtime-contract.md).
 //
 // These lock the *composite return shapes* that agents parse and that
@@ -19,11 +22,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
@@ -99,7 +102,7 @@ test('search() hit shape matches api-reference.md', () => {
   const hit = createQueryApi(db).search('needle', { limit: 1 })[0];
 
   exactKeys(hit, ['message', 'session', 'rank', 'context'], 'search() hit');
-  exactKeys(hit.message, ['uuid', 'text', 'content_type', 'is_meta', 'role', 'timestamp', 'model', 'cwd', 'source'], 'search() hit.message');
+  exactKeys(hit.message, ['uuid', 'text', 'content_type', 'is_meta', 'role', 'timestamp', 'model', 'cwd', 'visibility', 'source'], 'search() hit.message');
   exactKeys(hit.session, ['id', 'title', 'project', 'started_at', 'source'], 'search() hit.session');
   assert.ok(Array.isArray(hit.context), 'search() hit.context is an array');
   db.close();
@@ -115,11 +118,22 @@ test('context() shape matches api-reference.md', () => {
   db.close();
 });
 
+test('messages() shape matches api-reference.md', () => {
+  const db = fixture();
+  const api = createQueryApi(db);
+  const result = api.messages({ around: 'm-child', relation: 'parents', includeSession: true });
+  exactKeys(result, ['anchor', 'messages', 'session', 'hasMore', 'nextCursor'], 'messages()');
+  assert.deepEqual(result.messages.map(m => m.uuid), ['m-root', 'm-child']);
+  const page = api.messages({ sessionId: 'sid-1', limit: 1 });
+  exactKeys(page.nextCursor, ['timestamp', 'uuid'], 'messages() nextCursor');
+  db.close();
+});
+
 test('fileHistory() row shape matches api-reference.md', () => {
   const db = fixture();
   const row = createQueryApi(db).fileHistory('/x/file.ts')[0];
 
-  exactKeys(row, ['toolCall', 'session', 'timestamp'], 'fileHistory() row');
+  exactKeys(row, ['toolCall', 'session', 'timestamp', 'visibility'], 'fileHistory() row');
   exactKeys(row.toolCall, ['id', 'message_uuid', 'name', 'input_json'], 'fileHistory() row.toolCall');
   exactKeys(row.session, ['id', 'title', 'project'], 'fileHistory() row.session');
   db.close();
@@ -129,7 +143,7 @@ test('failures() row shape matches api-reference.md', () => {
   const db = fixture();
   const row = createQueryApi(db).failures()[0];
 
-  exactKeys(row, ['toolCall', 'result', 'session', 'nextMessages'], 'failures() row');
+  exactKeys(row, ['toolCall', 'result', 'session', 'nextMessages', 'visibility'], 'failures() row');
   assert.ok(Array.isArray(row.nextMessages), 'failures() row.nextMessages is an array');
   assert.equal(row.nextMessages[0].uuid, 'm-after');
   db.close();
@@ -168,7 +182,8 @@ test('overview() shape matches api-reference.md', () => {
   const view = createQueryApi(db).overview({ limit: 5 });
 
   exactKeys(view, ['current', 'current_project', 'projects', 'totals'], 'overview()');
-  exactKeys(view.current, ['cwd', 'project'], 'overview() current');
+  exactKeys(view.current, ['cwd', 'project', 'session_id'], 'overview() current');
+  assert.equal(view.current.session_id, null, 'no invocation nonce: session_id is null');
   exactKeys(view.totals, ['projects', 'sessions', 'memories', 'sources'], 'overview() totals');
   db.close();
 });
@@ -183,7 +198,7 @@ test('forget() result shape matches api-reference.md', () => {
 });
 
 test('raw() shape matches api-reference.md', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-raw-'));
+  const dir = makeTempDir('obelisk-raw-');
   const jsonlPath = join(dir, 'session.jsonl');
   const line = JSON.stringify({ uuid: 'm-raw', type: 'user', message: { role: 'user', content: 'raw line body' } });
   writeFileSync(jsonlPath, line + '\n');
@@ -196,7 +211,7 @@ test('raw() shape matches api-reference.md', () => {
     VALUES (?, ?, ?, ?, ?, ?, ?)`).run('m-raw', 'sid-raw', 'user', 'user', 'raw line body', 'text', 'claude');
 
   const result = createQueryApi(db).raw('m-raw');
-  exactKeys(result, ['text', 'totalLength', 'offset', 'limit', 'hasMore'], 'raw()');
+  exactKeys(result, ['text', 'totalLength', 'offset', 'limit', 'hasMore', 'visibility'], 'raw()');
   assert.equal(result.text, line);
   assert.equal(result.totalLength, line.length);
   db.close();

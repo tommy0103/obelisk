@@ -1,27 +1,45 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { app, BrowserWindow, ipcMain, clipboard, dialog, shell, type IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import chokidar from 'chokidar';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
+import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
+import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
+import { createDeferredQuit } from './quit-teardown.ts';
+import { createUpdateLifecycle } from './update-lifecycle.ts';
+import { createUpdateService } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
+import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
+  createConfiguredBuiltinProviderRuntime,
+  getCopilotEditions,
+  hasExplicitProviderRoot,
+  readPersistedProviderSettings,
+} from '../../../packages/core/src/provider-settings.ts';
+import {
   buildSourceCatalog,
-  resolveProviderRoots,
   setPersistedSetting,
+  type ProviderSourceIssue,
 } from './provider-settings.ts';
 import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
   SessionMetadata,
+  SessionCatalogueOptions,
+  ActivitySessionsOptions,
+  SessionsQueryOptions,
   SourceQueryOptions,
+  WindowControlAction,
 } from '../shared/ipc-types.ts';
 import type {
   SessionDetailAssemblyInput,
@@ -65,6 +83,8 @@ const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');
 let db;
 let indexerService;
 let indexerWorker;
+let latestSourceIssues: ProviderSourceIssue[] = [];
+let latestSettingsError: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
 
@@ -77,16 +97,33 @@ function acquireAppWriterLease(dbPath: string, waitMs = 0) {
 }
 
 function getRuntimePaths(persisted = loadPersistedSettings()) {
-  const defaultRegistry = createBuiltinProviderRegistry({
-    claude: DEFAULT_CLAUDE_DIR,
-    codex: DEFAULT_CODEX_DIR,
+  const runtime = createConfiguredBuiltinProviderRuntime(persisted, {
+    baseRoots: {
+      claude: DEFAULT_CLAUDE_DIR,
+      codex: DEFAULT_CODEX_DIR,
+    },
+    openCopilotChronicle: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+    }),
+    openZcodeDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
+    openKiroDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
   });
-  const providerRoots = resolveProviderRoots(defaultRegistry, persisted);
-  const providerRegistry = createBuiltinProviderRegistry(providerRoots);
+  const providerRoots = runtime.roots;
+  const providerRegistry = runtime.registry;
   const claudeDir = providerRoots['claude'] ?? DEFAULT_CLAUDE_DIR;
   const codexDir = providerRoots['codex'] ?? DEFAULT_CODEX_DIR;
   return {
     providerRoots,
+    providerSettings: persisted,
     providerRegistry,
     claudeDir,
     codexDir,
@@ -182,6 +219,12 @@ function openDb(
   if (!fs.existsSync(dbPath)) return null;
   db = new Database(dbPath, { readonly: false });
   db.pragma('busy_timeout = 5000');
+  // Match the catalogue's original JavaScript substring semantics, including
+  // Unicode case conversion and literal %, _ and backslashes.
+  db.function('catalogue_contains', { deterministic: true },
+    (title: string | null, project: string | null, branch: string | null, query: string) =>
+      title?.toLowerCase().includes(query) || project?.toLowerCase().includes(query)
+        || branch?.toLowerCase().includes(query) ? 1 : 0);
   const lease = writerLeaseMode === 'acquire' ? acquireAppWriterLease(dbPath) : null;
   if (writerLeaseMode === 'caller-held' || lease) {
     try {
@@ -195,6 +238,7 @@ function openDb(
 }
 
 function runAppDbWrite(work: () => void): boolean {
+  updateLifecycle.assertWritable();
   if (!db) return false;
   const lease = acquireAppWriterLease(getRuntimePaths().dbPath, 250);
   if (!lease) {
@@ -208,11 +252,37 @@ function runAppDbWrite(work: () => void): boolean {
   }
 }
 
-function notifyIndexUpdated(result: { affectedSessionIds?: unknown } = {}) {
+function notifyIndexUpdated(result: {
+  affectedSessionIds?: unknown;
+  inventoryIssues?: unknown;
+  skippedFiles?: unknown;
+} = {}) {
   const affectedSessionIds = Array.isArray(result.affectedSessionIds)
     ? [...new Set(result.affectedSessionIds.filter(Boolean))]
     : [];
-  const payload = { affectedSessionIds };
+  const issueLists = [result.inventoryIssues, result.skippedFiles]
+    .filter(Array.isArray)
+    .flat();
+  if (Array.isArray(result.inventoryIssues) || Array.isArray(result.skippedFiles)) {
+    const unique = new Map<string, ProviderSourceIssue>();
+    for (const value of issueLists) {
+      const issue = value as Partial<ProviderSourceIssue> | null;
+      if (
+        issue !== null
+        && typeof issue.provider === 'string'
+        && typeof issue.path === 'string'
+        && typeof issue.error === 'string'
+      ) {
+        unique.set(`${issue.provider}\0${issue.path}\0${issue.error}`, {
+          provider: issue.provider,
+          path: issue.path,
+          error: issue.error,
+        });
+      }
+    }
+    latestSourceIssues = [...unique.values()];
+  }
+  const payload = { affectedSessionIds, sourceIssues: latestSourceIssues };
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('obelisk:index-updated', payload);
     for (const sessionId of affectedSessionIds) {
@@ -233,23 +303,32 @@ function appendWhere(sql, params, clause) {
 }
 
 function startIndexerService({ buildOnStart = false } = {}) {
+  if (updateLifecycle.isBlocked()) return null;
+  if (indexerService) return indexerService;
   const paths = getRuntimePaths();
+  if (latestSettingsError !== null) return null;
   migrateLegacyDbIfNeeded(paths);
-  indexerService = createIndexerService({
+  const service = createIndexerService({
     projectsDir: paths.projectsDir,
-    watchDirs: paths.providerRegistry.watchRoots(paths.providerRoots),
-    buildIndex: async ({ reason, changedPaths }) => {
+    watchTargets: paths.providerRegistry.watchTargets(paths.providerRoots),
+    buildIndex: async ({ reason, changedPaths, retrySessionIds }) => {
       const result = await indexerWorker.buildIndex({
         reason,
         changedPaths,
+        retrySessionIds,
         providerRoots: paths.providerRoots,
+        providerSettings: paths.providerSettings,
         claudeDir: paths.claudeDir,
         codexDir: paths.codexDir,
         projectsDir: paths.projectsDir,
         dbPath: paths.dbPath,
       });
       if (result?.deferred) {
-        if (Array.isArray(result.affectedSessionIds) && result.affectedSessionIds.length) {
+        if (
+          (Array.isArray(result.affectedSessionIds) && result.affectedSessionIds.length)
+          || (Array.isArray(result.inventoryIssues) && result.inventoryIssues.length)
+          || (Array.isArray(result.skippedFiles) && result.skippedFiles.length)
+        ) {
           notifyIndexUpdated(result);
         }
       } else {
@@ -260,18 +339,20 @@ function startIndexerService({ buildOnStart = false } = {}) {
     },
     writeHeartbeat: () => writeHeartbeat({ dbPath: paths.dbPath }),
   });
-  indexerService.start({ buildOnStart });
-  return indexerService;
+  service.start({ buildOnStart });
+  indexerService = service;
+  return service;
 }
 
-function startBackgroundResources({ runStartupBuild = false } = {}) {
+function startBackgroundResources({ runStartupBuild = false, watchSources = true } = {}) {
+  if (updateLifecycle.isBlocked()) return;
   if (!indexerWorker) indexerWorker = createWorkerBuildIndex();
   const paths = getRuntimePaths();
-  migrateLegacyDbIfNeeded(paths);
+  if (latestSettingsError === null) migrateLegacyDbIfNeeded(paths);
   openDb(paths.dbPath);
-  if (!indexerService) {
+  if (watchSources && !indexerService && latestSettingsError === null) {
     const service = startIndexerService({ buildOnStart: false });
-    if (runStartupBuild) service.runBuildNow('startup');
+    if (runStartupBuild) service?.runBuildNow('startup');
   }
   if (!obeliskWatcher) startObeliskWatcher();
 }
@@ -279,36 +360,90 @@ function startBackgroundResources({ runStartupBuild = false } = {}) {
 async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
   const service = indexerService;
   if (!service) return;
-  service.stop();
-  if (waitForIdle && typeof service.idle === 'function') await service.idle();
+  const closed = service.stop();
+  const results = await Promise.allSettled([closed, waitForIdle && typeof service.idle === 'function' ? service.idle() : undefined]);
   if (indexerService === service) indexerService = null;
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
-async function stopBackgroundResources({ stopWorker = false } = {}) {
-  await stopIndexerServiceAndWait();
-  if (stopWorker && indexerWorker) {
-    indexerWorker.stop();
-    indexerWorker = null;
-  }
+let resourcesStop: Promise<void> | null = null;
+async function stopBackgroundResources(options: { stopWorker?: boolean } = {}) {
+  if (resourcesStop) return resourcesStop;
+  resourcesStop = stopBackgroundResourcesNow(options);
+  try { await resourcesStop; } finally { resourcesStop = null; }
+}
+async function stopBackgroundResourcesNow({ stopWorker = false } = {}) {
+  // Close the ~/.obelisk watcher before the first await. close() flips its
+  // `closed` flag synchronously and every parcel event callback guards on it,
+  // so once this function yields, no teardown-time FSEvents delivery can
+  // enter user code — even when the bounded quit path (#187) cuts the
+  // remaining waits short. The service watcher's close() works the same way
+  // inside service.stop().
+  let watcherClosed: Promise<unknown> | null = null;
   if (obeliskWatcher) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
-    if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
+    if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
+    pendingObeliskChanges.clear();
+    if (typeof watcher.close === 'function') {
+      watcherClosed = Promise.resolve(watcher.close());
+      // Attach immediately so a rejection during service.idle() is observed.
+      void watcherClosed.catch(() => {});
+    }
+  }
+  const results = await Promise.allSettled([stopIndexerServiceAndWait(), watcherClosed]);
+  if (stopWorker && indexerWorker) {
+    const worker = indexerWorker;
+    const termination = await Promise.allSettled([Promise.resolve(worker.stop())]);
+    results.push(...termination);
+    if (indexerWorker === worker) indexerWorker = null;
   }
   closeDb();
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
+}
+
+function safeProtocol(url: string): string {
+  try { return new URL(url).protocol; } catch { return ''; }
+}
+
+function isSameOrigin(url: string, currentUrl: string): boolean {
+  try {
+    return new URL(url).origin === new URL(currentUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
+// Reloads and in-app routing keep the same origin and pathname; anything else is a real
+// navigation away from the renderer document.
+function isSameDocumentNavigation(url: string, currentUrl: string): boolean {
+  try {
+    const target = new URL(url);
+    const current = new URL(currentUrl);
+    return target.origin === current.origin && target.pathname === current.pathname;
+  } catch {
+    return false;
+  }
 }
 
 function createWindow() {
   const isDev = process.argv.includes('--dev') || !!process.env.ELECTRON_RENDERER_URL;
   const shouldOpenDevTools = process.argv.includes('--devtools');
+  const isLinux = process.platform === 'linux';
 
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 800,
     minHeight: 500,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 14, y: 10 },
+    ...(isLinux ? {
+      frame: false,
+    } : {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 14, y: 10 },
+    }),
     backgroundColor: '#0a0b14',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
@@ -318,11 +453,34 @@ function createWindow() {
     },
   });
 
+  const pushWindowState = () => win.webContents.send('obelisk:window-state', { maximized: win.isMaximized() });
+  win.on('maximize', pushWindowState);
+  win.on('unmaximize', pushWindowState);
+
   // Prevent Electron's built-in zoom so Cmd+=/- reaches the renderer
   win.webContents.on('before-input-event', (event, input) => {
     if ((input.meta || input.control) && ['+', '=', '-', '0'].includes(input.key)) {
       win.webContents.setZoomLevel(0);
     }
+  });
+
+  // Keep the SPA in place: a Markdown link in a transcript must never replace the running
+  // renderer. External http(s) targets are handed to the system browser instead.
+  // Only genuinely external targets go to the browser. A same-origin URL is a local document
+  // reference — in dev that would hand the system browser a Vite-served source file.
+  const releaseNavigation = (url: string) => {
+    if (!/^https?:$/i.test(safeProtocol(url))) return;
+    if (isSameOrigin(url, win.webContents.getURL())) return;
+    shell.openExternal(url).catch(() => {});
+  };
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    releaseNavigation(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, url) => {
+    if (isSameDocumentNavigation(url, win.webContents.getURL())) return;
+    event.preventDefault();
+    releaseNavigation(url);
   });
 
   if (isDev) {
@@ -337,25 +495,39 @@ function createWindow() {
 
 const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
 const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
-let obeliskWatcher: import("chokidar").FSWatcher | null = null;
+let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
+let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingObeliskChanges = new Set<string>();
+
+function flushObeliskChanges() {
+  obeliskNotifyTimer = null;
+  const changedPaths = [...pendingObeliskChanges];
+  pendingObeliskChanges.clear();
+  for (const changedPath of changedPaths) onObeliskChange(changedPath);
+}
 
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
-  if (!fs.existsSync(OBELISK_DIR)) {
-    fs.mkdirSync(OBELISK_DIR, { recursive: true });
-  }
-  obeliskWatcher = chokidar.watch(OBELISK_DIR, {
-    ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
-    ignored: (p, stats) => {
-      if (stats?.isDirectory()) return false;
-      if (!stats) return false;
-      return !p.endsWith('.md') && !p.endsWith('.json');
+  // Idempotent ensure, off the main thread (mkdir recursive does not need an
+  // existence check). The watcher tolerates the directory appearing late —
+  // that is what the probe + retry loop inside the package is for — so there
+  // is no ordering dependency between the two.
+  void fs.promises.mkdir(OBELISK_DIR, { recursive: true }).catch(() => {});
+  obeliskWatcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: OBELISK_DIR }],
+    onInvalidate: (invalidation) => {
+      if (invalidation.type !== 'paths') return;
+      for (const changedPath of invalidation.paths) {
+        if (!changedPath.endsWith('.md') && !changedPath.endsWith('.json')) continue;
+        // True trailing debounce — reset on every event so an actively written
+        // file notifies only after its writes settle (the awaitWriteFinish
+        // replacement). Without the reset this would be a throttle.
+        pendingObeliskChanges.add(changedPath);
+        if (obeliskNotifyTimer) clearTimeout(obeliskNotifyTimer);
+        obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
+      }
     },
   });
-  obeliskWatcher.on('add', onObeliskChange);
-  obeliskWatcher.on('change', onObeliskChange);
-  obeliskWatcher.on('unlink', onObeliskChange);
   return obeliskWatcher;
 }
 
@@ -367,9 +539,39 @@ function onObeliskChange(filePath) {
   }
 }
 
+let appQuitRequested = false;
+const updateLifecycle = createUpdateLifecycle({
+  stop: () => stopBackgroundResources({ stopWorker: true }),
+  resume: () => { if (!appQuitRequested) startBackgroundResources({ watchSources: loadPersistedSettings().autoRefresh !== false }); },
+});
+// Only the shipped amd64 Debian target has a verified Linux update channel.
+// AppImage/source builds and other architectures must not consume its feed.
+const isDebInstall = app.isPackaged && process.platform === 'linux' && process.arch === 'x64' &&
+  await fs.promises.readFile(path.join(process.resourcesPath, 'package-type'), 'utf8')
+    .then(value => value.trim() === 'deb', () => false);
+const updater = createUpdateService({
+  enabled: app.isPackaged === true && (process.platform === 'darwin' || isDebInstall),
+  version: app.getVersion(),
+  createBackend: async receive => {
+    const { createMacUpdateBackend, createDebUpdateBackend } = await import('./update-backends.ts');
+    return process.platform === 'darwin' ? createMacUpdateBackend(receive) : createDebUpdateBackend(receive);
+  },
+  prepare: updateLifecycle.prepare,
+  recover: updateLifecycle.recover,
+  publish: state => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send('obelisk:update-state', state);
+    }
+  },
+});
+ipcMain.handle('updates:getState', () => updater.getState());
+ipcMain.handle('updates:check', () => updater.check());
+ipcMain.handle('updates:install', () => updater.install());
+
 app.whenReady().then(() => {
   startBackgroundResources({ runStartupBuild: true });
   createWindow();
+  void updater.check();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -379,12 +581,24 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  void stopBackgroundResources({ stopWorker: true });
+// Quit must not tear the JS environment down while a watcher is still live: a
+// @parcel/watcher callback firing during CleanupHandles throws with no JS
+// frame to catch it, and napi_throw fatals the process (#187). The stop is
+// not cached: a macOS pause (window-all-closed) can be followed by activate →
+// restart, and a later quit must stop the restarted singletons.
+const deferOrdinaryQuit = createDeferredQuit({
+  quit: () => app.quit(),
+  stop: () => stopBackgroundResources({ stopWorker: true }),
+});
+app.on('before-quit', event => {
+  appQuitRequested = true;
+  if (updateLifecycle.isPrepared()) return;
+  updater.stop();
+  deferOrdinaryQuit(event);
 });
 
 app.on('window-all-closed', () => {
-  void stopBackgroundResources({ stopWorker: true });
+  if (!updateLifecycle.isBlocked()) void stopBackgroundResources({ stopWorker: true }).catch(error => console.warn('Obelisk cleanup failed:', error));
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -396,18 +610,37 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
     SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
-    FROM messages m WHERE m.session_id = ? AND m.agent_id IS NULL ORDER BY m.timestamp, m.uuid
+    FROM messages m
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY m.timestamp, m.uuid
   `).all(sessionId) as SessionMessageRow[];
 }
 
 function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   if (!db) return [];
-  return db.prepare(`SELECT * FROM tool_calls WHERE session_id = ?`).all(sessionId) as SessionToolCallRow[];
+  // Insertion order is the provider's source order, and the assembled session detail keeps a
+  // message's calls the way they arrive here: `tool_calls` carries a `(session_id, name)` index, so
+  // an explicit order is what stops the planner from returning them sorted by tool name (ADR-0007).
+  return db.prepare(`
+    SELECT tc.* FROM messages m
+    CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+      AND tc.session_id = ?
+    ORDER BY tc.rowid
+  `).all(sessionId, sessionId) as SessionToolCallRow[];
 }
 
 function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   if (!db) return [];
-  return db.prepare(`SELECT * FROM tool_results WHERE session_id = ?`).all(sessionId) as SessionToolResultRow[];
+  return db.prepare(`
+    SELECT tr.* FROM messages m
+    CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
+    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+      AND tr.session_id = ?
+  `).all(sessionId, sessionId) as SessionToolResultRow[];
 }
 
 function querySessionSubagents(sessionId: string): SessionSubagentRow[] {
@@ -426,7 +659,10 @@ function querySessionWorkflows(sessionId: string): SessionWorkflowRow[] {
 
 function querySessionSummaries(sessionId: string): SessionSummaryRow[] {
   if (!db) return [];
-  return db.prepare(`SELECT * FROM summaries WHERE session_id = ?`).all(sessionId) as SessionSummaryRow[];
+  return db.prepare(`
+    SELECT * FROM summaries
+    WHERE session_id = ? AND COALESCE(visibility, 'visible') = 'visible'
+  `).all(sessionId) as SessionSummaryRow[];
 }
 
 function querySessionSnapshot(sessionId: string): SessionDetailAssemblyInput {
@@ -471,9 +707,9 @@ function querySessionMetadata(sessionId: string): SessionMetadata | null {
   ) || null;
 }
 
-ipcMain.handle('db:getSessions', (_, opts = {}) => {
+ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
   if (!db) return [];
-  const { project, limit = 200 } = opts;
+  const { project, sessionId, limit = 200 } = opts;
   let sql = `SELECT ${SESSION_METADATA_COLUMNS} FROM sessions`;
   const params: unknown[] = [];
   const sourceFilter = sourceWhereClause(opts);
@@ -482,9 +718,56 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
     params.push(...sourceFilter.params);
   }
   if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
-  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`;
-  params.push(limit);
+  if (sessionId !== undefined) { sql = appendWhere(sql, params, `id = ?`); params.push(sessionId); }
+  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC`;
+  if (limit !== null) {
+    sql += ' LIMIT ?';
+    params.push(limit);
+  }
   return db.prepare(sql).all(...params);
+});
+
+ipcMain.handle('db:getSessionCatalogue', (_, opts: SessionCatalogueOptions = {}) => {
+  if (!db) return { rows: [], total: 0 };
+  const limit = Number.isSafeInteger(opts.limit) ? Math.max(1, Math.min(opts.limit!, 100)) : 100;
+  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const sourceFilter = sourceWhereClause(opts);
+  if (sourceFilter.sql) { clauses.push(sourceFilter.sql); params.push(...sourceFilter.params); }
+  if (opts.project && opts.project !== 'all') { clauses.push('project = ?'); params.push(opts.project); }
+  if (opts.quiet) clauses.push("(title IS NULL OR title = '')");
+  else clauses.push("title IS NOT NULL AND title != ''");
+  const query = opts.query?.trim().toLowerCase();
+  if (query) {
+    clauses.push('catalogue_contains(title, project, git_branch, ?)');
+    params.push(query);
+  }
+  const where = `WHERE ${clauses.join(' AND ')}`;
+  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions ${where}`).get(...params) as { count: number }).count;
+  const direction = opts.descending === false ? 'ASC' : 'DESC';
+  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions ${where}
+    ORDER BY COALESCE(ended_at, started_at) ${direction}, id ${direction} LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset);
+  return { rows, total };
+});
+
+ipcMain.handle('db:getActivitySessions', (_, opts: ActivitySessionsOptions) => {
+  if (!db) return { rows: [], total: 0 };
+  if (!/^\d{4}-\d\d-\d\d/.test(opts?.from) || !/^\d{4}-\d\d-\d\d/.test(opts?.to)) {
+    throw new Error('Activity date range must use ISO dates');
+  }
+  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
+  const where = 's.started_at < ? AND COALESCE(s.ended_at, s.started_at) >= ?';
+  const params = [opts.to, opts.from];
+  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions s WHERE ${where}`).get(...params) as { count: number }).count;
+  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS.split(', ').map(column => `s.${column}`).join(', ')},
+    EXISTS (SELECT 1 FROM sessions earlier WHERE earlier.project = s.project
+      AND earlier.id != s.id AND earlier.started_at < s.started_at) AS has_earlier
+    FROM sessions s WHERE ${where}
+    ORDER BY COALESCE(s.ended_at, s.started_at) DESC, s.id DESC LIMIT 200 OFFSET ?`)
+    .all(...params, offset);
+  return { rows, total };
 });
 
 ipcMain.handle('db:getSessionMessages', (_, sessionId) => {
@@ -525,16 +808,20 @@ ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
     SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
            m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
-    FROM messages m WHERE m.agent_id = ? ORDER BY m.timestamp, m.uuid
+    FROM messages m
+    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY m.timestamp, m.uuid
   `).all(agentId);
 });
 
 ipcMain.handle('db:getSubagentToolCalls', (_, agentId) => {
   if (!db) return [];
+  // Same as querySessionToolCalls: insertion order, not the `(session_id, name)` index order.
   return db.prepare(`
     SELECT tc.* FROM tool_calls tc
     JOIN messages m ON m.uuid = tc.message_uuid
-    WHERE m.agent_id = ?
+    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
+    ORDER BY tc.rowid
   `).all(agentId);
 });
 
@@ -543,7 +830,7 @@ ipcMain.handle('db:getSubagentToolResults', (_, agentId) => {
   return db.prepare(`
     SELECT tr.* FROM tool_results tr
     JOIN messages m ON m.uuid = tr.message_uuid
-    WHERE m.agent_id = ?
+    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
   `).all(agentId);
 });
 
@@ -554,15 +841,16 @@ ipcMain.handle('db:getSessionSummaries', (_, sessionId) => {
 ipcMain.handle('db:getMemories', () => {
   if (!db) return [];
   return db.prepare(`
-    SELECT id, session_id, project, message_start, message_end, path, anchors, summary, created_at, deleted_at, deleted_reason
-    FROM memories ORDER BY created_at DESC
+    SELECT m.id, m.session_id, m.project, m.message_start, m.message_end, m.path, m.anchors,
+           m.summary, m.created_at, m.deleted_at, m.deleted_reason, s.title AS session_title
+    FROM memories m LEFT JOIN sessions s ON s.id = m.session_id ORDER BY m.created_at DESC
   `).all();
 });
 
-ipcMain.handle('db:getMessageFullText', (_, uuid) => {
+ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
   if (!db) return null;
   const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-  if (!msg) return null;
+  if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
   const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
   const subagent = msg.agent_id
     ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
@@ -571,14 +859,31 @@ ipcMain.handle('db:getMessageFullText', (_, uuid) => {
     ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const paths = getRuntimePaths();
-  const raw = paths.providerRegistry.raw({
+  const lookup = {
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
     agentId: msg.agent_id || null,
+    cursor: storedSessionCursor(db, paths.providerRegistry, session),
     subagent,
     workflowAgent,
-  });
+  };
+  // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
+  if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode') {
+    try {
+      const messageText = lookup.source === 'zcode'
+        ? await indexerWorker?.readZcodeMessageText(lookup)
+        : lookup.source === 'kiro'
+          ? await indexerWorker?.readKiroMessageText({ ...lookup, rootDir: paths.providerRoots.kiro })
+          : lookup.source === 'opencode'
+            ? await indexerWorker?.readOpencodeMessageText(lookup)
+            : await indexerWorker?.readHermesMessageText(lookup);
+      return messageText ?? msg.text ?? null;
+    } catch {
+      return msg.text ?? null;
+    }
+  }
+  const raw = paths.providerRegistry.raw(lookup);
   return raw?.messageText ?? msg.text ?? null;
 });
 
@@ -587,6 +892,46 @@ ipcMain.handle('db:readMemoryFile', (_, filePath) => {
     if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf-8');
     return null;
   } catch { return null; }
+});
+
+// Every root this session actually worked in. A reference is only opened if it lands inside
+// one of them, so untrusted transcript text cannot reach a file outside the session's own
+// projects. Scoping is deliberately per session, not corpus-wide.
+function querySessionFileRoots(sessionId: unknown): string[] {
+  if (!db || typeof sessionId !== 'string' || !sessionId) return [];
+  const roots: string[] = [];
+  try {
+    const rows = db.prepare(
+      `SELECT DISTINCT cwd FROM messages
+       WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
+         AND COALESCE(visibility, 'visible') = 'visible'`
+    ).all(sessionId);
+    for (const row of rows) roots.push(row.cwd);
+    const session = db.prepare(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
+    if (session?.project_path) roots.push(session.project_path);
+  } catch {}
+  return roots;
+}
+
+ipcMain.handle('file-ref:open', async (_, ref) => {
+  const { sessionId, path: rawPath, cwd, line, column } = ref || {};
+  const roots = querySessionFileRoots(sessionId);
+  // The renderer-supplied cwd only counts if this session actually recorded it.
+  const scopedCwd = typeof cwd === 'string' && roots.includes(cwd) ? cwd : null;
+  const filePath = resolveFileReference({ rawPath, cwd: scopedCwd, roots });
+  if (!filePath) return { opened: false };
+  const { editorScheme } = loadPersistedSettings();
+  try {
+    await shell.openExternal(buildEditorUrl({
+      scheme: typeof editorScheme === 'string' ? editorScheme : undefined,
+      filePath,
+      line,
+      column,
+    }));
+    return { opened: true, path: filePath };
+  } catch {
+    return { opened: false, path: filePath };
+  }
 });
 
 ipcMain.handle('db:archiveMemory', (_, id, reason) => {
@@ -626,44 +971,49 @@ ipcMain.handle('db:getStats', (_, opts = {}) => {
 
 ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   if (!db) return { daily: [], totalTokens: 0, peakDay: null, longestTurn: null };
-  const sourceFilter = sourceWhereClause(opts, 'source');
-  const sourceSql = sourceFilter.sql ? `AND ${sourceFilter.sql}` : '';
-
-  const daily = db.prepare(`
+  // Visibility controls evidence display, not accounting. Abandoned model calls
+  // still consumed tokens, so aggregate usage intentionally includes them.
+  const messageSourceFilter = sourceWhereClause(opts, 'source');
+  const summarySourceFilter = sourceWhereClause(opts, 's.source');
+  const usageDays = db.prepare(`
+    WITH usage_events AS (
+      SELECT timestamp, input_tokens, output_tokens
+      FROM messages
+      WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+        ${messageSourceFilter.sql ? `AND ${messageSourceFilter.sql}` : ''}
+      UNION ALL
+      SELECT su.timestamp, su.input_tokens, su.output_tokens
+      FROM summaries su
+      LEFT JOIN sessions s ON s.id = su.session_id
+      WHERE (su.input_tokens IS NOT NULL OR su.output_tokens IS NOT NULL)
+        ${summarySourceFilter.sql ? `AND ${summarySourceFilter.sql}` : ''}
+    )
     SELECT DATE(timestamp) as day,
            SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
-    FROM messages
-    WHERE timestamp IS NOT NULL AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
-      ${sourceSql}
+    FROM usage_events
     GROUP BY DATE(timestamp)
     ORDER BY day
-  `).all(...sourceFilter.params);
+  `).all(...messageSourceFilter.params, ...summarySourceFilter.params);
 
-  const totalTokens = db.prepare(`
-    SELECT SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as total
-    FROM messages
-    ${sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : ''}
-  `).get(...sourceFilter.params)?.total || 0;
+  const totalTokens = usageDays.reduce((total, row) => total + (row.tokens || 0), 0);
+  const daily: Array<{ day: string; tokens: number }> = [];
+  for (const row of usageDays) {
+    if (row.day !== null) daily.push({ day: row.day, tokens: row.tokens || 0 });
+  }
 
-  const peakDay = db.prepare(`
-    SELECT DATE(timestamp) as day,
-           SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
-    FROM messages
-    WHERE timestamp IS NOT NULL AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
-      ${sourceSql}
-    GROUP BY DATE(timestamp)
-    ORDER BY tokens DESC
-    LIMIT 1
-  `).get(...sourceFilter.params) || null;
+  let peakDay: { day: string; tokens: number } | null = null;
+  for (const day of daily) {
+    if (!peakDay || day.tokens > peakDay.tokens) peakDay = day;
+  }
 
   const longestTurn = db.prepare(`
     SELECT turn_duration_ms, uuid, session_id, timestamp
     FROM messages
     WHERE turn_duration_ms IS NOT NULL
-      ${sourceSql}
+      ${messageSourceFilter.sql ? `AND ${messageSourceFilter.sql}` : ''}
     ORDER BY turn_duration_ms DESC
     LIMIT 1
-  `).get(...sourceFilter.params) || null;
+  `).get(...messageSourceFilter.params) || null;
 
   return { daily, totalTokens, peakDay, longestTurn };
 });
@@ -737,6 +1087,17 @@ ipcMain.handle('capture:copy', async (event, { cardIdx, archetype, filename } = 
   return true;
 });
 
+ipcMain.handle('win:control', (event, action: WindowControlAction) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  switch (action) {
+    case 'minimize': win.minimize(); return null;
+    case 'toggle-maximize': win.isMaximized() ? win.unmaximize() : win.maximize(); return null;
+    case 'close': win.close(); return null;
+    default: throw new Error(`win:control accepts 'minimize', 'toggle-maximize', or 'close'; received "${String(action)}"`);
+  }
+});
+
 // --- Recap files ---
 
 ipcMain.handle('recap:list', () => {
@@ -760,20 +1121,32 @@ ipcMain.handle('recap:read', (_, filename) => {
 const SETTINGS_PATH = path.join(OBELISK_DIR, 'settings.json');
 
 function loadPersistedSettings() {
-  try {
-    if (fs.existsSync(SETTINGS_PATH)) return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8'));
-  } catch {}
-  return {};
+  const result = readPersistedProviderSettings(SETTINGS_PATH);
+  latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
+  if (latestSettingsError !== null) console.warn(latestSettingsError);
+  return result.settings;
 }
 
 function savePersistedSettings(settings) {
   if (!fs.existsSync(OBELISK_DIR)) fs.mkdirSync(OBELISK_DIR, { recursive: true });
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
+    fs.renameSync(temporaryPath, SETTINGS_PATH);
+    latestSettingsError = null;
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch {}
+    throw error;
+  }
 }
 
-ipcMain.handle('settings:get', () => {
+ipcMain.handle('settings:get', async () => {
   const persisted = loadPersistedSettings();
   const paths = getRuntimePaths(persisted);
+  const copilotEditions = getCopilotEditions(persisted);
+  const copilotCustomRoot = hasExplicitProviderRoot(persisted, 'copilot');
   const { providerRoots, providerRegistry, claudeDir, codexDir, dbPath: dbFile } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
@@ -797,33 +1170,63 @@ ipcMain.handle('settings:get', () => {
       memoryCount = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
     } catch {}
   }
+  const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
+  const sourcePaths = new Set([
+    ...providerRegistry.catalog().map((provider) => providerRoots[provider.id] ?? provider.defaultRoot),
+    ...(!copilotCustomRoot ? selectedCopilotEditions.map((edition) => edition.path) : []),
+  ]);
+  const existingPaths = new Set((await Promise.all([...sourcePaths].map(async (sourcePath) => {
+    try {
+      await fs.promises.access(sourcePath);
+      return sourcePath;
+    } catch {
+      return null;
+    }
+  }))).filter((sourcePath): sourcePath is string => sourcePath !== null));
+  const copilotCatalogRoot = selectedCopilotEditions.find((edition) => existingPaths.has(edition.path))
+    ?? selectedCopilotEditions[0];
   const sources = buildSourceCatalog({
     registry: providerRegistry,
-    roots: providerRoots,
+    roots: copilotCustomRoot ? providerRoots : {
+      ...providerRoots,
+      copilot: copilotCatalogRoot?.path ?? '',
+    },
     stats: sourceStats,
-    pathExists: fs.existsSync,
+    sourceIssues: latestSourceIssues,
+    pathExists: (sourcePath) => existingPaths.has(sourcePath),
+  }).map((source) => {
+    if (source.id !== 'copilot' || copilotCustomRoot) return source;
+    if (selectedCopilotEditions.length === 0) {
+      return { ...source, exists: false, status: 'warn', statusText: 'No folders selected' };
+    }
+    return source;
   });
   const sessionCount = sources.reduce((sum, source) => sum + source.sessionCount, 0);
   const lastIndexed = sources.map((source) => source.lastIndexed).filter(Boolean).sort().at(-1) || '';
-  const connected = sources.some((source) => source.status !== 'error');
+  const connected = latestSettingsError === null
+    && sources.some((source) => source.status !== 'error');
 
   return {
+    version: app.getVersion(),
     providerRoots,
+    copilotEditions,
+    copilotCustomRoot,
     claudeDir,
     codexDir,
     dbPath: dbFile,
     recapDir,
     autoRefresh: persisted.autoRefresh !== false,
+    editorScheme: persisted.editorScheme || DEFAULT_EDITOR_SCHEME,
     sources,
     memoryCount,
     sessionCount,
     lastIndexed,
     status: connected ? 'ok' : 'error',
-    statusText: connected ? 'Connected' : 'No source folders found',
+    statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
   };
 });
 
-ipcMain.handle('settings:set', async (_, key, value) => {
+ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(async () => {
   const persisted = loadPersistedSettings();
   const providerRootChanged = setPersistedSetting(persisted, key, value);
   savePersistedSettings(persisted);
@@ -831,9 +1234,9 @@ ipcMain.handle('settings:set', async (_, key, value) => {
   if (key === 'autoRefresh') {
     if (value === false && indexerService) {
       await stopIndexerServiceAndWait();
-    } else if (value !== false && indexerService) {
-      await stopIndexerServiceAndWait();
-      startIndexerService({ buildOnStart: false });
+    } else if (value !== false) {
+      if (indexerService) await stopIndexerServiceAndWait();
+      startIndexerService({ buildOnStart: true });
     }
   }
 
@@ -849,10 +1252,10 @@ ipcMain.handle('settings:set', async (_, key, value) => {
     if (persisted.autoRefresh !== false) {
       startIndexerService({ buildOnStart: true });
     }
-    notifyIndexUpdated();
+    notifyIndexUpdated({ inventoryIssues: [] });
   }
   return true;
-});
+}));
 
 ipcMain.handle('settings:browseFolder', async (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -869,12 +1272,12 @@ ipcMain.handle('settings:revealPath', (_, p) => {
   if (fs.existsSync(p)) shell.showItemInFolder(p);
 });
 
-ipcMain.handle('settings:rebuildIndex', async () => {
+ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () => {
   if (!indexerWorker) return null;
   const persisted = loadPersistedSettings();
+  if (latestSettingsError !== null) throw new Error(latestSettingsError);
   const paths = getRuntimePaths(persisted);
   const tempDbPath = rebuildTempDbPath(paths.dbPath);
-  const shouldRestartWatcher = persisted.autoRefresh !== false;
   await stopIndexerServiceAndWait({ waitForIdle: false });
   if (indexerWorker) {
     await Promise.resolve(indexerWorker.stop());
@@ -882,6 +1285,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
   }
   cleanupDbFiles(tempDbPath);
   let writerLease: ReturnType<typeof acquireWriterLease> = null;
+  let rebuildWatchHints: string[] = [];
   try {
     const writerLeasePath = writerLockPathFor(paths.dbPath);
     writerLease = acquireWriterLease({
@@ -898,6 +1302,9 @@ ipcMain.handle('settings:rebuildIndex', async () => {
         skipped: 0,
         skippedFiles: [],
         deferred: true,
+        complete: false,
+        incompleteProviders: [],
+        inventoryIssues: [],
         reason: 'writer_busy',
       };
     }
@@ -906,6 +1313,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       reason: 'manual-rebuild',
       force: true,
       providerRoots: paths.providerRoots,
+      providerSettings: paths.providerSettings,
       claudeDir: paths.claudeDir,
       codexDir: paths.codexDir,
       projectsDir: paths.projectsDir,
@@ -914,7 +1322,11 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });
-    if (result?.deferred) return result;
+    rebuildWatchHints = result?.watchHints ?? [];
+    if (result?.deferred || result?.complete !== true) {
+      notifyIndexUpdated(result);
+      return result;
+    }
     closeDb();
     replaceDbWithTemp(tempDbPath, paths.dbPath);
     openDb(paths.dbPath, { writerLeaseMode: 'caller-held' });
@@ -934,7 +1346,20 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       }
     } finally {
       writerLease?.release();
-      if (shouldRestartWatcher) startIndexerService({ buildOnStart: false });
+      if (loadPersistedSettings().autoRefresh !== false) {
+        const service = startIndexerService({ buildOnStart: false });
+        if (rebuildWatchHints.length) {
+          // The rebuild bypassed the service's own build path, so seed the
+          // hot set from its hints here.
+          service?.promoteWatchHints?.(rebuildWatchHints);
+        } else {
+          // A failed/deferred rebuild produced no hints and the old hot set
+          // died with the old watcher. Run one reconciling build through the
+          // service — its deferral retry absorbs writer-busy — so long-open
+          // transcripts are re-seeded now, not at the next 5-min reconcile.
+          service?.runBuildNow('reconcile');
+        }
+      }
     }
   }
-});
+}));

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import { getArgPreview, getToolIcon, renderTerminalTool } from './tool-renderer.js';
 import { renderMarkdown } from './utils.js';
 
@@ -21,9 +24,9 @@ function formatToolInput(toolCall) {
   }
 }
 
-function renderFileContent(text) {
+function renderFileContent(text, label = 'File contents', stripLineNumbers = true) {
   let lines = text.split('\n');
-  const hasLineNums = lines.length > 1 && lines.slice(0, 5).every(line => /^\s*\d+\t/.test(line) || line === '');
+  const hasLineNums = stripLineNumbers && lines.length > 1 && lines.slice(0, 5).every(line => /^\s*\d+\t/.test(line) || line === '');
   let gutter;
   if (hasLineNums) {
     const parsed = lines.map(line => {
@@ -38,7 +41,7 @@ function renderFileContent(text) {
   const total = lines.length;
   const collapsed = total > 12;
   return `<div class="file-content">
-    <div class="file-content-head"><span class="label">File contents</span><span class="meta">${total} lines</span></div>
+    <div class="file-content-head"><span class="label">${escapeHtml(label)}</span><span class="meta">${total} lines</span></div>
     <div class="file-content-body ${collapsed ? 'collapsed' : ''}"><div class="gutter">${gutter}</div><div class="code">${escapeHtml(lines.join('\n'))}</div></div>
     ${collapsed ? `<button class="file-content-expand" onclick="this.previousElementSibling.classList.toggle('collapsed');this.textContent=this.previousElementSibling.classList.contains('collapsed')?'Show all ${total} lines':'Collapse'">Show all ${total} lines</button>` : ''}
   </div>`;
@@ -226,7 +229,10 @@ export function renderPrettyTool(toolCall) {
 
   const terminal = renderTerminalTool(toolCall.name, args, output, isError);
   if (terminal !== null) return terminal;
-  return `<div class="body-section"><div class="body-label">Input</div>${renderFieldGrid(args)}</div>`
+  const input = typeof args === 'string'
+    ? renderFileContent(args, 'Input', false)
+    : `<div class="body-section"><div class="body-label">Input</div>${renderFieldGrid(args)}</div>`;
+  return input
     + (output ? `<div class="body-section" style="margin-top:12px;"><div class="body-label">Output</div>${renderOutput(output, isError)}</div>` : '');
 }
 
@@ -252,6 +258,7 @@ export function buildSessionTimelinePresentation(item, { query = '', expandedTex
   const toolArgPreviews = new Map();
   const toolIcons = new Map();
   const workflowAgentGroups = new Map();
+  const refs = { cwd: message.cwd || null, sessionId: message.session_id || null };
 
   for (const toolCall of toolCalls) {
     const input = parseToolInput(toolCall);
@@ -263,7 +270,7 @@ export function buildSessionTimelinePresentation(item, { query = '', expandedTex
       toolPrettyHtml.set(toolCall.id, renderPrettyTool(toolCall));
     }
     if ((toolCall.name === 'Agent' || toolCall.name === 'Task') && toolCall.result?.content) {
-      toolResultHtml.set(toolCall.id, renderMarkdown(toolCall.result.content, { variant: 'compact' }));
+      toolResultHtml.set(toolCall.id, renderMarkdown(toolCall.result.content, { variant: 'compact', ...refs }));
     }
     if (toolCall.name === 'Workflow') workflowAgentGroups.set(toolCall.id, groupWorkflowAgents(toolCall.workflow));
   }
@@ -271,14 +278,14 @@ export function buildSessionTimelinePresentation(item, { query = '', expandedTex
   const effectiveText = expandedText ?? message.text;
   return {
     messageHtml: message.text
-      ? renderMarkdown(effectiveText, { variant: item?.kind === 'meta' ? 'compact' : 'msg', query })
+      ? renderMarkdown(effectiveText, { variant: item?.kind === 'meta' ? 'compact' : 'msg', query, ...refs })
       : '',
     thinkingHtml: message._thinking
-      ? renderMarkdown(message._thinking, { variant: 'msg', query })
-      : (item?.kind === 'thinking' ? renderMarkdown(message.text, { variant: 'msg', query }) : ''),
-    skillHtml: message._skillMd ? renderMarkdown(message._skillMd, { variant: 'compact' }) : '',
+      ? renderMarkdown(message._thinking, { variant: 'msg', query, ...refs })
+      : (item?.kind === 'thinking' ? renderMarkdown(message.text, { variant: 'msg', query, ...refs }) : ''),
+    skillHtml: message._skillMd ? renderMarkdown(message._skillMd, { variant: 'compact', ...refs }) : '',
     summaryHtml: message.summary?.content
-      ? renderMarkdown(message.summary.content, { variant: 'compact' })
+      ? renderMarkdown(message.summary.content, { variant: 'compact', ...refs })
       : '',
     toolInputs,
     toolInputText,

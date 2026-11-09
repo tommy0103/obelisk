@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 export const PALETTES = {
   architect:    { tc: '#a78bfa', tc2: '#c4b5fd', glow: 'rgba(167,139,250,0.40)', mid: 'rgba(167,139,250,0.22)', soft: 'rgba(167,139,250,0.10)' },
   debugger:     { tc: '#fbbf24', tc2: '#fde68a', glow: 'rgba(251,191,36,0.40)', mid: 'rgba(251,191,36,0.22)', soft: 'rgba(251,191,36,0.10)' },
