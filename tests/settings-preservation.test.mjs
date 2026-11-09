@@ -7,6 +7,7 @@ import { promises as fsp, readFileSync, readdirSync, writeFileSync } from 'node:
 import { join } from 'node:path';
 
 import { preserveRejectedSettings } from '../app/src/main/settings-preservation.ts';
+import { readPersistedProviderSettings } from '../packages/core/src/provider-settings.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const realOps = {
@@ -43,7 +44,7 @@ test('a file with malformed JSON is preserved byte-for-byte and the backup path 
   assert.throws(() => JSON.parse(corruptText), 'the fixture must be unparseable');
   const { dir, settingsPath } = settingsFixture(corruptText);
 
-  const backupPath = await preserveRejectedSettings(settingsPath, realOps);
+  const backupPath = await preserveRejectedSettings(settingsPath, realOps, readPersistedProviderSettings(settingsPath));
 
   assert.notEqual(backupPath, null, 'the rejection is reported as preserveable');
   assert.equal(readFileSync(backupPath, 'utf8'), corruptText, 'the preserved bytes are unchanged');
@@ -57,7 +58,7 @@ test('a file the reader rejects for its structure is preserved even though it pa
   assert.doesNotThrow(() => JSON.parse(STRUCTURALLY_INVALID), 'the fixture is valid JSON');
   const { dir, settingsPath } = settingsFixture(STRUCTURALLY_INVALID);
 
-  const backupPath = await preserveRejectedSettings(settingsPath, realOps);
+  const backupPath = await preserveRejectedSettings(settingsPath, realOps, readPersistedProviderSettings(settingsPath));
 
   assert.notEqual(backupPath, null, 'providerRoots: [] is a rejection, not a valid file');
   assert.equal(readFileSync(backupPath, 'utf8'), STRUCTURALLY_INVALID);
@@ -67,14 +68,14 @@ test('a file the reader rejects for its structure is preserved even though it pa
 test('a top-level array is preserved: the reader rejects it, so the save path would empty it', async () => {
   const { settingsPath } = settingsFixture('[]');
 
-  assert.notEqual(await preserveRejectedSettings(settingsPath, realOps), null);
+  assert.notEqual(await preserveRejectedSettings(settingsPath, realOps, readPersistedProviderSettings(settingsPath)), null);
 });
 
 test('a settings file the reader accepts is left alone', async () => {
   const validText = JSON.stringify({ providerRoots: { pi: '/custom/pi' }, editorScheme: 'cursor' });
   const { dir, settingsPath } = settingsFixture(validText);
 
-  assert.equal(await preserveRejectedSettings(settingsPath, realOps), null);
+  assert.equal(await preserveRejectedSettings(settingsPath, realOps, readPersistedProviderSettings(settingsPath)), null);
   assert.deepEqual(backupsIn(dir), [], 'nothing was moved aside');
   assert.equal(readFileSync(settingsPath, 'utf8'), validText, 'the file is still in place');
 });
@@ -82,7 +83,7 @@ test('a settings file the reader accepts is left alone', async () => {
 test('a missing settings file is nothing to preserve', async () => {
   const { dir, settingsPath } = settingsFixture();
 
-  assert.equal(await preserveRejectedSettings(settingsPath, realOps), null);
+  assert.equal(await preserveRejectedSettings(settingsPath, realOps, readPersistedProviderSettings(settingsPath)), null);
   assert.deepEqual(readdirSync(dir), [], 'no backup was written for a file that never existed');
 });
 
@@ -97,7 +98,7 @@ test('a refused rename falls back to a copy instead of giving up on the backup',
     copyFile: realOps.copyFile,
   };
 
-  const backupPath = await preserveRejectedSettings(settingsPath, ops);
+  const backupPath = await preserveRejectedSettings(settingsPath, ops, readPersistedProviderSettings(settingsPath));
 
   assert.notEqual(backupPath, null, 'the copy succeeded, so the caller may proceed');
   assert.equal(readFileSync(backupPath, 'utf8'), corruptText, 'the copied bytes are complete');
@@ -115,7 +116,7 @@ test('when nothing can preserve the file the call throws and the original surviv
   };
 
   await assert.rejects(
-    () => preserveRejectedSettings(settingsPath, ops),
+    () => preserveRejectedSettings(settingsPath, ops, readPersistedProviderSettings(settingsPath)),
     /could not back up/,
     'the caller must be told to leave the file alone',
   );

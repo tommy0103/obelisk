@@ -1140,8 +1140,7 @@ ipcMain.handle('recap:read', (_, filename) => {
 
 // --- Settings ---
 
-function loadPersistedSettings() {
-  const result = readPersistedProviderSettings(SETTINGS_PATH);
+function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
   if (latestSettingsError !== null) console.warn(latestSettingsError);
   return result.settings;
@@ -1267,15 +1266,16 @@ ipcMain.handle('settings:get', async () => {
 let settingsWriteTail: Promise<unknown> = Promise.resolve();
 ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
   const write = settingsWriteTail.then(async () => {
-    const persisted = loadPersistedSettings();
+    const currentRead = readPersistedProviderSettings(SETTINGS_PATH);
+    const persisted = loadPersistedSettings(currentRead);
     // Preserve a file the shared reader rejected before the write below replaces it. Runs
-    // before the save, and re-reads the file itself rather than trusting latestSettingsError,
-    // so a stale flag from an earlier read cannot skip or repeat it. Throwing here is the
+    // before the save, using this queued write's fresh read rather than latestSettingsError,
+    // so a stale flag from an earlier settings:get cannot skip or repeat it. Throwing here is the
     // point: with no preserved copy the overwrite is the silent #42 loss.
     const backupPath = await preserveRejectedSettings(SETTINGS_PATH, {
       rename: (from, to) => fs.promises.rename(from, to),
       copyFile: (from, to) => fs.promises.copyFile(from, to),
-    });
+    }, currentRead);
     const providerRootChanged = setPersistedSetting(persisted, key, value);
     savePersistedSettings(persisted);
     if (backupPath !== null) {

@@ -11,7 +11,7 @@
 // node:test cannot mock a builtin module, and the failure branch is the whole point of this
 // module. Callers pass fs.promises.
 
-import { readPersistedProviderSettings } from '../../../packages/core/src/provider-settings.ts';
+import type { ProviderSettingsReadResult } from '../../../packages/core/src/provider-settings.ts';
 
 interface SettingsFileOps {
   rename: (from: string, to: string) => Promise<void>;
@@ -24,12 +24,12 @@ interface SettingsFileOps {
 async function preserveRejectedSettings(
   settingsPath: string,
   { rename, copyFile }: SettingsFileOps,
+  currentRead: ProviderSettingsReadResult,
 ): Promise<string | null> {
-  // Reuse the shared reader's boundary instead of a second, weaker "does JSON.parse throw"
-  // test. It rejects more than malformed syntax -- a non-object document, or providerRoots
-  // that is not an object -- and everything it rejects is exactly the set of files the save
-  // path would otherwise rebuild from {}. One boundary means the two can never disagree.
-  if (readPersistedProviderSettings(settingsPath).ok) return null;
+  // The serialized save supplies the shared reader's fresh result for this
+  // path. Reuse its complete classification without another synchronous read
+  // on the main thread or a stale error flag from an earlier settings:get.
+  if (currentRead.ok) return null;
 
   // Date.now() rather than an ISO timestamp: ISO carries colons, which are not legal in a
   // Windows file name.
