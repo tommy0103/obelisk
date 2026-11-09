@@ -24,7 +24,7 @@ import {
   codexEventText, codexMessagePayloadText, codexVisibleMessageKey,
   codexToolInput, codexToolOutput,
   extractMessageIsMeta, isSkillInstructions,
-  readCodexGuardianThreadInfo,
+  readCodexGuardianThreadInfo, normalizeTranscriptTimestamp,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes,
   readCodexBufferLines, readCodexLines,
 } from '../parsing.ts';
@@ -43,9 +43,9 @@ import type {
 } from './types.ts';
 
 export const name = 'codex';
-// Replay existing indexes once to repair session-index updates previously lost
-// on strict/unsupported-identity read plans, even when rollouts are unchanged.
-const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v4__';
+// v5 replays v3/v4 rows once so transcript timestamps and session bounds
+// use canonical UTC milliseconds after timestamp normalization.
+const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v5__';
 const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
@@ -122,7 +122,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         if (item?.id && item?.thread_name) {
           sessionIndex.set(codexRawId(item.id) as string, {
             title: item.thread_name,
-            updatedAt: item.updated_at || null,
+            updatedAt: normalizeTranscriptTimestamp(item.updated_at),
           });
         }
       } catch { /* malformed session-index entry */ }
@@ -729,7 +729,10 @@ export function* parse(
   // are appended. For same-size sources, require the unchanged ctime before
   // treating the file as a no-op, otherwise let fingerprinting detect rewrites.
   const sameCheckpoint = !compressed && !guardianInvalidation && cooperativeCandidate && stat.size === prior.size;
-  const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
+  const rawIndexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
+  const indexedMeta = rawIndexedMeta && {
+    ...rawIndexedMeta, indexedUpdatedAt: normalizeTranscriptTimestamp(rawIndexedMeta.indexedUpdatedAt),
+  };
   // Session-index metadata is independent of the source read plan. Strict
   // mode and unsupported file identities still need the aggregate patch
   // after fingerprint verification, even though they cannot use the noop path.
@@ -987,7 +990,7 @@ export function* parse(
   if (canRetract) out.push({ kind: 'delete-session', sessionId });
   const msgByUuid = new Map<string, MessageRecord>();
   const emittedMessageUuids = new Set<string>();
-  const initialTimestamp = (meta.timestamp || capturedMeta.obj.timestamp || null) as string | null;
+  const initialTimestamp = normalizeTranscriptTimestamp(meta.timestamp || capturedMeta.obj.timestamp);
   const indexedUpdatedAt = indexedMeta?.indexedUpdatedAt ?? null;
   const sm = {
     started_at: previous?.startedAt ?? initialTimestamp,
@@ -1043,12 +1046,12 @@ export function* parse(
   };
 
   const processRecord = (currentLine: number, obj: any): void => {
-    const ts = obj.timestamp || null;
+    const ts = normalizeTranscriptTimestamp(obj.timestamp);
     if (obj.type === 'session_meta') {
       if (obj.payload?.cwd) currentCwd = normalizeObservedCwd(obj.payload.cwd) || currentCwd;
       if (obj.payload?.git?.branch) sm.git_branch = obj.payload.git.branch;
       if (obj.payload?.cli_version) sm.version = obj.payload.cli_version;
-      updateBounds(obj.payload?.timestamp || ts);
+      updateBounds(normalizeTranscriptTimestamp(obj.payload?.timestamp) || ts);
       return;
     }
     if (obj.type === 'turn_context') {
