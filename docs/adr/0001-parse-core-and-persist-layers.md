@@ -300,7 +300,13 @@ Unlike `retainSession`, this declaration does not withhold projection. The same
 plan applies to in-place CLI rebuilds and desktop database replacement. Ordinary
 refresh likewise performs no family retraction. Orphan count finalization counts
 all stored messages, including cached evidence from unavailable files; it does
-not substitute the surviving-file count. When a main transcript returns, its
+not substitute the surviving-file count. Shared orphan finalization also applies
+the established UTC timestamp normalization to retained messages, summaries,
+workflows and session bounds. Source-gone legacy records cannot pass through the
+provider parser again, but must remain retrievable by canonical UTC time ranges.
+This repair uses bounded batches, skips unchanged canonical values, and keeps
+zone-less or unparseable values unchanged; readable, denied and other-provider
+sources retain their existing authority. When a main transcript returns, its
 normal count authority resumes. This retention policy does not change the fresh
 database canonical parse/persistence invariant: a fresh source projection cannot
 reconstruct additional history that exists only in a previously populated index.

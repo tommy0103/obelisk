@@ -18,7 +18,7 @@ import { join, win32 } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { projectSlugFromPath } from '../packages/core/src/parsing.ts';
-import { repairOrphanedSessionCounts } from '../packages/core/src/index-finalize.ts';
+import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import {
   createProviderIndexPlan,
@@ -2743,7 +2743,7 @@ test('Claude orphan count repair preserves Hermes visible-message counts and log
     const before = counts();
     assert.ok(before.some(session => session.message_count > 0));
     assert.ok(before.every(session => session.jsonl_path.includes('#session:')));
-    assert.equal(repairOrphanedSessionCounts(index.db), 0);
+    assert.equal(repairOrphanedSessionMetadata(index.db), 0);
     assert.deepEqual(counts(), before);
   } finally {
     index.close();

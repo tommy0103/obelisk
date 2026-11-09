@@ -24,7 +24,7 @@ import { persist } from '../packages/core/src/persist.ts';
 import {
   backfillSessionTitles,
   refreshSessionProjectPaths,
-  repairOrphanedSessionCounts,
+  repairOrphanedSessionMetadata,
 } from '../packages/core/src/index-finalize.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -134,7 +134,7 @@ test('orphaned subagent messages land in one browsable session row', () => {
 
   persist(db, subagentUnit(first, 'agent-a'), parse(subagentUnit(first, 'agent-a'), null));
   persist(db, subagentUnit(second, 'agent-b'), parse(subagentUnit(second, 'agent-b'), null));
-  repairOrphanedSessionCounts(db);
+  repairOrphanedSessionMetadata(db);
   refreshSessionProjectPaths(db, new Set([SESSION_ID]));
 
   const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(SESSION_ID);
@@ -223,12 +223,12 @@ test('a replayed orphan unit recovers its count instead of growing it', () => {
   const drifted = db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count;
   assert.equal(drifted, 2, 'a fresh replay restates its per-unit total');
 
-  assert.equal(repairOrphanedSessionCounts(db), 0);
+  assert.equal(repairOrphanedSessionMetadata(db), 0);
   assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count, 2);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(SESSION_ID).n, 2);
 
   // Idempotent: a second pass has nothing left to correct.
-  assert.equal(repairOrphanedSessionCounts(db), 0);
+  assert.equal(repairOrphanedSessionMetadata(db), 0);
   db.close();
 });
 
@@ -296,7 +296,7 @@ test('an inaccessible main transcript is not absence and keeps its authoritative
     db.exec(SCHEMA);
     db.prepare('INSERT INTO sessions(id,message_count,jsonl_path,source) VALUES(?,?,?,?)').run(SESSION_ID, 20, main, 'claude');
     persist(db, unit, parse(unit, null));
-    assert.equal(repairOrphanedSessionCounts(db), 0);
+    assert.equal(repairOrphanedSessionMetadata(db), 0);
     assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 20);
   } finally { chmodSync(targetDir, 0o700); db.close(); }
 });
@@ -314,7 +314,7 @@ test('metadata-only orphan input stays untitled and a returning main transcript 
     const main = writeMainTranscript(root, [capturedMessage('main', 'main text')]);
     const unit = { key: main, sessionId: SESSION_ID, project: PROJECT };
     persist(db, unit, parse(unit, null));
-    assert.equal(repairOrphanedSessionCounts(db), 0);
+    assert.equal(repairOrphanedSessionMetadata(db), 0);
     assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 1);
   } finally { db.close(); }
 });
@@ -333,7 +333,7 @@ test('orphan sibling families have identical direct and finalized SQLite counts 
   try {
     db.exec(SCHEMA);
     const cursor = persist(db, unit, provider.parse(unit, null));
-    assert.equal(repairOrphanedSessionCounts(db), 0);
+    assert.equal(repairOrphanedSessionMetadata(db), 0);
     const roundtrip = () => assembleSessionDetail({
       session: db.prepare('SELECT * FROM sessions').get(),
       messages: db.prepare('SELECT * FROM messages').all(),

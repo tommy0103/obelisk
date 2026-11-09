@@ -11,7 +11,7 @@ import {
   backfillUnresolvedSessionProjectPathsOnce,
   ensureFtsReady,
   refreshSessionProjectPaths,
-  repairOrphanedSessionCounts,
+  repairOrphanedSessionMetadata,
 } from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
@@ -326,7 +326,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             });
             refreshSessionProjectPaths(db, null);
             backfillUnresolvedSessionProjectPathsOnce(db);
-            repairOrphanedSessionCounts(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
+            repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
             backfillSessionTitles(db);
             healWorkflowParentLinks(db);
             ensureFtsReady(db, { force: true });
@@ -440,7 +440,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           // Per-unit paths commit atomically with their provider cursors above;
           // legacy unresolved rows use one explicit, convergent backfill.
           backfillUnresolvedSessionProjectPathsOnce(db);
-          repairOrphanedSessionCounts(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
+          repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
           backfillSessionTitles(db);
           healWorkflowParentLinks(db);
           ensureFtsReady(db);

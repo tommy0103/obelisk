@@ -15,7 +15,7 @@ import {
   dropMessageFtsTriggers,
   ensureFtsReady,
   refreshSessionProjectPaths,
-  repairOrphanedSessionCounts,
+  repairOrphanedSessionMetadata,
 } from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
@@ -429,7 +429,7 @@ function buildIndex({
           backfillUnresolvedSessionProjectPathsOnce(db);
         }
         healWorkflowParentLinks(db);
-        repairOrphanedSessionCounts(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
+        repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
         backfillSessionTitles(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });

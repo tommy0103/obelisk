@@ -7,7 +7,7 @@
 // the two indexing modes.
 
 import { statSync } from 'node:fs';
-import { inferProjectPath } from './parsing.ts';
+import { inferProjectPath, normalizeTranscriptTimestamp } from './parsing.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 const FTS_TRIGGERS_READY_MARKER = '__fts_triggers_ready__';
@@ -197,7 +197,7 @@ export function backfillSessionTitles(db: SqliteDb): number {
 }
 
 /**
- * Recompute counts only for Claude sessions with surviving subagent rows or
+ * Repair retained counts and timestamps only for Claude sessions with subagent rows or
  * a source-proven family supplied by the current index plan, and a main
  * transcript proved absent. Other providers own their count semantics
  * and may store logical provenance such as database paths with fragments.
@@ -211,11 +211,12 @@ export function backfillSessionTitles(db: SqliteDb): number {
  * Rows are the authority here, including previously indexed main/child
  * history whose source file has disappeared. Absence does not retract that
  * evidence. Idempotent by construction — after the first pass the
- * stored count equals `COUNT(*)` and the statement is a no-op.
+ * stored count equals `COUNT(*)` and canonical timestamp updates are no-ops.
+ * Returns the number of sessions whose retained metadata changed.
  */
-export function repairOrphanedSessionCounts(db: SqliteDb, familySessionIds: Iterable<string> = []): number {
+export function repairOrphanedSessionMetadata(db: SqliteDb, familySessionIds: Iterable<string> = []): number {
   const sessions = db.prepare(`
-    SELECT s.id, s.jsonl_path, s.message_count FROM sessions s
+    SELECT s.id, s.jsonl_path, s.message_count, s.started_at, s.ended_at FROM sessions s
     WHERE COALESCE(s.source, 'claude') = 'claude'
       AND s.jsonl_path IS NOT NULL AND s.jsonl_path <> ''
       AND EXISTS (SELECT 1 FROM messages m
@@ -227,7 +228,7 @@ export function repairOrphanedSessionCounts(db: SqliteDb, familySessionIds: Iter
   // rather than interpreting provider-private paths or cursors here.
   const knownIds = new Set(sessions.map(session => String(session.id)));
   const familySession = db.prepare(`
-    SELECT id, jsonl_path, message_count FROM sessions
+    SELECT id, jsonl_path, message_count, started_at, ended_at FROM sessions
     WHERE id = ? AND COALESCE(source, 'claude') = 'claude'
       AND jsonl_path IS NOT NULL AND jsonl_path <> ''
   `);
@@ -240,7 +241,7 @@ export function repairOrphanedSessionCounts(db: SqliteDb, familySessionIds: Iter
   }
   if (sessions.length === 0) return 0;
   const count = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?');
-  const update = db.prepare('UPDATE sessions SET message_count = ? WHERE id = ?');
+  const update = db.prepare('UPDATE sessions SET message_count = ?, started_at = ?, ended_at = ? WHERE id = ?');
   let repaired = 0;
   for (const session of sessions) {
     // A readable transcript stays authoritative: it can be re-parsed, and
@@ -254,11 +255,44 @@ export function repairOrphanedSessionCounts(db: SqliteDb, familySessionIds: Iter
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') continue;
     }
     const actual = Number(count.get(String(session.id))?.n ?? 0);
-    if (actual === Number(session.message_count ?? 0)) continue;
-    update.run(actual, String(session.id));
-    repaired++;
+    // Source-gone legacy rows cannot pass through the provider parser again.
+    // Retention must still honor the already-established UTC query contract.
+    let changed = repairRetainedTimestamps(db, String(session.id));
+    const startedAt = normalizeTranscriptTimestamp(session.started_at);
+    const endedAt = normalizeTranscriptTimestamp(session.ended_at);
+    if (actual !== Number(session.message_count ?? 0)
+      || startedAt !== session.started_at || endedAt !== session.ended_at) {
+      update.run(actual, startedAt, endedAt, String(session.id));
+      changed = true;
+    }
+    if (changed) repaired++;
   }
   return repaired;
+}
+
+function repairRetainedTimestamps(db: SqliteDb, sessionId: string): boolean {
+  let changed = false;
+  // Table/column names are schema constants. Bound the migration's memory and
+  // avoid rewriting canonical rows (and their FTS entries) on later refreshes.
+  for (const table of ['messages', 'summaries', 'workflows']) {
+    const selection = `FROM ${table} WHERE session_id = ? AND timestamp IS NOT NULL
+      AND timestamp NOT GLOB '????-??-??T??:??:??.???Z'`;
+    const first = db.prepare(`SELECT rowid, timestamp ${selection} ORDER BY rowid LIMIT 256`);
+    const next = db.prepare(`SELECT rowid, timestamp ${selection} AND rowid > ? ORDER BY rowid LIMIT 256`);
+    const update = db.prepare(`UPDATE ${table} SET timestamp = ? WHERE rowid = ?`);
+    let rows = first.all(sessionId);
+    while (rows.length > 0) {
+      for (const row of rows) {
+        const timestamp = normalizeTranscriptTimestamp(row.timestamp);
+        if (timestamp === row.timestamp) continue;
+        update.run(timestamp, row.rowid);
+        changed = true;
+      }
+      if (rows.length < 256) break;
+      rows = next.all(sessionId, rows[rows.length - 1]!.rowid);
+    }
+  }
+  return changed;
 }
 
 /** Repair legacy unresolved project paths once; new/changed sessions use their unit transaction. */

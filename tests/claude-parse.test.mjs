@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
-import { repairOrphanedSessionCounts } from '../packages/core/src/index-finalize.ts';
+import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -263,7 +263,7 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   const orphan = provider.discover({ ...context, changedPaths: [mainPath] });
   assert.equal(orphan.length, 1);
   for (const unit of orphan) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
-  repairOrphanedSessionCounts(db);
+  repairOrphanedSessionMetadata(db);
   healWorkflowParentLinks(db);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 3, 'missing main transcript retains its two cached messages');
   const orphanWorkflows = db.prepare('SELECT * FROM workflows').all();
@@ -286,7 +286,7 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   writeFileSync(childPath, JSON.stringify(child) + '\n');
   const changed = provider.discover({ ...context, changedPaths: [childPath] });
   for (const unit of changed) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
-  repairOrphanedSessionCounts(db);
+  repairOrphanedSessionMetadata(db);
   healWorkflowParentLinks(db);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 3);
   assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 3);
