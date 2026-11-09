@@ -26,6 +26,7 @@ import type {
   TranscriptRecord,
 } from './providers/types.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
+import { normalizeTranscriptTimestamp } from './parsing.ts';
 
 const REPLAY_FILTER_THRESHOLD = 250;
 const SQLITE_SAFE_KEY_COUNT = 900;
@@ -109,6 +110,12 @@ function loadReplayState(db: SqliteDb, records: readonly TranscriptRecord[]): Re
 
 const minStr = (a: string | null, b: string | null) => (a == null ? b : b == null ? a : a < b ? a : b);
 const maxStr = (a: string | null, b: string | null) => (a == null ? b : b == null ? a : a > b ? a : b);
+const CANONICAL_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const priorTimestampForMerge = (prior: string | null | undefined, incoming: string | null) => (
+  incoming !== null && CANONICAL_TIMESTAMP.test(incoming)
+    ? normalizeTranscriptTimestamp(prior)
+    : prior ?? null
+);
 
 function statements(db: SqliteDb) {
   return {
@@ -288,8 +295,11 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
           r.title ?? prev?.title ?? null,
           r.project ?? prev?.project ?? null,
           prev?.project_path ?? null, // authoritative project_path is set by refreshSessionProjectPaths
-          minStr(prev?.started_at ?? null, r.started_at),
-          maxStr(prev?.ended_at ?? null, r.ended_at),
+          // Compare instants in the same canonical representation. Otherwise
+          // replayed UTC bounds can lose to old offset/no-millisecond strings
+          // and leave a partially migrated session behind indefinitely.
+          minStr(priorTimestampForMerge(prev?.started_at, r.started_at), r.started_at),
+          maxStr(priorTimestampForMerge(prev?.ended_at, r.ended_at), r.ended_at),
           r.git_branch ?? prev?.git_branch ?? null,
           r.version ?? prev?.version ?? null,
           message_count,
