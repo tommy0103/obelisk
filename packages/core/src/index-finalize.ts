@@ -207,8 +207,9 @@ export function backfillSessionTitles(db: SqliteDb): number {
  * provider side, because the main transcript that used to own the total is
  * exactly what is missing.
  *
- * Rows are the authority here: their transcript is gone, so the count is
- * derived from them. Idempotent by construction — after the first pass the
+ * Rows are the authority here, including previously indexed main/child
+ * history whose source file has disappeared. Absence does not retract that
+ * evidence. Idempotent by construction — after the first pass the
  * stored count equals `COUNT(*)` and the statement is a no-op.
  */
 export function repairOrphanedSessionCounts(db: SqliteDb): number {

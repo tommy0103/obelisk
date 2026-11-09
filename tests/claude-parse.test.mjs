@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { repairOrphanedSessionCounts } from '../packages/core/src/index-finalize.ts';
+import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -227,9 +229,10 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   unlinkSync(mainPath);
   const orphan = provider.discover({ ...context, changedPaths: [mainPath] });
   assert.equal(orphan.length, 1);
-  const freshOrphan = assembleSessionDetail([...provider.parse(orphan[0], null)]);
   for (const unit of orphan) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 1);
+  repairOrphanedSessionCounts(db);
+  healWorkflowParentLinks(db);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 3, 'missing main transcript retains its two cached messages');
   const orphanWorkflows = db.prepare('SELECT * FROM workflows').all();
   for (const row of orphanWorkflows) row.agents = db.prepare('SELECT * FROM workflow_agents WHERE run_id=?').all(row.run_id);
   assert.deepEqual(assembleSessionDetail({
@@ -239,8 +242,8 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
     toolResults: db.prepare('SELECT * FROM tool_results').all(),
     subagents: db.prepare('SELECT * FROM subagents').all(),
     workflows: orphanWorkflows,
-  }), freshOrphan);
-  assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, freshOrphan.session.message_count);
+  }), { ...detail, session: { ...detail.session, message_count: 3 } });
+  assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 3, 'count includes cached main and surviving child history');
   assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
 
@@ -250,6 +253,10 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   writeFileSync(childPath, JSON.stringify(child) + '\n');
   const changed = provider.discover({ ...context, changedPaths: [childPath] });
   for (const unit of changed) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
+  repairOrphanedSessionCounts(db);
+  healWorkflowParentLinks(db);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 3);
+  assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 3);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1, 'child-only family update retains unchanged workflow ownership');
   assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
 

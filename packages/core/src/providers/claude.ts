@@ -153,7 +153,9 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       continue;
     }
     if (ctx.lastCursor(key) === signature) continue;
-    orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, retractSessionIds: [member.sessionId],
+    // A missing main file does not revoke already indexed history. Preserve
+    // that evidence during force cleanup while refreshing surviving children.
+    orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, preserveSessionHistory: true,
       meta: { kind: 'orphan-family', members, signature, mainPath: normalize(mainPath), mainCursor } satisfies ClaudeOrphanFamilyMeta });
   }
   const transcriptUnits = files.filter((file) => {
