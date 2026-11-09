@@ -72,21 +72,28 @@ for (const runtime of ['built CLI', 'App SQLite']) for (const version of [3, 4])
       const previous = dbPath;
       if (mode === 'replacement') dbPath = join(home, 'replacement.sqlite');
       build(mode !== 'refresh', mode === 'replacement' ? previous : undefined);
-      const snapshot = () => inspect(db => {
-        assert.deepEqual(createQueryApi(db).messages(options).messages.map(row => row.uuid), ['cached-main'], mode);
-        assert.deepEqual(db.prepare('SELECT uuid,timestamp FROM messages ORDER BY uuid').all().map(row => [row.uuid, row.timestamp]), [
-          ['cached-child', '2026-06-10T11:00:00.000Z'], ['cached-main', '2026-06-10T09:00:00.000Z'], ['readable-child', '2026-06-10T10:00:00.000Z'],
-        ]);
-        const session = db.prepare("SELECT message_count,started_at,ended_at FROM sessions WHERE id='session'").get();
-        assert.equal(session.message_count, 3);
-        assert.equal(session.started_at, '2026-06-10T09:00:00.000Z');
-        assert.equal(session.ended_at, '2026-06-10T11:00:00.000Z');
-        assert.equal(db.prepare("SELECT timestamp FROM summaries WHERE id='cached-summary'").get().timestamp, '2026-06-10T09:00:00.000Z');
-        assert.equal(db.prepare("SELECT timestamp FROM workflows WHERE run_id='cached-workflow'").get().timestamp, '2026-06-10T09:00:00.000Z');
-        assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER));
-        db.exec("INSERT INTO messages_fts(messages_fts,rank) VALUES('integrity-check',1)");
-        return db.prepare('SELECT uuid,timestamp,text FROM messages ORDER BY uuid').all();
-      });
+      const snapshot = () => {
+        // Node24 enforces the query API's read-only authorizer. Keep its
+        // connection separate from writable FTS integrity inspection below.
+        const queryDb = new DatabaseSync(dbPath, { readOnly: true });
+        try {
+          assert.deepEqual(createQueryApi(queryDb).messages(options).messages.map(row => row.uuid), ['cached-main'], mode);
+        } finally { queryDb.close(); }
+        return inspect(db => {
+          assert.deepEqual(db.prepare('SELECT uuid,timestamp FROM messages ORDER BY uuid').all().map(row => [row.uuid, row.timestamp]), [
+            ['cached-child', '2026-06-10T11:00:00.000Z'], ['cached-main', '2026-06-10T09:00:00.000Z'], ['readable-child', '2026-06-10T10:00:00.000Z'],
+          ]);
+          const session = db.prepare("SELECT message_count,started_at,ended_at FROM sessions WHERE id='session'").get();
+          assert.equal(session.message_count, 3);
+          assert.equal(session.started_at, '2026-06-10T09:00:00.000Z');
+          assert.equal(session.ended_at, '2026-06-10T11:00:00.000Z');
+          assert.equal(db.prepare("SELECT timestamp FROM summaries WHERE id='cached-summary'").get().timestamp, '2026-06-10T09:00:00.000Z');
+          assert.equal(db.prepare("SELECT timestamp FROM workflows WHERE run_id='cached-workflow'").get().timestamp, '2026-06-10T09:00:00.000Z');
+          assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER));
+          db.exec("INSERT INTO messages_fts(messages_fts,rank) VALUES('integrity-check',1)");
+          return db.prepare('SELECT uuid,timestamp,text FROM messages ORDER BY uuid').all();
+        });
+      };
       const before = snapshot();
       build(mode !== 'refresh');
       assert.deepEqual(snapshot(), before, 'repeated refresh/rebuild preserves the repaired history');
