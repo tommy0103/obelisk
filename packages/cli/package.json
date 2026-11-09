@@ -1,6 +1,6 @@
 {
   "name": "@obelisk-apps/cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local Obelisk runtime for coding agents.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "scripts/postinstall.mjs",
     "README.md"
   ],
   "engines": {
@@ -16,6 +17,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "postinstall": "node scripts/postinstall.mjs",
     "prepack": "npm run build"
   },
   "publishConfig": {
