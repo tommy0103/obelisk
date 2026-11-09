@@ -27,7 +27,7 @@ import {
   createConfiguredBuiltinProviderRuntime,
   readPersistedProviderSettings,
 } from './provider-settings.ts';
-import { coreSchemaNeedsMigration } from './schema-migrations.ts';
+import { coreSchemaNeedsMigration, ftsTokenizerMigrationPending, resolveFtsTokenizer } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
@@ -44,6 +44,7 @@ interface SkippedFile {
 interface BuildCheckOptions {
   now?: number;
   ignoreRecentBuild?: boolean;
+  ftsTokenizer?: string | null;
   ignoreDaemonOwnership?: boolean;
 }
 
@@ -157,16 +158,23 @@ function healWorkflowParentLinks(db: SqliteDb): void {
 const BUILD_DEBOUNCE_MS = 30000;
 const APP_HEARTBEAT_FRESH_MS = 60000;
 
-function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ignoreDaemonOwnership = false }: BuildCheckOptions = {}) {
-  if (!ignoreDaemonOwnership) {
-    const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
-    if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
-      return { skip: true, reason: 'daemon_active' };
-    }
+function assertFtsTokenizerMatches(db: SqliteDb, tokenizer: string | null): void {
+  if (ftsTokenizerMigrationPending(db, tokenizer)) {
+    throw new Error('OBELISK_FTS_TOKENIZER differs from the active index. Restart the Obelisk desktop app with the same setting, or quit it and run obelisk --build to apply the tokenizer.');
+  }
+}
+
+function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ignoreDaemonOwnership = false, ftsTokenizer = resolveFtsTokenizer() }: BuildCheckOptions = {}) {
+  const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
+  if (appHeartbeat && now - appHeartbeat.mtime < APP_HEARTBEAT_FRESH_MS) {
+    assertFtsTokenizerMatches(db, ftsTokenizer);
+    if (!ignoreDaemonOwnership) return { skip: true, reason: 'daemon_active' };
   }
   if (!ignoreRecentBuild) {
     const last = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__last_build__'").get();
-    if (last && now - last.mtime < BUILD_DEBOUNCE_MS) {
+    // A pending tokenizer switch needs the write path, which only the build acquires.
+    // Debouncing here would leave a newly configured tokenizer silently inactive.
+    if (last && now - last.mtime < BUILD_DEBOUNCE_MS && !ftsTokenizerMigrationPending(db, ftsTokenizer)) {
       return { skip: true, reason: 'recent_build' };
     }
   }
@@ -208,7 +216,8 @@ function ensureReadableSchema(): { ready: boolean; reason?: string } {
     if (!existsSync(DB_PATH)) return { ready: false };
     const db = openReadDb();
     try {
-      if (!coreSchemaNeedsMigration(db)) return { ready: true };
+      const tokenizer = resolveFtsTokenizer();
+      if (!coreSchemaNeedsMigration(db) && !ftsTokenizerMigrationPending(db, tokenizer)) return { ready: true };
       try {
         if (shouldSkipBuild(db, { ignoreRecentBuild: true }).reason === 'daemon_active') {
           return { ready: false, reason: 'daemon_active' };
