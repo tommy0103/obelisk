@@ -104,9 +104,11 @@ function rethrowUnlessSchemaBlocked(error: unknown): never {
   throw error;
 }
 
-// Run a user-supplied CodeAct script inside the query/attune sandbox. The script
-// body runs as an async IIFE with a 30s timeout; its `return` value is resolved.
-function runInSandbox(api: SandboxApi, scriptContent: string): Promise<unknown> {
+// Run a user-supplied CodeAct script. The script body runs as an async IIFE
+// with a 30s timeout; its `return` value is resolved. This uses node:vm for
+// convenience scoping, not as a security boundary — see
+// https://nodejs.org/api/vm.html#vm-executing-javascript
+function runCodeActScript(api: SandboxApi, scriptContent: string): Promise<unknown> {
   const sandbox = {
     ...api, JSON, Math, Array, Object, Set, Map, Date, RegExp,
     parseInt, parseFloat, String, Number, Boolean, Error, Promise, console, setTimeout,
@@ -425,7 +427,7 @@ export async function executeQuery(scriptContent: string, invocation?: Invocatio
   const db = openReadDb();
   try {
     try {
-      return await runInSandbox(createQueryApi(db, { providerRegistry, invokingSessionId }), scriptContent);
+      return await runCodeActScript(createQueryApi(db, { providerRegistry, invokingSessionId }), scriptContent);
     } catch (error) {
       return rethrowUnlessSchemaBlocked(error);
     }
@@ -460,7 +462,7 @@ export async function executeAttune(scriptContent: string): Promise<unknown> {
     // retryable transaction wrapper, so lock contention is waited out by the
     // same budget instead of failing the open with a misleading error.
     runMutation(() => probeAttuneMemoryLayer(db));
-    return await runInSandbox(createAttuneApi(db, runMutation), scriptContent);
+    return await runCodeActScript(createAttuneApi(db, runMutation), scriptContent);
   } finally {
     db.close();
   }
