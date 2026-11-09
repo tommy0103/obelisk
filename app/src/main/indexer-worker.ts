@@ -7,6 +7,7 @@ import { buildIndex } from './indexer.ts';
 import { createHermesProvider } from '../../../packages/core/src/providers/hermes.ts';
 import { createZcodeProvider } from '../../../packages/core/src/providers/zcode.ts';
 import { createKiroProvider } from '../../../packages/core/src/providers/kiro.ts';
+import { createOpencodeProvider } from '../../../packages/core/src/providers/opencode.ts';
 import type { RawLookup } from '../../../packages/core/src/providers/types.ts';
 
 if (!parentPort) throw new Error('indexer-worker must run as a worker thread');
@@ -21,6 +22,13 @@ const zcodeProvider = createZcodeProvider({
     timeout: 500,
   }),
 });
+const opencodeProvider = createOpencodeProvider({
+  openDatabase: sourcePath => new Database(sourcePath, {
+    readonly: true,
+    fileMustExist: true,
+    timeout: 500,
+  }),
+});
 
 port.on('message', ({ id, operation, args }: { id: number; operation?: string; args?: Record<string, unknown> }) => {
   try {
@@ -28,12 +36,14 @@ port.on('message', ({ id, operation, args }: { id: number; operation?: string; a
       ? hermesProvider.raw(args as unknown as RawLookup)?.messageText ?? null
       : operation === 'readZcodeMessageText'
         ? zcodeProvider.raw(args as unknown as RawLookup)?.messageText ?? null
-        : operation === 'readKiroMessageText'
-          ? createKiroProvider({
-            rootDir: typeof args?.rootDir === 'string' ? args.rootDir : undefined,
-            openDatabase: sourcePath => new Database(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 }),
-          }).raw(args as unknown as RawLookup)?.messageText ?? null
-          : buildIndex(args || {});
+        : operation === 'readOpencodeMessageText'
+          ? opencodeProvider.raw(args as unknown as RawLookup)?.messageText ?? null
+          : operation === 'readKiroMessageText'
+            ? createKiroProvider({
+              rootDir: typeof args?.rootDir === 'string' ? args.rootDir : undefined,
+              openDatabase: sourcePath => new Database(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 }),
+            }).raw(args as unknown as RawLookup)?.messageText ?? null
+            : buildIndex(args || {});
     port.postMessage({ id, result });
   } catch (error) {
     port.postMessage({

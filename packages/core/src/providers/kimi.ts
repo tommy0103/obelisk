@@ -139,7 +139,7 @@ function messageContentType(content: unknown): string {
   return types.size === 1 ? [...types][0]! : 'unknown';
 }
 
-function namespacedSessionId(nativeId: string): string {
+export function namespacedSessionId(nativeId: string): string {
   return `kimi:${nativeId}`;
 }
 

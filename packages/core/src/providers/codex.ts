@@ -39,7 +39,9 @@ import type {
 } from './types.ts';
 
 export const name = 'codex';
-const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v3__';
+// Replay existing indexes once to repair session-index updates previously lost
+// on strict/unsupported-identity read plans, even when rollouts are unchanged.
+const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v4__';
 const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
@@ -552,7 +554,10 @@ export function* parse(
   // treating the file as a no-op, otherwise let fingerprinting detect rewrites.
   const sameCheckpoint = !guardianInvalidation && cooperativeCandidate && stat.size === prior.size;
   const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
-  const metadataChanged = sameCheckpoint && (
+  // Session-index metadata is independent of the source read plan. Strict
+  // mode and unsupported file identities still need the aggregate patch
+  // after fingerprint verification, even though they cannot use the noop path.
+  const metadataChanged = prior !== null && (
     prior.indexedTitle !== indexedMeta?.indexedTitle
     || prior.indexedUpdatedAt !== (indexedMeta?.indexedUpdatedAt ?? undefined)
   );
