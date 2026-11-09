@@ -44,12 +44,14 @@ function setup() {
 
 function discover(provider, indexed = [], cursors = new Map()) {
   const issues = [];
+  const skipped = [];
   const units = provider.discover({
     lastCursor: (key) => cursors.get(key) ?? null,
     indexedSessions: () => indexed,
     reportIncompleteInventory: (issue) => issues.push(issue),
+    reportSkippedArtifact: (issue) => skipped.push(issue),
   });
-  return { units, issues };
+  return { units, issues, skipped };
 }
 
 function seedIndexedSession(source) {
@@ -176,8 +178,25 @@ test('unsupported Antigravity version is reported without poisoning unrelated se
   source.write();
   const result = discover(source.provider);
   assert.deepEqual(result.units, []);
-  assert.match(result.issues[0].error, /Unsupported/);
+  assert.deepEqual(result.issues, []);
+  assert.match(result.skipped[0].error, /Unsupported/);
 });
+
+for (const target of ['mapping', 'history']) {
+  test(`a future Antigravity ${target} retains its last-good snapshot during force planning`, () => {
+    const source = setup();
+    const { db, unit } = seedIndexedSession(source);
+    source[target].formatVersion = 2;
+    source.write();
+    const { plan } = runIndexPlan(db, source.provider, { force: true });
+    assert.equal(plan.incompleteProviders.size, 0);
+    assert.equal(plan.skippedArtifacts.length, 1);
+    assert.ok(plan.retainedSessions.some(session => session.sessionId === unit.sessionId));
+    assert.equal(plan.items.length, 0, 'a future artifact cannot replace the retained session');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(unit.sessionId).n, 4);
+    db.close();
+  });
+}
 
 test('failed command retains the upstream error when no output was recorded', () => {
   const source = setup();

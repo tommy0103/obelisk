@@ -36,6 +36,8 @@ export type WatchTarget = {
   path: string;
   /** Caller-side event filter hint; the watcher itself only uses kind and path. */
   fileNames?: readonly string[];
+  /** Optional predicate matching descendant basenames beyond exact fileNames. */
+  matches?: (filename: string) => boolean;
 };
 
 export type WatchInvalidation =

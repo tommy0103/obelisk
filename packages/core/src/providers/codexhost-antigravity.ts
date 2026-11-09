@@ -28,6 +28,14 @@ const CURSOR_TAG = 'codexhost-antigravity-snapshot-v1';
 const HISTORY_DIR = 'antigravity-history';
 const MAPPING_DIR = join('mapping-store', 'threads');
 
+class UnsupportedSourceFormat extends Error {
+  readonly sourcePath: string;
+  constructor(sourcePath: string) {
+    super(`Unsupported CodexHost Antigravity format: ${sourcePath}`);
+    this.sourcePath = sourcePath;
+  }
+}
+
 type JsonObject = Record<string, unknown>;
 
 interface SourceSnapshot {
@@ -163,6 +171,9 @@ function sourceSnapshot(mappingPath: string, historyPath: string): SourceSnapsho
   const nativeRef = object(mapped.nativeSessionRef);
   const nativeSessionId = text(nativeRef?.nativeSessionId);
   const cwd = normalizeObservedCwd(mapped.cwd);
+  if (typeof mapped.formatVersion === 'number' && mapped.formatVersion > 1) {
+    throw new UnsupportedSourceFormat(mappingPath);
+  }
   if (mapped.formatVersion !== 1) {
     throw new Error(`Unsupported CodexHost Antigravity mapping version: ${mappingPath}`);
   }
@@ -176,6 +187,9 @@ function sourceSnapshot(mappingPath: string, historyPath: string): SourceSnapsho
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     history = null;
+  }
+  if (history !== null && typeof history.value.formatVersion === 'number' && history.value.formatVersion > 1) {
+    throw new UnsupportedSourceFormat(historyPath);
   }
   if (history !== null && (history.value.formatVersion !== 1
     || history.value.nativeSessionId !== nativeSessionId || !Array.isArray(history.value.turns))) {
@@ -337,6 +351,15 @@ export function createCodexHostAntigravityProvider({
         try {
           snapshot = sourceSnapshot(mappingPath, historyPath);
         } catch (error) {
+          if (error instanceof UnsupportedSourceFormat) {
+            const prior = indexedByPath.get(normalize(mappingPath));
+            if (prior) {
+              live.add(prior.sessionId);
+              ctx.retainSession?.(prior.sessionId);
+            }
+            ctx.reportSkippedArtifact?.(sourceInventoryIssue(error.sourcePath, error));
+            continue;
+          }
           issue(mappingPath, error);
           continue;
         }
@@ -347,7 +370,7 @@ export function createCodexHostAntigravityProvider({
         const prior = indexedByPath.get(key);
         const priorId = prior?.sessionId;
         const oldCursor = ctx.lastCursor(key);
-        const knownCursors = [prior?.cursor, oldCursor]
+        const knownCursors = [ctx.previousCursor?.(key), oldCursor]
           .filter((cursor): cursor is string => typeof cursor === 'string');
         const previouslyIndexed = prior !== undefined || oldCursor !== null;
         const historyWasDefinitelyAbsent = knownCursors.length > 0

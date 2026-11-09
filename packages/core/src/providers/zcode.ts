@@ -263,7 +263,7 @@ interface SessionUnitMeta {
   rawSessionId: string;
 }
 
-function canonicalSessionId(dbPath: string, rawSessionId: string): string {
+export function canonicalSessionId(dbPath: string, rawSessionId: string): string {
   // The session id and cursor key must use the same stable configured path.
   // Resolving only this side lets a symlink retarget tombstone every old id
   // while identical cursors suppress re-indexing the new ids.

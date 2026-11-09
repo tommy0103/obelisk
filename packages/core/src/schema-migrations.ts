@@ -12,6 +12,7 @@ const COLUMN_MIGRATIONS = [
   ['tool_calls', 'presentation', "TEXT DEFAULT 'default'"],
   ['workflows', 'parent_tool_use_id', 'TEXT'],
   ['index_state', 'cursor', 'TEXT'],
+  ['index_state', 'replay_required', 'INTEGER NOT NULL DEFAULT 0'],
   ['summaries', 'visibility', "TEXT DEFAULT 'visible'"],
   ['summaries', 'input_tokens', 'INTEGER'],
   ['summaries', 'output_tokens', 'INTEGER'],

@@ -15,6 +15,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+import { storedProviderCursor } from '../packages/core/src/provider-indexing.ts';
 import { buildIndex } from '../app/src/main/indexer.ts';
 import {
   createPiProvider,
@@ -422,11 +423,8 @@ test('an unavailable Pi root keeps replay pending on the missing session cursor'
       .get(PI_CANONICAL_TRANSCRIPT_MARKER).c,
     1,
   );
-  assert.equal(
-    db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?')
-      .get(sessionPath).c,
-    0,
-  );
+  assert.equal(storedProviderCursor(db, sessionPath), null, 'pending replay cannot resume the old projection');
+  assert.equal(db.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(sessionPath).replay_required, 1);
   assert.equal(
     db.prepare("SELECT COUNT(*) AS c FROM messages WHERE text='stale Pi projection'").get().c,
     1,
@@ -475,11 +473,8 @@ test('an unresolved Pi root keeps replay pending on the unresolved session curso
       .get(PI_CANONICAL_TRANSCRIPT_MARKER).c,
     1,
   );
-  assert.equal(
-    db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?')
-      .get(sessionPath).c,
-    0,
-  );
+  assert.equal(storedProviderCursor(db, sessionPath), null, 'pending replay cannot resume the old projection');
+  assert.equal(db.prepare('SELECT replay_required FROM index_state WHERE jsonl_path=?').get(sessionPath).replay_required, 1);
   assert.ok(
     db.prepare("SELECT COUNT(*) AS c FROM messages WHERE text='stale unresolved projection'").get().c > 0,
   );

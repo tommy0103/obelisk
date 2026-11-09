@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { createQueryApi } from '../packages/core/src/query.ts';
-import { resolveInvokingSessionId, resolveInvokingSessionIdWithWait } from '../packages/core/src/core.ts';
+import { resolveInvokingSessionId, resolveInvokingSessionIdWithWait, RECENT_CLI_INVOKER_MESSAGES_SQL } from '../packages/core/src/core.ts';
 import { acquireWriterLease, writerLockPathFor } from '../packages/core/src/writer-lease.ts';
 import { cliEntry, repoRoot, runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
@@ -268,6 +268,46 @@ test('strict candidate rejects content matched by multiple sessions', () => {
   assert.equal(
     resolveInvokingSessionId(db, [{ value: script.trim(), strict: true }], { nowMs: FIXTURE_NOW_MS }),
     null,
+  );
+  db.close();
+});
+
+test('strict invoker lookup stays bounded by the recency window, not total history', () => {
+  // #220: with DISTINCT, the planner chose idx_messages_session and scanned
+  // every row of `messages`, so a documented `--query` call paid ~37s on a
+  // 4.7GB index before the script ran. The statement must resolve through the
+  // timestamp index so its cost tracks the 15-minute window instead.
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  const plan = db
+    .prepare(`EXPLAIN QUERY PLAN ${RECENT_CLI_INVOKER_MESSAGES_SQL}`)
+    .all('2026-08-11T09:45:10Z', '%obelisk --%', '%obelisk.js --%')
+    .map(step => step.detail)
+    .join('\n');
+
+  assert.match(plan, /idx_messages_time/, `expected a timestamp-index search, got:\n${plan}`);
+  assert.doesNotMatch(plan, /SCAN messages/, `expected no full scan of messages, got:\n${plan}`);
+  db.close();
+});
+
+test('strict invoker lookup still deduplicates sessions without DISTINCT', () => {
+  // Dropping DISTINCT is only safe because callers collect into a Set: one
+  // session with several in-window invocation records must still resolve.
+  const db = invokingDb();
+  const script = "const hits = search('dedupe needle', { limit: 3 });\nreturn hits.length;\n";
+  const command = `cat > "$qfile" <<'QUERY_EOF'\n${script}QUERY_EOF\nobelisk --query "$qfile"`;
+  db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+    .run('call-dedupe', 'msg-self-call', 'sid-self', 'Bash', JSON.stringify({ command }));
+  // Two more in-window message rows in the same session carry the invocation
+  // text, so the messages leg returns duplicate session_id rows.
+  db.prepare('INSERT INTO messages (uuid, session_id, type, role, text, timestamp) VALUES (?,?,?,?,?,?)')
+    .run('msg-self-echo-a', 'sid-self', 'assistant', 'assistant', 'ran obelisk --query "$qfile"', '2026-08-11T10:00:03Z');
+  db.prepare('INSERT INTO messages (uuid, session_id, type, role, text, timestamp) VALUES (?,?,?,?,?,?)')
+    .run('msg-self-echo-b', 'sid-self', 'assistant', 'assistant', 'then obelisk --search "needle"', '2026-08-11T10:00:04Z');
+
+  assert.equal(
+    resolveInvokingSessionId(db, [{ value: script.trim(), strict: true }], { nowMs: FIXTURE_NOW_MS }),
+    'sid-self',
   );
   db.close();
 });
