@@ -42,6 +42,10 @@ export interface IndexUnit {
   meta?: unknown;
   /** Previously indexed sessions atomically retracted by persist before this unit is written. */
   retractSessionIds?: readonly string[];
+  /** Preserve this session's cached canonical history across force cleanup,
+   * then upsert this unit's readable records. Unlike retainSession, this does
+   * not withhold projection; unavailable historical sources remain evidence. */
+  preserveSessionHistory?: boolean;
   /** Cursor prerequisites checked inside this unit's destination transaction.
    * Used when source observation/pending work must be durable before replacement.
    * A prerequisite is observed state, not proof that its dependent units finished. */
