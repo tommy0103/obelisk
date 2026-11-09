@@ -41,11 +41,28 @@ export function createProviderRegistry(providers: readonly ProviderAdapter[]): P
           const previous = byKey.get(key);
           if (previous === undefined) {
             byKey.set(key, target);
-          } else if (target.kind === 'tree' && (previous.fileNames || target.fileNames)) {
-            byKey.set(key, {
+          } else if (target.kind === 'tree' && (previous.fileNames || target.fileNames || (previous as any).matches || (target as any).matches)) {
+            const prevMatches = (previous as any).matches;
+            const nextMatches = (target as any).matches;
+            const combinedMatches = prevMatches && nextMatches
+              ? (fn: string) => prevMatches(fn) || nextMatches(fn)
+              : (prevMatches ?? nextMatches);
+            const fileNames = previous.fileNames || target.fileNames
+              ? [...new Set([...(previous.fileNames ?? []), ...(target.fileNames ?? [])])].sort()
+              : undefined;
+            const mergedTarget: WatchTarget = {
               ...previous,
-              fileNames: [...new Set([...(previous.fileNames ?? []), ...(target.fileNames ?? [])])],
-            });
+              ...(fileNames ? { fileNames } : {}),
+            };
+            if (combinedMatches) {
+              Object.defineProperty(mergedTarget, 'matches', {
+                value: combinedMatches,
+                enumerable: false,
+                writable: true,
+                configurable: true,
+              });
+            }
+            byKey.set(key, mergedTarget);
           }
         }
       }

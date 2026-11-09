@@ -9,8 +9,9 @@ Detailed reference for globals available inside `obelisk --query` and
 - Use `references/pitfalls.md` after runtime errors or confusing row shapes.
 
 Query scripts run inside an async IIFE with a 30-second timeout. Use `return` to
-emit JSON. `--query` scripts are read-only. `--attune` scripts expose only
-memory mutation helpers.
+emit JSON. The `--query` helper API is read-only, but the script itself runs
+with the privileges of the CLI process — see the security note in `SKILL.md`.
+`--attune` scripts expose only memory mutation helpers.
 
 ## Invocation Identity
 
@@ -249,14 +250,25 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"`; omit for all |
-| `opts.sessionId` | `string` | Exact session ID |
-| `opts.sessions` | `string[]` | Restrict to session IDs |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"`; omit for all |
+| `opts.sessionId` | `string` | Canonical session ID; a non-exact ref resolves as a literal fragment, capped at the 10 newest matches |
+| `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 
 Returns `Array<session_row>`.
+Only `sessions()` resolves fragments; every other helper matches `sessionId`
+exactly. Fragments match literally, so `%` and `_` in them are not SQL
+wildcards, and expand to at most the 10 newest containing sessions within the
+requested project/source/time/branch filters; entries
+from `sessionId` and `sessions` union. A raw native id normally resolves to
+exactly one session; several rows mean the id is not unique (for example a
+copied session file), so narrow with `project` or `source`.
 `message_count` describes the visible canonical transcript; inactive and hidden
 records do not increase it. The invoking session row carries
 `is_invoking: true` (see Invocation Identity); other rows omit the field.
+
+Passing a string is treated as `sessionId`. An exact canonical ID takes priority
+globally, even if other filters exclude it; no containing session is substituted.
+Unknown references and empty entries in the `sessions` array match nothing.
 
 #### `recent(n?)`
 

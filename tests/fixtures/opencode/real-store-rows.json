@@ -1,0 +1,342 @@
+{
+  "version": "upstream anomalyco/opencode V1=v1.19.3, V2=v2.0.32",
+  "v1": {
+    "sessions": [
+      {
+        "id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "project_id": "global",
+        "workspace_id": null,
+        "parent_id": null,
+        "slug": "silent-planet",
+        "directory": "/workspace/v1-project",
+        "path": "workspace/v1-project",
+        "title": "Neutral V1 Session",
+        "version": "1.17.7",
+        "share_url": null,
+        "summary_additions": 0,
+        "summary_deletions": 0,
+        "summary_files": 0,
+        "summary_diffs": null,
+        "metadata": null,
+        "cost": 0,
+        "tokens_input": 18302,
+        "tokens_output": 18,
+        "tokens_reasoning": 54,
+        "tokens_cache_read": 18048,
+        "tokens_cache_write": 0,
+        "revert": null,
+        "permission": null,
+        "agent": "build",
+        "model": "{\"id\":\"big-pickle\",\"providerID\":\"opencode\"}",
+        "time_created": 1781619105738,
+        "time_updated": 1781619125649,
+        "time_compacting": null,
+        "time_archived": null
+      }
+    ],
+    "messages": [
+      {
+        "id": "msg_ed0c62014001uCx8k9txQ7VQ6G",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619105812,
+        "time_updated": 1781619107865,
+        "data": "{\"role\":\"user\",\"time\":{\"created\":1781619105812},\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\",\"modelID\":\"big-pickle\"},\"summary\":{\"diffs\":[]}}"
+      },
+      {
+        "id": "msg_ed0c62035001eV2tslRXVQGCoA",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619105845,
+        "time_updated": 1781619107851,
+        "data": "{\"parentID\":\"msg_ed0c62014001uCx8k9txQ7VQ6G\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/workspace/v1-project\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"total\":18191,\"input\":18167,\"output\":9,\"reasoning\":15,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"big-pickle\",\"providerID\":\"opencode\",\"time\":{\"created\":1781619105845,\"completed\":1781619107849},\"finish\":\"stop\"}"
+      },
+      {
+        "id": "msg_ed0c66602001imJu2ymxmi34Ji",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619123717,
+        "time_updated": 1781619125655,
+        "data": "{\"role\":\"user\",\"time\":{\"created\":1781619123717},\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\",\"modelID\":\"big-pickle\"},\"summary\":{\"diffs\":[]}}"
+      },
+      {
+        "id": "msg_ed0c6661c001GEiEoEXhMOdotF",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619123740,
+        "time_updated": 1781619125641,
+        "data": "{\"parentID\":\"msg_ed0c66602001imJu2ymxmi34Ji\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/workspace/v1-project\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"total\":18231,\"input\":135,\"output\":9,\"reasoning\":39,\"cache\":{\"write\":0,\"read\":18048}},\"modelID\":\"big-pickle\",\"providerID\":\"opencode\",\"time\":{\"created\":1781619123740,\"completed\":1781619125634},\"finish\":\"stop\"}"
+      },
+      {
+        "id": "msg_ed0da16eb0010eLUU4SrazWq2q",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781620414187,
+        "time_updated": 1781620420657,
+        "data": "{\"role\":\"assistant\",\"time\":{\"created\":1781619120000}}"
+      }
+    ],
+    "parts": [
+      {
+        "id": "prt_ed0c6201700132eiZSqJMcsosC",
+        "message_id": "msg_ed0c62014001uCx8k9txQ7VQ6G",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619105824,
+        "time_updated": 1781619105825,
+        "data": "{\"type\":\"text\",\"text\":\"Neutral assistant text response.\"}"
+      },
+      {
+        "id": "prt_ed0c62472001dZ6PhECf2lqOZy",
+        "message_id": "msg_ed0c62035001eV2tslRXVQGCoA",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619106930,
+        "time_updated": 1781619106931,
+        "data": "{\"type\":\"step-start\"}"
+      },
+      {
+        "id": "prt_ed0c6269a001cgvBLr2foM0m52",
+        "message_id": "msg_ed0c62035001eV2tslRXVQGCoA",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619107482,
+        "time_updated": 1781619107726,
+        "data": "{\"type\":\"reasoning\",\"text\":\"Thinking about the request.\",\"time\":{\"start\":1781619107482,\"end\":1781619107725}}"
+      },
+      {
+        "id": "prt_ed0c6278f001koAhz2rru18IxN",
+        "message_id": "msg_ed0c62035001eV2tslRXVQGCoA",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619107727,
+        "time_updated": 1781619107830,
+        "data": "{\"type\":\"text\",\"text\":\"Neutral assistant text response.\",\"time\":{\"start\":1781619107727,\"end\":1781619107829}}"
+      },
+      {
+        "id": "prt_ed0c627fb001JCH5YkOZPkzNBJ",
+        "message_id": "msg_ed0c62035001eV2tslRXVQGCoA",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619107835,
+        "time_updated": 1781619107842,
+        "data": "{\"reason\":\"stop\",\"type\":\"step-finish\",\"tokens\":{\"total\":18191,\"input\":18167,\"output\":9,\"reasoning\":15,\"cache\":{\"write\":0,\"read\":0}},\"cost\":0}"
+      },
+      {
+        "id": "prt_ed0c666060016lSwFkTOctiDvb",
+        "message_id": "msg_ed0c66602001imJu2ymxmi34Ji",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619123726,
+        "time_updated": 1781619123726,
+        "data": "{\"type\":\"text\",\"text\":\"Neutral assistant text response.\"}"
+      },
+      {
+        "id": "prt_ed0c66905001w1GXT2TEBLj75i",
+        "message_id": "msg_ed0c6661c001GEiEoEXhMOdotF",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619124485,
+        "time_updated": 1781619124487,
+        "data": "{\"type\":\"step-start\"}"
+      },
+      {
+        "id": "prt_ed0c66b61001nD4rdg9ZXnnK07",
+        "message_id": "msg_ed0c6661c001GEiEoEXhMOdotF",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619125089,
+        "time_updated": 1781619125503,
+        "data": "{\"type\":\"reasoning\",\"text\":\"Thinking about the request.\",\"time\":{\"start\":1781619125089,\"end\":1781619125501}}"
+      },
+      {
+        "id": "prt_ed0c66d01001SLR78t5IHXvyX7",
+        "message_id": "msg_ed0c6661c001GEiEoEXhMOdotF",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619125505,
+        "time_updated": 1781619125603,
+        "data": "{\"type\":\"text\",\"text\":\"Neutral assistant text response.\",\"time\":{\"start\":1781619125505,\"end\":1781619125600}}"
+      },
+      {
+        "id": "prt_ed0c66d69001M8A3YlTXUE7VhN",
+        "message_id": "msg_ed0c6661c001GEiEoEXhMOdotF",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781619125610,
+        "time_updated": 1781619125613,
+        "data": "{\"reason\":\"stop\",\"type\":\"step-finish\",\"tokens\":{\"total\":18231,\"input\":135,\"output\":9,\"reasoning\":39,\"cache\":{\"write\":0,\"read\":18048}},\"cost\":0}"
+      },
+      {
+        "id": "prt_ed0da2402001ht9T3dKgU7l8r0",
+        "message_id": "msg_ed0da16eb0010eLUU4SrazWq2q",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781620417538,
+        "time_updated": 1781620417548,
+        "data": "{\"type\":\"step-start\"}"
+      },
+      {
+        "id": "prt_ed0da2411001zigEMM4HottzZg",
+        "message_id": "msg_ed0da16eb0010eLUU4SrazWq2q",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781620417553,
+        "time_updated": 1781620419735,
+        "data": "{\"type\":\"reasoning\",\"text\":\"Checking tool parameters.\",\"time\":{\"start\":1781620417553,\"end\":1781620419733}}"
+      },
+      {
+        "id": "prt_ed0da2c98001hCHxIEea0ff7ey",
+        "message_id": "msg_ed0da16eb0010eLUU4SrazWq2q",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781620419737,
+        "time_updated": 1781620420055,
+        "data": "{\"type\":\"text\",\"text\":\"Running file inspection.\",\"time\":{\"start\":1781620419736,\"end\":1781620420054}}"
+      },
+      {
+        "id": "prt_ed0da2d2d0017iwFbJBKVgY4Ag",
+        "message_id": "msg_ed0da16eb0010eLUU4SrazWq2q",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781620419885,
+        "time_updated": 1781620420651,
+        "data": "{\"type\":\"tool\",\"tool\":\"read\",\"callID\":\"call_rypmcjNy8I2xS83p3yyPM47Z\",\"state\":{\"status\":\"completed\",\"input\":{\"path\":\"src/index.ts\"},\"output\":\"export const answer = 42;\",\"metadata\":{},\"time\":{\"start\":1781619121000,\"end\":1781619122000}}}"
+      },
+      {
+        "id": "prt_ed0da302e001Bgpzcf56kVjodQ",
+        "message_id": "msg_ed0da16eb0010eLUU4SrazWq2q",
+        "session_id": "ses_12f39e039ffe6rWd5dMwj2ZwZp",
+        "time_created": 1781620420654,
+        "time_updated": 1781620420654,
+        "data": "{\"reason\":\"tool-calls\",\"type\":\"step-finish\",\"tokens\":{\"total\":16809,\"input\":803,\"output\":53,\"reasoning\":81,\"cache\":{\"write\":0,\"read\":15872}},\"cost\":0}"
+      }
+    ]
+  },
+  "v2": {
+    "sessions": [
+      {
+        "id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "project_id": "8ed2b732562aa32e324b883b206d3d8cf60e6ada",
+        "workspace_id": null,
+        "parent_id": null,
+        "fork_session_id": null,
+        "fork_boundary": null,
+        "slug": "playful-squid",
+        "directory": "/workspace/v2-project",
+        "path": "",
+        "title": "Neutral V2 Parent Session",
+        "version": "2.0.16",
+        "share_url": null,
+        "summary_additions": null,
+        "summary_deletions": null,
+        "summary_files": null,
+        "summary_diffs": null,
+        "metadata": null,
+        "cost": 0,
+        "tokens_input": 7168624,
+        "tokens_output": 36076,
+        "tokens_reasoning": 139751,
+        "tokens_cache_read": 54365377,
+        "tokens_cache_write": 0,
+        "revert": null,
+        "permission": null,
+        "agent": "build",
+        "model": "{\"id\":\"gpt-6-luna\",\"providerID\":\"cliproxy\",\"variant\":\"max\"}",
+        "time_created": 1791247096902,
+        "time_updated": 1791341579470,
+        "time_compacting": null,
+        "time_archived": null,
+        "time_suspended": null,
+        "resume_attempts": 0,
+        "time_idle": 1791341801356,
+        "time_viewed": 1791341801356,
+        "idle_outcome": "succeeded"
+      },
+      {
+        "id": "ses_f27074b55ffeKkmn2oZhvPrVN4",
+        "project_id": "global",
+        "workspace_id": null,
+        "parent_id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "fork_session_id": null,
+        "fork_boundary": null,
+        "slug": "sunny-river",
+        "directory": "/workspace/v2-project",
+        "path": "workspace/v2-project",
+        "title": "Neutral Subagent Child (@explore)",
+        "version": "1.17.12",
+        "share_url": null,
+        "summary_additions": 0,
+        "summary_deletions": 0,
+        "summary_files": 0,
+        "summary_diffs": null,
+        "metadata": null,
+        "cost": 0,
+        "tokens_input": 51454,
+        "tokens_output": 1759,
+        "tokens_reasoning": 434,
+        "tokens_cache_read": 12288,
+        "tokens_cache_write": 0,
+        "revert": null,
+        "permission": null,
+        "agent": "explore",
+        "model": "{\"id\":\"gpt-5.6-luna\",\"providerID\":\"cliproxy\",\"variant\":\"default\"}",
+        "time_created": 1790346572970,
+        "time_updated": 1790346639754,
+        "time_compacting": null,
+        "time_archived": null,
+        "time_suspended": null,
+        "resume_attempts": 0,
+        "time_idle": null,
+        "time_viewed": null,
+        "idle_outcome": null
+      }
+    ],
+    "messages": [
+      {
+        "id": "msg_v2_001_user",
+        "session_id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "type": "user",
+        "seq": 1,
+        "time_created": 1781700001000,
+        "time_updated": 1781700001000,
+        "data": "{\"text\":\"Please read src/index.ts and summarize.\",\"time\":{\"created\":1781700001000}}"
+      },
+      {
+        "id": "msg_v2_002_model",
+        "session_id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "type": "model-switched",
+        "seq": 2,
+        "time_created": 1781700002000,
+        "time_updated": 1781700002000,
+        "data": "{\"model\":{\"id\":\"gpt-5-turbo\",\"providerID\":\"openai\"},\"previous\":{\"id\":\"gpt-5-mini\",\"providerID\":\"openai\"},\"time\":1781700002000}"
+      },
+      {
+        "id": "msg_v2_003_agent",
+        "session_id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "type": "agent-switched",
+        "seq": 3,
+        "time_created": 1781700003000,
+        "time_updated": 1781700003000,
+        "data": "{\"agent\":\"code\",\"previous\":\"general\",\"time\":1781700003000}"
+      },
+      {
+        "id": "msg_v2_004_asst",
+        "session_id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "type": "assistant",
+        "seq": 4,
+        "time_created": 1781700004000,
+        "time_updated": 1781700005000,
+        "data": "{\"agent\":\"code\",\"model\":{\"id\":\"gpt-5-turbo\",\"providerID\":\"openai\"},\"content\":[{\"type\":\"reasoning\",\"text\":\"Planning file inspection.\"},{\"type\":\"tool\",\"id\":\"call_read_001\",\"name\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{\"path\":\"src/index.ts\"},\"content\":[{\"type\":\"text\",\"text\":\"console.log('hello world');\"}]}},{\"type\":\"text\",\"text\":\"File contents inspected successfully.\"}],\"tokens\":{\"input\":1500,\"output\":120,\"reasoning\":45,\"cache\":{\"read\":500,\"write\":50}},\"cost\":0.005,\"time\":{\"created\":1781700004000,\"completed\":1781700005000}}"
+      },
+      {
+        "id": "msg_v2_005_comp",
+        "session_id": "ses_ef15a63ffffeFIWpEYrVnkGRjm",
+        "type": "compaction",
+        "seq": 5,
+        "time_created": 1781700006000,
+        "time_updated": 1781700006000,
+        "data": "{\"status\":\"completed\",\"reason\":\"auto\",\"summary\":\"Neutral summary of previous turn.\",\"tokens\":{\"input\":2000,\"output\":50,\"reasoning\":20,\"cache\":{\"read\":1000,\"write\":0}},\"time\":1781700006000}"
+      },
+      {
+        "id": "msg_v2_child_001",
+        "session_id": "ses_f27074b55ffeKkmn2oZhvPrVN4",
+        "type": "user",
+        "seq": 1,
+        "time_created": 1781700010000,
+        "time_updated": 1781700010000,
+        "data": "{\"text\":\"Subagent task prompt.\",\"time\":{\"created\":1781700010000}}"
+      },
+      {
+        "id": "msg_v2_child_002",
+        "session_id": "ses_f27074b55ffeKkmn2oZhvPrVN4",
+        "type": "assistant",
+        "seq": 2,
+        "time_created": 1781700011000,
+        "time_updated": 1781700012000,
+        "data": "{\"agent\":\"explore\",\"model\":\"gpt-5-turbo\",\"content\":[{\"type\":\"text\",\"text\":\"Subagent completed exploration.\"}],\"tokens\":{\"input\":800,\"output\":60,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"time\":{\"created\":1781700011000,\"completed\":1781700012000}}"
+      }
+    ]
+  }
+}
