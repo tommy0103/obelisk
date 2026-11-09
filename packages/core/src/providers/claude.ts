@@ -146,14 +146,14 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     const mainPath = join(dirname(key), '..', `${member.sessionId}.jsonl`);
     const mainCursor = ctx.previousCursor?.(normalize(mainPath)) ?? ctx.lastCursor(normalize(mainPath));
     let signature: string;
-    try { signature = orphanFingerprint(members.map(unit => unit.key), mainCursor); }
+    try { signature = orphanFingerprint([...members.map(unit => unit.key), ...orphanWorkflowPaths(key)], mainCursor); }
     catch (error) {
       ctx.retainSession?.(member.sessionId);
       ctx.reportIncompleteInventory?.(sourceInventoryIssue(key, error));
       continue;
     }
     if (ctx.lastCursor(key) === signature) continue;
-    orphanUnits.push({ key, sessionId: member.sessionId, project: member.project,
+    orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, retractSessionIds: [member.sessionId],
       meta: { kind: 'orphan-family', members, signature, mainPath: normalize(mainPath), mainCursor } satisfies ClaudeOrphanFamilyMeta });
   }
   const transcriptUnits = files.filter((file) => {
@@ -223,7 +223,8 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       }
     }
   }
-  return [...transcriptUnits, ...orphanUnits, ...workflowUnits];
+  return [...transcriptUnits, ...orphanUnits, ...workflowUnits.filter(unit =>
+    !orphanMembers.has(join(projectsDir, unit.project!, unit.sessionId, 'subagents')))];
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
@@ -514,9 +515,9 @@ interface ClaudeOrphanFamilyMeta {
 function orphanFingerprint(paths: string[], mainCursor: Cursor): string {
   const signature = [...paths].sort().map(path => {
     const stat = statSync(path);
-    const sidecar = path.replace(/\.jsonl$/, '.meta.json');
+    const sidecar = path.endsWith('.jsonl') ? path.replace(/\.jsonl$/, '.meta.json') : null;
     let metaSignature: number[] | null = null;
-    try { const meta = statSync(sidecar); metaSignature = [meta.mtimeMs, meta.ctimeMs, meta.size, meta.ino]; }
+    try { const meta = sidecar === null ? null : statSync(sidecar); metaSignature = meta === null ? null : [meta.mtimeMs, meta.ctimeMs, meta.size, meta.ino]; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     return [path, stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino, stat.dev, metaSignature];
   });
@@ -537,11 +538,17 @@ function orphanMemberPaths(directory: string): string[] {
   return paths;
 }
 
-function* parseOrphanFamily(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+function orphanWorkflowPaths(directory: string): string[] {
+  const workflows = join(dirname(directory), 'workflows');
+  try { return readdirSync(workflows).filter(name => name.endsWith('.json')).map(name => join(workflows, name)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+}
+
+function* parseOrphanFamily(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as ClaudeOrphanFamilyMeta;
   const verify = () => {
     if (!transcriptProvedMissing(meta.mainPath)
-      || orphanFingerprint(orphanMemberPaths(unit.key), meta.mainCursor) !== meta.signature) {
+      || orphanFingerprint([...orphanMemberPaths(unit.key), ...orphanWorkflowPaths(unit.key)], meta.mainCursor) !== meta.signature) {
       throw new RetryableSourceReadError(unit.key, 'Orphan transcript family changed during snapshot');
     }
   };
@@ -549,6 +556,19 @@ function* parseOrphanFamily(unit: IndexUnit, cursor: Cursor): Generator<Transcri
   const records: TranscriptRecord[] = [];
   const sessions: Extract<TranscriptRecord, { kind: 'session' }>[] = [];
   for (const member of meta.members) {
+    const sidecar = member.key.replace(/\.jsonl$/, '.meta.json');
+    try {
+      const data = JSON.parse(readFileSync(sidecar, 'utf8'));
+      if (data === null || typeof data !== 'object' || Array.isArray(data)
+        || (data.agentType !== undefined && typeof data.agentType !== 'string')
+        || (data.description !== undefined && typeof data.description !== 'string')) {
+        throw new Error('Orphan subagent metadata has no stable object shape');
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new RetryableSourceReadError(sidecar, 'Orphan subagent metadata is incomplete or invalid', { cause: error });
+      }
+    }
     let hasJson = false;
     readLines(member.key, (line, terminated) => {
       if (!line.trim()) return;
@@ -561,8 +581,15 @@ function* parseOrphanFamily(unit: IndexUnit, cursor: Cursor): Generator<Transcri
       else records.push(record);
     }
   }
+  for (const path of orphanWorkflowPaths(unit.key)) {
+    const workflow = JSON.parse(readFileSync(path, 'utf8'));
+    if (typeof workflow?.runId !== 'string' || !workflow.runId) {
+      throw new RetryableSourceReadError(path, 'Orphan workflow has no stable identity');
+    }
+    records.push(...parseWorkflow({ key: path, sessionId: unit.sessionId, project: unit.project,
+      meta: { kind: 'workflow', mainTranscriptPath: meta.mainPath } satisfies ClaudeWorkflowUnitMeta }));
+  }
   verify();
-  if (cursor !== null) yield { kind: 'delete-session', sessionId: unit.sessionId };
   yield* records;
   const timestamps = sessions.flatMap(session => [session.started_at, session.ended_at]).filter((value): value is string => value !== null).sort();
   yield {
