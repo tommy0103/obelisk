@@ -197,8 +197,9 @@ export function backfillSessionTitles(db: SqliteDb): number {
 }
 
 /**
- * Recompute counts only for Claude sessions with surviving subagent rows and
- * a main transcript proved absent. Other providers own their count semantics
+ * Recompute counts only for Claude sessions with surviving subagent rows or
+ * a source-proven family supplied by the current index plan, and a main
+ * transcript proved absent. Other providers own their count semantics
  * and may store logical provenance such as database paths with fragments.
  *
  * Fresh orphan units publish per-unit totals and appends publish deltas.
@@ -212,7 +213,7 @@ export function backfillSessionTitles(db: SqliteDb): number {
  * evidence. Idempotent by construction — after the first pass the
  * stored count equals `COUNT(*)` and the statement is a no-op.
  */
-export function repairOrphanedSessionCounts(db: SqliteDb): number {
+export function repairOrphanedSessionCounts(db: SqliteDb, familySessionIds: Iterable<string> = []): number {
   const sessions = db.prepare(`
     SELECT s.id, s.jsonl_path, s.message_count FROM sessions s
     WHERE COALESCE(s.source, 'claude') = 'claude'
@@ -220,6 +221,23 @@ export function repairOrphanedSessionCounts(db: SqliteDb): number {
       AND EXISTS (SELECT 1 FROM messages m
                   WHERE m.session_id = s.id AND m.agent_id IS NOT NULL)
   `).all();
+  // A valid child transcript may contain metadata only. It proves the family
+  // exists without producing an agent_id message row; cached main history must
+  // still contribute to its count. Keep that source evidence in the plan,
+  // rather than interpreting provider-private paths or cursors here.
+  const knownIds = new Set(sessions.map(session => String(session.id)));
+  const familySession = db.prepare(`
+    SELECT id, jsonl_path, message_count FROM sessions
+    WHERE id = ? AND COALESCE(source, 'claude') = 'claude'
+      AND jsonl_path IS NOT NULL AND jsonl_path <> ''
+  `);
+  for (const id of familySessionIds) {
+    if (knownIds.has(id)) continue;
+    const session = familySession.get(id);
+    if (session === undefined) continue;
+    sessions.push(session);
+    knownIds.add(id);
+  }
   if (sessions.length === 0) return 0;
   const count = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?');
   const update = db.prepare('UPDATE sessions SET message_count = ? WHERE id = ?');

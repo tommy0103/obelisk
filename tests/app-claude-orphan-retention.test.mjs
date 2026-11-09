@@ -21,6 +21,47 @@ const line = (uuid, text, timestamp = '2026-06-10T10:00:00Z') => JSON.stringify(
 }) + '\n';
 
 for (const runtime of ['built CLI', 'App SQLite']) {
+  test(`${runtime}: metadata-only children preserve cached main counts across refresh and rebuild`, () => {
+    const home = makeTempDir('obelisk-metadata-orphan-history-');
+    const claudeDir = join(home, '.claude');
+    const project = join(claudeDir, 'projects', '-project');
+    const children = join(project, 'session', 'subagents');
+    mkdirSync(children, { recursive: true });
+    const main = join(project, 'session.jsonl');
+    writeFileSync(main, line('cached-main', 'retainedonlyneedle'));
+    const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8')
+      .trim().split('\n').map(JSON.parse).find(record => record.type === 'agent-name');
+    assert.ok(captured, 'use actual captured metadata-only Claude input');
+    writeFileSync(join(children, 'agent-a.jsonl'), JSON.stringify(captured) + '\n');
+    const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+    const registry = createProviderRegistry([createClaudeProvider({ rootDir: claudeDir })]);
+    const query = join(home, 'query.mjs');
+    writeFileSync(query, 'return sql("SELECT COUNT(*) n FROM messages");');
+    const build = force => {
+      if (runtime === 'built CLI') {
+        const result = runCli(force ? ['--build'] : ['--query', query], { home });
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+      } else {
+        const result = buildIndex({ claudeDir, dbPath, providerRegistry: registry, DatabaseImpl: Database, force });
+        assert.equal(result.complete, true, JSON.stringify(result));
+      }
+    };
+    const inspect = fn => { const db = new DatabaseSync(dbPath); try { fn(db); } finally { db.close(); } };
+    build(false);
+    unlinkSync(main);
+    for (const mode of ['refresh', 'force', 'marker replay']) {
+      inspect(db => {
+        db.exec("DELETE FROM index_state WHERE jsonl_path='__last_build__'");
+        if (mode === 'marker replay') db.prepare('DELETE FROM index_state WHERE jsonl_path=?').run(CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
+      });
+      build(mode === 'force');
+      inspect(db => {
+        assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 1, mode);
+        assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id=?').get('session').message_count, 1, mode);
+        assert.equal(db.prepare("SELECT uuid FROM messages_fts WHERE messages_fts MATCH 'retainedonlyneedle'").get().uuid, 'cached-main');
+      });
+    }
+  });
   test(`${runtime}: missing main history survives refresh, force and marker replay while readable children advance`, () => {
     const home = makeTempDir('obelisk-orphan-history-');
     const claudeDir = join(home, '.claude');

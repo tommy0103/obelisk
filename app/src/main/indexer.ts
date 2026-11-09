@@ -429,7 +429,7 @@ function buildIndex({
           backfillUnresolvedSessionProjectPathsOnce(db);
         }
         healWorkflowParentLinks(db);
-        repairOrphanedSessionCounts(db);
+        repairOrphanedSessionCounts(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
         backfillSessionTitles(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
