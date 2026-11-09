@@ -85,3 +85,80 @@ entirely.
 - Packed chunk rows are not expanded during projection (their content
   duplicates the step-final `assistant/message`); the vendored codec stays
   available for raw reconstruction but is not on the indexing path.
+
+
+**Amendment (2026-10-20): future members retain their whole tree.** A readable
+future-format identity envelope participates in ancestry discovery but its body
+never reaches projection. An unsupported member retains the complete root tree,
+not just its physical session directory. Discovery closes that decision over
+both the current graph and checkpointed members, so another tree cannot adopt a
+member and overwrite retained rows. If historical ownership is unavailable,
+project-local protection is conservative. Unaccounted historical identities
+defer deletion until unknown content clears. The same current and
+historical ownership closure expands watcher invalidation on recovery, so an
+old owner cannot retract a member without its new owner being projected in the
+same completed refresh. Pending replay also bypasses the changed-path filter.
+Malformed or unreadable headers still invalidate inventory and use the
+established project suppression.
+
+Retention matches current and checkpointed paths through the same physical-path
+canonicalization as watcher routing, including the longest existing ancestor for
+removed generations. Current realpath or directory existence alone is not proof
+of historical ownership: links can be rebound and members can move while the old
+project remains. A checkpoint is trusted only for its own indexed session id.
+While future artifacts exist, an indexed tree whose historical member identities
+are not fully accounted for in the current census retains its last-good closure.
+A rootless group remains ownership evidence, but cannot account for historical
+members because it cannot publish a replacement tree.
+Unknown envelopes may change id, scope and location together, and a source path
+may be rebound or replaced by a regular directory. Without historical physical
+namespace evidence, no current-path comparison can distinguish such a move from
+a deletion. This correctness fallback covers root/child relocation and namespace
+reuse without adding another ownership heuristic. Intact readable trees continue
+publishing; a genuinely deleted historical root or member may remain stale until
+unknown content clears, including when that content later proves unrelated.
+Recovery then converges to the same result as a fresh full rebuild.
+
+If checkpoint membership is missing or belongs to another session, canonical
+subagent ownership supplies historical edges and the member census. Legacy
+callers without either source retain possible projects conservatively. An
+absent root still retains its own history. Persisted unit keys,
+checkpoint encoding and canonical identities remain unchanged.
+
+Historical paths/checkpoints identify candidate replaced roots, not deletion
+proof. Old identities may retire only when the complete current root census
+proves them absent everywhere; a live moved root is protected even if its old
+directory is reused. Retirement uses `IndexUnit.retractSessionIds` inside the
+publication transaction and requires strict snapshot validation, so no-op
+parse guards cannot certify an eager retraction. A standalone indexed root
+adopted as a subagent retires its old root row in that same transaction.
+Its moved-away checkpoint closes without repeating the retraction after the
+new owner writes child rows. If its old directory now belongs to a different
+root, that replacement owns the checkpoint key and must not retract the
+adopted identity. A changed checkpoint identity bypasses watcher routing hints
+and requires a complete snapshot.
+Force, canonical-marker replay, and pending replay of an indexed identity set
+`snapshotRequired`; an unavailable member, changed header, or undurable seed
+fails that projection instead of committing a cursor-only no-op after
+destructive cleanup or reporting unfinished recovery as complete. Ordinary
+incremental no-op guards retain their existing fail-closed behavior and cannot
+commit a retirement.
+
+**Amendment (2026-10-20): ownership transfers publish atomically.** Current
+trees, owned checkpoint members and canonical subagent ownership form connected
+components. A component with more than one root owner receives a shared
+`atomicGroup`; all its live owners and proven tombstones are planned together,
+including unchanged owners outside a watcher hint. Every live unit requires a
+complete snapshot. Shared indexing commits or rolls back that set as a whole,
+so the old owner cannot delete history before a failing new owner publishes it.
+A known divergent or unreadable receiver withholds the connected owners during
+discovery. A rootless transfer also withholds them; a rootless singleton may
+still represent a proven root deletion. Incomplete inventory protects historical
+members that cannot be accounted for, as does an unsupported artifact. Healthy
+components continue independently.
+
+Canonical ownership remains evidence even when its source checkpoint is lost or
+reused. It does not make every recorded spawn a required on-disk file: an owned
+checkpoint's actual file census remains authoritative when available. A
+successfully published deletion leaves a non-null tombstone cursor, clearing
+replay debt without recreating the retired session.
