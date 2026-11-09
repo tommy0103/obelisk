@@ -286,7 +286,7 @@ test('replaying unchanged compressed parent preserves child contributions', () =
   persist(db, parentMetadata, provider.parse(parentMetadata, parentCursor));
   const session = db.prepare('SELECT title, ended_at, message_count FROM sessions WHERE id=?').get(parentSessionId);
   assert.equal(session.title, 'Updated compressed title');
-  assert.equal(session.ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(session.ended_at, '2026-06-10T12:00:00.000Z');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id=?').get(parentSessionId).count, 2);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM subagents WHERE session_id=?').get(parentSessionId).count, 1);
   assert.equal(metadata.ret, parentCursor, 'metadata-only publication does not consume transcript progress');
