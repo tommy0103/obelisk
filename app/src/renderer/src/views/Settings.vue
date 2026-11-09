@@ -60,7 +60,7 @@ async function loadSettings({ preserveRecapPath = false } = {}) {
   dbPath.value = s.dbPath || '';
   // The first accepted snapshot initializes the form even during a refresh.
   preserveRecapPath = preserveRecapPath && settingsLoaded;
-  if (!preserveRecapPath) recapPath.value = s.recapDir || '~/.obelisk/recap';
+  if (!preserveRecapPath) recapPath.value = s.recapDir || '';
   autoRefresh.value = s.autoRefresh !== false;
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
