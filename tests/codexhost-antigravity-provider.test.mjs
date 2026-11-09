@@ -20,8 +20,7 @@ const historyFixture = JSON.parse(readFileSync(new URL('history-v1.json', fixtur
 const mappingFixture = JSON.parse(readFileSync(new URL('mapping-v1.json', fixtureRoot), 'utf8'));
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
-function setup() {
-  const root = makeTempDir('obelisk-codexhost-antigravity-');
+function setup(root = makeTempDir('obelisk-codexhost-antigravity-')) {
   const historyDir = join(root, 'antigravity-history');
   const mappingDir = join(root, 'mapping-store', 'threads');
   mkdirSync(historyDir, { recursive: true });
@@ -70,6 +69,26 @@ function runIndexPlan(db, provider, options = {}) {
     db, plan, runTransaction: (_label, work) => work(), onError: () => 'skip',
   });
   return { plan, result };
+}
+
+for (const nested of [false, true]) {
+  test(`an excluded ${nested ? 'nested' : 'separate'} root is not deletion evidence for the selected root`, () => {
+    const selectedRoot = makeTempDir('obelisk-antigravity-selected-');
+    const selectedMappingRoot = join(selectedRoot, 'mapping-store', 'threads');
+    mkdirSync(selectedMappingRoot, { recursive: true });
+    const oldRoot = nested ? join(selectedMappingRoot, 'excluded-root') : makeTempDir('obelisk-antigravity-excluded-');
+    const source = setup(oldRoot);
+    const { db, unit, cursor } = seedIndexedSession(source);
+    try {
+      rmSync(oldRoot, { recursive: true });
+      const selected = createCodexHostAntigravityProvider({ rootDir: selectedRoot });
+      const result = discover(selected, [{ sessionId: unit.sessionId, jsonlPath: source.mappingPath }],
+        new Map([[unit.key, cursor]]));
+      assert.deepEqual(result.issues, []);
+      assert.deepEqual(result.units, [], 'only mapping files in the directory actually enumerated can be tombstoned');
+      assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 4);
+    } finally { db.close(); }
+  });
 }
 
 test('CodexHost Antigravity history indexes user, assistant, and tool evidence without duplicating native harnesses', () => {

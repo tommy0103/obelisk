@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, normalize, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 
 import { normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import type {
@@ -392,6 +392,10 @@ export function createCodexHostAntigravityProvider({
       if (complete) {
         const tombstones: IndexUnit[] = [];
         for (const old of indexed) {
+          // This census enumerated only the direct mapping directory. A root
+          // excluded by settings, including a nested data directory, is not
+          // evidence of deletion even when its old path is unavailable.
+          if (relative(mappingRoot, dirname(normalize(old.jsonlPath))) !== '') continue;
           if (live.has(old.sessionId)) continue;
           // A remaining but invalid mapping was reported above, so it may
           // not be interpreted as a deletion of this indexed identity.
