@@ -22,7 +22,7 @@ const COLUMN_MIGRATIONS = [
   ['memories', 'deleted_reason', 'TEXT'],
 ] as const;
 
-const FTS_TABLES = ['messages_fts', 'memories_fts'] as const;
+const FTS_TABLES = ['messages_fts', 'memories_fts', 'tool_errors_fts'] as const;
 
 // FTS5 built-in tokenizers plus their word-only arguments. The configured value is
 // interpolated into DDL, so the grammar is a whitelist: no quotes, no separators.
@@ -111,14 +111,26 @@ export function migrateFtsTokenizer(db: SqliteDb, tokenizer: string | null): voi
     for (const { table, sql } of replacements) {
       db.exec(`DROP TABLE ${table}`);
       db.exec(sql);
-      db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`);
+      if (table === 'tool_errors_fts') rebuildToolErrorsFts(db);
+      else db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`);
     }
   };
   if (txDb.inTransaction()) migrate();
   else runWriteTransaction(txDb, migrate, { label: 'fts-tokenizer-migration' });
 }
 
+/** Refill the filtered, contentful FTS table inside the caller's transaction. */
+export function rebuildToolErrorsFts(db: SqliteDb): void {
+  db.exec('DELETE FROM tool_errors_fts');
+  db.exec(`INSERT INTO tool_errors_fts(rowid, tool_use_id, session_id, content)
+    SELECT rowid, tool_use_id, session_id, content FROM tool_results WHERE is_error = 1`);
+}
+
 export function coreSchemaNeedsMigration(db: SqliteDb): boolean {
+  if (!tableExists(db, 'tool_errors_fts')) return true;
+  for (const name of ['tool_errors_fts_ai', 'tool_errors_fts_ad', 'tool_errors_fts_au']) {
+    if (!db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name=?").get(name)) return true;
+  }
   const columnsByTable = new Map<string, Set<string>>();
   for (const [table, column] of COLUMN_MIGRATIONS) {
     if (!tableExists(db, table)) return true;

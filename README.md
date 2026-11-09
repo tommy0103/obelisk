@@ -170,7 +170,8 @@ where the source tool has the concept:
 | **Workflows** | Workflow script, result, and per-agent transcripts | Claude Code |
 | **Memories** | Conclusions linked to source sessions | registered markdown files |
 
-Full-text search via FTS5 covers all layers. Per-provider source locations are
+Full-text search via FTS5 covers messages, memories and failed tool results.
+Successful tool output remains available through SQL. Per-provider source locations are
 listed under [Provider coverage](#provider-coverage).
 
 ### CJK transcripts
@@ -184,7 +185,7 @@ are missed. Sessions in those languages can set a different tokenizer:
 export OBELISK_FTS_TOKENIZER=trigram
 ```
 
-With the desktop app stopped, the next command atomically migrates both FTS tables
+With the desktop app stopped, the next command atomically migrates all FTS tables
 and reindexes them from the content tables;
 nothing else needs to be rebuilt, and unsetting the variable leaves the existing index
 alone. If the desktop app is running with a different setting, the CLI reports the

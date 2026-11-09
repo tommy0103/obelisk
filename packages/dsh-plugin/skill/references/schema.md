@@ -340,3 +340,16 @@ Common indexed filters:
   `references/api-reference.md` when a specific message needs its source record.
 - Prefer SQL-side `COUNT`, `GROUP BY`, `MAX`, `ORDER BY`, and `LIMIT` over
   returning large row sets and hand-counting in the final answer.
+
+
+### `tool_errors_fts`
+
+FTS5 index of `tool_results` rows whose `is_error = 1`. Columns are
+`tool_use_id` (unindexed), `session_id` (unindexed), and `content` (indexed).
+Successful tool output stays in `tool_results` and is available through SQL.
+UPSERT-safe insert/update/delete triggers maintain the filtered contents.
+Existing databases backfill once during index finalization; force repair refills
+from the stored content. Explicit `OBELISK_FTS_TOKENIZER` configuration applies
+to this index as well as message and memory FTS.
+
+This is a SQL retrieval surface; `search()` continues to search message text.

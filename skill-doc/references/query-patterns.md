@@ -684,3 +684,34 @@ return {
   text: first?.text?.slice(0, 500),
 };
 ```
+
+
+## Find a past failure by error text
+
+When an error appears only in tool output, query `tool_errors_fts` and then
+read a bounded window around the result's message. Filter visibility and meta
+rows explicitly when using SQL:
+
+```js
+const failures = sql(`
+  SELECT tef.session_id, tef.tool_use_id, tr.message_uuid,
+         tc.name AS tool_name, s.title, s.project
+  FROM tool_errors_fts tef
+  JOIN tool_results tr ON tr.tool_use_id = tef.tool_use_id
+                       AND tr.session_id = tef.session_id
+  JOIN messages m ON m.uuid = tr.message_uuid AND m.session_id = tr.session_id
+  LEFT JOIN tool_calls tc ON tc.id = tef.tool_use_id AND tc.session_id = tef.session_id
+  LEFT JOIN sessions s ON s.id = tef.session_id
+  WHERE tool_errors_fts MATCH ?
+    AND COALESCE(m.visibility, 'visible') = 'visible'
+    AND COALESCE(m.is_meta, 0) = 0
+  LIMIT 10
+`, '"ENOENT"');
+return { failures, nearby: failures[0]
+  ? messages({ around: failures[0].message_uuid, beforeCount: 3, afterCount: 3 })
+  : null };
+```
+
+Quote each literal MATCH term to avoid treating punctuation as FTS operators.
+Only failed results are indexed. For successful output, use a `LIKE` query
+scoped to a known session; `search()` defaults and results are unchanged.
