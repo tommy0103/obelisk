@@ -54,6 +54,26 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
   INSERT INTO messages_fts(rowid, uuid, session_id, text)
   VALUES (new.rowid, new.uuid, new.session_id, new.text);
 END;
+-- Only failed tool output is indexed. Persist uses UPSERT (not REPLACE), so
+-- these triggers retract old text on updates and session cleanup without a
+-- full-history rebuild on each incremental index pass.
+CREATE VIRTUAL TABLE IF NOT EXISTS tool_errors_fts USING fts5(
+  tool_use_id UNINDEXED, session_id UNINDEXED, content);
+CREATE TRIGGER IF NOT EXISTS tool_errors_fts_ai AFTER INSERT ON tool_results
+WHEN new.is_error = 1 BEGIN
+  INSERT INTO tool_errors_fts(rowid, tool_use_id, session_id, content)
+  VALUES(new.rowid, new.tool_use_id, new.session_id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_errors_fts_ad AFTER DELETE ON tool_results
+WHEN old.is_error = 1 BEGIN
+  DELETE FROM tool_errors_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS tool_errors_fts_au AFTER UPDATE ON tool_results
+WHEN old.is_error = 1 OR new.is_error = 1 BEGIN
+  DELETE FROM tool_errors_fts WHERE rowid = old.rowid;
+  INSERT INTO tool_errors_fts(rowid, tool_use_id, session_id, content)
+  SELECT new.rowid, new.tool_use_id, new.session_id, new.content WHERE new.is_error = 1;
+END;
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(session_id, timestamp);

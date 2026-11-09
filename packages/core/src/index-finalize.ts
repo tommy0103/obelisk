@@ -6,10 +6,12 @@
 // transactions; this module owns the invariants that must not diverge between
 // the two indexing modes.
 
+import { rebuildToolErrorsFts } from './schema-migrations.ts';
 import { inferProjectPath } from './parsing.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
 const FTS_TRIGGERS_READY_MARKER = '__fts_triggers_ready__';
+const TOOL_ERRORS_READY_MARKER = '__tool_errors_fts_ready_v1__';
 const PROJECT_PATH_BACKFILL_MARKER = '__project_path_backfill_v1__';
 const MESSAGE_FTS_TRIGGERS = [
   'messages_fts_ai',
@@ -25,7 +27,7 @@ export function dropMessageFtsTriggers(db: SqliteDb): void {
 }
 
 /**
- * Rebuild both external-content FTS indexes only when the index has not yet
+ * Rebuild external-content FTS indexes only when the index has not yet
  * recorded trigger readiness, or when a force snapshot explicitly requests a
  * complete repair. Trigger-only maintenance is safe because persist writes
  * messages with INSERT ... ON CONFLICT DO UPDATE (fires messages_fts_au) and
@@ -34,15 +36,26 @@ export function dropMessageFtsTriggers(db: SqliteDb): void {
  * transaction after both rebuilds succeed.
  */
 export function ensureFtsReady(db: SqliteDb, { force = false }: { force?: boolean } = {}): boolean {
-  const ready = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?')
-    .get(FTS_TRIGGERS_READY_MARKER);
-  if (ready && !force) return false;
-  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-  db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
-  db.prepare(
+  const marker = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?');
+  const writeMarker = db.prepare(
     'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
-  ).run(FTS_TRIGGERS_READY_MARKER, Date.now());
-  return true;
+  );
+  let rebuilt = false;
+  if (force || !marker.get(FTS_TRIGGERS_READY_MARKER)) {
+    db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+    db.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')");
+    writeMarker.run(FTS_TRIGGERS_READY_MARKER, Date.now());
+    rebuilt = true;
+  }
+  // A separate marker upgrades installations whose message FTS was already
+  // ready before this filtered index existed. Failure rolls back both contents
+  // and marker in the caller's finalize transaction.
+  if (force || !marker.get(TOOL_ERRORS_READY_MARKER)) {
+    rebuildToolErrorsFts(db);
+    writeMarker.run(TOOL_ERRORS_READY_MARKER, Date.now());
+    rebuilt = true;
+  }
+  return rebuilt;
 }
 
 /**
@@ -104,4 +117,4 @@ export function backfillUnresolvedSessionProjectPathsOnce(db: SqliteDb): boolean
   return true;
 }
 
-export { FTS_TRIGGERS_READY_MARKER, PROJECT_PATH_BACKFILL_MARKER };
+export { FTS_TRIGGERS_READY_MARKER, TOOL_ERRORS_READY_MARKER, PROJECT_PATH_BACKFILL_MARKER };

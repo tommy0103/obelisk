@@ -17,7 +17,7 @@ import { createDeferredQuit } from './quit-teardown.ts';
 import { createUpdateLifecycle } from './update-lifecycle.ts';
 import { createUpdateService } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
-import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
+import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from '../../../packages/core/src/schema-migrations.ts';
 import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
@@ -204,6 +204,7 @@ function migrateDb(db) {
   const schemaPath = resolveSchemaPath();
   if (schemaPath) db.exec(fs.readFileSync(schemaPath, 'utf8'));
   migrateCoreSchemaColumns(db);
+  migrateFtsTokenizer(db, resolveFtsTokenizer());
 }
 
 function closeDb() {

@@ -170,8 +170,28 @@ where the source tool has the concept:
 | **Workflows** | Workflow script, result, and per-agent transcripts | Claude Code |
 | **Memories** | Conclusions linked to source sessions | registered markdown files |
 
-Full-text search via FTS5 covers all layers. Per-provider source locations are
+Full-text search via FTS5 covers messages, memories and failed tool results.
+Successful tool output remains available through SQL. Per-provider source locations are
 listed under [Provider coverage](#provider-coverage).
+
+### CJK transcripts
+
+FTS5 defaults to the `unicode61` tokenizer, which treats an unbroken run of Chinese,
+Japanese, or Korean characters as a single token — a phrase only matches when it happens
+to be delimited by punctuation or ASCII, and identifiers glued to CJK text (`重跑gen-itgc后`)
+are missed. Sessions in those languages can set a different tokenizer:
+
+```bash
+export OBELISK_FTS_TOKENIZER=trigram
+```
+
+With the desktop app stopped, the next command atomically migrates all FTS tables
+and reindexes them from the content tables;
+nothing else needs to be rebuilt, and unsetting the variable leaves the existing index
+alone. If the desktop app is running with a different setting, the CLI reports the
+mismatch: restart the app with the same setting, or quit it before the build.
+The trade-off is a larger index and a floor of 3 characters per query — `trigram` cannot
+match anything shorter, so short queries need `sql()` with `LIKE`.
 
 ## Provider coverage
 

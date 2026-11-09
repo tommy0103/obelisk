@@ -12,8 +12,8 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    // 2026-10-20: preserve checkpoints while marking retained units for replay.
-    '71c4ecef93d72808f8c56bb3ab7f7296a53fd1fad34e0adbcd3e300262f629bb',
+    // 2026-11-09: add filtered failed-tool-result FTS and UPSERT-safe maintenance triggers (#256).
+    'f6099dc8ead1433b81feef0fcfc9be7c38d656837b361991e5984cef17e7e1f3',
   );
 });
 
