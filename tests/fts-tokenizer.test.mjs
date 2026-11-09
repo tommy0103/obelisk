@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 
 import { ftsTokenizerMigrationPending, migrateFtsTokenizer, resolveFtsTokenizer } from '../packages/core/src/schema-migrations.ts';
@@ -170,3 +171,61 @@ test('migrateFtsTokenizer is idempotent and reversible', () => {
     db.close();
   }
 });
+
+const BetterSqliteDatabase = createRequire(new URL('../app/package.json', import.meta.url))('better-sqlite3');
+for (const [binding, open] of [
+  ['node:sqlite', () => new DatabaseSync(':memory:')],
+  ['better-sqlite3', () => new BetterSqliteDatabase(':memory:')],
+]) {
+  for (const boundary of ['DROP TABLE messages_fts', 'CREATE VIRTUAL TABLE messages_fts',
+    'INSERT INTO messages_fts', 'DROP TABLE memories_fts']) {
+    test(`${binding}: interrupted tokenizer migration at ${boundary} preserves both searchable indexes and retries`, () => {
+      const db = open();
+      db.exec(SCHEMA);
+      insertMessage(db, 'migration-recovery', 'needle 悬空引用');
+      const before = ['messages_fts', 'memories_fts'].map(table => createSqlFor(db, table));
+      const interrupted = new Proxy(db, {
+        get(target, property) {
+          if (property === 'exec') return sql => {
+            if (sql.startsWith(boundary)) throw new Error('injected migration interruption');
+            return target.exec(sql);
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      try {
+        assert.throws(() => migrateFtsTokenizer(interrupted, 'trigram'), /injected migration interruption/);
+        assert.deepEqual(['messages_fts', 'memories_fts'].map(table => createSqlFor(db, table)), before);
+        assert.equal(ftsHits(db, 'needle'), 1);
+        migrateFtsTokenizer(db, 'trigram');
+        assert.equal(ftsHits(db, '悬空引用'), 1, 'a retry finishes the rebuild');
+      } finally { db.close(); }
+    });
+  }
+  test(`${binding}: invalid tokenizer arguments are rejected before either index is dropped`, () => {
+    const db = open();
+    db.exec(SCHEMA);
+    insertMessage(db, 'invalid-tokenizer', 'needle');
+    const before = ['messages_fts', 'memories_fts'].map(table => createSqlFor(db, table));
+    try {
+      assert.throws(() => migrateFtsTokenizer(db, 'trigram unsupported_option 1'));
+      assert.deepEqual(['messages_fts', 'memories_fts'].map(table => createSqlFor(db, table)), before);
+      assert.equal(ftsHits(db, 'needle'), 1);
+      assert.throws(() => migrateFtsTokenizer(db, "trigram'); DROP TABLE messages; --"), /OBELISK_FTS_TOKENIZER/);
+      assert.equal(ftsHits(db, 'needle'), 1);
+    } finally { db.close(); }
+  });
+  test(`${binding}: tokenizer migration leaves commit and rollback to an existing transaction`, () => {
+    const db = open();
+    db.exec(SCHEMA);
+    const before = createSqlFor(db, 'messages_fts');
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      migrateFtsTokenizer(db, 'trigram');
+      assert.match(createSqlFor(db, 'messages_fts'), /trigram/);
+      db.exec('ROLLBACK');
+      assert.equal(createSqlFor(db, 'messages_fts'), before);
+    } finally { db.close(); }
+  });
+}

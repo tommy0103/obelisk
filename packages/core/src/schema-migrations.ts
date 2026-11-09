@@ -1,4 +1,5 @@
-import type { SqliteDb } from './sqlite-types.ts';
+import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
+import { betterSqliteTransactionAdapter, nodeSqliteTransactionAdapter, runWriteTransaction } from './tx.ts';
 
 const COLUMN_MIGRATIONS = [
   ['sessions', 'source', "TEXT DEFAULT 'claude'"],
@@ -74,21 +75,39 @@ export function ftsTokenizerMigrationPending(db: SqliteDb, tokenizer: string | n
  * table definition is rewritten from `sqlite_master` rather than restated here, so
  * `schema.sql` stays the single source of truth for the columns.
  *
- * Not wrapped in a transaction on purpose: if this is interrupted between the drop and
- * the create, the next `schema.sql` pass recreates the table and this migration runs
- * again. Triggers live on the content tables and survive the drop.
+ * Validate SQLite's actual tokenizer grammar before dropping either index, then
+ * replace and rebuild both in one transaction. A caller-owned transaction keeps
+ * ownership of rollback; otherwise use the shared write transaction primitive.
  */
 export function migrateFtsTokenizer(db: SqliteDb, tokenizer: string | null): void {
   if (!tokenizer) return;
+  const configured = resolveFtsTokenizer({ OBELISK_FTS_TOKENIZER: tokenizer });
+  if (!configured) return;
+  const replacements: { table: string; sql: string }[] = [];
   for (const table of FTS_TABLES) {
     const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table) as { sql?: string } | undefined;
     if (!row?.sql) continue;
-    if (currentTokenizer(row.sql) === tokenizer) continue;
-    db.exec(`DROP TABLE ${table}`);
-    db.exec(withTokenizer(row.sql, tokenizer));
-    // External content tables hold no data of their own; repopulate from the content table.
-    db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`);
+    if (currentTokenizer(row.sql) === configured) continue;
+    replacements.push({ table, sql: withTokenizer(row.sql, configured) });
   }
+  if (replacements.length === 0) return;
+  const state = db as SqliteDb & { readonly isTransaction?: boolean; readonly inTransaction?: boolean };
+  const txDb = typeof state.isTransaction === 'boolean'
+    ? nodeSqliteTransactionAdapter(db as NodeSqliteDb)
+    : betterSqliteTransactionAdapter(db as SqliteDb & { readonly inTransaction: boolean });
+  const migrate = () => {
+    // The lexical allowlist prevents DDL injection; this probe also rejects
+    // tokenizer arguments SQLite cannot execute, while both real indexes exist.
+    db.exec(`CREATE VIRTUAL TABLE temp.obelisk_fts_tokenizer_probe USING fts5(text, tokenize='${configured}')`);
+    db.exec('DROP TABLE temp.obelisk_fts_tokenizer_probe');
+    for (const { table, sql } of replacements) {
+      db.exec(`DROP TABLE ${table}`);
+      db.exec(sql);
+      db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`);
+    }
+  };
+  if (txDb.inTransaction()) migrate();
+  else runWriteTransaction(txDb, migrate, { label: 'fts-tokenizer-migration' });
 }
 
 /** Binding-agnostic additive migrations shared by the CLI and desktop app. */
