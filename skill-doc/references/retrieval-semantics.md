@@ -31,13 +31,20 @@ multiple steps, but the first locator should be the narrowest semantic fit. If a
 scope locator finds the relevant project/session/file, do not also run broad FTS
 unless scoped evidence is insufficient and `query_plan` says why.
 
+Session references resolve through `sessions()`: a raw provider uuid (pi-family
+canonical ids are `source:uuid:project-scope`, so the uuid is only a fragment)
+resolves to the containing sessions, capped at the 10 newest matches within the requested filters — a raw
+uuid normally resolves to exactly one session. All other helpers match
+`sessionId` exactly; feed them the canonical `id` from the `sessions()` row,
+never the raw uuid.
+
 Project-like fields are distinct:
 
 - `sessions.project`: provider-normalized project slug.
 - `memories.project`: stored project slug copied onto registered memory records.
 - `sessions.project_path`: absolute session path derived from message `cwd` when available; slug decoding is only a fallback.
 - `messages.cwd`: working directory at message time.
-- `sessions.source` / `messages.source`: transcript provider: `claude`, `codex`, `kimi`, `kiro`, `omp`, or `pi`.
+- `sessions.source` / `messages.source`: transcript provider: `claude`, `codex`, `kimi`, `kiro`, `omp`, `opencode`, or `pi`.
 - helper `project`: SQL `LIKE` over `sessions.project`, not exact membership.
 - helper `source`: optional provider filter. Omit it unless provenance matters.
 
@@ -106,9 +113,15 @@ Ordering and context are semantic:
 
 Obelisk's raw session layer stores original structure, not precompiled claims:
 sessions, messages, summaries, tool calls/results, files, subagents, workflows,
-parent chains, and raw JSONL windows. The memory layer can store
+parent chains, and raw JSONL/store windows. The memory layer can store
 human-approved markdown conclusions, but treat them as prior notes to compare
 against raw evidence when correctness matters.
+
+Providers fold native token breakdowns into canonical `input_tokens` and
+`output_tokens`: for example, OpenCode V2 folds input plus cache read/write into
+`input_tokens` and output plus reasoning into `output_tokens`, while V1 uses
+per-step `step-finish` accounting. When raw payloads are needed, `raw()` accesses
+the underlying transcript line or SQLite row projection (`opencode`).
 
 Pi and OMP can preserve a branch that was tried and later superseded as
 `visibility='inactive'`. Other sources either do not record supersession or

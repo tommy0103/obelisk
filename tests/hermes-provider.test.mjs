@@ -35,7 +35,10 @@ const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.me
 
 const openStore = path => new DatabaseSync(path, { readOnly: true });
 
-const SUPPORTED_SCHEMA_VERSION = 30;
+// The version the fixtures write. The adapter has no ceiling to mirror: it decides on the store's
+// shape (the columns it projects), not on this number. See "a newer schema version with an intact
+// shape is indexed" below.
+const SHIPPED_SCHEMA_VERSION = 32;
 const DEFAULT_PROFILE = 'default';
 const SESSION_ALPHA = '20260101_120000_aaaaaa';
 const SESSION_BETA = '20260102_130000_bbbbbb';
@@ -85,7 +88,10 @@ const STORE_DDL = `
     last_activity_description TEXT, last_activity_provenance TEXT,
     compression_ineffective_count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL, git_metadata_generation INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0,
-    compression_recovery_deadline REAL, tool_names TEXT,
+    compression_recovery_deadline REAL, tool_names TEXT, created_source TEXT,
+    compression_overload_streak INTEGER NOT NULL DEFAULT 0, auto_archived INTEGER NOT NULL DEFAULT 0,
+    runtime_revision INTEGER NOT NULL DEFAULT 0, runtime_generation INTEGER NOT NULL DEFAULT 0,
+    transcript_revision INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
   );
   CREATE TABLE messages (
@@ -95,11 +101,13 @@ const STORE_DDL = `
     reasoning_content TEXT, reasoning_details TEXT, codex_reasoning_items TEXT, codex_message_items TEXT,
     platform_message_id TEXT, observed INTEGER DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0, effect_disposition TEXT, api_content TEXT, display_kind TEXT,
-    display_metadata TEXT, _compressed_summary INTEGER NOT NULL DEFAULT 0
+    display_metadata TEXT, _compressed_summary INTEGER NOT NULL DEFAULT 0,
+    display_identity BLOB, display_order INTEGER,
+    message_uid TEXT, absorbed_message_uids TEXT, tool_call_uids TEXT, tool_call_uid TEXT
   );
 `;
 
-function createStore(home, { profile = null, schemaVersion = SUPPORTED_SCHEMA_VERSION, wal = false } = {}) {
+function createStore(home, { profile = null, schemaVersion = SHIPPED_SCHEMA_VERSION, wal = false } = {}) {
   const dir = profile === null ? home : join(home, 'profiles', profile);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, 'state.db');
@@ -176,7 +184,7 @@ const CAPTURED_ROWS = JSON.parse(
 function seedCapturedStore(path) {
   const db = new DatabaseSync(path, { enableForeignKeyConstraints: false });
   db.exec(STORE_DDL);
-  db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SUPPORTED_SCHEMA_VERSION);
+  db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SHIPPED_SCHEMA_VERSION);
   for (const row of CAPTURED_ROWS.rows) {
     const columns = row.columns.map(column => `"${column}"`).join(', ');
     const placeholders = row.columns.map(() => '?').join(', ');
@@ -398,8 +406,10 @@ test(
     assert.deepEqual(tombstones[0].retractSessionIds, [missingId]);
     assert.equal(drain(provider.parse(tombstones[0], null)).cursor, null, 'a tombstone advances no cursor');
 
-    // An unreadable inventory (a newer schema) skips and records, and never mass-retracts.
-    const newer = createStore(layout.base, { profile: 'future', schemaVersion: SUPPORTED_SCHEMA_VERSION + 5 });
+    // A store whose shape this adapter cannot project skips and records, and never mass-retracts.
+    // The version is not what makes it unreadable — a projected column the adapter needs is gone.
+    const newer = createStore(layout.base, { profile: 'future', schemaVersion: SHIPPED_SCHEMA_VERSION + 5 });
+    newer.db.exec('ALTER TABLE messages DROP COLUMN display_kind');
     newer.db.close();
     const issues = [];
     const blocked = discover(provider, {
@@ -415,12 +425,142 @@ test(
       ],
     });
     assert.equal(issues.length, 1);
-    assert.match(issues[0].error, /Unsupported Hermes schema version 35/);
+    assert.match(
+      issues[0].error,
+      new RegExp(`Unsupported Hermes schema version ${SHIPPED_SCHEMA_VERSION + 5}: messages is missing display_kind`),
+    );
     assert.equal(
       blocked.some(unit => unit.sessionId === missingId),
       false,
       'an incomplete inventory proves no deletion',
     );
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// The version is read by column NAME. A store that declared another column first must not have
+// that column read as the version — the wrong number would enter every session fingerprint — and a
+// store that does not name a version column has no version to report at all.
+test('the schema version is read by name, not by position', () => {
+  const layout = fixtureHome();
+  try {
+    writeStore(layout.primaryPath, db => {
+      db.exec('DROP TABLE schema_version');
+      // `id` leads, so a positional read returns 7 where the version is 40.
+      db.exec('CREATE TABLE schema_version (id INTEGER, version INTEGER)');
+      db.prepare('INSERT INTO schema_version (id, version) VALUES (?, ?)').run(7, 40);
+    });
+    writeStore(layout.profilePath, db => {
+      db.exec('DROP TABLE schema_version');
+      db.exec('CREATE TABLE schema_version (id INTEGER)');
+      db.prepare('INSERT INTO schema_version (id) VALUES (?)').run(7);
+    });
+    // A version column that exists but holds NULL. `Number(null)` is 0, so this must be refused
+    // rather than read as version zero.
+    const nullVersion = createStore(layout.base, { profile: 'nullversion' });
+    nullVersion.db.exec('DROP TABLE schema_version');
+    nullVersion.db.exec('CREATE TABLE schema_version (version INTEGER)');
+    nullVersion.db.exec('INSERT INTO schema_version (version) VALUES (NULL)');
+    nullVersion.db.close();
+
+    const provider = createHermesProvider({ rootDir: layout.base, openStore });
+    const issues = [];
+    const units = discover(provider, { issues });
+
+    const alpha = units.find(unit => unit.meta.rawSessionId === SESSION_ALPHA);
+    assert.equal(alpha.meta.schemaVersion, 40, 'the named column wins over the first column');
+    assert.equal(
+      units.some(unit => unit.meta.rawSessionId === SESSION_PROFILE),
+      false,
+      'a store with no version column is refused rather than guessed at',
+    );
+    assert.equal(
+      issues.filter(issue => /no schema_version\.version/.test(issue.error)).length,
+      2,
+      'the refusal names the missing column, for both the absent and the NULL version',
+    );
+  } finally {
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// Both halves of the shape gate. A store is refused for the sessions shape as well as the messages
+// one, and the refusal has to come from the gate: without this, deleting the sessions half of the
+// loop leaves the suite green, because the SELECT that reads the store throws the same way.
+test('a store missing a projected sessions column or the sessions table is refused', () => {
+  const layout = fixtureHome();
+  try {
+    const absentColumn = createStore(layout.base, { profile: 'no-hidden' });
+    absentColumn.db.exec('ALTER TABLE sessions DROP COLUMN hidden');
+    absentColumn.db.close();
+    const absentTable = createStore(layout.base, { profile: 'no-sessions' });
+    absentTable.db.exec('DROP TABLE sessions');
+    absentTable.db.close();
+
+    const provider = createHermesProvider({ rootDir: layout.base, openStore });
+    const issues = [];
+    const units = discover(provider, { issues });
+
+    assert.equal(issues.length, 2, 'one refusal per unreadable store');
+    assert.equal(
+      issues.filter(issue => /Unsupported Hermes schema version \d+: sessions is missing hidden/.test(issue.error)).length,
+      1,
+      'the missing column is named',
+    );
+    assert.equal(
+      issues.filter(issue => /has no readable sessions table/.test(issue.error)).length,
+      1,
+      'a store with no sessions table is refused, not read through the error',
+    );
+    assert.equal(sessionUnits(units).length, 3, 'the readable stores are still discovered');
+  } finally {
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+// The point of deciding on shape rather than on a version ceiling: a Hermes release that adds
+// columns must not need an Obelisk patch. This store claims a version no one has shipped yet and
+// has every column the adapter projects, so it indexes exactly like a current one.
+test('a newer schema version with an intact shape is indexed', () => {
+  const layout = fixtureHome();
+  const provider = createHermesProvider({ rootDir: layout.base, openStore });
+  const index = indexFixture(provider);
+  try {
+    const futureVersion = SHIPPED_SCHEMA_VERSION + 9;
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE schema_version SET version = ?').run(futureVersion);
+      // A column only a future release writes: present, unused, and not a reason to refuse the store.
+      db.exec('ALTER TABLE sessions ADD COLUMN some_future_column TEXT');
+    });
+    const issues = [];
+    const skipped = [];
+    const units = provider.discover({
+      lastCursor: () => null,
+      indexedSessions: () => [],
+      reportIncompleteInventory: issue => issues.push(issue),
+      reportSkippedArtifact: issue => skipped.push(issue),
+    });
+    assert.deepEqual(issues, [], 'an intact shape is not an inventory problem');
+    assert.deepEqual(skipped, [], 'and not a skipped artifact either');
+    assert.equal(sessionUnits(units).length, 3, 'every session of the store is discovered');
+
+    const { values } = drain(provider.parse(
+      units.find(unit => unit.meta.rawSessionId === SESSION_ALPHA), null,
+    ));
+    assert.equal(
+      values.find(record => record.kind === 'session').version,
+      `hermes-v${futureVersion}`,
+      'the record reports the version the store actually carries',
+    );
+    assert.ok(
+      values.some(record => record.kind === 'message' && record.text === 'Search the repository'),
+      'the transcript projects',
+    );
+    assert.equal(settle(index) && index.db.prepare(
+      'SELECT count(*) AS n FROM sessions WHERE source = ?',
+    ).get('hermes').n, 3, 'the indexer publishes it');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
@@ -506,7 +646,7 @@ test('parse() projects Hermes messages, thinking, tool calls and results into th
     assert.equal(session.id, unit.sessionId);
     assert.equal(session.title, 'Alpha session');
     assert.equal(session.git_branch, 'main');
-    assert.equal(session.version, `hermes-v${SUPPORTED_SCHEMA_VERSION}`);
+    assert.equal(session.version, `hermes-v${SHIPPED_SCHEMA_VERSION}`);
     assert.equal(session.countMode, 'total');
     assert.equal(session.jsonl_path, `${layout.primaryPath}#session:${SESSION_ALPHA}`);
     assert.equal(session.started_at, new Date(1767225600 * 1000).toISOString());

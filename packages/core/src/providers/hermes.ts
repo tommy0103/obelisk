@@ -56,7 +56,6 @@ const CURSOR_TAG = 'hermes-snapshot-v2';
 const STORE_FILE = 'state.db';
 const WAL_FILE = `${STORE_FILE}-wal`;
 const PROFILES_DIR = 'profiles';
-const SUPPORTED_SCHEMA_VERSION = 30;
 const TOMBSTONE_CURSOR = '0:0:hermes-tombstone';
 const SESSION_PATH_PREFIX = 'session:';
 // The store gate lives in `index_state` under a `__`-prefixed pseudo key, the way the
@@ -401,19 +400,88 @@ function readSchemaVersion(db: SqliteDb): number | null {
   const rows = db.prepare('SELECT * FROM schema_version LIMIT 1').all();
   const row = rows[0];
   if (!row) return null;
-  const value = Object.values(row)[0];
+  // By name, never by position: a table that declared another column first would otherwise have
+  // that column read as the version. A store that does not name it has no version to report, and a
+  // guess here would feed a wrong number into every session fingerprint.
+  // The null check is not redundant with the NaN one: `Number(null)` is 0, so a NULL version would
+  // otherwise read as version zero and be accepted.
+  const value = row['version'];
+  if (value === null || value === undefined) return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-const SESSION_COLUMNS = `id, source, model, title, parent_session_id, started_at, ended_at,
-  end_reason, message_count, tool_call_count, cwd, git_branch, profile_name, archived, hidden`;
+/**
+ * The columns this adapter cannot work without. Together they are the real contract: a store that
+ * has them can be projected whatever its `schema_version` says, because every upstream release so
+ * far has only ADDED columns (hermes_cli/session_schema_history.py). A version ceiling therefore
+ * reported nothing but the passing of time — it rejected every store written by a newer Hermes even
+ * when the shape was unchanged, and cost a code change per upstream release.
+ *
+ * Reading the shape instead means a new Hermes version needs a patch only when it removes or
+ * renames something projected here, which is when a patch is actually owed. This is the same rule
+ * `sessionColumns()` already applies to the optional usage columns.
+ *
+ * These are also the SELECT lists they guard, so "the shape check passed" and "parse() can read
+ * every column it names" cannot drift apart.
+ */
+const SESSION_COLUMNS = [
+  'id', 'source', 'model', 'title', 'parent_session_id', 'started_at', 'ended_at', 'end_reason',
+  'message_count', 'tool_call_count', 'cwd', 'git_branch', 'profile_name', 'archived', 'hidden',
+] as const;
+
+/** Every column parse() projects from a message row; the digest pass reads exactly these too. */
+const PROJECTED_MESSAGE_COLUMNS = [
+  'id', 'role', 'content', 'tool_calls', 'tool_call_id', 'tool_name', 'timestamp',
+  'reasoning', 'reasoning_content', 'active', 'compacted', 'display_kind',
+  'codex_message_items', '_compressed_summary',
+] as const;
+
+/** As above, plus the session column the per-session reads scan on. */
+const REQUIRED_MESSAGES_COLUMNS = ['session_id', ...PROJECTED_MESSAGE_COLUMNS];
+
+/**
+ * The columns `table` is missing from `required`, or `null` when the table cannot be introspected
+ * at all. A read-only store answers `PRAGMA table_info`; a database that does not is not one this
+ * adapter can project.
+ */
+function missingColumns(db: SqliteDb, table: string, required: readonly string[]): string[] | null {
+  let present: Set<string>;
+  try {
+    present = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => String(row['name'])));
+  } catch {
+    return null;
+  }
+  if (present.size === 0) return null;
+  return required.filter(column => !present.has(column));
+}
+
+/**
+ * `null` when this store's shape can be projected, otherwise the reason it cannot. Replaces the
+ * former `schemaVersion > SUPPORTED_SCHEMA_VERSION` gate: a store is rejected for what it lacks,
+ * not for how new it claims to be.
+ */
+function unreadableShape(db: SqliteDb, schemaVersion: number): string | null {
+  for (const [table, required] of [
+    ['sessions', SESSION_COLUMNS],
+    ['messages', REQUIRED_MESSAGES_COLUMNS],
+  ] as const) {
+    const missing = missingColumns(db, table, required);
+    if (missing === null) {
+      return `Hermes state store (schema version ${schemaVersion}) has no readable ${table} table`;
+    }
+    if (missing.length > 0) {
+      return `Unsupported Hermes schema version ${schemaVersion}: ${table} is missing ${missing.join(', ')}`;
+    }
+  }
+  return null;
+}
 
 /** Add optional usage columns only where the source schema has them. */
 function sessionColumns(db: SqliteDb): string {
   const present = new Set(db.prepare('PRAGMA table_info(sessions)').all().map(row => String(row['name'])));
   const usage = ['input_tokens', 'output_tokens'].filter(column => present.has(column));
-  return [SESSION_COLUMNS, ...usage].join(', ');
+  return [...SESSION_COLUMNS, ...usage].join(', ');
 }
 
 function readSessionRows(db: SqliteDb): SqliteRow[] {
@@ -535,16 +603,6 @@ function sessionFingerprintOf(
   return sessionFingerprint(row, profile, sessionWatermark(db, row['id']), parent, schemaVersion);
 }
 
-/**
- * Every column parse() projects from a message row. The digest pass reads exactly these
- * columns, so "the digest changed" and "a projected row changed" are the same statement.
- */
-const PROJECTED_MESSAGE_COLUMNS = [
-  'id', 'role', 'content', 'tool_calls', 'tool_call_id', 'tool_name', 'timestamp',
-  'reasoning', 'reasoning_content', 'active', 'compacted', 'display_kind',
-  'codex_message_items', '_compressed_summary',
-] as const;
-
 function digestOfMessages(rows: readonly SqliteRow[]): string {
   const hash = createHash('sha256');
   for (const row of rows) {
@@ -595,10 +653,9 @@ function readStoreSessions(
     // handed to a caller as one store image.
     db.exec('BEGIN');
     const schemaVersion = readSchemaVersion(db);
-    if (schemaVersion === null) return { error: 'Hermes state store has no schema_version raw' };
-    if (schemaVersion > SUPPORTED_SCHEMA_VERSION) {
-      return { error: `Unsupported Hermes schema version ${schemaVersion}` };
-    }
+    if (schemaVersion === null) return { error: 'Hermes state store has no schema_version.version column' };
+    const unreadable = unreadableShape(db, schemaVersion);
+    if (unreadable !== null) return { error: unreadable };
     const watermarks = sessionWatermarks(db);
     const rows = readSessionRows(db);
     // A subagent's fingerprint includes its parent's liveness and profile, so the parent has to be
@@ -803,9 +860,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
       // decides the transcript order rather than timestamp.
       const messages = db
         .prepare(
-          `SELECT id, role, content, tool_calls, tool_call_id, tool_name, timestamp,
-                reasoning_content, reasoning, active, compacted, display_kind, codex_message_items,
-                _compressed_summary
+          `SELECT ${PROJECTED_MESSAGE_COLUMNS.join(', ')}
          FROM messages WHERE session_id = ? ORDER BY rowid`,
         )
         .all(meta.rawSessionId);

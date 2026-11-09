@@ -78,7 +78,10 @@ _Avoid_: lazy indexing, on-read indexing
 The bookkeeping table shared by both indexing modes. It stores the adapter's
 numeric cursor pair in the existing `mtime` and `lines_processed` columns (a
 file adapter can use mtime + line offset; Kimi uses aggregate max-mtime + total
-lines), plus heartbeat/last-build markers used for daemon arbitration.
+lines), opaque adapter checkpoints in `cursor`, and heartbeat/last-build markers
+used for daemon arbitration. `replay_required` prevents an old checkpoint from
+resuming projection while preserving its identity/membership evidence for safe
+retention; a successful persist clears it.
 
 **Daemon arbitration**:
 The policy by which the passive pull mode detects a fresh daemon from the
