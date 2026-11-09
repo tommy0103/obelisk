@@ -462,3 +462,5 @@ export function createCodexHostAntigravityProvider({
 }
 
 export const codexHostAntigravityProvider = createCodexHostAntigravityProvider();
+
+export { sessionId as codexhostAntigravitySessionId };

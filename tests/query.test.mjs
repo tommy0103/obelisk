@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { codexhostAntigravitySessionId } from '../packages/core/src/providers/codexhost-antigravity.ts';
 import { hermesSessionId } from '../packages/core/src/providers/hermes.ts';
 import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
 import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
@@ -670,6 +671,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
   const rawOpencode = '77777777-7777-4777-8777-777777777777';
   const rawHermes = '20260101_120000_aaaaaa';
+  const rawAntigravity = '88888888-8888-4888-8888-888888888888';
   const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
   const rawKiro = kiroHeader.id;
   // Canonical ids in each provider's own shape: pi/omp/deepseek/kiro namespace by
@@ -685,6 +687,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
   const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
   const canonicalKiro = kiroSessionId(rawKiro, kiroHeader.workspacePaths[0]);
+  const canonicalAntigravityA = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-a');
+  const canonicalAntigravityB = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-b');
   const canonicalOpencode = opencodeSessionId(rawOpencode, '/Users/me/opencode/db.sqlite');
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
@@ -702,6 +706,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
   insertSession.run(canonicalKiro, kiroHeader.title, '-workspace-demo', kiroHeader.workspacePaths[0], kiroHeader.createdAt, kiroHeader.lastModifiedAt, null, 1, 'kiro');
   insertSession.run(canonicalOpencode, 'Opencode session', '-Users-me-opencode', '/Users/me/opencode', '2026-09-18T00:30:00Z', '2026-09-18T00:45:00Z', null, 1, 'opencode');
+  insertSession.run(canonicalAntigravityA, 'Antigravity A', '-Users-me-antigravity-a', '/Users/me/antigravity-a', '2026-09-18T00:10:00Z', '2026-09-18T00:20:00Z', null, 1, 'codexhost-antigravity');
+  insertSession.run(canonicalAntigravityB, 'Antigravity B', '-Users-me-antigravity-b', '/Users/me/antigravity-b', '2026-09-18T00:10:00Z', '2026-09-18T00:21:00Z', null, 1, 'codexhost-antigravity');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -717,6 +723,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const lookups = {
     claude: [rawClaude, [rawClaude]],
     codex: [rawCodex, [canonicalCodex]],
+    'codexhost-antigravity': [rawAntigravity, [canonicalAntigravityB, canonicalAntigravityA]],
     copilot: [rawCopilot, [canonicalCopilot]],
     deepseek: [rawDeepseek, [canonicalDeepseek]],
     hermes: [rawHermes, [canonicalHermes]],
@@ -731,6 +738,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   for (const [source, [native, expected]] of Object.entries(lookups)) {
     assert.deepEqual(api.sessions({ sessionId: native }).map(row => row.id), expected, `${source} native-ID lookup`);
   }
+
+  assert.deepEqual(api.sessions({ sessionId: rawAntigravity, project: '-Users-me-antigravity-a' }).map(row => row.id), [canonicalAntigravityA]);
 
   // The same uuid scoped to two projects returns every containing row, each
   // labeled with project_path/started_at; other filters narrow as usual.
@@ -783,6 +792,7 @@ test('every provider embeds the native session id verbatim in its canonical id',
     claude: native,
     hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
     codex: codexDbId(native),
+    'codexhost-antigravity': codexhostAntigravitySessionId(native, '/Users/me/obelisk'),
     kimi: kimiSessionId(native),
     kiro: kiroSessionId(native, '/Users/me/obelisk'),
     pi: piFamilySessionId(piHeader, 'pi'),
