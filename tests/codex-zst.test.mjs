@@ -407,6 +407,13 @@ test('Plain to Compressed to Resumed Plaintext atomically preserves unchanged ch
     assert.ok(incomplete.incompleteProviders.has('codex'));
     assert.equal(incomplete.items.some(item => item.unit.sessionId === sessionId), false);
     assert.deepEqual(projection(), initial, 'unreadable old contributor identity withholds root replacement');
+    writeFileSync(plain, bytes);
+    unlinkSync(archive);
+    const pendingResume = run([plain, archive]);
+    assert.ok(pendingResume.incompleteProviders.has('codex'));
+    assert.deepEqual(projection(), initial, 'deferred compression followed by plaintext restoration still retains children');
+    writeFileSync(archive, zstdCompressSync(bytes));
+    unlinkSync(plain);
     writeFileSync(child, childBytes);
     writeFileSync(child, Buffer.concat([childBytes, Buffer.from('invalid completed line\n')]));
     assert.throws(() => run([plain, archive, child]), /complete stable snapshot/);
@@ -420,6 +427,12 @@ test('Plain to Compressed to Resumed Plaintext atomically preserves unchanged ch
     unlinkSync(archive);
     const resumedPlan = createProviderIndexPlan(db, registry, { changedPaths: [plain, archive], readMode: 'strict' });
     assert.equal(resumedPlan.items.length, 2);
+    writeFileSync(child, '');
+    db.exec('BEGIN');
+    assert.throws(() => indexProviderPlanStrict({ db, plan: resumedPlan }), /complete stable snapshot/);
+    db.exec('ROLLBACK');
+    assert.deepEqual(projection(), initial, 'identity lost after census cannot commit a partial family');
+    writeFileSync(child, childBytes);
     const failing = { ...provider, *parse(unit, cursor) {
       if (unit.key === child) throw new Error('injected child source failure');
       return yield* provider.parse(unit, cursor);

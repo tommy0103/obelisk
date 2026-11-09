@@ -152,7 +152,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     }
   }
   const discovered: IndexUnit[] = codexTranscriptDirs(rootDir).flatMap((transcriptDir) => (
-    discoverCodexJsonlFiles(transcriptDir, ctx.reportIncompleteInventory).flatMap((file) => {
+    discoverCodexJsonlFiles(transcriptDir, ctx.reportIncompleteInventory).flatMap<IndexUnit>((file) => {
       const fileChanged = changedFiles.has(normalize(file.path));
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
       const cursor = ctx.lastCursor(file.path);
@@ -170,7 +170,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
             key: file.path,
             sessionId: codexDbId(parentId || checkpoint.threadRawId) ?? '',
             meta: {
-              source: 'codex', guardian: false, parentThreadId: parentId,
+              source: 'codex', guardian: false, parentThreadId: parentId, threadRawId: checkpoint.threadRawId,
               indexedTitle: indexed?.title,
               indexedUpdatedAt: indexed?.updatedAt,
             },
@@ -232,6 +232,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
           source: 'codex',
           guardian: guardian !== null,
           parentThreadId: parentId,
+          threadRawId: rawId,
           indexedTitle: indexed?.title,
           indexedUpdatedAt: indexed?.updatedAt,
           sessionIndexChanged,
@@ -249,10 +250,16 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     const previous = indexed.get(unit.sessionId);
     if (!previous) return false;
     const canonical = (path: string) => normalize(path).replace(/\.zst$/, '');
+    const cursor = ctx.lastCursor(unit.key);
+    const prior = decodeCodexCursor(cursor);
+    const stat = statSync(unit.key);
+    const rootReplaced = cursor !== null && !isCodexCompressedPath(unit.key)
+      && (prior === null || prior.inode !== stat.ino || prior.dev !== String(stat.dev)
+        || (codexCursorSignatureDiffers(cursor, unit.key) && stat.size <= (prior.sourceSize ?? prior.size)));
     return canonical(previous.jsonlPath) === canonical(unit.key)
-      && (normalize(previous.jsonlPath) !== normalize(unit.key)
-        || (isCodexCompressedPath(unit.key) && ctx.lastCursor(unit.key) !== null
-          && codexCursorSignatureDiffers(ctx.lastCursor(unit.key)!, unit.key)));
+      && (normalize(previous.jsonlPath) !== normalize(unit.key) || rootReplaced
+        || (isCodexCompressedPath(unit.key) && cursor !== null
+          && codexCursorSignatureDiffers(cursor, unit.key)));
   });
   if (transitions.length === 0) return discovered;
   let censusComplete = true;
@@ -642,8 +649,13 @@ export function* parse(
     const records: TranscriptRecord[] = [];
     let step = fresh.next();
     while (!step.done) { records.push(step.value); step = fresh.next(); }
-    if (step.value === null || (sourceMeta.replaceSnapshot
-      && !records.some(record => record.kind === 'session' && record.id === unit.sessionId))) {
+    const childId = sourceMeta.parentThreadId ? codexDbId(sourceMeta.threadRawId) : null;
+    const identified = sourceMeta.replaceSnapshot
+      ? records.some(record => record.kind === 'session' && record.id === unit.sessionId)
+      : childId !== null && records.some(record =>
+        (record.kind === 'subagent' && record.agent_id === childId && record.session_id === unit.sessionId)
+        || (record.kind === 'delete-session' && record.sessionId === childId));
+    if (step.value === null || !identified) {
       throw new RetryableSourceReadError(unit.key, 'Archive contributor did not produce a complete stable snapshot');
     }
     if (sourceMeta.replaceSnapshot) yield { kind: 'delete-session', sessionId: unit.sessionId };
