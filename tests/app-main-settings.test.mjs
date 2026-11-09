@@ -10,6 +10,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
+import { defaultKiroDatabasePath } from '../packages/core/src/providers/kiro.ts';
+import { defaultCopilotUserDataRoots } from '../packages/core/src/providers/copilot.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
@@ -22,6 +24,7 @@ class SqliteCompatDatabase {
   pragma(statement) { this.db.exec(`PRAGMA ${statement}`); }
   exec(sql) { return this.db.exec(sql); }
   close() { return this.db.close(); }
+  function(name, options, callback) { this.db.function(name, options, callback); }
   prepare(sql) {
     const stmt = this.db.prepare(sql);
     return {
@@ -86,7 +89,7 @@ async function importMain() {
 // 'dialog', 'nativeImage', 'shell') must be present, even if unused by a test.
 function electronNamespace({ app, BrowserWindow, ipcMain }) {
   return {
-    app: app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} },
+    app: { isPackaged: false, getVersion: () => '0.2.3', ...(app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} }) },
     BrowserWindow,
     ipcMain: ipcMain ?? { handle() {} },
     clipboard: {},
@@ -143,6 +146,8 @@ function defaultIndexerWorkerClient() {
   return {
     createWorkerBuildIndex: () => ({
       buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
+      readHermesMessageText: async () => null,
+      readKiroMessageText: async () => null,
       stop() {},
     }),
   };
@@ -165,6 +170,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   const windows = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -190,6 +196,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
       windows.push(this);
     }
     loadFile(filePath) { this.loadedFile = filePath; }
+    on() {}
     loadURL(url) { this.loadedURL = url; return Promise.resolve(); }
     close() {}
     static getAllWindows() { return windows; }
@@ -244,6 +251,9 @@ test('malformed settings keep the desktop recovery window available', async () =
 test('main process watches every root declared by the built-in provider registry', async () => {
   const originalHome = process.env.HOME;
   const originalProfile = process.env.USERPROFILE;
+  const originalAppData = process.env.APPDATA;
+  const originalXdgConfig = process.env.XDG_CONFIG_HOME;
+  const originalHermesHome = process.env.HERMES_HOME;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -254,16 +264,28 @@ test('main process watches every root declared by the built-in provider registry
   writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
   process.env.HOME = home;
   process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+  process.env.APPDATA = join(home, 'AppData', 'Roaming');
+  process.env.XDG_CONFIG_HOME = join(home, '.config');
+  process.env.HERMES_HOME = join(home, '.hermes');
+  const [stableCopilotRoot, insidersCopilotRoot] = defaultCopilotUserDataRoots();
 
   const serviceOptions = [];
   const workerCalls = [];
+  const ipcHandlers = new Map();
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
-    prepare() {
-      return { get: () => null, all: () => [], run: () => ({}) };
+    prepare(sql) {
+      return {
+        get: () => null,
+        all: () => sql.includes("GROUP BY COALESCE(source")
+          ? [{ source: 'copilot', session_count: 2, last_indexed: '2026-10-08' }]
+          : [],
+        run: () => ({}),
+      };
     }
   }
 
@@ -272,6 +294,7 @@ test('main process watches every root declared by the built-in provider registry
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -279,7 +302,10 @@ test('main process watches every root declared by the built-in provider registry
   }
 
   const restore = registerMocks([
-    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
     [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
@@ -319,18 +345,58 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(codexDir, 'sessions') },
       { kind: 'tree', path: join(codexDir, 'archived_sessions') },
       { kind: 'file', path: join(codexDir, 'session_index.jsonl') },
+      { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+      { kind: 'file', path: join(stableCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+      { kind: 'tree', path: join(stableCopilotRoot, 'workspaceStorage') },
+      { kind: 'file', path: join(insidersCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+      { kind: 'file', path: join(insidersCopilotRoot, 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+      { kind: 'tree', path: join(insidersCopilotRoot, 'workspaceStorage') },
       { kind: 'tree', path: join(home, '.dsh', 'sessions') },
+      { kind: 'file', path: join(home, '.hermes', 'state.db') },
+      { kind: 'file', path: join(home, '.hermes', 'state.db-wal') },
+      { kind: 'tree', path: join(home, '.hermes', 'profiles'), fileNames: ['state.db', 'state.db-wal'] },
       { kind: 'tree', path: join(home, '.kimi-code', 'sessions') },
       { kind: 'file', path: join(home, '.kimi-code', 'session_index.jsonl') },
+      { kind: 'tree', path: join(home, '.kiro', 'sessions') },
+      { kind: 'file', path: defaultKiroDatabasePath({ homeDir: home }) },
+      { kind: 'file', path: `${defaultKiroDatabasePath({ homeDir: home })}-wal` },
+      { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db') },
+      { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db-wal') },
+      {
+        kind: 'tree',
+        path: join(home, '.local', 'share', 'opencode'),
+        fileNames: ['opencode-next.db', 'opencode-next.db-wal', 'opencode.db', 'opencode.db-wal'],
+      },
       { kind: 'tree', path: join(home, '.pi', 'agent', 'sessions') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite') },
+      { kind: 'file', path: join(home, '.zcode', 'cli', 'db', 'db.sqlite-wal') },
     ]);
     assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === codexDir), false);
     await serviceOptions[0].buildIndex({ reason: 'settings-transfer' });
     assert.deepEqual(workerCalls[0].providerSettings, {});
+    mkdirSync(insidersCopilotRoot, { recursive: true });
+    const defaultSettings = await ipcHandlers.get('settings:get')();
+    assert.deepEqual(defaultSettings.copilotEditions.map((edition) => edition.enabled), [true, true]);
+    const copilotSource = defaultSettings.sources.find((source) => source.id === 'copilot');
+    assert.equal(copilotSource.exists, true);
+    assert.equal(copilotSource.sessionCount, 2);
+    assert.equal(copilotSource.status, 'ok', 'Insiders-only indexed history is connected without a warning');
+    assert.equal(copilotSource.statusText, 'Connected');
+    await ipcHandlers.get('settings:set')(null, 'copilotEditions.stable', false);
+    assert.deepEqual((await ipcHandlers.get('settings:get')()).copilotEditions.map((edition) => edition.enabled), [false, true]);
+    assert.equal(serviceOptions.length, 2);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(stableCopilotRoot)), false);
+    assert.equal(serviceOptions[1].watchTargets.some((target) => target.path.startsWith(insidersCopilotRoot)), true);
+    await serviceOptions[1].buildIndex({ reason: 'settings-transfer' });
+    assert.deepEqual(workerCalls[1].providerSettings.copilotEditions, { stable: false });
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
+    restoreEnvVar('APPDATA', originalAppData);
+    restoreEnvVar('XDG_CONFIG_HOME', originalXdgConfig);
+    restoreEnvVar('HERMES_HOME', originalHermesHome);
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -352,6 +418,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
   const sent = [];
 
   class FakeDatabase {
+    function() {}
     constructor() { databaseOpens += 1; }
     pragma() {}
     exec() {}
@@ -364,6 +431,7 @@ test('main process forwards committed IDs without reopening after a deferred bui
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() { notifications += 1; } };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() {
@@ -460,6 +528,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
   const queries = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -483,6 +552,7 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -529,6 +599,14 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
     assert.match(queries.at(-1).sql, /COALESCE\(source, 'claude'\) = \?/);
     assert.ok(queries.at(-1).params.includes('codex'));
 
+    // ADR-0007: a message's calls are persisted in the provider's order, so both reads have to
+    // ask for that order rather than leave it to the `(session_id, name)` index.
+    ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session');
+    assert.match(queries.at(-1).sql, /ORDER BY tc\.rowid/);
+
+    ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:visible-agent');
+    assert.match(queries.at(-1).sql, /ORDER BY tc\.rowid/);
+
     const settings = await ipcHandlers.get('settings:get')();
     assert.equal(settings.version, '9.8.7-test');
     assert.ok(
@@ -574,6 +652,26 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   `).run('claude-undated-message', 'claude-session', 'assistant', 'assistant', 'ok', 7, 0, 'claude');
   setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
     .run('pi:session', 'pi');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('zcode:session', 'zcode', '/tmp/zcode/db/db.sqlite#z:session');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('zcode:full-text', 'zcode:session', 'assistant', 'assistant', 'truncated text', 'zcode');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('hermes:session', 'hermes', '/tmp/hermes/state.db#session:source');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('hermes:full-text', 'hermes:session', 'assistant', 'assistant', 'truncated Hermes text', 'hermes');
+  setup.prepare('INSERT INTO sessions (id,source,jsonl_path) VALUES (?,?,?)')
+    .run('kiro:session', 'kiro', '/workspace/kiro/sessions/cli/example.jsonl');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,source) VALUES (?,?,?,?,?,?)')
+    .run('kiro:full-text', 'kiro:session', 'assistant', 'assistant', 'truncated Kiro text', 'kiro');
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)')
+    .run('zcode:child', 'zcode');
+  setup.prepare('INSERT INTO messages (uuid,session_id,type,role,text,visibility,source,agent_id) VALUES (?,?,?,?,?,?,?,?)')
+    .run('zcode:child:message', 'zcode:child', 'assistant', 'assistant', 'child response', 'visible', 'zcode', 'zcode:child');
+  setup.prepare('INSERT INTO tool_calls (id,message_uuid,session_id,name,input_json) VALUES (?,?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'Read', '{}');
+  setup.prepare('INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content) VALUES (?,?,?,?)')
+    .run('zcode:child:call', 'zcode:child:message', 'zcode:child', 'read result');
   setup.prepare(`
     INSERT INTO summaries (
       id, session_id, timestamp, source, content, visibility, input_tokens, output_tokens
@@ -641,6 +739,166 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        app: captureAppHandlers(appHandlers),
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: {
+      createWorkerBuildIndex: () => ({
+        buildIndex: async () => ({ files: 0, affectedSessionIds: [] }),
+        readZcodeMessageText: async lookup => {
+          assert.equal(lookup.source, 'zcode');
+          assert.equal(lookup.messageUuid, 'zcode:full-text');
+          return 'complete ZCode text from worker';
+        },
+        readHermesMessageText: async lookup => {
+          assert.equal(lookup.source, 'hermes');
+          assert.equal(lookup.messageUuid, 'hermes:full-text');
+          return 'complete Hermes text from worker';
+        },
+        readKiroMessageText: async lookup => {
+          assert.equal(lookup.source, 'kiro');
+          assert.equal(lookup.messageUuid, 'kiro:full-text');
+          assert.equal(lookup.rootDir, join(home, '.kiro'));
+          return 'complete Kiro text from worker';
+        },
+        stop() {},
+      }),
+    } }],
+  ]);
+
+  try {
+    await importMain();
+
+    assert.deepEqual(ipcHandlers.get('db:getSessionSummaries')(null, 'pi:session'), []);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionMessages')(null, 'pi:session').map(row => row.uuid),
+      ['pi-visible-main'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session').map(row => row.id),
+      ['pi-visible-main-call'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session').map(row => row.tool_use_id),
+      ['pi-visible-main-call'],
+    );
+    assert.deepEqual(ipcHandlers.get('db:getSessionMessages')(null, 'zcode:child').map(row => row.uuid),
+      ['zcode:child:message'], 'first-class child detail includes its self-agent message');
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolCalls')(null, 'zcode:child').map(row => row.id),
+      ['zcode:child:call']);
+    assert.deepEqual(ipcHandlers.get('db:getSessionToolResults')(null, 'zcode:child').map(row => row.tool_use_id),
+      ['zcode:child:call']);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentMessages')(null, 'pi:visible-agent').map(row => row.uuid),
+      ['pi-visible-agent'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:visible-agent').map(row => row.id),
+      ['pi-visible-agent-call'],
+    );
+    assert.deepEqual(
+      ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:visible-agent').map(row => row.tool_use_id),
+      ['pi-visible-agent-call'],
+    );
+    const patch = ipcHandlers.get('db:getSessionPatch')(null, 'pi:session', {});
+    assert.equal(patch.changes.messages[0].tool_calls[0].result.content, 'main result');
+    assert.equal(JSON.stringify(patch).includes('agent result'), false);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'zcode:full-text'),
+      'complete ZCode text from worker');
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'hermes:full-text'),
+      'complete Hermes text from worker');
+    assert.equal(await ipcHandlers.get('db:getMessageFullText')(null, 'kiro:full-text'),
+      'complete Kiro text from worker');
+
+    const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
+    assert.equal(claudeOnly.totalTokens, 72);
+    assert.equal(claudeOnly.daily[0].tokens, 65);
+
+    const allSources = ipcHandlers.get('db:getUsageStats')(null, { source: 'all' });
+    assert.equal(allSources.totalTokens, 217);
+    assert.equal(allSources.daily[0].tokens, 210);
+    assert.equal(allSources.peakDay.tokens, 210);
+
+    const piOnly = ipcHandlers.get('db:getUsageStats')(null, { source: 'pi' });
+    assert.equal(piOnly.totalTokens, 35);
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ADR-0007 has to hold in the product and not only in the round-trip fixture: session detail reads
+// a message's calls back through these two queries, and `tool_calls` carries a `(session_id, name)`
+// index, so a read that leaves the order to the planner can return a message's calls sorted by
+// tool name instead of by the order the provider emitted them. On a store this small the planner
+// still picks the message index, so the explicit order those queries carry is pinned by the SQL
+// assertion in the Codex-rows test above; this one covers what the rows mean to the detail path.
+test('session IPC keeps a message tool calls in insertion order', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-call-order-${Date.now()}`);
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir, { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const setup = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  setup.prepare('INSERT INTO sessions (id,source) VALUES (?,?)').run('order:session', 'claude');
+  const insertMessage = setup.prepare(`
+    INSERT INTO messages (
+      uuid, session_id, type, role, text, timestamp, visibility, source, agent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCall = setup.prepare(`
+    INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  insertMessage.run('order-main', 'order:session', 'assistant', 'assistant', 'two calls', '2026-07-10T12:00:00Z', 'visible', 'claude', null);
+  insertMessage.run('order-agent', 'order:session', 'assistant', 'assistant', 'agent calls', '2026-07-10T12:01:00Z', 'visible', 'claude', 'order:agent');
+  // Both pairs are inserted in an order the `(session_id, name)` index would reverse.
+  insertCall.run('order-main-call-1', 'order-main', 'order:session', 'browser_snapshot', '{}');
+  insertCall.run('order-main-call-2', 'order-main', 'order:session', 'browser_console', '{}');
+  insertCall.run('order-agent-call-1', 'order-agent', 'order:session', 'write_file', '{}');
+  insertCall.run('order-agent-call-2', 'order-agent', 'order:session', 'read_file', '{}');
+  setup.close();
+
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -669,50 +927,126 @@ test('usage IPC aggregates normalized tokens across all indexed providers', asyn
   try {
     await importMain();
 
-    assert.deepEqual(ipcHandlers.get('db:getSessionSummaries')(null, 'pi:session'), []);
     assert.deepEqual(
-      ipcHandlers.get('db:getSessionMessages')(null, 'pi:session').map(row => row.uuid),
-      ['pi-visible-main'],
+      ipcHandlers.get('db:getSessionToolCalls')(null, 'order:session').map(row => row.id),
+      ['order-main-call-1', 'order-main-call-2'],
+      'a session detail read keeps the calls of one message in source order',
     );
     assert.deepEqual(
-      ipcHandlers.get('db:getSessionToolCalls')(null, 'pi:session').map(row => row.id),
-      ['pi-visible-main-call'],
+      ipcHandlers.get('db:getSubagentToolCalls')(null, 'order:agent').map(row => row.id),
+      ['order-agent-call-1', 'order-agent-call-2'],
+      'and so does a subagent detail read',
     );
+    const patch = ipcHandlers.get('db:getSessionPatch')(null, 'order:session', {});
+    const message = patch.changes.messages.find(candidate => candidate.uuid === 'order-main');
     assert.deepEqual(
-      ipcHandlers.get('db:getSessionToolResults')(null, 'pi:session').map(row => row.tool_use_id),
-      ['pi-visible-main-call'],
+      message.tool_calls.map(toolCall => toolCall.name),
+      ['browser_snapshot', 'browser_console'],
+      'which is the order the assembled session detail carries',
     );
-    assert.deepEqual(ipcHandlers.get('db:getSubagentMessages')(null, 'pi:hidden-agent'), []);
-    assert.deepEqual(ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:hidden-agent'), []);
-    assert.deepEqual(ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:hidden-agent'), []);
-    assert.deepEqual(
-      ipcHandlers.get('db:getSubagentMessages')(null, 'pi:visible-agent').map(row => row.uuid),
-      ['pi-visible-agent'],
-    );
-    assert.deepEqual(
-      ipcHandlers.get('db:getSubagentToolCalls')(null, 'pi:visible-agent').map(row => row.id),
-      ['pi-visible-agent-call'],
-    );
-    assert.deepEqual(
-      ipcHandlers.get('db:getSubagentToolResults')(null, 'pi:visible-agent').map(row => row.tool_use_id),
-      ['pi-visible-agent-call'],
-    );
-    const patch = ipcHandlers.get('db:getSessionPatch')(null, 'pi:session', {});
-    assert.equal(patch.changes.messages[0].tool_calls[0].result.content, 'main result');
-    assert.equal(JSON.stringify(patch).includes('agent result'), false);
-    assert.equal(ipcHandlers.get('db:getMessageFullText')(null, 'pi-hidden-main'), null);
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
-    const claudeOnly = ipcHandlers.get('db:getUsageStats')(null, {});
-    assert.equal(claudeOnly.totalTokens, 72);
-    assert.equal(claudeOnly.daily[0].tokens, 65);
+test('session catalogue includes older sessions beyond 1000 across providers and resolves exact IDs', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-catalogue-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const setup = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  const insert = setup.prepare('INSERT INTO sessions (id, title, project, source, started_at) VALUES (?, ?, ?, ?, ?)');
+  setup.exec('BEGIN');
+  for (let i = 0; i < 1105; i++) {
+    insert.run(`catalogue-${i}`, `Session ${i}`, i < 5 ? 'older-only' : 'active',
+      i % 2 ? 'codex' : 'claude', new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString());
+  }
+  setup.exec('COMMIT');
+  setup.exec("UPDATE sessions SET started_at = '2026-01-01T00:00:00.000Z' WHERE CAST(SUBSTR(id, 11) AS INTEGER) < 10");
+  setup.exec("UPDATE sessions SET git_branch = 'old-release' WHERE id = 'catalogue-1'");
+  setup.close();
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      app: captureAppHandlers(appHandlers), BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+  try {
+    await importMain();
+    const sessions = opts => ipcHandlers.get('db:getSessions')(null, opts);
+    const catalogue = sessions({ source: 'all', limit: null });
+    assert.equal(catalogue.length, 1105);
+    assert.equal(catalogue[0].id, 'catalogue-1104');
+    assert.equal(catalogue.at(-1).id, 'catalogue-0');
+    assert.equal(sessions({ source: 'all' }).length, 200, 'default bounded callers remain bounded');
+    assert.equal(sessions({ source: 'all', limit: 0 }).length, 0);
+    assert.equal(sessions({ source: 'codex', limit: null }).length, 552);
+    assert.equal(sessions({ source: 'all', project: 'older-only', limit: null }).length, 5);
+    assert.deepEqual(sessions({ source: 'all', sessionId: 'catalogue-1', limit: 1 }).map(s => s.id), ['catalogue-1']);
+    assert.equal(sessions({ source: 'claude', sessionId: 'catalogue-1' }).length, 0);
+    assert.equal(sessions({ source: 'all', sessionId: 'missing' }).length, 0);
+    assert.equal(ipcHandlers.get('db:getStats')(null, { source: 'all' }).sessions, 1105);
+    const projects = ipcHandlers.get('db:getProjects')(null, { source: 'all' });
+    assert.equal(projects.find(p => p.project === 'older-only').session_count, 5);
+    assert.equal(projects.reduce((sum, p) => sum + p.session_count, 0), 1105);
+    const page = opts => ipcHandlers.get('db:getSessionCatalogue')(null, { source: 'all', ...opts });
+    assert.equal(page({ limit: 1000 }).rows.length, 100, 'untrusted IPC cannot request an unbounded page');
+    assert.equal(page({ offset: 1000, limit: 100 }).rows[0].id, 'catalogue-104');
+    assert.equal(page({ offset: 1100 }).rows.at(-1).id, 'catalogue-0');
+    assert.deepEqual(page({ query: 'session 1', project: 'older-only', descending: false }).rows.map(s => s.id), ['catalogue-1']);
+    assert.equal(page({ source: 'codex', project: 'older-only' }).total, 2);
+    assert.deepEqual(page({ query: 'old-release' }).rows.map(s => s.id), ['catalogue-1']);
+    const lastPage = page({ offset: 1100, limit: 5 }).rows.map(s => s.id);
+    const previousPage = page({ offset: 1095, limit: 5 }).rows.map(s => s.id);
+    assert.equal(new Set([...previousPage, ...lastPage]).size, 10, 'tied timestamps across pages have no duplicates');
+    assert.equal(previousPage.at(-1), 'catalogue-5');
+    assert.equal(lastPage[0], 'catalogue-4');
+    assert.deepEqual([...lastPage].slice(-2), ['catalogue-1', 'catalogue-0']);
+    assert.deepEqual(page({ offset: 1105, limit: 5, descending: false }).rows, []);
+    assert.deepEqual(page({ offset: 0, limit: 2, descending: false }).rows.map(s => s.id), ['catalogue-0', 'catalogue-1']);
+    const activity = ipcHandlers.get('db:getActivitySessions')(null, { from: '2026-01-01', to: '2026-01-02' });
+    assert.ok(activity.total >= 2);
+    assert.equal(activity.rows.length, Math.min(200, activity.total));
+    const update = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+    try {
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('École', 'catalogue-0');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('ÜBER', 'catalogue-2');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Συνάντηση', 'catalogue-4');
+      update.prepare('UPDATE sessions SET project = ?, git_branch = ? WHERE id = ?').run('ÉQUIPE', 'DÉVELOP', 'catalogue-3');
+      update.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('100%_literal\\path', 'catalogue-6');
+    } finally { update.close(); }
+    for (const [query, id] of [['école', 'catalogue-0'], ['über', 'catalogue-2'], ['συνάντηση', 'catalogue-4'], ['équipe', 'catalogue-3'], ['dévelop', 'catalogue-3'], ['%_literal\\path', 'catalogue-6']]) {
+      assert.deepEqual(page({ query }).rows.map(row => row.id), [id],
+        'database catalogue search preserves Unicode case-insensitive literal matching');
+      assert.equal(page({ query }).total, 1, 'search counts use the same matching semantics');
+    }
+    assert.equal(page({ query: 'session_' }).total, 0, 'underscore is literal, not a wildcard');
 
-    const allSources = ipcHandlers.get('db:getUsageStats')(null, { source: 'all' });
-    assert.equal(allSources.totalTokens, 217);
-    assert.equal(allSources.daily[0].tokens, 210);
-    assert.equal(allSources.peakDay.tokens, 210);
-
-    const piOnly = ipcHandlers.get('db:getUsageStats')(null, { source: 'pi' });
-    assert.equal(piOnly.totalTokens, 35);
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -767,6 +1101,7 @@ test('main process migrates an existing app database before source-filtered IPC 
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -803,6 +1138,12 @@ test('main process migrates an existing app database before source-filtered IPC 
       memories: 0,
       memoriesArchived: 0,
     });
+    const migrated = new DatabaseSync(dbPath);
+    assert.ok(migrated.prepare('PRAGMA index_list(sessions)').all().some(index => index.name === 'idx_sessions_catalogue_order'));
+    assert.ok(migrated.prepare(`EXPLAIN QUERY PLAN SELECT id FROM sessions
+      ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 100`).all()
+      .some(step => step.detail.includes('idx_sessions_catalogue_order')));
+    migrated.close();
   } finally {
     restore();
     restoreEnvVar('HOME', originalHome);
@@ -839,6 +1180,7 @@ test('main process keeps schema and memory mutations behind the writer lease', a
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -901,6 +1243,7 @@ test('closing the last macOS window releases background resources until activati
   let quitCalled = false;
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() { serviceEvents.push('db-close'); }
@@ -915,6 +1258,7 @@ test('closing the last macOS window releases background resources until activati
       windows.push(this);
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return windows; }
@@ -1031,6 +1375,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
   let publishRebuild = false;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
       openedDbPaths.push(dbPath);
@@ -1055,6 +1400,7 @@ test('settings rebuild reopens the database from the configured Claude path', as
       };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return [new FakeBrowserWindow()]; }
@@ -1213,6 +1559,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
   const serviceEvents = [];
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.dbPath = dbPath;
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
@@ -1234,6 +1581,7 @@ test('settings rebuild keeps the existing database after a worker failure', asyn
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1326,6 +1674,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
   let buildIndexCalls = 0;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1342,6 +1691,7 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1424,6 +1774,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
   let finishRebuild;
 
   class FakeDatabase {
+    function() {}
     constructor(dbPath) {
       this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
     }
@@ -1440,6 +1791,7 @@ test('settings changes during rebuild keep one watcher and re-enable with a catc
       this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return []; }
@@ -1536,6 +1888,7 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
   const sent = [];
 
   class FakeDatabase {
+    function() {}
     pragma() {}
     exec() {}
     close() {}
@@ -1553,6 +1906,7 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
       windows.push(this);
     }
     loadFile() {}
+    on() {}
     loadURL() {}
     close() {}
     static getAllWindows() { return windows; }
@@ -1603,6 +1957,98 @@ test('main process watches OBELISK_DIR as a tree target and debounces recap noti
   } finally {
     restore();
     mock.timers.reset();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the win:control IPC applies only whitelisted window actions to the sender window', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-window-control-${Date.now()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+  const windowCalls = [];
+  const windows = [];
+  let maximized = false;
+
+  class FakeDatabase {
+    function() {}
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {},
+      };
+      windows.push(this);
+    }
+    on() {}
+    loadFile() {}
+    loadURL() {}
+    close() { windowCalls.push('close'); }
+    minimize() { windowCalls.push('minimize'); }
+    maximize() { windowCalls.push('maximize'); maximized = true; }
+    unmaximize() { windowCalls.push('unmaximize'); maximized = false; }
+    isMaximized() { return maximized; }
+    static getAllWindows() { return windows; }
+    static fromWebContents() { return windows[0] ?? null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+
+    const handler = ipcHandlers.get('win:control');
+    assert.equal(typeof handler, 'function', 'the main process registers one win:control handler');
+
+    // The window always comes from the sender; a renderer-supplied argument is ignored.
+    assert.equal(handler({ sender: {} }, 'minimize', 'window-from-the-renderer'), null);
+    assert.deepEqual(windowCalls, ['minimize']);
+
+    assert.equal(handler({ sender: {} }, 'toggle-maximize'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize'], 'an unmaximized window maximizes');
+    assert.equal(handler({ sender: {} }, 'toggle-maximize'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize'], 'a maximized window restores');
+
+    assert.equal(handler({ sender: {} }, 'close'), null);
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize', 'close'], 'close stays win.close()');
+
+    assert.throws(
+      () => handler({ sender: {} }, 'explode'),
+      /win:control accepts 'minimize', 'toggle-maximize', or 'close'/,
+    );
+    assert.deepEqual(windowCalls, ['minimize', 'maximize', 'unmaximize', 'close'], 'an unknown action changes nothing');
+  } finally {
+    restore();
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });

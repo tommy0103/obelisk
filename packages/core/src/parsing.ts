@@ -47,14 +47,27 @@ interface CodexLineRecord {
 }
 
 // ---- message/text helpers ----
+/**
+ * Slice a string to `limit` UTF-16 code units without leaving half of a surrogate pair at the cut.
+ * A lone surrogate has no UTF-8 form, so every store that persists the text rewrites it (SQLite
+ * writes U+FFFD) and the record no longer matches what the provider emitted — which ADR-0007
+ * forbids. Rare, but it is exactly what a limit that lands on an emoji produces.
+ */
+function sliceText(s: string, limit: number): string {
+  if (s.length <= limit) return s;
+  const boundary = s.charCodeAt(limit - 1);
+  const splitsPair = boundary >= 0xd800 && boundary <= 0xdbff;
+  return s.slice(0, splitsPair ? limit - 1 : limit);
+}
+
 function trunc(s: any): any {
-  return typeof s === 'string' && s.length > TEXT_LIMIT ? s.slice(0, TEXT_LIMIT) : s;
+  return typeof s === 'string' ? sliceText(s, TEXT_LIMIT) : s;
 }
 
 function truncJson(obj: JsonValue, limit = TEXT_LIMIT): string | null {
   if (obj === null || obj === undefined) return null;
   const walk = (v: JsonValue): JsonValue => {
-    if (typeof v === 'string') return v.length > limit ? v.slice(0, limit) + '...[truncated]' : v;
+    if (typeof v === 'string') return v.length > limit ? sliceText(v, limit) + '...[truncated]' : v;
     if (Array.isArray(v)) return v.map(walk);
     if (typeof v === 'object' && v !== null) {
       const out: JsonRecord = {};
@@ -113,25 +126,46 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
 
 function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
-function readLines(filePath: string, callback: (line: string, terminated: boolean) => boolean | void): void {
+interface ReadLinesOptions {
+  start?: number;
+  onBytesRead?: (bytes: number) => void;
+}
+
+function readLines(
+  filePath: string,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
+  { start = 0, onBytesRead }: ReadLinesOptions = {},
+): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
-  let remainder = '';
+  let remainder = Buffer.alloc(0);
   let bytesRead;
+  let position = start;
   try {
-    while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
-      const lines = buf.toString('utf8', 0, bytesRead).split('\n');
-      lines[0] = remainder + lines[0];
-      remainder = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line && callback(line, true) === false) return;
+    while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      onBytesRead?.(bytesRead);
+      const chunkStart = position;
+      position += bytesRead;
+      const chunk = buf.subarray(0, bytesRead);
+      const combinedStart = chunkStart - remainder.length;
+      const data = remainder.length === 0 ? chunk : Buffer.concat([remainder, chunk]);
+      let lineStart = 0;
+      while (true) {
+        const newline = data.indexOf(0x0a, lineStart);
+        if (newline < 0) break;
+        const line = data.toString('utf8', lineStart, newline);
+        lineStart = newline + 1;
+        if (line && callback(line, true, combinedStart + lineStart) === false) return;
       }
+      // `buf` is reused by the next readSync; retain an owned copy so a line
+      // spanning chunks is never overwritten before it is completed.
+      remainder = Buffer.from(data.subarray(lineStart));
     }
     // `terminated: false` — the final chunk had no trailing newline, so this
     // tail may still be growing (or may simply be an unterminated last line;
     // the caller cannot tell, and must decide what that means).
-    if (remainder) callback(remainder, false);
+    if (remainder.length > 0) callback(remainder.toString('utf8'), false);
   } finally {
     closeSync(fd);
   }

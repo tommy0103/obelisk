@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
@@ -66,27 +67,54 @@ test('built-in provider registry exposes every source without caller-side branch
   const registry = createBuiltinProviderRegistry({
     claude: '/sources/claude',
     codex: '/sources/codex',
+    copilot: '/sources/copilot',
     deepseek: '/sources/deepseek',
+    hermes: '/sources/hermes',
     kimi: '/sources/kimi',
+    kiro: '/sources/kiro',
+    omp: '/sources/omp',
+    opencode: '/sources/opencode',
     pi: '/sources/pi',
+    zcode: '/sources/zcode',
   });
 
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
     { id: 'claude', name: 'Claude Code' },
     { id: 'codex', name: 'Codex' },
+    { id: 'copilot', name: 'GitHub Copilot' },
     { id: 'deepseek', name: 'DeepSeek Harness' },
+    { id: 'hermes', name: 'Hermes Agent' },
     { id: 'kimi', name: 'Kimi Code' },
+    { id: 'kiro', name: 'Kiro' },
+    { id: 'omp', name: 'OMP' },
+    { id: 'opencode', name: 'OpenCode' },
     { id: 'pi', name: 'Pi' },
+    { id: 'zcode', name: 'ZCode' },
   ]);
   assert.deepEqual(registry.watchTargets(), [
-    { kind: 'tree', path: '/sources/claude/projects' },
-    { kind: 'file', path: '/sources/claude/history.jsonl' },
-    { kind: 'tree', path: '/sources/codex/sessions' },
-    { kind: 'tree', path: '/sources/codex/archived_sessions' },
-    { kind: 'file', path: '/sources/codex/session_index.jsonl' },
+    { kind: 'tree', path: join('/sources/claude', 'projects') },
+    { kind: 'file', path: join('/sources/claude', 'history.jsonl') },
+    { kind: 'tree', path: join('/sources/codex', 'sessions') },
+    { kind: 'tree', path: join('/sources/codex', 'archived_sessions') },
+    { kind: 'file', path: join('/sources/codex', 'session_index.jsonl') },
+    { kind: 'file', path: join('/sources/copilot', 'globalStorage', 'github.copilot-chat', 'session-store.db') },
+    { kind: 'file', path: join('/sources/copilot', 'globalStorage', 'github.copilot-chat', 'session-store.db-wal') },
+    { kind: 'tree', path: join('/sources/copilot', 'workspaceStorage') },
     { kind: 'tree', path: '/sources/deepseek' },
-    { kind: 'tree', path: '/sources/kimi/sessions' },
-    { kind: 'file', path: '/sources/kimi/session_index.jsonl' },
-    { kind: 'tree', path: '/sources/pi' },
+    { kind: 'file', path: join('/sources/hermes', 'state.db') },
+    { kind: 'file', path: join('/sources/hermes', 'state.db-wal') },
+    { kind: 'tree', path: join('/sources/hermes', 'profiles'), fileNames: ['state.db', 'state.db-wal'] },
+    { kind: 'tree', path: join('/sources/kimi', 'sessions') },
+    { kind: 'file', path: join('/sources/kimi', 'session_index.jsonl') },
+    { kind: 'tree', path: join('/sources/kiro', 'sessions') },
+    { kind: 'file', path: join('/sources/kiro', 'data.sqlite3') },
+    { kind: 'file', path: join('/sources/kiro', 'data.sqlite3-wal') },
+    { kind: 'tree', path: join('/sources/omp') },
+    { kind: 'file', path: join('/sources/opencode', 'opencode.db') },
+    { kind: 'file', path: join('/sources/opencode', 'opencode.db-wal') },
+    { kind: 'tree', path: '/sources/opencode', fileNames: ['opencode-next.db', 'opencode-next.db-wal', 'opencode.db', 'opencode.db-wal'] },
+    { kind: 'tree', path: join('/sources/pi') },
+    { kind: 'file', path: join('/sources/zcode', 'db', 'db.sqlite') },
+    { kind: 'file', path: join('/sources/zcode', 'db', 'db.sqlite-wal') },
   ]);
 });

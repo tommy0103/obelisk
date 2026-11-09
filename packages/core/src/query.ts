@@ -8,8 +8,11 @@ import { isAbsolute, normalize, resolve, sep } from 'node:path';
 import { constants as sqliteConstants } from 'node:sqlite';
 import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
+import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type { SqliteDb, SqliteRow, SqliteStatement } from './sqlite-types.ts';
+import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
+import { openOpencodeDatabaseWithNodeSqlite } from './providers/opencode-node.ts';
 
 type DbRow = SqliteRow;
 
@@ -21,6 +24,7 @@ interface QueryOptions extends Record<string, any> {
   sessionId?: string;
   sessions?: string[];
   project?: string;
+  projectPath?: string;
   after?: string;
   before?: string;
   cwd?: string;
@@ -28,9 +32,30 @@ interface QueryOptions extends Record<string, any> {
   source?: string;
   includeMeta?: boolean;
   includeInactive?: boolean;
+  fallback?: 'or';
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
+  contextLimit?: number;
+  snippetTokens?: number;
+}
+
+interface MessageQueryOptions {
+  uuid?: string;
+  around?: string;
+  sessionId?: string;
+  relation?: 'timeline' | 'parents';
+  beforeCount?: number;
+  afterCount?: number;
+  after?: string;
+  before?: string;
+  limit?: number;
+  cursor?: { timestamp: string | null; uuid: string };
+  agentId?: string | null;
+  contentTypes?: string[];
+  includeMeta?: boolean;
+  includeInactive?: boolean;
+  includeSession?: boolean;
 }
 
 interface ColumnAliases {
@@ -64,6 +89,10 @@ function normalizeOpts(optsOrScalar: QueryOptions | string | number | null | und
   if (typeof optsOrScalar === 'string') return { [scalarKey]: optsOrScalar };
   if (typeof optsOrScalar === 'number') return { limit: optsOrScalar };
   return optsOrScalar;
+}
+
+function assertNonNegativeLimit(value: number, label: string): void {
+  if (value < 0) throw new RangeError(`${label} must be non-negative (got ${value})`);
 }
 
 function buildWhere(opts: QueryOptions, aliases: ColumnAliases) {
@@ -256,18 +285,22 @@ function assertEnglishMemoryText(value: unknown, label: string): void {
   }
 }
 
-function buildSafeFtsQuery(text: unknown): string {
+function buildSafeFtsQuery(text: unknown, separator = ' '): string {
   const tokens = String(text || '').match(/[\p{Letter}\p{Number}]+/gu) || [];
   return tokens
     .slice(0, 12)
     .map(token => `"${token}"`)
-    .join(' ');
+    .join(separator);
 }
 
 function createQueryApi(
   db: SqliteDb,
   {
-    providerRegistry = createBuiltinProviderRegistry(),
+    providerRegistry = createBuiltinProviderRegistry({}, {
+      openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
+      openHermesStore: openHermesStoreWithNodeSqlite,
+      openOpencodeDatabase: openOpencodeDatabaseWithNodeSqlite,
+    }),
     invokingSessionId = null,
   }: { providerRegistry?: ProviderRegistry; invokingSessionId?: string | null } = {},
 ) {
@@ -290,25 +323,40 @@ function createQueryApi(
       limit = 20,
       sessionId,
       project,
+      projectPath,
       after,
       before,
       cwd,
       source,
       includeMeta = false,
       includeInactive = false,
+      contextLimit = 6,
+      snippetTokens,
+      fallback,
     } = opts;
+    assertNonNegativeLimit(limit, 'search() limit');
+    if (!Number.isInteger(contextLimit) || contextLimit < 0 || contextLimit > 6) {
+      throw new RangeError('search() contextLimit must be an integer from 0 to 6');
+    }
+    if (snippetTokens !== undefined && (!Number.isInteger(snippetTokens) || snippetTokens < 1 || snippetTokens > 64)) {
+      throw new RangeError('search() snippetTokens must be an integer from 1 to 64');
+    }
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
+    if (projectPath) { where += ' AND s.project_path=?'; filterParams.push(projectPath); }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
     if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
     if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
     where += ` AND ${visibilitySql('m', includeInactive)}`;
+    const hitText = snippetTokens === undefined ? 'm.text' : `snippet(messages_fts, 2, '', '', '…', ${snippetTokens})`;
     const stmt = db.prepare(`
-      SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
+      SELECT m.uuid,m.session_id,${hitText} AS text,
+             ${snippetTokens === undefined ? 'NULL' : 'length(m.text)'} AS text_length,
+             m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
              COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source,
@@ -325,6 +373,10 @@ function createQueryApi(
     } catch {
       const safe = buildSafeFtsQuery(text);
       rows = safe ? runMatch(safe) : [];
+    }
+    if (rows.length === 0 && fallback === 'or') {
+      const broad = buildSafeFtsQuery(text, ' OR ');
+      rows = broad ? runMatch(broad) : [];
     }
     const metaClause = includeMeta ? '' : 'AND COALESCE(is_meta,0)=0';
     const contextWhere = `
@@ -385,8 +437,9 @@ function createQueryApi(
       };
       const indexedTimestamp = typeof r.timestamp === 'string'
         && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.timestamp);
-      const ctx = (indexedTimestamp ? indexedContext : scanContext)
+      const ctx = contextLimit === 0 ? [] : (indexedTimestamp ? indexedContext : scanContext)
         .all(contextParams)
+        .slice(0, contextLimit)
         .map(withVisibility)
         .sort((a: DbRow, b: DbRow) => {
           if (a.timestamp === b.timestamp) return 0;
@@ -403,6 +456,7 @@ function createQueryApi(
         message: {
           uuid: r.uuid,
           text: r.text,
+          ...(snippetTokens === undefined ? {} : { textLength: r.text_length, isSnippet: true }),
           content_type: r.content_type,
           is_meta: r.is_meta || 0,
           role: r.role,
@@ -419,6 +473,128 @@ function createQueryApi(
     });
   };
 
+  const messages = (input: MessageQueryOptions | string) => {
+    const opts = typeof input === 'string' ? { uuid: input } : input;
+    if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError('messages() requires uuid, around, or sessionId');
+    }
+    const allowed = new Set(['uuid', 'around', 'sessionId', 'relation', 'beforeCount', 'afterCount',
+      'after', 'before', 'limit', 'cursor', 'agentId', 'contentTypes', 'includeMeta', 'includeInactive', 'includeSession']);
+    for (const key of Object.keys(opts)) {
+      if (!allowed.has(key)) throw new TypeError(`messages() does not support option ${key}`);
+    }
+    const locators = ['uuid', 'around', 'sessionId'].filter(key => key in opts);
+    if (locators.length !== 1) throw new TypeError('messages() requires exactly one of uuid, around, or sessionId');
+    const mode = locators[0];
+    const locator = opts[mode as 'uuid' | 'around' | 'sessionId'];
+    if (typeof locator !== 'string' || !locator.trim()) throw new TypeError(`messages() ${mode} must be a non-empty string`);
+    for (const key of ['includeMeta', 'includeInactive', 'includeSession'] as const) {
+      if (opts[key] !== undefined && typeof opts[key] !== 'boolean') throw new TypeError(`messages() ${key} must be boolean`);
+    }
+    const rangeKeys = ['after', 'before', 'limit', 'cursor', 'agentId'];
+    const windowKeys = ['relation', 'beforeCount', 'afterCount'];
+    for (const key of [...(mode !== 'sessionId' ? rangeKeys : []), ...(mode !== 'around' ? windowKeys : [])]) {
+      if (key in opts) throw new TypeError(`messages() ${key} is not supported with ${mode}`);
+    }
+    const boundedCount = (value: number | undefined, fallback: number, key: string) => {
+      const count = value === undefined ? fallback : value;
+      if (!Number.isSafeInteger(count) || count < 0 || count > 500) throw new RangeError(`messages() ${key} must be an integer from 0 to 500`);
+      return count;
+    };
+    const relation = opts.relation === undefined ? 'timeline' : opts.relation;
+    if (relation !== 'timeline' && relation !== 'parents') throw new TypeError('messages() relation must be timeline or parents');
+    const beforeCount = mode === 'around' ? boundedCount(opts.beforeCount, 3, 'beforeCount') : 0;
+    const afterCount = mode === 'around' ? boundedCount(opts.afterCount, relation === 'parents' ? 0 : 3, 'afterCount') : 0;
+    if (relation === 'parents' && afterCount !== 0) throw new RangeError('messages() parents relation requires afterCount: 0');
+    if (beforeCount + afterCount + 1 > 500) throw new RangeError('messages() window must contain at most 500 messages including the anchor');
+    const limit = mode === 'sessionId' ? boundedCount(opts.limit, 20, 'limit') : 0;
+    if (opts.contentTypes !== undefined && (!Array.isArray(opts.contentTypes) || !opts.contentTypes.length
+      || opts.contentTypes.some(value => typeof value !== 'string' || !value.trim()))) {
+      throw new TypeError('messages() contentTypes must be a non-empty array of strings');
+    }
+    for (const key of ['after', 'before'] as const) {
+      if (opts[key] !== undefined && (typeof opts[key] !== 'string' || !opts[key].trim())) throw new TypeError(`messages() ${key} must be a non-empty timestamp string`);
+    }
+    if (opts.agentId !== undefined && opts.agentId !== null && typeof opts.agentId !== 'string') throw new TypeError('messages() agentId must be a string or null');
+    const cursor = opts.cursor;
+    if (cursor !== undefined && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)
+      || typeof cursor.uuid !== 'string' || !cursor.uuid.trim() || (cursor.timestamp !== null && typeof cursor.timestamp !== 'string'))) {
+      throw new TypeError('messages() cursor requires timestamp (string or null) and uuid');
+    }
+    const predicate = `${visibilitySql('m', opts.includeInactive === true)}${opts.includeMeta === true ? '' : ' AND COALESCE(m.is_meta,0)=0'}${opts.contentTypes ? ` AND m.content_type IN (${opts.contentTypes.map(() => '?').join(',')})` : ''}`;
+    const filterParams = opts.contentTypes ?? [];
+    const sessionFor = (id: unknown) => opts.includeSession === true
+      ? db.prepare('SELECT * FROM sessions WHERE id=?').get(id) ?? null : null;
+    if (mode === 'sessionId') {
+      const clauses = ['m.session_id=?', predicate];
+      const params: any[] = [locator, ...filterParams];
+      if (opts.agentId !== undefined) { clauses.push('m.agent_id IS ?'); params.push(opts.agentId); }
+      if (opts.after !== undefined) { clauses.push('m.timestamp > ?'); params.push(opts.after); }
+      if (opts.before !== undefined) { clauses.push('m.timestamp < ?'); params.push(opts.before); }
+      if (cursor) {
+        clauses.push("(COALESCE(m.timestamp,'') > ? OR (COALESCE(m.timestamp,'')=? AND m.uuid > ?))");
+        params.push(cursor.timestamp ?? '', cursor.timestamp ?? '', cursor.uuid);
+      }
+      const rows = db.prepare(`SELECT m.* FROM messages m WHERE ${clauses.join(' AND ')} ORDER BY COALESCE(m.timestamp,''),m.uuid LIMIT ?`).all(...params, limit + 1);
+      const hasMore = rows.length > limit;
+      const selected = rows.slice(0, limit).map(withVisibility);
+      const last = selected[selected.length - 1];
+      return { anchor: null, messages: selected, session: sessionFor(locator), hasMore,
+        nextCursor: hasMore && last ? { timestamp: last.timestamp as string | null, uuid: last.uuid as string } : null };
+    }
+    // An explicit anchor is selected by visibility, independently of neighbor content/meta filters.
+    const row = db.prepare(`SELECT * FROM messages WHERE uuid=? AND ${visibilitySql('messages', opts.includeInactive === true)}`).get(locator);
+    if (!isQueryableMessage(row, opts.includeInactive === true)) return null;
+    const anchor = withVisibility(row);
+    let preceding: DbRow[] = [];
+    let following: DbRow[] = [];
+    let hasMore = false;
+    if (mode === 'around' && relation === 'parents' && beforeCount > 0) {
+      // Traverse only structure until N+1 qualifying ancestors; load body fields at the final join.
+      // Hidden/inactive bridge rows are traversable, but never projected unless eligible.
+      const ancestors = db.prepare(`WITH RECURSIVE path(uuid,parent_uuid,depth,n,eligible,visited,cycle) AS (
+        SELECT uuid,parent_uuid,0,0,0,json_array(uuid),0 FROM messages WHERE uuid=?
+        UNION ALL
+        SELECT m.uuid,m.parent_uuid,p.depth+1,p.n+CASE WHEN ${predicate} THEN 1 ELSE 0 END,
+          CASE WHEN ${predicate} THEN 1 ELSE 0 END,json_insert(p.visited,'$[#]',m.uuid),
+          EXISTS(SELECT 1 FROM json_each(p.visited) WHERE value=m.uuid)
+        FROM path p JOIN messages m ON m.uuid=p.parent_uuid
+        WHERE p.n < ? AND p.depth < 10000 AND p.cycle=0
+      ) SELECT m.*,p.depth AS __depth,p.cycle AS __cycle,p.n AS __n,
+        EXISTS(SELECT 1 FROM messages parent WHERE parent.uuid=p.parent_uuid) AS __continues
+        FROM path p LEFT JOIN messages m ON m.uuid=p.uuid AND p.eligible=1 AND p.cycle=0
+        WHERE p.depth>0 AND (p.eligible=1 OR p.cycle=1 OR p.depth=10000) ORDER BY p.depth`)
+        .all(locator, ...filterParams, ...filterParams, beforeCount + 1);
+      if (ancestors.some(value => value.__cycle === 1)) throw new Error('messages() found a cyclic parent path');
+      if (ancestors.some(value => value.__depth === 10000 && value.__continues === 1 && Number(value.__n) < beforeCount + 1)) {
+        throw new Error('messages() parent traversal exceeded 10000 records');
+      }
+      const eligible = ancestors.filter(value => value.uuid !== null);
+      hasMore = eligible.length > beforeCount;
+      preceding = eligible.slice(0, beforeCount).reverse().map(value => {
+        const { __depth, __cycle, __n, __continues, ...message } = value;
+        return withVisibility(message);
+      });
+    } else if (mode === 'around' && relation === 'timeline') {
+      const neighbors = (count: number, direction: 'before' | 'after') => {
+        if (count === 0) return [];
+        const comparison = direction === 'before' ? '<' : '>';
+        const order = direction === 'before' ? 'DESC' : 'ASC';
+        const rows = db.prepare(`SELECT m.* FROM messages m WHERE m.session_id=? AND m.agent_id IS ? AND ${predicate}
+          AND (COALESCE(m.timestamp,'') ${comparison} ? OR (COALESCE(m.timestamp,'')=? AND m.uuid ${comparison} ?))
+          ORDER BY COALESCE(m.timestamp,'') ${order},m.uuid ${order} LIMIT ?`)
+          .all(row.session_id, row.agent_id, ...filterParams, row.timestamp ?? '', row.timestamp ?? '', row.uuid, count + 1);
+        hasMore = hasMore || rows.length > count;
+        const selected = rows.slice(0, count).map(withVisibility);
+        return direction === 'before' ? selected.reverse() : selected;
+      };
+      preceding = neighbors(beforeCount, 'before');
+      following = neighbors(afterCount, 'after');
+    }
+    return { anchor, messages: [...preceding, anchor, ...following], session: sessionFor(row.session_id), hasMore, nextCursor: null };
+  };
+
+  // Compatibility helpers retain their full-chain/full-session behavior.
   const context = (uuid: string, opts: QueryOptions = {}) => {
     const includeInactive = opts.includeInactive === true;
     const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
@@ -468,6 +644,7 @@ function createQueryApi(
   const subagents = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    assertNonNegativeLimit(limit, 'subagents() limit');
     const needsJoin = opts.project || opts.branch || opts.source;
     // The subagents table has no timestamp column; scope time filters by the
     // subagent's activity interval instead of comparing session IDs. `after`
@@ -488,6 +665,7 @@ function createQueryApi(
   const workflows = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    assertNonNegativeLimit(limit, 'workflows() limit');
     const needsJoin = opts.project || opts.branch || opts.source;
     const { where, params } = buildWhere(opts, { sessionId: 'w.session_id', project: 's.project', timestamp: 'w.timestamp', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
@@ -509,6 +687,7 @@ function createQueryApi(
 
   const fileHistory = (fp: string, opts: QueryOptions = {}) => {
     const { limit = 200, after, before, source, includeInactive = false } = opts;
+    assertNonNegativeLimit(limit, 'fileHistory() limit');
     let where = `tc.file_path=? AND ${visibilitySql('m', includeInactive)}`;
     const params: any[] = [fp];
     if (after)  { where += ' AND m.timestamp > ?'; params.push(after); }
@@ -522,7 +701,7 @@ function createQueryApi(
        LEFT JOIN sessions s ON s.id=tc.session_id
        LEFT JOIN messages m ON m.uuid=tc.message_uuid
        WHERE ${where}
-       ORDER BY m.timestamp
+       ORDER BY m.timestamp, m.uuid, tc.rowid
        LIMIT ?`
     ).all(...params).map((r: DbRow) => ({
       toolCall: { id: r.id, message_uuid: r.message_uuid, name: r.name, input_json: r.input_json },
@@ -535,6 +714,7 @@ function createQueryApi(
   const failures = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50 } = opts;
+    assertNonNegativeLimit(limit, 'failures() limit');
     const includeInactive = opts.includeInactive === true;
     const needsJoin = opts.project || opts.branch || opts.source;
     const { where, params: filterParams } = buildWhere(opts, { sessionId: 'tr.session_id', project: 's.project', timestamp: 'rm.timestamp', branch: 's.git_branch', source: 's.source' });
@@ -586,10 +766,21 @@ function createQueryApi(
 
   const sessions = (optsOrN?: QueryOptions | number | string) => {
     const opts = normalizeOpts(optsOrN, 'sessionId');
-    const { limit = 50 } = opts;
-    const { where, params } = buildWhere(opts, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const { limit = 50, sessionId, sessions: sessionIds, ...filters } = opts;
+    assertNonNegativeLimit(limit, 'sessions() limit');
+    const { where, params } = buildWhere(filters, { sessionId: 's.id', project: 's.project', timestamp: 's.started_at', branch: 's.git_branch', source: 's.source' });
+    const refs = [...(sessionId ? [sessionId] : []), ...(sessionIds ?? [])];
+    // Resolve within the requested scope, retaining exact-ID precedence globally.
+    const resolvedWhere = refs.length ? `${where} AND s.id IN (
+      WITH refs(id) AS (VALUES ${refs.map(() => '(?)').join(',')})
+      SELECT id FROM refs UNION ALL
+      SELECT hit.id FROM refs JOIN sessions hit ON hit.id IN (
+        SELECT s.id FROM sessions s WHERE ${where} AND instr(s.id, refs.id) > 0
+        ORDER BY s.ended_at DESC LIMIT 10)
+      WHERE refs.id <> '' AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = refs.id))` : where;
+    if (refs.length) params.push(...refs, ...params);
     params.push(limit);
-    return db.prepare(`SELECT * FROM sessions s WHERE ${where} ORDER BY ended_at DESC LIMIT ?`).all(...params)
+    return db.prepare(`SELECT * FROM sessions s WHERE ${resolvedWhere} ORDER BY ended_at DESC LIMIT ?`).all(...params)
       .map((row: DbRow) => invokingSessionId && row.id === invokingSessionId ? { ...row, is_invoking: true } : row);
   };
 
@@ -598,6 +789,7 @@ function createQueryApi(
   const summaries = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 100 } = opts;
+    assertNonNegativeLimit(limit, 'summaries() limit');
     const includeInactive = opts.includeInactive === true;
     const { where, params } = buildWhere(opts, { sessionId: 'su.session_id', project: 's.project', timestamp: 'su.timestamp', branch: 's.git_branch', source: 's.source' });
     params.push(limit);
@@ -617,6 +809,9 @@ function createQueryApi(
     const sessionLimit = opts.limit ?? 8;
     const projectLimit = opts.projectLimit ?? 20;
     const memoryLimit = opts.memoryLimit ?? 100;
+    assertNonNegativeLimit(sessionLimit, 'overview() limit');
+    assertNonNegativeLimit(projectLimit, 'overview() projectLimit');
+    assertNonNegativeLimit(memoryLimit, 'overview() memoryLimit');
 
     const projectDescriptor = (row: DbRow | null, source: string, confidence: string) => row ? ({
       project: row.project,
@@ -795,6 +990,8 @@ function createQueryApi(
     opts: { offset?: number; limit?: number; includeInactive?: boolean } = {},
   ) => {
     const { offset = 0, limit = 10000, includeInactive = false } = opts;
+    assertNonNegativeLimit(limit, 'raw() limit');
+    assertNonNegativeLimit(offset, 'raw() offset');
     const message = db.prepare('SELECT * FROM messages WHERE uuid=?').get(messageUuid);
     if (!isQueryableMessage(message, includeInactive)) return null;
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(message.session_id) ?? null;
@@ -829,6 +1026,7 @@ function createQueryApi(
   const memories = (optsOrSid?: QueryOptions | string) => {
     const opts = normalizeOpts(optsOrSid);
     const { limit = 50, query } = opts;
+    assertNonNegativeLimit(limit, 'memories() limit');
     assertEnglishMemoryText(query, 'memories() query');
     const needsJoin = opts.branch || opts.source;
     const { where: baseWhere, params } = buildWhere(opts, {
@@ -860,7 +1058,7 @@ function createQueryApi(
     `).all(...params);
   };
 
-  return { sql: q, search, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
+  return { sql: q, search, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
 function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {
@@ -955,3 +1153,4 @@ function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (w
 }
 
 export { createQueryApi, createAttuneApi };
+export type { MessageQueryOptions };

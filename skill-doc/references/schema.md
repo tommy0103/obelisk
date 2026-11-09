@@ -14,14 +14,21 @@ exist.
 
 ## Source Model
 
-Obelisk stores Claude Code, Codex, DeepSeek Harness, Kimi Code, and Pi transcripts in the same
+Obelisk stores Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi transcripts in the same
 schema.
 
 - Claude rows use `source='claude'`.
 - Codex rows use `source='codex'`; root session and message IDs are prefixed
   with `codex:`.
 - Kimi Code rows use `source='kimi'`.
+- OMP rows use `source='omp'`; session IDs are prefixed with `omp:`.
 - Pi rows use `source='pi'`; session IDs are prefixed with `pi:`.
+- OpenCode rows use `source='opencode'`; session IDs are prefixed with
+  `opencode:`. Obelisk indexes V1 and V2 SQLite databases (`opencode.db` and
+  channel stores; earlier JSON formats are not indexed). Canonical token
+  accounting folds provider breakdowns: V2 combines input + cache read/write
+  into `input_tokens` and output + reasoning into `output_tokens`; V1 uses
+  per-step `step-finish` usage with assistant-level fallback.
 - DeepSeek Harness rows use `source='deepseek'`; session IDs are prefixed with
   `deepseek:`. Subagent logs fold into their root parent session as sidechain
   messages (`is_sidechain=1`, `agent_id` = the subagent's `deepseek:` id), and
@@ -69,7 +76,7 @@ One row per root session.
 | `version` | Provider CLI/app version |
 | `message_count` | Visible canonical messages; inactive and hidden records are excluded |
 | `jsonl_path` | Source JSONL path |
-| `source` | Provider ID: `claude`, `codex`, `deepseek`, `kimi`, or `pi` |
+| `source` | Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi` |
 
 ### `messages`
 
@@ -85,7 +92,7 @@ Core evidence table.
 | `text` | Extracted text, truncated to 10k chars |
 | `content_type` | `text`, `thinking`, `tool_use`, `tool_result`, or `unknown` |
 | `is_meta` | 1 for injected/control-plane messages |
-| `visibility` | `visible` for current evidence, `inactive` for provider-attested superseded history, `hidden` for display-suppressed or transport-only material. Only Pi emits `inactive` |
+| `visibility` | `visible` for current evidence, `inactive` for provider-attested superseded history, `hidden` for display-suppressed or transport-only material. Pi and OMP emit `inactive` |
 | `model` | Assistant model name |
 | `is_sidechain` | Retry/branch marker |
 | `agent_id` | Subagent/workflow agent ID |
@@ -93,7 +100,7 @@ Core evidence table.
 | `cwd` | Working directory at message time |
 | `skill` | Skill that generated the response, if known |
 | `turn_duration_ms` | Wall-clock duration for the turn |
-| `source` | Provider ID: `claude`, `codex`, `deepseek`, `kimi`, or `pi` |
+| `source` | Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi` |
 
 `content_type='tool_use'` is only a marker. Tool-call details live in
 `tool_calls`. `content_type='tool_result'` marks provider-emitted tool-result

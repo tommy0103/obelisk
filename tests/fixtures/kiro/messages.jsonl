@@ -1,0 +1,9 @@
+{"id": "id-35", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "agent_note", "content": "Example content"}}
+{"id": "id-36", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "user", "content": "Example content", "documents": [], "images": [], "_meta": {"kiro": {"userMessageTag": "Example content"}}}}
+{"id": "id-37", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "turn_start", "executionId": "id-38"}}
+{"id": "id-39", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "assistant", "content": "Example content", "operationType": "Say", "executionId": "id-38", "_meta": {"kiro": {"agentMode": "Example content"}}}}
+{"id": "id-40", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "session_metadata", "key": "contextUsage", "value": {"usagePercentage": 2.7357001304626465}, "executionId": "id-38"}}
+{"id": "id-41", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "usage_summary", "promptTurnSummaries": [{"unit": "credit", "unitPlural": "credits", "usage": 0.23029349799336654}], "elapsedTime": 3279, "status": "success", "executionId": "id-38", "requestIds": ["Example content"]}}
+{"id": "id-42", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "session_event", "category": "Example content", "context": {"executionId": "id-38", "status": "success"}}}
+{"id": "id-43", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "turn_end", "stopReason": "end_turn", "executionId": "id-38"}}
+{"id": "id-44", "timestamp": "2026-01-01T12:00:00.000Z", "payload": {"type": "session_start", "agentType": "Example content", "backgroundExecution": false, "content": "Example content", "forcedRole": true, "messageId": "id-45"}}

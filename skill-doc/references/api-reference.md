@@ -9,22 +9,26 @@ Detailed reference for globals available inside `obelisk --query` and
 - Use `references/pitfalls.md` after runtime errors or confusing row shapes.
 
 Query scripts run inside an async IIFE with a 30-second timeout. Use `return` to
-emit JSON. `--query` scripts are read-only. `--attune` scripts expose only
-memory mutation helpers.
+emit JSON. The `--query` helper API is read-only, but the script itself runs
+with the privileges of the CLI process — see the security note in `SKILL.md`.
+`--attune` scripts expose only memory mutation helpers.
 
 ## Invocation Identity
 
 Obelisk refreshes the index before each query, so the invoking agent's own live
 session appears in results. The CLI carries an invocation nonce to identify it:
 
-- `obelisk --search "text" --nonce <token>` — pass a unique token, for example
-  `--nonce "$(uuidgen 2>/dev/null || echo "$$.$RANDOM.$RANDOM")"` (prefers
-  `uuidgen`, falls back to shell builtins). The nonce is never part of the FTS
-  search text.
+- `obelisk --search "text" --nonce <token>` — type a unique literal token,
+  for example `--nonce "obq-<unique-token-you-invent>"`. Shell substitutions
+  are recorded as typed in the transcript, so their expanded values cannot
+  identify the invocation. The nonce is never part of the FTS search text.
 - `obelisk --query <file>` — the nonce is the query file path as typed, so use
   unique temp names such as
   `qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; }) && qfile="$qdir/query.mjs"`
   (a unique directory per query; the `mktemp` template always ends in the `X` run).
+  When the path is not recorded literally, script content of at least 40
+  characters is a fallback candidate; it must uniquely identify a recent
+  CLI-invoking session.
 
 Resolution is newest-wins within a ~15-minute recency window (both the
 message-text and tool-call legs are bounded to it, which keeps weeks-old
@@ -55,18 +59,26 @@ further fallback.
 
 ### Read Helpers
 
-These globals are available only in `obelisk --query` scripts:
+The default retrieval surface in CLI 0.3.0+ is available only in
+`obelisk --query` scripts:
 
 ```js
-sql, search, context, trace, thread, raw,
-overview, sessions, recent, summaries, memories,
-subagents, workflows, workflowTree, fileHistory, failures
+overview, sessions, search, messages, memories, summaries, sql
 ```
 
-All list helpers accept bounded `limit` options. Many helpers also accept
+Specialized globals remain available: `fileHistory`, `failures`, `subagents`,
+and `raw`. Compatibility globals remain available with their previous behavior:
+`context`, `thread`, `recent`, `trace`, `workflows`, and `workflowTree`.
+They are not part of the default teaching surface. `recent` is deprecated;
+use `sessions({ limit: n })` instead.
+
+Use each list helper's documented `limit` option. Compatibility thread/trace
+return complete sequences; their signatures do not accept a limit. Many helpers also accept
 `project`, `sessionId`, `sessions`, `after`, `before`, `branch`, and `source`
 when the underlying table can express that scope. Passing a string to many list
 helpers is treated as `sessionId`; passing a number is treated as `limit`.
+Limits must be non-negative; passing a negative limit throws a `RangeError`
+whose message names the helper and the offending value.
 
 ### Mutation Helpers
 
@@ -98,12 +110,16 @@ Full-text search across all indexed message text using FTS5.
 | `opts.limit` | `number` | Max results, default 20 |
 | `opts.sessionId` | `string` | Restrict to one session |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
+| `opts.projectPath` | `string` | Exact match on `sessions.project_path` |
+| `opts.contextLimit` | `number` | Temporal neighbors per hit, integer 0–6; default 6. Zero skips neighbor lookup |
+| `opts.snippetTokens` | `number` | Return a matched FTS excerpt instead of the full hit text, integer 1–64; omitted by default |
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"` |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
+| `opts.fallback` | `'or'` | On zero hits only, retry safe tokens joined by OR |
 
 Returns:
 
@@ -121,18 +137,104 @@ Array<{
 
 `context` is temporal neighbor context in the same session, not a parent chain.
 Hits and neighbors carry `visibility`.
-Use `context(uuid)` or `trace(uuid)` for causal/parent-chain expansion. Lower
+Use `messages({ around: uuid, relation: 'parents', beforeCount: 3 })` for
+bounded parent-path expansion. Lower
 FTS rank sorts earlier; prefer returned order unless deliberately inspecting
 FTS ranking.
+
+For a compact first pass, use `search(topic, { projectPath, limit: 30,
+snippetTokens: 16, contextLimit: 0 })`; promising hits retain their UUID and
+session ID. When `snippetTokens` is set, `message.text` is a matched excerpt and
+`message.isSnippet` plus `message.textLength` mark that the full text was not
+returned. Expand selected UUIDs with `context(uuid)` or `raw(uuid)`; do not treat
+the excerpt as complete evidence. The CLI exposes the same controls as
+`--project-path`, `--limit`, `--snippet-tokens`, and `--context-limit`.
+The first argument after `--search` is search text, even when it begins with
+`--`; options follow that argument. A standalone `--` ends option parsing and
+treats everything after it as text: `obelisk --search -- --limit` searches for
+the literal flag name, and `obelisk --search needle -- --help` searches both terms.
 
 Valid FTS5 syntax in `text` is honored. Input that FTS5 would reject as
 malformed (for example a hyphenated term like `foo-bar`) does not error: it
 falls back to safe per-token quoting — the same tokenization `memories()` uses —
 so ordinary text never crashes the query.
 
-#### `context(uuid, opts?)`
+`fallback: 'or'` is opt-in and does not alter a non-empty primary result. Use it
+for semantic-history recall, not exact scopes or sentinels where zero hits carry
+meaning. The retry retains all structural, visibility, and meta filters.
+
+#### `messages(optsOrUuid)`
+
+Bounded message retrieval (CLI 0.3.0+). Choose exactly one locator:
+
+```js
+messages(uuid) // exact lookup; equivalent to { uuid }
+messages({ around: uuid, beforeCount: 3, afterCount: 3 }) // temporal neighbors
+messages({ around: uuid, relation: 'parents', beforeCount: 3 }) // ancestor tail
+messages({ sessionId, after, before, limit: 20, cursor }) // session page
+```
+
+Returns:
+
+```js
+{ anchor, messages, session, hasMore, nextCursor } | null
+// anchor: message row for uuid/around, otherwise null
+// messages: Array<message>, including an explicitly selected anchor
+// session: session row only with includeSession: true, otherwise null
+// nextCursor: { timestamp, uuid } for a non-final session page, otherwise null
+```
+
+| Option | Description |
+| --- | --- |
+| `uuid` | Exact message lookup; string shorthand has this meaning |
+| `around` | Anchor for a finite window |
+| `sessionId` | Session interval/page; cannot combine with uuid/around |
+| `relation` | Around only: `timeline` (default) or `parents` |
+| `beforeCount`, `afterCount` | Around only; default 3/3 for timeline, 3/0 for parents |
+| `after`, `before` | Session only; exclusive timestamp bounds |
+| `limit` | Session only; default 20, integer 0–500 |
+| `cursor` | Session only; continue after timestamp+UUID from nextCursor with the same filters |
+| `agentId` | Session only; string for one agent, null for main-agent rows; omitted includes all agents |
+| `contentTypes` | Non-empty array of content-type strings; omitted includes all types |
+| `includeMeta` | Include control-plane neighbors/page rows; default false |
+| `includeInactive` | Include inactive anchors/neighbors/page rows; default false |
+| `includeSession` | Attach session metadata; default false |
+
+All returned messages carry normalized `visibility`. Hidden messages never
+appear, even with includeInactive. An explicit anchor is selected by visibility
+and remains included regardless of contentTypes/includeMeta; those filters apply
+to neighbors and session pages. Missing, hidden, or non-opted-in inactive anchors
+return null. Sessions with no matching indexed messages return an empty page.
+If indexed messages exist but their session metadata is missing, the messages
+remain available and attached session is null.
+
+Timeline windows stay in the anchor's session and agent. Timeline windows and
+session pages sort ascending by `COALESCE(timestamp,'')`, then UUID. This is a
+deterministic temporal order, **not provider entry order or branch ancestry**;
+same-time UUID ties may disagree with parent order. A timeline window does not
+assert that all returned messages belong to one causal branch.
+
+Parents mode follows parent_uuid, omits the anchor from the ancestor count, and
+returns oldest selected ancestor first, followed by the anchor. It preserves
+parent order, including equal timestamps. Filtering happens before counting,
+and hidden/inactive bridge records may be traversed without being exposed.
+Missing parents terminate the path without temporal stitching. Parents mode
+requires afterCount=0: descendants can be ambiguous across branches, so this
+interface does not invent a forward causal path.
+
+Counts are integers 0–500; an around window, including its anchor, cannot exceed
+500 returned messages. hasMore indicates additional eligible rows beyond a
+requested direction/page; zero-count directions are not traversed. A zero-limit
+session page has no continuation cursor. No full ancestor count is computed.
+Detected parent cycles and scans exceeding 10,000 structural records fail
+explicitly, without returning partial evidence. Unknown options or options for
+the wrong locator mode are rejected. No schema change or re-index is required.
+
+#### `context(uuid, opts?)` — compatibility
 
 Full indexed context around one message.
+Existing behavior is retained. New retrieval should use a bounded messages
+window; an ordinary time window does not reproduce this full-chain contract.
 
 | Param | Type | Description |
 | --- | --- | --- |
@@ -230,7 +332,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'pi', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'deepseek' | 'kimi' | 'kiro' | 'omp' | 'pi' | 'opencode' | 'zcode', session_count, last_session_at }]
   }
 }
 ```
@@ -249,18 +351,26 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"deepseek"`, `"kimi"`, or `"pi"`; omit for all |
-| `opts.sessionId` | `string` | Exact session ID |
-| `opts.sessions` | `string[]` | Restrict to session IDs |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"`; omit for all |
+| `opts.sessionId` | `string` | Canonical session ID; a non-exact ref resolves as a literal fragment, capped at the 10 newest matches |
+| `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 
 Returns `Array<session_row>`.
+Only `sessions()` resolves fragments; every other helper matches `sessionId`
+exactly. Fragments match literally, so `%` and `_` in them are not SQL
+wildcards, and expand to at most the 10 newest containing sessions within the
+requested project/source/time/branch filters; entries
+from `sessionId` and `sessions` union. A raw native id normally resolves to
+exactly one session; several rows mean the id is not unique (for example a
+copied session file), so narrow with `project` or `source`.
 `message_count` describes the visible canonical transcript; inactive and hidden
 records do not increase it. The invoking session row carries
 `is_invoking: true` (see Invocation Identity); other rows omit the field.
 
-#### `recent(n?)`
+#### `recent(n?)` — deprecated compatibility alias
 
 Shorthand for `sessions({ limit: n })`. Default `n` is 10.
+Use sessions directly in new scripts.
 
 Returns `Array<session_row>`.
 
@@ -324,9 +434,9 @@ full content.
 
 ---
 
-## Structural Expansion Helpers
+## Specialized and Compatibility Helpers
 
-#### `trace(uuid, opts?)`
+#### `trace(uuid, opts?)` — advanced compatibility
 
 Walk the `parent_uuid` chain from a message to the conversation root.
 
@@ -334,7 +444,7 @@ Pass `{ includeInactive: true }` to follow a superseded path. Returns labeled
 messages ordered root-first. A hidden target returns an empty array, and hidden
 ancestors are omitted.
 
-#### `thread(sessionId, opts?)`
+#### `thread(sessionId, opts?)` — compatibility
 
 Messages in a session ordered by timestamp.
 
@@ -344,8 +454,9 @@ Messages in a session ordered by timestamp.
 | `opts.includeMeta` | `boolean` | Include injected/control-plane rows, default false |
 | `opts.includeInactive` | `boolean` | Include superseded messages, default false |
 
-Returns `Array<message>`. Use `thread()` as a last resort; prefer targeted
-search/context or compact SQL projections.
+Returns `Array<message>` for the complete session. This compatibility helper
+does not apply limit, after, or before. Use messages({ sessionId, limit, after,
+before }) for bounded new queries, and nextCursor for paging.
 
 #### `raw(uuid, opts?)`
 
@@ -369,7 +480,9 @@ Returns:
 ```
 
 `raw()` resolves main-session, subagent, workflow-agent, and Codex JSONL paths
-from indexed metadata. Hidden targets always return `null`.
+from indexed metadata. OpenCode resolves projected SQLite store rows (V2
+`session_message` or V1 `message`/`part`) with extracted message text. Hidden
+targets always return `null`.
 
 ---
 
@@ -395,7 +508,7 @@ Returns:
 Array<{ ...subagent_row, messageCount }>
 ```
 
-#### `workflows(opts?)`
+#### `workflows(opts?)` — advanced compatibility
 
 Workflow run rows ordered newest first. Passing a string is treated as
 `sessionId`.
@@ -411,7 +524,7 @@ Workflow run rows ordered newest first. Passing a string is treated as
 
 Returns `Array<workflow_row>`.
 
-#### `workflowTree(runId)`
+#### `workflowTree(runId)` — advanced compatibility
 
 Lightweight execution tree for one workflow run. It parses `result_json` and
 adds per-agent message counts. It does not load agent messages.

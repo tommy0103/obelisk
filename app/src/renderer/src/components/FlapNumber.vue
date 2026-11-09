@@ -64,13 +64,13 @@ onUnmounted(() => {
   <span class="flap-number" :aria-label="String(value)">
     <span
       v-for="(slot, index) in slots"
-      :key="`${state.version}:${index}`"
+      :key="index"
       class="flap-slot"
       :class="{ flipping: state.animating && slot.changed }"
       aria-hidden="true"
     >
       <span v-if="!state.animating || !slot.changed" class="flap-digit stable">{{ slot.to }}</span>
-      <template v-else>
+      <template v-else :key="state.version">
         <span class="flap-digit flap-new-top">{{ slot.to }}</span>
         <span class="flap-digit flap-old-bottom">{{ slot.from }}</span>
         <span class="flap-digit flap-old-top">{{ slot.from }}</span>
@@ -96,6 +96,9 @@ onUnmounted(() => {
   height: 1lh;
   overflow: hidden;
   contain: paint;
+  /* Prepare the digit context once; flips replace only their animated faces. */
+  perspective: 90px;
+  transform-style: preserve-3d;
 }
 
 .flap-digit {
@@ -104,11 +107,6 @@ onUnmounted(() => {
   display: grid;
   place-items: center;
   backface-visibility: hidden;
-}
-
-.flap-slot.flipping {
-  perspective: 90px;
-  transform-style: preserve-3d;
 }
 
 .flap-slot.flipping::after {

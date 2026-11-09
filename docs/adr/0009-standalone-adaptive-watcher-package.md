@@ -47,6 +47,12 @@ lifecycle remain implementation details of the package.
 - `tree` targets use `@parcel/watcher`'s native recursive backend to observe
   topology changes and ordinary updates with resource use proportional to
   configured roots rather than total files.
+- A provider may attach `fileNames` to a `tree` target when its source uses files
+  without a transcript suffix (for example, a SQLite store inside each profile
+  directory). The watcher ignores this caller-side hint; the app uses it to
+  forward matching descendant file events and promote active files into the
+  bounded hot set. This covers profiles created after startup without
+  synchronously enumerating directories in Electron's main process.
 - `file` targets are pinned in a small asynchronous metadata poller and are
   never passed to Parcel as subscription roots.
 - Recently active transcript paths occupy a bounded LRU hot set. The first
@@ -66,6 +72,11 @@ explicit path into the hot set for both startup and runtime activity:
 1. A startup/full inventory returns `watchHints` for recently processed
    transcripts, covering an active file whose descriptor was already open
    before the watcher started.
+   For virtual database-unit keys, an adapter may implement
+   `watchHints(unitKey)` to return actual source files (including its WAL).
+   Core expands and deduplicates these paths within the same bounded hint
+   budget, in the indexer worker. Adapters return no hints for excluded roots;
+   no provider-specific key parsing or directory scans run in Electron main.
 2. A new transcript is first visible as a topology `create` event on its tree.
    The package promotes that path before delivering the path invalidation; the
    caller's catch-up build reads all content written before promotion, and

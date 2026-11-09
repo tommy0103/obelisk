@@ -36,12 +36,13 @@ test('README presents agent-led installation before manual npm setup', () => {
     join(repoRoot, 'packaging', 'skill-README.md'),
     'utf8',
   );
-  const agentInstall = source.indexOf('Let your agent install it (recommended)');
-  const manualInstall = source.indexOf('Install manually');
+  const agentInstall = source.indexOf(
+    'curl -fsSL https://raw.githubusercontent.com/tommy0103/obelisk/main/SKILL.md',
+  );
+  const manualInstall = source.indexOf('npm install --global @obelisk-apps/cli');
 
   assert.ok(agentInstall >= 0);
   assert.ok(manualInstall > agentInstall);
-  assert.match(source, /curl -fsSL .*\/SKILL\.md/);
   assert.ok(
     publishedSkillReadme.indexOf('Install with your agent (recommended)')
       < publishedSkillReadme.indexOf('Install manually'),
