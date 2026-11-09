@@ -269,6 +269,26 @@ test('replaying unchanged compressed parent preserves child contributions', () =
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id=?').get(parentSessionId).count, 2, 'child message preserved');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM subagents WHERE session_id=?').get(parentSessionId).count, 1, 'child subagent preserved');
 
+  const sessionIndexPath = join(root, 'session_index.jsonl');
+  writeFileSync(sessionIndexPath, JSON.stringify({
+    id: parentId, thread_name: 'Updated compressed title', updated_at: '2026-06-10T12:00:00Z',
+  }) + '\n');
+  const metadataUnits = provider.discover({
+    lastCursor: key => cursorMap.get(key) ?? null,
+    changedPaths: [sessionIndexPath],
+  });
+  const parentMetadata = metadataUnits.find(unit => unit.key === parentPath);
+  assert.ok(parentMetadata);
+  const metadata = drain(provider.parse(parentMetadata, parentCursor));
+  assert.deepEqual(metadata.values.map(record => record.kind), ['session']);
+  persist(db, parentMetadata, provider.parse(parentMetadata, parentCursor));
+  const session = db.prepare('SELECT title, ended_at, message_count FROM sessions WHERE id=?').get(parentSessionId);
+  assert.equal(session.title, 'Updated compressed title');
+  assert.equal(session.ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id=?').get(parentSessionId).count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM subagents WHERE session_id=?').get(parentSessionId).count, 1);
+  assert.equal(metadata.ret, parentCursor, 'metadata-only publication does not consume transcript progress');
+
   db.close();
 });
 

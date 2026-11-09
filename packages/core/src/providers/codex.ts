@@ -224,6 +224,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
           guardian: guardian !== null,
           indexedTitle: indexed?.title,
           indexedUpdatedAt: indexed?.updatedAt,
+          sessionIndexChanged,
         },
       }];
     })
@@ -575,7 +576,20 @@ export function* parse(
 ): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
   const compressed = isCodexCompressedPath(unit.key);
-  if (compressed && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key)) {
+  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean } | undefined;
+  if (compressed && !sourceMeta?.guardian && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key)) {
+    if (sourceMeta?.sessionIndexChanged) {
+      // The archive did not change, but session_index.jsonl is a separate
+      // metadata source. Read a fresh snapshot for native-title precedence and
+      // bounds, then publish only its root aggregate. Replaying its deletion
+      // or messages would retract unchanged child contributions.
+      for (const record of parse(unit, null, metrics, testHooks)) {
+        if (record.kind === 'session') {
+          yield { ...record, message_count: 0, countMode: 'delta' };
+        }
+      }
+      return _cursor;
+    }
     if (metrics) metrics.plan = 'noop';
     return _cursor;
   }
