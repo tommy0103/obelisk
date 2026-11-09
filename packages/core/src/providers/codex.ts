@@ -149,7 +149,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       }
     }
   }
-  return codexTranscriptDirs(rootDir).flatMap((transcriptDir) => (
+  const discovered: IndexUnit[] = codexTranscriptDirs(rootDir).flatMap((transcriptDir) => (
     discoverCodexJsonlFiles(transcriptDir, ctx.reportIncompleteInventory).flatMap((file) => {
       const fileChanged = changedFiles.has(normalize(file.path));
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
@@ -168,7 +168,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
             key: file.path,
             sessionId: codexDbId(parentId || checkpoint.threadRawId) ?? '',
             meta: {
-              source: 'codex', guardian: false,
+              source: 'codex', guardian: false, parentThreadId: parentId,
               indexedTitle: indexed?.title,
               indexedUpdatedAt: indexed?.updatedAt,
             },
@@ -224,6 +224,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         meta: {
           source: 'codex',
           guardian: guardian !== null,
+          parentThreadId: parentId,
           indexedTitle: indexed?.title,
           indexedUpdatedAt: indexed?.updatedAt,
           sessionIndexChanged,
@@ -231,6 +232,52 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       }];
     })
   ));
+  // Switching archive representation can replace the root inode while leaving
+  // unchanged child cursors behind. A root snapshot retracts its whole session,
+  // so publish every contributor in one transaction, even in changed-path mode.
+  const indexed = new Map((ctx.indexedSessions?.() ?? []).map(session => [session.sessionId, session]));
+  const transitions = discovered.filter(unit => {
+    const meta = unit.meta as { guardian?: boolean; parentThreadId?: string | null };
+    if (meta.guardian || meta.parentThreadId || !unit.sessionId) return false;
+    const previous = indexed.get(unit.sessionId);
+    if (!previous) return false;
+    const canonical = (path: string) => normalize(path).replace(/\.zst$/, '');
+    return canonical(previous.jsonlPath) === canonical(unit.key)
+      && (normalize(previous.jsonlPath) !== normalize(unit.key)
+        || (isCodexCompressedPath(unit.key) && ctx.lastCursor(unit.key) !== null
+          && codexCursorSignatureDiffers(ctx.lastCursor(unit.key)!, unit.key)));
+  });
+  if (transitions.length === 0) return discovered;
+  let censusComplete = true;
+  const complete = discoverAt(rootDir, {
+    ...ctx, changedPaths: undefined, lastCursor: () => null, indexedSessions: () => [],
+    reportIncompleteInventory: issue => {
+      censusComplete = false;
+      ctx.reportIncompleteInventory?.(issue);
+    },
+  });
+  const replaced = new Set(transitions.map(unit => unit.sessionId));
+  const remaining = discovered.filter(unit => !replaced.has(unit.sessionId));
+  if (!censusComplete) {
+    for (const id of replaced) ctx.retainSession?.(id);
+    return remaining;
+  }
+  for (const root of transitions) {
+    const family = complete.filter(unit => unit.sessionId === root.sessionId);
+    if (!family.some(unit => unit.key === root.key)) {
+      ctx.retainSession?.(root.sessionId);
+      ctx.reportIncompleteInventory?.({ path: root.key, error: 'Archive transition root disappeared during contributor census' });
+      continue;
+    }
+    family.sort((a, b) => Number(b.key === root.key) - Number(a.key === root.key));
+    for (const unit of family) {
+      remaining.push({
+        ...unit, atomicGroup: `archive-transition:${root.sessionId}`,
+        meta: { ...(unit.meta as object), forceSnapshot: true, replaceSnapshot: unit.key === root.key },
+      });
+    }
+  }
+  return remaining;
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
@@ -578,7 +625,8 @@ export function* parse(
 ): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
   const compressed = isCodexCompressedPath(unit.key);
-  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean } | undefined;
+  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean; forceSnapshot?: boolean; replaceSnapshot?: boolean } | undefined;
+  if (sourceMeta?.forceSnapshot) _cursor = null;
   if (compressed && !sourceMeta?.guardian && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key)) {
     if (sourceMeta?.sessionIndexChanged) {
       // The archive did not change, but session_index.jsonl is a separate
@@ -900,7 +948,7 @@ export function* parse(
   // A child rollout contributes to its parent projection. Replaying only this
   // child cannot safely retract the whole parent session; leave destructive
   // replacement to orchestration that replays the complete contributing tree.
-  const canRetract = _cursor !== null && !fast && !agentId;
+  const canRetract = (sourceMeta?.replaceSnapshot || (_cursor !== null && !fast)) && !agentId;
   if (canRetract) out.push({ kind: 'delete-session', sessionId });
   const msgByUuid = new Map<string, MessageRecord>();
   const emittedMessageUuids = new Set<string>();

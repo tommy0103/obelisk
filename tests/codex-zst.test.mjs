@@ -4,11 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
 
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
+import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { createProviderIndexPlan, indexProviderPlanStrict } from '../packages/core/src/provider-indexing.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import {
@@ -363,4 +365,69 @@ test('discoverAt reports incomplete inventory on corrupt compressed file', () =>
   assert.equal(units.length, 0);
   assert.equal(reported.length, 1);
   assert.equal(reported[0].path, corruptPath);
+});
+
+test('Plain to Compressed to Resumed Plaintext atomically preserves unchanged child contributors', () => {
+  const root = makeTempDir('obelisk-codex-archive-family-');
+  const dir = join(root, 'sessions');
+  mkdirSync(dir);
+  const bytes = readFileSync(new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url));
+  const lines = bytes.toString().trimEnd().split('\n').map(JSON.parse);
+  const parentId = lines[0].payload.id;
+  const sessionId = `codex:${parentId}`;
+  const childLines = structuredClone(lines);
+  childLines[0].payload.id = 'archive-child';
+  childLines[0].payload.source = { subagent: { thread_spawn: { parent_thread_id: parentId, agent_role: 'worker' } } };
+  const plain = join(dir, 'a-root.jsonl');
+  const archive = `${plain}.zst`;
+  const child = join(dir, 'z-child.jsonl');
+  writeFileSync(plain, bytes);
+  writeFileSync(child, childLines.map(JSON.stringify).join('\n') + '\n');
+  const provider = createCodexProvider({ rootDir: root });
+  const registry = createProviderRegistry([provider]);
+  const db = freshDb();
+  const projection = () => ['messages', 'tool_calls', 'tool_results', 'subagents'].map(table =>
+    JSON.stringify(db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map(row => ({ ...row }))));
+  const run = changedPaths => {
+    const plan = createProviderIndexPlan(db, registry, { changedPaths, readMode: 'strict' });
+    db.exec('BEGIN');
+    try { indexProviderPlanStrict({ db, plan }); db.exec('COMMIT'); }
+    catch (error) { db.exec('ROLLBACK'); throw error; }
+    return plan;
+  };
+  try {
+    run();
+    const initial = projection();
+    assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE session_id=?').get(sessionId).n, 80);
+    writeFileSync(archive, zstdCompressSync(bytes));
+    unlinkSync(plain);
+    const compressed = run([plain, archive]);
+    assert.equal(compressed.items.length, 2);
+    assert.ok(compressed.items.every(item => item.unit.atomicGroup === compressed.items[0].unit.atomicGroup));
+    assert.deepEqual(projection(), initial);
+    writeFileSync(plain, bytes); // upstream materializes into a new inode
+    unlinkSync(archive);
+    const resumedPlan = createProviderIndexPlan(db, registry, { changedPaths: [plain, archive], readMode: 'strict' });
+    assert.equal(resumedPlan.items.length, 2);
+    const failing = { ...provider, *parse(unit, cursor) {
+      if (unit.key === child) throw new Error('injected child source failure');
+      return yield* provider.parse(unit, cursor);
+    } };
+    const failingPlan = { ...resumedPlan, items: resumedPlan.items.map(item => ({ ...item, provider: failing })) };
+    db.exec('BEGIN');
+    assert.throws(() => indexProviderPlanStrict({ db, plan: failingPlan }), /injected child source failure/);
+    db.exec('ROLLBACK');
+    assert.deepEqual(projection(), initial, 'failed family publication retains root and child tool/message rows');
+    run([plain, archive]);
+    assert.deepEqual(projection(), initial);
+    // Append another captured event shape with distinct text after restoration.
+    const appended = structuredClone(lines.find(row => row.type === 'event_msg' && row.payload.type === 'user_message'));
+    appended.payload.message = 'archive-resume-append';
+    appended.timestamp = '2026-11-09T12:00:00Z';
+    writeFileSync(plain, Buffer.concat([bytes, Buffer.from(JSON.stringify(appended) + '\n')]));
+    run([plain]);
+    assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE session_id=? AND agent_id IS NOT NULL').get(sessionId).n, 40);
+    assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE text=?').get('archive-resume-append').n, 1);
+    assert.equal(db.prepare('SELECT count(*) n FROM subagents').get().n, 1);
+  } finally { db.close(); }
 });
