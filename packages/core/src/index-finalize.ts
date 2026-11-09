@@ -6,7 +6,7 @@
 // transactions; this module owns the invariants that must not diverge between
 // the two indexing modes.
 
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { inferProjectPath } from './parsing.ts';
 import type { SqliteDb, SqliteRow } from './sqlite-types.ts';
 
@@ -199,7 +199,9 @@ export function backfillSessionTitles(db: SqliteDb): number {
 }
 
 /**
- * Recompute `message_count` for sessions whose transcript no longer exists.
+ * Recompute counts only for Claude sessions with surviving subagent rows and
+ * a main transcript proved absent. Other providers own their count semantics
+ * and may store logical provenance such as database paths with fragments.
  *
  * Sessions rebuilt from the last surviving subagent log (see the claude
  * adapter) are counted with `countMode: 'delta'`, because several subagent
@@ -215,8 +217,11 @@ export function backfillSessionTitles(db: SqliteDb): number {
  */
 export function repairOrphanedSessionCounts(db: SqliteDb): number {
   const sessions = db.prepare(`
-    SELECT id, jsonl_path, message_count FROM sessions
-    WHERE jsonl_path IS NOT NULL AND jsonl_path <> ''
+    SELECT s.id, s.jsonl_path, s.message_count FROM sessions s
+    WHERE COALESCE(s.source, 'claude') = 'claude'
+      AND s.jsonl_path IS NOT NULL AND s.jsonl_path <> ''
+      AND EXISTS (SELECT 1 FROM messages m
+                  WHERE m.session_id = s.id AND m.agent_id IS NOT NULL)
   `).all();
   if (sessions.length === 0) return 0;
   const count = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?');
@@ -225,7 +230,14 @@ export function repairOrphanedSessionCounts(db: SqliteDb): number {
   for (const session of sessions) {
     // A readable transcript stays authoritative: it can be re-parsed, and
     // `message_count` may legitimately cover rows the adapter chose to fold.
-    if (existsSync(String(session.jsonl_path))) continue;
+    try {
+      statSync(String(session.jsonl_path));
+      continue;
+    } catch (error) {
+      // Denied or unstable source access is not evidence that the main file
+      // disappeared. Leave the provider's last-good count alone in that case.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') continue;
+    }
     const actual = Number(count.get(String(session.id))?.n ?? 0);
     if (actual === Number(session.message_count ?? 0)) continue;
     update.run(actual, String(session.id));
