@@ -23,8 +23,11 @@ obelisk --query /tmp/query.mjs
 
 ### Unreadable provider settings
 
-Only a missing `~/.obelisk/settings.json` (`ENOENT` when read) selects default
-provider roots. Access-denied, I/O and invalid-path failures are reported as
+Only a missing settings file (`ENOENT` when read) selects default provider
+roots. This uses the resolved settings location: `OBELISK_HOME/settings.json`
+when overridden, the config location when XDG storage is enabled, or
+`~/.obelisk/settings.json` by default. Access-denied, I/O and invalid-path
+failures are reported as
 unavailable settings, not as an absent configuration. A force build then fails
 without publishing a snapshot. Existing indexed queries remain available with
 an explicit refresh-skipped warning, but invocation-nonce recovery cannot write
