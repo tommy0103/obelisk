@@ -13,6 +13,7 @@ import {
   createProviderRegistry,
   type ProviderRegistry,
 } from './providers/registry.ts';
+import { resolveObeliskPaths } from './paths.ts';
 import type { CopilotChronicleOpener } from './providers/copilot.ts';
 import { defaultCopilotUserDataRoots } from './providers/copilot.ts';
 import type { HermesStoreOpener } from './providers/hermes.ts';
@@ -103,7 +104,7 @@ export function resolveProviderRoots(
 }
 
 export function readPersistedProviderSettings(
-  settingsPath = join(homedir(), '.obelisk', 'settings.json'),
+  settingsPath = resolveObeliskPaths().settingsPath,
 ): ProviderSettingsReadResult {
   if (!existsSync(settingsPath)) return { ok: true, settings: {} };
   try {
