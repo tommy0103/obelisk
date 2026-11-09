@@ -80,7 +80,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, basename, isAbsolute, join, normalize, sep } from 'node:path';
+import { dirname, basename, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 
 import { filePath, normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson } from '../parsing.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../vendor/dsh-zstd.ts';
@@ -1794,7 +1794,12 @@ function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
 function deepseekSessionsRoot(): string {
   const env = process.env.DSH_HOME;
   const home = env !== undefined && env.trim().length > 0 ? env : join(homedir(), '.dsh');
-  return join(home, 'sessions');
+  // Match DSH's resolveDshHome(): expand only bare ~ and the two supported
+  // home-relative prefixes, then resolve relative overrides against cwd.
+  const expanded = home === '~' ? homedir()
+    : home.startsWith('~/') || home.startsWith('~\\') ? join(homedir(), home.slice(2))
+    : home;
+  return join(resolve(expanded), 'sessions');
 }
 
 export function createDeepseekProvider({ rootDir = deepseekSessionsRoot() }: { rootDir?: string } = {}): ProviderAdapter {
