@@ -10,10 +10,12 @@ import Database from 'better-sqlite3';
 import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
+  backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
   dropMessageFtsTriggers,
   ensureFtsReady,
   refreshSessionProjectPaths,
+  repairOrphanedSessionMetadata,
 } from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
@@ -40,12 +42,12 @@ import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migr
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
 import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
+import { resolveObeliskPaths } from '../../../packages/core/src/paths.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const DEFAULT_OBELISK_DIR = path.join(os.homedir(), '.obelisk');
-const DEFAULT_DB_PATH = path.join(DEFAULT_OBELISK_DIR, 'obelisk.sqlite');
+const DEFAULT_DB_PATH = resolveObeliskPaths().dbPath;
 
 function resolveSchemaPath() {
   const candidates = [
@@ -427,6 +429,8 @@ function buildIndex({
           backfillUnresolvedSessionProjectPathsOnce(db);
         }
         healWorkflowParentLinks(db);
+        repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
+        backfillSessionTitles(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
         writeIndexMarker(db, '__last_build__');

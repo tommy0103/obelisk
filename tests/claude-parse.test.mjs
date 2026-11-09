@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
+import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -74,8 +76,8 @@ test('claude parse() yields the expected record stream for a main session', () =
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].title, 'My Session');
   assert.equal(sessions[0].message_count, 3);
-  assert.equal(sessions[0].started_at, '2026-06-10T10:00:00Z');
-  assert.equal(sessions[0].ended_at, '2026-06-10T10:00:10Z');
+  assert.equal(sessions[0].started_at, '2026-06-10T10:00:00.000Z');
+  assert.equal(sessions[0].ended_at, '2026-06-10T10:00:10.000Z');
   assert.equal(sessions[0].git_branch, 'main');
 
   const detail = assembleSessionDetail(values);
@@ -94,6 +96,39 @@ test('claude parse() emits no session record for a subagent transcript', () => {
   assert.equal(values.filter(r => r.kind === 'session').length, 0);
   // Subagent messages carry the unit's agent id.
   assert.equal(values.filter(r => r.kind === 'message').every(m => m.agent_id === 'agent-7'), true);
+});
+
+test('claude parse() normalizes zone-carrying timestamps and keeps zone-less ones verbatim', () => {
+  const dir = makeTempDir('obelisk-claude-ts-');
+  const path = join(dir, 'sid-ts.jsonl');
+  const lines = [
+    { uuid: 'o1', type: 'user', timestamp: '2026-06-10T18:00:04+08:00', message: { role: 'user', content: 'offset' } },
+    { uuid: 'n1', type: 'assistant', timestamp: '2026-06-10T10:00:05Z', message: { role: 'assistant', content: [{ type: 'text', text: 'no millis' }] } },
+    { uuid: 'm1', type: 'assistant', timestamp: '2026-06-10T10:00:06.123456Z', message: { role: 'assistant', content: [{ type: 'text', text: 'micros' }] } },
+    { uuid: 'z1', type: 'user', timestamp: '2026-06-10T10:00:07', message: { role: 'user', content: 'zone-less' } },
+    { uuid: 'x1', type: 'user', message: { role: 'user', content: 'no timestamp' } },
+  ];
+  writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+
+  const { values } = drain(parse({ key: path, sessionId: 'sid-ts', project: 'quiet-zero' }, null));
+  const messages = values.filter(r => r.kind === 'message');
+
+  // Zone-carrying values are stored in canonical .sssZ form — the shape whose
+  // text order is chronological — whatever offset or precision the provider
+  // wrote. A zone-less value has no unambiguous UTC reading (JS would assume
+  // local time, SQLite UTC), so it is stored verbatim instead of being
+  // silently shifted; a missing value stays null.
+  assert.deepEqual(messages.map(m => [m.uuid, m.timestamp]), [
+    ['o1', '2026-06-10T10:00:04.000Z'],
+    ['n1', '2026-06-10T10:00:05.000Z'],
+    ['m1', '2026-06-10T10:00:06.123Z'],
+    ['z1', '2026-06-10T10:00:07'],
+    ['x1', null],
+  ]);
+
+  const session = values.find(r => r.kind === 'session');
+  assert.equal(session.started_at, '2026-06-10T10:00:04.000Z');
+  assert.equal(session.ended_at, '2026-06-10T10:00:07');
 });
 
 test('claude parse() resumes from a cursor, skipping already-indexed lines', () => {
@@ -205,7 +240,8 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
 
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
-  for (const unit of units) persist(db, unit, provider.parse(unit, null));
+  const cursors = new Map();
+  for (const unit of units) cursors.set(unit.key, persist(db, unit, provider.parse(unit, null)));
   const workflows = db.prepare('SELECT * FROM workflows').all();
   for (const row of workflows) row.agents = db.prepare('SELECT * FROM workflow_agents WHERE run_id=?').all(row.run_id);
   const persistedDetail = assembleSessionDetail({
@@ -218,6 +254,55 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
     summaries: db.prepare('SELECT * FROM summaries').all(),
   });
   assert.deepEqual(persistedDetail, detail);
+
+  // Reuse the same established workflow fixture across the main→orphan
+  // ownership transition and subsequent child-only updates.
+  const context = { lastCursor: key => cursors.get(key) ?? null, previousCursor: key => cursors.get(key) ?? null };
+  const mainPath = join(projectDir, 'sid-workflow.jsonl');
+  unlinkSync(mainPath);
+  const orphan = provider.discover({ ...context, changedPaths: [mainPath] });
+  assert.equal(orphan.length, 1);
+  for (const unit of orphan) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
+  repairOrphanedSessionMetadata(db);
+  healWorkflowParentLinks(db);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 3, 'missing main transcript retains its two cached messages');
+  const orphanWorkflows = db.prepare('SELECT * FROM workflows').all();
+  for (const row of orphanWorkflows) row.agents = db.prepare('SELECT * FROM workflow_agents WHERE run_id=?').all(row.run_id);
+  assert.deepEqual(assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions').get(),
+    messages: db.prepare('SELECT * FROM messages').all(),
+    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+    toolResults: db.prepare('SELECT * FROM tool_results').all(),
+    subagents: db.prepare('SELECT * FROM subagents').all(),
+    workflows: orphanWorkflows,
+  }), { ...detail, session: { ...detail.session, message_count: 3 } });
+  assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 3, 'count includes cached main and surviving child history');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
+
+  const childPath = join(workflowAgentDir, 'agent-7.jsonl');
+  const child = JSON.parse(readFileSync(childPath, 'utf8'));
+  child.message.content = 'updated review';
+  writeFileSync(childPath, JSON.stringify(child) + '\n');
+  const changed = provider.discover({ ...context, changedPaths: [childPath] });
+  for (const unit of changed) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
+  repairOrphanedSessionMetadata(db);
+  healWorkflowParentLinks(db);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 3);
+  assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 3);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1, 'child-only family update retains unchanged workflow ownership');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
+
+  const metaPath = join(workflowAgentDir, 'agent-7.meta.json');
+  const stableMeta = readFileSync(metaPath);
+  writeFileSync(metaPath, '{"agentType":');
+  const damaged = provider.discover({ ...context, changedPaths: [metaPath] });
+  db.exec('BEGIN');
+  assert.throws(() => persist(db, damaged[0], provider.parse(damaged[0], context.lastCursor(damaged[0].key))), /metadata is incomplete/);
+  db.exec('ROLLBACK');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1);
+  writeFileSync(metaPath, stableMeta);
   db.close();
 });
 

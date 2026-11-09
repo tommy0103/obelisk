@@ -290,3 +290,23 @@ a checkpoint is missing or belongs to a different identity. Shared code neither
 decodes provider cursors nor interprets ancestry. Providers without groups keep
 their existing per-unit publication behavior; force remains a single snapshot
 transaction across all units.
+
+**Amendment (2026-11-09): refresh surviving sources over retained history.**
+A missing Claude main transcript with surviving subagent transcripts does not
+revoke already indexed main or child history. Its family unit declares
+`IndexUnit.preserveSessionHistory`: force publication stages that session through
+the existing retained-snapshot mechanism, then upserts the readable family.
+Unlike `retainSession`, this declaration does not withhold projection. The same
+plan applies to in-place CLI rebuilds and desktop database replacement. Ordinary
+refresh likewise performs no family retraction. Orphan count finalization counts
+all stored messages, including cached evidence from unavailable files; it does
+not substitute the surviving-file count. Shared orphan finalization also applies
+the established UTC timestamp normalization to retained messages, summaries,
+workflows and session bounds. Source-gone legacy records cannot pass through the
+provider parser again, but must remain retrievable by canonical UTC time ranges.
+This repair uses bounded batches, skips unchanged canonical values, and keeps
+zone-less or unparseable values unchanged; readable, denied and other-provider
+sources retain their existing authority. When a main transcript returns, its
+normal count authority resumes. This retention policy does not change the fresh
+database canonical parse/persistence invariant: a fresh source projection cannot
+reconstruct additional history that exists only in a previously populated index.

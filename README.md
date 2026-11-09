@@ -216,6 +216,21 @@ discovery) are documented in
 [retrieval semantics](skill-doc/references/retrieval-semantics.md) and the
 [ADRs](docs/adr/).
 
+## Advanced configuration
+
+Storage customization is opt-in. `OBELISK_HOME` has highest precedence, expands
+a leading `~`, and must resolve to an absolute path; otherwise an existing
+`~/.obelisk` keeps precedence. With `OBELISK_USE_XDG=1`, settings use
+`$XDG_CONFIG_HOME/obelisk` (fallback `~/.config/obelisk`) and the database,
+writer lock, and `recap/` use `$XDG_DATA_HOME/obelisk` (fallback
+`~/.local/share/obelisk`). An `OBELISK_HOME` root contains `settings.json`,
+`obelisk.sqlite`, `writer.lock.sqlite`, and `recap/`. Without either option,
+Obelisk uses `~/.obelisk`.
+
+Custom and XDG layouts do not automatically migrate existing data, including
+`~/.claude/obelisk.sqlite`; move files manually if needed. Obelisk emits a
+one-time warning with a link to this section when that legacy database is found.
+
 ## Contributing
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening

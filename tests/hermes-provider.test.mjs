@@ -18,6 +18,7 @@ import { join, win32 } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { projectSlugFromPath } from '../packages/core/src/parsing.ts';
+import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import {
   createProviderIndexPlan,
@@ -2728,5 +2729,24 @@ test('a compaction summary is retrievable through the query API with includeInac
   } finally {
     index.close();
     rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('Claude orphan count repair preserves Hermes visible-message counts and logical source paths', () => {
+  const layout = fixtureHome();
+  const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
+  try {
+    index.run();
+    const counts = () => index.db.prepare(
+      "SELECT id, message_count, jsonl_path FROM sessions WHERE source = 'hermes' ORDER BY id",
+    ).all();
+    const before = counts();
+    assert.ok(before.some(session => session.message_count > 0));
+    assert.ok(before.every(session => session.jsonl_path.includes('#session:')));
+    assert.equal(repairOrphanedSessionMetadata(index.db), 0);
+    assert.deepEqual(counts(), before);
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
   }
 });

@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { codexhostAntigravitySessionId } from '../packages/core/src/providers/codexhost-antigravity.ts';
 import { hermesSessionId } from '../packages/core/src/providers/hermes.ts';
 import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
 import { piFamilySessionId } from '../packages/core/src/providers/pi.ts';
@@ -80,6 +81,49 @@ function searchDb() {
   insert.run('msg-inactive-meta', 'sid-search', 'needle superseded injected', 'user', '2026-06-10T10:02:40Z', null, '/tmp/quiet-zero', 'text', 1, 'inactive');
   insert.run('msg-hidden', 'sid-search', 'needle abandoned branch', 'assistant', '2026-06-10T10:03:00Z', 'claude-opus', '/tmp/quiet-zero', 'text', 0, 'hidden');
   db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  return db;
+}
+
+function guardMessageReads(db, maxReads = 10) {
+  let messageReads = 0;
+  return new Proxy(db, {
+    get(target, property) {
+      if (property !== 'prepare') {
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+      return (sql) => {
+        const statement = target.prepare(sql);
+        if (sql !== 'SELECT * FROM messages WHERE uuid=?') return statement;
+        return new Proxy(statement, {
+          get(statementTarget, statementProperty) {
+            if (statementProperty !== 'get') {
+              return Reflect.get(statementTarget, statementProperty, statementTarget);
+            }
+            return (...bindings) => {
+              messageReads++;
+              if (messageReads > maxReads) throw new Error('parent traversal did not stop');
+              return statementTarget.get(...bindings);
+            };
+          },
+        });
+      };
+    },
+  });
+}
+
+function parentChainDb(sessionId, title, messages) {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO sessions (id,title,source) VALUES (?,?,?)')
+    .run(sessionId, title, 'pi');
+  const insert = db.prepare(`
+    INSERT INTO messages (uuid,session_id,type,parent_uuid,role,text,visibility,source)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+  for (const [uuid, parentUuid] of messages) {
+    insert.run(uuid, sessionId, 'user', parentUuid, 'user', uuid, 'visible', 'pi');
+  }
   return db;
 }
 
@@ -343,6 +387,63 @@ test('context and trace reject hidden targets and omit hidden ancestors', () => 
     api.trace('visible-child').map(message => message.uuid),
     ['visible-root', 'visible-child'],
   );
+  db.close();
+});
+
+test('context and trace stop before repeating a self-referential target', () => {
+  const db = parentChainDb('sid-self-cycle', 'Self cycle', [['self-cycle', 'self-cycle']]);
+  const api = createQueryApi(guardMessageReads(db));
+  assert.deepEqual(api.context('self-cycle').parentChain, []);
+  assert.deepEqual(api.trace('self-cycle').map(message => message.uuid), ['self-cycle']);
+  db.close();
+});
+
+test('context and trace return each message once in a two-message parent cycle', () => {
+  const db = parentChainDb('sid-pair-cycle', 'Pair cycle', [
+    ['cycle-a', 'cycle-b'],
+    ['cycle-b', 'cycle-a'],
+  ]);
+  const api = createQueryApi(guardMessageReads(db));
+  assert.deepEqual(
+    api.context('cycle-a').parentChain.map(message => message.uuid),
+    ['cycle-b'],
+  );
+  assert.deepEqual(
+    api.trace('cycle-a').map(message => message.uuid),
+    ['cycle-b', 'cycle-a'],
+  );
+  db.close();
+});
+
+test('context and trace stop cleanly when a parent message is missing', () => {
+  const db = parentChainDb('sid-broken-chain', 'Broken chain', [
+    ['orphan-child', 'missing-parent'],
+  ]);
+  const api = createQueryApi(guardMessageReads(db));
+  assert.deepEqual(api.context('orphan-child').parentChain, []);
+  assert.deepEqual(api.trace('orphan-child').map(message => message.uuid), ['orphan-child']);
+  db.close();
+});
+
+test('context and trace return a complete chain deeper than 1000 parent edges', () => {
+  const db = parentChainDb(
+    'sid-deep-chain',
+    'Deep chain',
+    Array.from({ length: 1003 }, (_, index) => [
+      `deep-${index}`,
+      index === 0 ? null : `deep-${index - 1}`,
+    ]),
+  );
+  const api = createQueryApi(db);
+  const contextChain = api.context('deep-1002').parentChain.map(message => message.uuid);
+  assert.equal(contextChain.length, 1002);
+  assert.equal(contextChain[0], 'deep-0');
+  assert.equal(contextChain.at(-1), 'deep-1001');
+
+  const trace = api.trace('deep-1002').map(message => message.uuid);
+  assert.equal(trace.length, 1003);
+  assert.equal(trace[0], 'deep-0');
+  assert.equal(trace.at(-1), 'deep-1002');
   db.close();
 });
 
@@ -670,6 +771,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawZcode = 'c72e83f1-594a-426d-b8c0-39f621e745ab';
   const rawOpencode = '77777777-7777-4777-8777-777777777777';
   const rawHermes = '20260101_120000_aaaaaa';
+  const rawAntigravity = '88888888-8888-4888-8888-888888888888';
   const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
   const rawKiro = kiroHeader.id;
   // Canonical ids in each provider's own shape: pi/omp/deepseek/kiro namespace by
@@ -685,6 +787,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalZcode = zcodeSessionId('/Users/me/zcode/db/db.sqlite', rawZcode);
   const canonicalHermes = hermesSessionId(rawHermes, 'default', '/Users/me/.hermes/state.db');
   const canonicalKiro = kiroSessionId(rawKiro, kiroHeader.workspacePaths[0]);
+  const canonicalAntigravityA = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-a');
+  const canonicalAntigravityB = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-b');
   const canonicalOpencode = opencodeSessionId(rawOpencode, '/Users/me/opencode/db.sqlite');
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
@@ -702,6 +806,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
   insertSession.run(canonicalKiro, kiroHeader.title, '-workspace-demo', kiroHeader.workspacePaths[0], kiroHeader.createdAt, kiroHeader.lastModifiedAt, null, 1, 'kiro');
   insertSession.run(canonicalOpencode, 'Opencode session', '-Users-me-opencode', '/Users/me/opencode', '2026-09-18T00:30:00Z', '2026-09-18T00:45:00Z', null, 1, 'opencode');
+  insertSession.run(canonicalAntigravityA, 'Antigravity A', '-Users-me-antigravity-a', '/Users/me/antigravity-a', '2026-09-18T00:10:00Z', '2026-09-18T00:20:00Z', null, 1, 'codexhost-antigravity');
+  insertSession.run(canonicalAntigravityB, 'Antigravity B', '-Users-me-antigravity-b', '/Users/me/antigravity-b', '2026-09-18T00:10:00Z', '2026-09-18T00:21:00Z', null, 1, 'codexhost-antigravity');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -717,6 +823,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const lookups = {
     claude: [rawClaude, [rawClaude]],
     codex: [rawCodex, [canonicalCodex]],
+    'codexhost-antigravity': [rawAntigravity, [canonicalAntigravityB, canonicalAntigravityA]],
     copilot: [rawCopilot, [canonicalCopilot]],
     deepseek: [rawDeepseek, [canonicalDeepseek]],
     hermes: [rawHermes, [canonicalHermes]],
@@ -731,6 +838,8 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   for (const [source, [native, expected]] of Object.entries(lookups)) {
     assert.deepEqual(api.sessions({ sessionId: native }).map(row => row.id), expected, `${source} native-ID lookup`);
   }
+
+  assert.deepEqual(api.sessions({ sessionId: rawAntigravity, project: '-Users-me-antigravity-a' }).map(row => row.id), [canonicalAntigravityA]);
 
   // The same uuid scoped to two projects returns every containing row, each
   // labeled with project_path/started_at; other filters narrow as usual.
@@ -783,6 +892,7 @@ test('every provider embeds the native session id verbatim in its canonical id',
     claude: native,
     hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
     codex: codexDbId(native),
+    'codexhost-antigravity': codexhostAntigravitySessionId(native, '/Users/me/obelisk'),
     kimi: kimiSessionId(native),
     kiro: kiroSessionId(native, '/Users/me/obelisk'),
     pi: piFamilySessionId(piHeader, 'pi'),
