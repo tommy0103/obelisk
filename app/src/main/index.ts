@@ -1233,50 +1233,59 @@ ipcMain.handle('settings:get', async () => {
   };
 });
 
-ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(async () => {
-  const persisted = loadPersistedSettings();
-  // Preserve a file the shared reader rejected before the write below replaces it. Runs
-  // before the save, and re-reads the file itself rather than trusting latestSettingsError,
-  // so a stale flag from an earlier read cannot skip or repeat it. Throwing here is the
-  // point: with no preserved copy the overwrite is the silent #42 loss.
-  const backupPath = await preserveRejectedSettings(SETTINGS_PATH, {
-    rename: (from, to) => fs.promises.rename(from, to),
-    copyFile: (from, to) => fs.promises.copyFile(from, to),
-  });
-  const providerRootChanged = setPersistedSetting(persisted, key, value);
-  savePersistedSettings(persisted);
-  if (backupPath !== null) {
-    latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
-    console.warn(latestSettingsRecovery);
-  }
+// A save yields while preserving a rejected file. Keep the complete read/backup/write
+// sequence ordered so another save cannot overwrite a stale snapshot or race its backup.
+// updateLifecycle still tracks queued saves immediately so update cleanup waits for them.
+let settingsWriteTail: Promise<unknown> = Promise.resolve();
+ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
+  const write = settingsWriteTail.then(async () => {
+    const persisted = loadPersistedSettings();
+    // Preserve a file the shared reader rejected before the write below replaces it. Runs
+    // before the save, and re-reads the file itself rather than trusting latestSettingsError,
+    // so a stale flag from an earlier read cannot skip or repeat it. Throwing here is the
+    // point: with no preserved copy the overwrite is the silent #42 loss.
+    const backupPath = await preserveRejectedSettings(SETTINGS_PATH, {
+      rename: (from, to) => fs.promises.rename(from, to),
+      copyFile: (from, to) => fs.promises.copyFile(from, to),
+    });
+    const providerRootChanged = setPersistedSetting(persisted, key, value);
+    savePersistedSettings(persisted);
+    if (backupPath !== null) {
+      latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
+      console.warn(latestSettingsRecovery);
+    }
 
-  if (key === 'autoRefresh') {
-    if (value === false && indexerService) {
+    if (key === 'autoRefresh') {
+      if (value === false && indexerService) {
+        await stopIndexerServiceAndWait();
+      } else if (value !== false) {
+        if (indexerService) await stopIndexerServiceAndWait();
+        startIndexerService({ buildOnStart: true });
+      }
+    }
+
+    const knownLegacyRootChanged = createBuiltinProviderRegistry({
+      claude: DEFAULT_CLAUDE_DIR,
+      codex: DEFAULT_CODEX_DIR,
+    }).catalog().some((provider) => key === `${provider.id}Dir`);
+    if (providerRootChanged || knownLegacyRootChanged) {
       await stopIndexerServiceAndWait();
-    } else if (value !== false) {
-      if (indexerService) await stopIndexerServiceAndWait();
-      startIndexerService({ buildOnStart: true });
+      const paths = getRuntimePaths(persisted);
+      migrateLegacyDbIfNeeded(paths);
+      openDb(paths.dbPath);
+      if (persisted.autoRefresh !== false) {
+        startIndexerService({ buildOnStart: true });
+      }
+      notifyIndexUpdated({ inventoryIssues: [] });
     }
-  }
-
-  const knownLegacyRootChanged = createBuiltinProviderRegistry({
-    claude: DEFAULT_CLAUDE_DIR,
-    codex: DEFAULT_CODEX_DIR,
-  }).catalog().some((provider) => key === `${provider.id}Dir`);
-  if (providerRootChanged || knownLegacyRootChanged) {
-    await stopIndexerServiceAndWait();
-    const paths = getRuntimePaths(persisted);
-    migrateLegacyDbIfNeeded(paths);
-    openDb(paths.dbPath);
-    if (persisted.autoRefresh !== false) {
-      startIndexerService({ buildOnStart: true });
-    }
-    notifyIndexUpdated({ inventoryIssues: [] });
-  }
-  // The save is what moves a rejected file aside, so the notice is returned here as well as
-  // from settings:get: the paths that save without reloading settings (editor, recap
-  // directory, auto-refresh) would otherwise never see it.
-  return { settingsRecovery: latestSettingsRecovery };
+    // The save is what moves a rejected file aside, so the notice is returned here as well as
+    // from settings:get: the paths that save without reloading settings (editor, recap
+    // directory, auto-refresh) would otherwise never see it.
+    return { settingsRecovery: latestSettingsRecovery };
+  });
+  // A refused save must not prevent a later retry after the file becomes writable.
+  settingsWriteTail = write.catch(() => {});
+  return write;
 }));
 
 ipcMain.handle('settings:browseFolder', async (event) => {

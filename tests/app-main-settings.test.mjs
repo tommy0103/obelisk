@@ -2304,3 +2304,45 @@ test('a save is refused and the file left alone when the rejected file cannot be
     cleanup();
   }
 });
+
+for (const corrupt of [false, true]) {
+  test(`concurrent settings saves preserve both changes${corrupt ? ' while backing up a rejected file once' : ''}`, async () => {
+    const original = corrupt ? '{broken' : JSON.stringify({ editorScheme: 'vscode', recapDir: '/before' });
+    const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: original });
+    try {
+      const save = ipcHandlers.get('settings:set');
+      await Promise.all([
+        save(null, 'editorScheme', 'zed'),
+        save(null, 'recapDir', '/after'),
+      ]);
+      const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+      assert.equal(saved.editorScheme, 'zed');
+      assert.equal(saved.recapDir, '/after');
+      const backups = corruptSettingsBackups(home);
+      assert.equal(backups.length, corrupt ? 1 : 0);
+      if (corrupt) assert.equal(readFileSync(join(home, '.obelisk', backups[0]), 'utf8'), original);
+    } finally {
+      cleanup();
+    }
+  });
+}
+
+test('a refused settings save does not poison the next queued save', async () => {
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({
+    settingsText: JSON.stringify({ editorScheme: 'vscode', recapDir: '/before' }),
+  });
+  try {
+    const save = ipcHandlers.get('settings:set');
+    const results = await Promise.allSettled([
+      save(null, 'recapDir', 1n),
+      save(null, 'editorScheme', 'zed'),
+    ]);
+    assert.equal(results[0].status, 'rejected');
+    assert.equal(results[1].status, 'fulfilled');
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.equal(saved.editorScheme, 'zed');
+    assert.equal(saved.recapDir, '/before');
+  } finally {
+    cleanup();
+  }
+});
