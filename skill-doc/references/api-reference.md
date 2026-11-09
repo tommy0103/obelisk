@@ -116,7 +116,7 @@ Full-text search across all indexed message text using FTS5.
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"` |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"codexhost-antigravity"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
 | `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
 | `opts.fallback` | `'or'` | On zero hits only, retry safe tokens joined by OR |
@@ -253,6 +253,8 @@ to a subagent or workflow agent, `subagent` or `workflow` is populated when the
 metadata exists. Hidden targets always return `null`, and hidden ancestors are
 always omitted.
 
+Traversal stops before a repeated UUID or a missing parent.
+
 #### `sql(query, ...params)`
 
 Read-only SQL helper with positional `?` bindings.
@@ -351,7 +353,7 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"`; omit for all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"codexhost-antigravity"`, `"copilot"`, `"deepseek"`, `"hermes"`, `"kimi"`, `"kiro"`, `"omp"`, `"opencode"`, `"pi"`, or `"zcode"`; omit for all |
 | `opts.sessionId` | `string` | Canonical session ID; a non-exact ref resolves as a literal fragment, capped at the 10 newest matches |
 | `opts.sessions` | `string[]` | Same resolution per entry; union of matches |
 
@@ -363,6 +365,9 @@ requested project/source/time/branch filters; entries
 from `sessionId` and `sessions` union. A raw native id normally resolves to
 exactly one session; several rows mean the id is not unique (for example a
 copied session file), so narrow with `project` or `source`.
+For `codexhost-antigravity`, the fragment identifier is the CodexHost
+`hostThreadId`; its canonical ID also scopes that thread by cwd. The upstream
+Antigravity `nativeSessionRef.nativeSessionId` is a separate source identifier.
 `message_count` describes the visible canonical transcript; inactive and hidden
 records do not increase it. The invoking session row carries
 `is_invoking: true` (see Invocation Identity); other rows omit the field.
@@ -442,7 +447,8 @@ Walk the `parent_uuid` chain from a message to the conversation root.
 
 Pass `{ includeInactive: true }` to follow a superseded path. Returns labeled
 messages ordered root-first. A hidden target returns an empty array, and hidden
-ancestors are omitted.
+ancestors are omitted. Traversal stops before a repeated UUID or a missing
+parent.
 
 #### `thread(sessionId, opts?)` — compatibility
 
