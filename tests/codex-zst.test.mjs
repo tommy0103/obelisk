@@ -402,6 +402,12 @@ test('Plain to Compressed to Resumed Plaintext atomically preserves unchanged ch
     writeFileSync(archive, zstdCompressSync(bytes));
     unlinkSync(plain);
     const childBytes = readFileSync(child);
+    writeFileSync(child, '');
+    const incomplete = run([plain, archive, child]);
+    assert.ok(incomplete.incompleteProviders.has('codex'));
+    assert.equal(incomplete.items.some(item => item.unit.sessionId === sessionId), false);
+    assert.deepEqual(projection(), initial, 'unreadable old contributor identity withholds root replacement');
+    writeFileSync(child, childBytes);
     writeFileSync(child, Buffer.concat([childBytes, Buffer.from('invalid completed line\n')]));
     assert.throws(() => run([plain, archive, child]), /complete stable snapshot/);
     assert.deepEqual(projection(), initial, 'real malformed child parsing cannot commit a root-only projection');

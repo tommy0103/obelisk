@@ -218,6 +218,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         return [];
       }
       const rawId = meta ? codexRawId(meta.id) : null;
+      if (rawId === null && guardian === null
+        && (ctx.previousCursor?.(file.path) ?? ctx.lastCursor(file.path)) !== null) {
+        ctx.reportIncompleteInventory?.({ path: file.path, error: 'Previously indexed rollout has no readable session identity' });
+        return [];
+      }
       const parentId = meta ? codexParentThreadId(meta) : null;
       const indexed = rawId ? sessionIndex.get(rawId) : undefined;
       return [{
