@@ -60,6 +60,18 @@ test('trigram: a short term next to a long one filters instead of silently match
   assert.equal(typeof hits[0].rank, 'number', 'the long-term MATCH keeps relevance ranking');
 });
 
+test('trigram: every plain query term constrains results even after the twelfth term', () => {
+  const db = trigramDb();
+  const terms = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima missing';
+  const insert = db.prepare('INSERT INTO messages (uuid, session_id, role, text) VALUES (?,?,?,?)');
+  insert.run('first-twelve', 's1', 'user', terms.split(' ').slice(0, 12).join(' '));
+  const api = createQueryApi(db);
+  assert.deepEqual(api.search(terms), [], 'a missing thirteenth term must reject the row');
+  insert.run('all-thirteen', 's1', 'user', terms);
+  assert.deepEqual(api.search(terms, { limit: 1 }).map(hit => hit.message.uuid), ['all-thirteen']);
+  db.close();
+});
+
 test('trigram: an all-short query falls back to a LIKE scan instead of zero hits', () => {
   const api = createQueryApi(trigramDb());
   const hits = api.search('ok');

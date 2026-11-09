@@ -417,7 +417,7 @@ function createQueryApi(
       const unique = [...new Set(tokens)];
       const short = unique.filter((token) => [...token].length < 3);
       const long = unique.filter((token) => [...token].length >= 3);
-      const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
+      const matchText = long.map((token) => `"${token}"`).join(' ');
       if (short.length === 0) return { rows: matchText ? runMatch(matchText) : [], degraded: null };
       if (long.length === 0) return { rows: runLikeScan(short), degraded: 'like-scan' };
       return { rows: runMatchWithSubstrings(matchText, short), degraded: 'short-token-post-filter' };
