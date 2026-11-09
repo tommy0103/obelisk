@@ -36,9 +36,12 @@ keep one projection path.
   post-migration twin pair from tripping the divergent-identity guard or
   double-indexing.
 - **Version gate**: accept `undefined`, 0, 1, 2, 3; anything newer stays
-  fail-closed (skip and record, suppress the project directory — CONTRIBUTING:
-  tolerate the unknown, never poison the provider). v1 is physically v0 and
-  takes the v0 path.
+  fail-closed for its complete root tree (skip and record, explicitly retain
+  last-good canonical rows, and continue unrelated trees — CONTRIBUTING:
+  tolerate the unknown, never poison the provider). Identity/ancestry are kept
+  for discovery only. Malformed version values and unreadable identity headers
+  remain inventory errors with project-level suppression. v1 is physically v0
+  and takes the v0 path.
 - **Seed-prefix marker**: v0/v1 keep using `header.seedLength`; v2/v3 drop it,
   so the inherited parent prefix ends at the last `session/end-seed` event
   with `data.inherited === true` (skip `seq <` that event's seq). The resolved
@@ -197,9 +200,17 @@ with a failed `assistant/attempt`, one committed answer, then a reopened writer
 appending a second turn. Its test requires unique committed-message identities,
 both answers surviving, incremental/full replay equivalence, and the canonical
 round trip; it does not bless overwriting one committed answer with another.
-The first version past the new range (5) is still rejected and still suppresses
-its project directory.
+The first version past the new range (5) is still rejected. The 2026-10-20
+amendment below replaces project-wide suppression with explicit tree retention.
 
 The historical plan document
 (`docs/deepseek-harness-v2-v3-multiversion-adapter-plan.md`) is left as the
 point-in-time record of the v0–v3 implementation, not updated for v4.
+
+**Amendment (2026-10-20): safe future-format publication.** The v5 canonical
+marker repairs readable partial trees from the old directory-only suppression.
+The adapter checkpoint encoding remains v2. Force rebuilds retain affected
+last-good trees via the shared snapshot contract in ADR-0001; historical
+checkpoints remain identity evidence while per-unit replay is pending. Current
+and historical ownership are reconciled as described in ADR-0011. This combines
+with the v4 projection amendment above; v5 is the first unsupported generation.

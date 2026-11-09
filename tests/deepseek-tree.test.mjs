@@ -28,6 +28,7 @@ import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+import { runCli } from './cli-test-helpers.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
@@ -1048,10 +1049,16 @@ test('an unknown higher header version is skipped and recorded, never parsed as 
     JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text: 'future' }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
   ].join('\n') + '\n');
   const issues = [];
+  const skipped = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    reportSkippedArtifact: (i) => skipped.push(i),
+  });
   assert.equal(units.length, 0);
-  assert.ok(issues.some((i) => i.error.includes('version 99')));
+  assert.ok(skipped.some((i) => i.error.includes('version 99')));
+  assert.deepEqual(issues, [], 'the artifact was enumerated, so it is a skip and not an inventory gap');
 });
 
 test('a permission-denied session dir is an inventory error, never a deletion', { skip: process.platform === 'win32' }, () => {
@@ -1637,12 +1644,12 @@ test('an upstream v2→v3 migration continues the indexed session: no tombstone,
 
 // The gate accepts 0–4 and nothing beyond: a version-5 file must never be
 // parsed as a known format, and per CONTRIBUTING it must not poison the
-// provider — skip, record, and suppress the project directory.
-test('a version-5 header is rejected at the gate and suppresses its whole project directory (fail closed)', () => {
+// provider — skip and record, withhold the affected tree, preserve siblings.
+test('a version-5 header withholds its tree while healthy sibling sessions stay live', () => {
   const dir = makeTempDir('obelisk-version5-');
   const sessionsDir = join(dir, 'sessions');
   // A v5 artifact (the first rejectable generation) beside a healthy v0
-  // sibling in the SAME project directory.
+  // sibling in the SAME project directory, but a DIFFERENT session directory.
   const projectDir = join(sessionsDir, '--tmp-dsh-project--');
   const write = (name, file, header, text) => {
     const d = join(projectDir, name);
@@ -1663,12 +1670,22 @@ test('a version-5 header is rejected at the gate and suppresses its whole projec
   ].join('\n') + '\n');
 
   const issues = [];
+  const skipped = [];
   const provider = createDeepseekProvider({ rootDir: sessionsDir });
-  const units = provider.discover({ lastCursor: () => null, reportIncompleteInventory: (i) => issues.push(i) });
+  const units = provider.discover({
+    lastCursor: () => null,
+    reportIncompleteInventory: (i) => issues.push(i),
+    reportSkippedArtifact: (i) => skipped.push(i),
+  });
   assert.ok(units.some((u) => u.sessionId.includes('other-session')), 'other projects stay live');
-  assert.ok(!units.some((u) => u.sessionId.includes('healthy-session') || u.sessionId.includes('v5-session')),
-    'the whole project directory is suppressed — no partial snapshot');
-  assert.ok(issues.some((i) => i.error === 'Unsupported session format version 5'));
+  assert.ok(!units.some((u) => u.sessionId.includes('v5-session')),
+    'the unreadable session directory is withheld — no partial snapshot');
+  assert.ok(units.some((u) => u.sessionId.includes('healthy-session')),
+    'a sibling session the v5 file does not touch is still indexed');
+  assert.ok(skipped.some((i) => i.error === 'Unsupported session format version 5'),
+    'the skipped artifact is recorded for the user');
+  assert.deepEqual(issues, [],
+    'the path was enumerated, so an unsupported version must not certify the inventory as incomplete');
 });
 
 // DSH ≥ 0.2.0 writes v4. Its two touched deltas — the released tool/result
@@ -2090,4 +2107,32 @@ test('nested run_code dispatches chain to the outer anchor; isError and error bo
   const bashResult = values.find((r) => r.kind === 'tool_result' && r.tool_use_id === bash.id);
   assert.equal(bashResult.is_error, 1, 'a settle event with only the error field still marks failure');
   assertCanonicalRoundTrip(provider, unit, values);
+});
+
+// The user-visible consequence of the gate (issue #228 follow-up): one
+// newer-format artifact in ~/.dsh must not make `obelisk --build` unpublishable
+// for every other provider on the machine.
+test('a version-5 artifact no longer blocks the whole force build: healthy projects publish and the skip is recorded', () => {
+  const home = makeTempDir('obelisk-deepseek-v5-build-');
+  const sessionsDir = join(home, '.dsh', 'sessions');
+  const writeSession = (project, name, file, header, text) => {
+    const dir = join(sessionsDir, project, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, file), [
+      JSON.stringify(header),
+      JSON.stringify({ type: 'user/message', seq: 1, time: 1753005601000, data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'm-1' } }),
+    ].join('\n') + '\n');
+  };
+  writeSession('--tmp-dsh-future--', 'v5-session', 'session.v5.jsonl', { ...HEADER, version: 5, id: 'v5-session' }, 'from the future');
+  writeSession('--tmp-dsh-healthy--', 'healthy-session', 'session.jsonl', { ...HEADER, id: 'healthy-session', cwd: '/tmp/dsh-healthy' }, 'healthy question');
+
+  const built = runCli(['--build'], { home, env: {} });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+  assert.deepEqual(JSON.parse(built.stdout), { ok: true, db: join(home, '.obelisk', 'obelisk.sqlite') });
+
+  const db = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  const ids = db.prepare("SELECT id FROM sessions WHERE source = 'deepseek' ORDER BY id").all().map((row) => row.id);
+  db.close();
+  assert.ok(ids.some((id) => id.includes('healthy-session')), 'the healthy project is indexed');
+  assert.ok(!ids.some((id) => id.includes('v5-session')), 'the unsupported artifact is never parsed as a known format');
 });
