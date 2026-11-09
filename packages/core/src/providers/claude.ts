@@ -9,6 +9,8 @@
 // persist layer consumes them. Session aggregates here reflect only THIS chunk
 // (started_at/ended_at/message_count); persist merges them with any existing row.
 
+import { createHash } from 'node:crypto';
+import { RetryableSourceReadError } from './source-read-error.ts';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path';
@@ -119,7 +121,43 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       changedWorkflowPaths.add(absolute);
     }
   }
-  const transcriptUnits = discoverJsonlFiles(projectsDir, ctx.reportIncompleteInventory).filter((file) => {
+  let inventoryComplete = true;
+  const files = discoverJsonlFiles(projectsDir, issue => {
+    inventoryComplete = false;
+    ctx.reportIncompleteInventory?.(issue);
+  });
+  const orphanMembers = new Map<string, IndexUnit[]>();
+  for (const file of files) {
+    if (!file.isSubagent) continue;
+    const mainPath = join(projectsDir, file.project, `${file.sessionId}.jsonl`);
+    if (!transcriptProvedMissing(mainPath)) continue;
+    const key = join(projectsDir, file.project, file.sessionId, 'subagents');
+    const members = orphanMembers.get(key) ?? [];
+    members.push({ key: file.path, sessionId: file.sessionId, project: file.project,
+      isSubagent: true, agentId: file.agentId,
+      meta: file.workflowRunId ? { workflowRunId: file.workflowRunId } : {} });
+    orphanMembers.set(key, members);
+  }
+  const orphanPaths = new Set([...orphanMembers.values()].flatMap(members => members.map(unit => unit.key)));
+  const orphanUnits: IndexUnit[] = [];
+  for (const [key, members] of orphanMembers) {
+    const member = members[0]!;
+    if (!inventoryComplete) { ctx.retainSession?.(member.sessionId); continue; }
+    const mainPath = join(dirname(key), '..', `${member.sessionId}.jsonl`);
+    const mainCursor = ctx.previousCursor?.(normalize(mainPath)) ?? ctx.lastCursor(normalize(mainPath));
+    let signature: string;
+    try { signature = orphanFingerprint(members.map(unit => unit.key), mainCursor); }
+    catch (error) {
+      ctx.retainSession?.(member.sessionId);
+      ctx.reportIncompleteInventory?.(sourceInventoryIssue(key, error));
+      continue;
+    }
+    if (ctx.lastCursor(key) === signature) continue;
+    orphanUnits.push({ key, sessionId: member.sessionId, project: member.project,
+      meta: { kind: 'orphan-family', members, signature, mainPath: normalize(mainPath), mainCursor } satisfies ClaudeOrphanFamilyMeta });
+  }
+  const transcriptUnits = files.filter((file) => {
+    if (orphanPaths.has(file.path)) return false;
     const normalizedPath = normalize(file.path);
     if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath)) return false;
     const cursor = ctx.lastCursor(file.path);
@@ -140,11 +178,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   }));
 
   const workflowUnits: IndexUnit[] = [];
-  if (!existsSync(projectsDir)) return transcriptUnits;
+  if (!existsSync(projectsDir)) return [...transcriptUnits, ...orphanUnits];
   let projects: string[];
   try { projects = readdirSync(projectsDir); } catch (error) {
     ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectsDir, error));
-    return transcriptUnits;
+    return [...transcriptUnits, ...orphanUnits];
   }
   for (const project of projects) {
     const projectPath = join(projectsDir, project);
@@ -185,7 +223,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       }
     }
   }
-  return [...transcriptUnits, ...workflowUnits];
+  return [...transcriptUnits, ...orphanUnits, ...workflowUnits];
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
@@ -276,6 +314,9 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
 }
 
 export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+  if ((unit.meta as ClaudeOrphanFamilyMeta | undefined)?.kind === 'orphan-family') {
+    return yield* parseOrphanFamily(unit, cursor);
+  }
   if ((unit.meta as ClaudeWorkflowUnitMeta | undefined)?.kind === 'workflow') {
     return yield* parseWorkflow(unit);
   }
@@ -462,6 +503,78 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
  * so the owning session file is `<project>/<sessionId>.jsonl` — which is not
  * necessarily on disk any more (see the orphaned-subagent branch in parse).
  */
+interface ClaudeOrphanFamilyMeta {
+  kind: 'orphan-family';
+  members: IndexUnit[];
+  signature: string;
+  mainPath: string;
+  mainCursor: Cursor;
+}
+
+function orphanFingerprint(paths: string[], mainCursor: Cursor): string {
+  const signature = [...paths].sort().map(path => {
+    const stat = statSync(path);
+    const sidecar = path.replace(/\.jsonl$/, '.meta.json');
+    let metaSignature: number[] | null = null;
+    try { const meta = statSync(sidecar); metaSignature = [meta.mtimeMs, meta.ctimeMs, meta.size, meta.ino]; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    return [path, stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino, stat.dev, metaSignature];
+  });
+  return `claude-orphan-v1:${createHash('sha256').update(JSON.stringify([signature, mainCursor])).digest('hex')}`;
+}
+
+function orphanMemberPaths(directory: string): string[] {
+  const paths = readdirSync(directory).filter(name => name.endsWith('.jsonl')).map(name => join(directory, name));
+  const workflows = join(directory, 'workflows');
+  let runs: string[];
+  try { runs = readdirSync(workflows); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return paths; throw error; }
+  for (const run of runs) {
+    const runPath = join(workflows, run);
+    if (!statSync(runPath).isDirectory()) continue;
+    for (const name of readdirSync(runPath)) if (name.endsWith('.jsonl')) paths.push(join(runPath, name));
+  }
+  return paths;
+}
+
+function* parseOrphanFamily(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+  const meta = unit.meta as ClaudeOrphanFamilyMeta;
+  const verify = () => {
+    if (!transcriptProvedMissing(meta.mainPath)
+      || orphanFingerprint(orphanMemberPaths(unit.key), meta.mainCursor) !== meta.signature) {
+      throw new RetryableSourceReadError(unit.key, 'Orphan transcript family changed during snapshot');
+    }
+  };
+  verify();
+  const records: TranscriptRecord[] = [];
+  const sessions: Extract<TranscriptRecord, { kind: 'session' }>[] = [];
+  for (const member of meta.members) {
+    let hasJson = false;
+    readLines(member.key, (line, terminated) => {
+      if (!line.trim()) return;
+      try { JSON.parse(line); hasJson = true; }
+      catch { throw new RetryableSourceReadError(member.key, terminated ? 'Malformed orphan transcript' : 'Incomplete orphan transcript'); }
+    });
+    if (!hasJson) throw new RetryableSourceReadError(member.key, 'Orphan transcript has no stable records');
+    for (const record of parse(member, null)) {
+      if (record.kind === 'session') sessions.push(record);
+      else records.push(record);
+    }
+  }
+  verify();
+  if (cursor !== null) yield { kind: 'delete-session', sessionId: unit.sessionId };
+  yield* records;
+  const timestamps = sessions.flatMap(session => [session.started_at, session.ended_at]).filter((value): value is string => value !== null).sort();
+  yield {
+    kind: 'session', id: unit.sessionId, title: null, project: unit.project ?? null,
+    started_at: timestamps[0] ?? null, ended_at: timestamps.at(-1) ?? null,
+    git_branch: null, version: null,
+    message_count: new Set(records.filter(record => record.kind === 'message').map(record => record.uuid)).size,
+    countMode: 'total', jsonl_path: meta.mainPath, source: 'claude',
+  };
+  return meta.signature;
+}
+
 function mainTranscriptPathOf(unit: IndexUnit): string | null {
   // Match the owning session directory rather than the first ancestor named
   // subagents (the user's home or project can legally contain that name).

@@ -246,8 +246,10 @@ test('fresh orphan discover and parse preserve direct canonical detail through S
   const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8').trim().split('\n').at(-1);
   const path = writeSubagentTranscript(projects, 'agent-a', [JSON.parse(captured)]);
   const provider = createClaudeProvider({ rootDir: root });
-  const unit = provider.discover({ lastCursor: () => null }).find(unit => unit.key === path);
-  assert.ok(unit);
+  const units = provider.discover({ lastCursor: () => null });
+  assert.equal(units.length, 1);
+  const unit = units[0];
+  assert.equal(unit.meta.kind, 'orphan-family');
   const records = [...provider.parse(unit, null)];
   const direct = assembleSessionDetail(records);
   const db = new DatabaseSync(':memory:');
@@ -314,5 +316,46 @@ test('metadata-only orphan input stays untitled and a returning main transcript 
     persist(db, unit, parse(unit, null));
     assert.equal(repairOrphanedSessionCounts(db), 0);
     assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 1);
+  } finally { db.close(); }
+});
+
+test('orphan sibling families have identical direct and finalized SQLite counts and retry damaged sources', () => {
+  const root = makeTempDir('obelisk-orphan-family-');
+  const projects = join(root, 'projects');
+  const first = writeSubagentTranscript(projects, 'agent-a', [capturedMessage('a1', 'first'), capturedMessage('a2', 'second')]);
+  const second = writeSubagentTranscript(projects, 'agent-b', [capturedMessage('b1', 'third')]);
+  const provider = createClaudeProvider({ rootDir: root });
+  const units = provider.discover({ lastCursor: () => null });
+  assert.equal(units.length, 1);
+  const unit = units[0];
+  const direct = assembleSessionDetail([...provider.parse(unit, null)]);
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(SCHEMA);
+    const cursor = persist(db, unit, provider.parse(unit, null));
+    assert.equal(repairOrphanedSessionCounts(db), 0);
+    const roundtrip = () => assembleSessionDetail({
+      session: db.prepare('SELECT * FROM sessions').get(),
+      messages: db.prepare('SELECT * FROM messages').all(),
+      subagents: db.prepare('SELECT * FROM subagents').all(),
+    });
+    assert.equal(direct.session.message_count, 3);
+    assert.deepEqual(roundtrip(), direct);
+    const context = { lastCursor: key => key === unit.key ? cursor : null };
+    assert.deepEqual(provider.discover(context), []);
+    writeFileSync(second, JSON.stringify(capturedMessage('b1', 'third updated')) + '\n');
+    const changed = provider.discover({ ...context, changedPaths: [second] });
+    assert.equal(changed.length, 1);
+    const stableBytes = readFileSync(second);
+    writeFileSync(second, 'invalid completed line\n');
+    assert.throws(() => [...provider.parse(changed[0], cursor)], /snapshot|transcript/i);
+    assert.deepEqual(roundtrip(), direct, 'failed source verification publishes no destructive records');
+    writeFileSync(second, stableBytes);
+    const retry = provider.discover(context)[0];
+    const next = persist(db, retry, provider.parse(retry, cursor));
+    assert.ok(next);
+    assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 3);
+    assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE text=?').get('third updated').n, 1);
+    assert.equal(readFileSync(first, 'utf8').includes('first'), true);
   } finally { db.close(); }
 });
