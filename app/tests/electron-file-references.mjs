@@ -13,6 +13,7 @@ const sessionId = 'file-ref-session';
 const cwd = '/tmp/obelisk-file-ref-fixture';
 const channels = [
   'db:getSessions',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -32,6 +33,13 @@ const channels = [
 let failures = 0;
 const openCalls = [];
 const settingCalls = [];
+let stableEnabled = true;
+let stableWriteGate = null;
+let stableWritesCompleted = 0;
+let nextSettingsReadGate = null;
+let blockedSettingsReadStarted = false;
+let blockedSettingsReadReturned = false;
+let settingsReadsCompleted = 0;
 
 const messageText = [
   'Absolute link: [roadmap.md](/tmp/obelisk-file-ref-fixture/docs/roadmap.md:162)',
@@ -84,14 +92,28 @@ function assert(condition, message) {
 async function waitFor(webContents, expression, message, timeoutMs = 8_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await webContents.executeJavaScript(`Boolean(${expression})`, true)) return;
+    if (typeof expression === 'function'
+      ? expression()
+      : await webContents.executeJavaScript(`Boolean(${expression})`, true)) return;
     await delay(40);
   }
   throw new Error(`Timed out waiting for ${message}`);
 }
 
+function createSettingsGate() {
+  let release;
+  const promise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Copilot settings gate timed out')), 8_000);
+    release = () => { clearTimeout(timeout); resolve(); };
+  });
+  return { promise, release: () => release() };
+}
+
 function registerHandlers() {
   ipcMain.handle('db:getSessions', () => [summary()]);
+  ipcMain.handle('db:getSessionCatalogue', (_event, opts) => ({
+    rows: opts.quiet || opts.offset ? [] : [summary()], total: opts.quiet ? 0 : 1,
+  }));
   ipcMain.handle('db:getSessionMessages', () => messages);
   ipcMain.handle('db:getSessionToolCalls', () => []);
   ipcMain.handle('db:getSessionToolResults', () => []);
@@ -109,14 +131,41 @@ function registerHandlers() {
   ipcMain.handle('db:getSessionSummaries', () => []);
   ipcMain.handle('db:getMessageFullText', () => null);
   ipcMain.handle('db:getMemories', () => []);
-  ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', count: 1 }]);
-  ipcMain.handle('db:getStats', () => ({}));
-  ipcMain.handle('settings:get', () => ({
-    editorScheme: 'vscode',
-    version: '9.8.7-test',
-  }));
-  ipcMain.handle('settings:set', (_event, key, value) => {
+  ipcMain.handle('db:getProjects', () => [{ project: 'quiet-zero', session_count: 1 }]);
+  ipcMain.handle('db:getStats', () => ({ sessions: 1 }));
+  ipcMain.handle('settings:get', async () => {
+    const snapshot = {
+      editorScheme: 'vscode',
+      version: '9.8.7-test',
+      recapDir: '/fixture/persisted-recap',
+      sources: [{
+        id: 'copilot', name: 'GitHub Copilot', vendor: 'GitHub', color: '#8957e5',
+        path: '/fixture/Code/User', settingKey: 'providerRoots.copilot',
+        status: 'warn', statusText: 'No sessions found', sessionCount: 0, lastIndexed: '',
+      }],
+      copilotEditions: [
+        { id: 'stable', name: 'VS Code', path: '/fixture/Code/User', enabled: stableEnabled },
+        { id: 'insiders', name: 'VS Code Insiders', path: '/fixture/Code - Insiders/User', enabled: true },
+      ],
+      copilotCustomRoot: false,
+    };
+    const gate = nextSettingsReadGate;
+    nextSettingsReadGate = null;
+    if (gate !== null) {
+      blockedSettingsReadStarted = true;
+      await gate;
+      blockedSettingsReadReturned = true;
+    }
+    settingsReadsCompleted++;
+    return snapshot;
+  });
+  ipcMain.handle('settings:set', async (_event, key, value) => {
     settingCalls.push({ key, value });
+    if (key === 'copilotEditions.stable') {
+      if (stableWriteGate !== null) await stableWriteGate;
+      stableEnabled = value;
+      stableWritesCompleted++;
+    }
     return true;
   });
   ipcMain.handle('file-ref:open', (_event, ref) => {
@@ -197,7 +246,31 @@ async function run() {
   assert(openCalls[0]?.sessionId === sessionId, 'click sends the session id');
   assert(navigatedAway.length === 0, 'clicking a reference never navigates the window');
 
-  await win.webContents.executeJavaScript(`window.location.hash = '#/settings'`, true);
+  const initialRead = createSettingsGate();
+  nextSettingsReadGate = initialRead.promise;
+  try {
+    await win.webContents.executeJavaScript(`window.location.hash = '#/settings'`, true);
+    await waitFor(win.webContents, () => blockedSettingsReadStarted, 'initial Settings snapshot captured');
+    win.webContents.send('obelisk:index-updated', {});
+    await waitFor(win.webContents, `document.querySelector('.version-text')?.textContent.includes('9.8.7-test')`,
+      'index refresh initializes Settings before the initial response returns');
+    assert(await win.webContents.executeJavaScript(`document.querySelector('input.path-field:not([readonly])').value === '/fixture/persisted-recap'`, true),
+      'the first accepted settings snapshot initializes the saved recap path even during an index refresh');
+  } finally {
+    initialRead.release();
+    nextSettingsReadGate = null;
+  }
+  await waitFor(win.webContents, () => blockedSettingsReadReturned, 'initial Settings response returned');
+  const readsBeforeDraftRefresh = settingsReadsCompleted;
+  await win.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('input.path-field:not([readonly])');
+    input.value = '/fixture/unsaved-recap';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`, true);
+  win.webContents.send('obelisk:index-updated', {});
+  await waitFor(win.webContents, () => settingsReadsCompleted >= readsBeforeDraftRefresh + 2, 'index refresh returns to App and Settings');
+  assert(await win.webContents.executeJavaScript(`document.querySelector('input.path-field:not([readonly])').value === '/fixture/unsaved-recap'`, true),
+    'later index refreshes preserve an unsaved recap path');
   await waitFor(
     win.webContents,
     `document.body.textContent.includes('Editor URL scheme')`,
@@ -230,6 +303,52 @@ async function run() {
   assert(settingsState.label.includes('VS Code'), `editor picker uses a readable label (${settingsState.label})`);
   assert(settingsState.nativeSelects === 0, 'Settings does not fall back to a native select');
   assert(settingsState.version === 'Obelisk 9.8.7-test', `Settings renders the IPC app version (${settingsState.version})`);
+
+  const copilotCheckboxes = await win.webContents.executeJavaScript(`(() =>
+    [...document.querySelectorAll('.copilot-edition input[type="checkbox"]')].map(input => input.checked)
+  )()`, true);
+  assert(JSON.stringify(copilotCheckboxes) === '[true,true]', 'Copilot settings default to both folders enabled');
+  await win.webContents.executeJavaScript(`document.querySelector('.copilot-edition input').click()`, true);
+  await waitFor(win.webContents, () => stableWritesCompleted === 1, 'Copilot Stable persistence');
+  await waitFor(win.webContents, `document.querySelector('.copilot-edition input')?.checked === false`, 'Copilot Stable toggle');
+  assert(settingCalls.some(call => call.key === 'copilotEditions.stable' && call.value === false), 'Copilot folder toggle persists through settings IPC');
+
+  const beforeRapidToggle = settingCalls.length;
+  const writes = createSettingsGate();
+  stableWriteGate = writes.promise;
+  try {
+    await win.webContents.executeJavaScript(`(() => {
+      const input = document.querySelector('.copilot-edition input');
+      input.click(); input.click();
+    })()`, true);
+    await waitFor(win.webContents, () => settingCalls.length === beforeRapidToggle + 2, 'both Copilot changes reach IPC');
+    assert(JSON.stringify(settingCalls.slice(beforeRapidToggle).map(call => call.value)) === '[true,false]',
+      'rapid Copilot changes save each actual checkbox selection while a previous write is pending');
+  } finally {
+    writes.release();
+    stableWriteGate = null;
+  }
+  await waitFor(win.webContents, () => stableWritesCompleted === 3, 'rapid Copilot changes finish persistence');
+  assert(stableEnabled === false, 'the last Copilot selection remains persisted after both writes');
+  await waitFor(win.webContents, `document.querySelector('.copilot-edition input')?.checked === false`, 'final Copilot selection');
+
+  const oldRead = createSettingsGate();
+  blockedSettingsReadStarted = false;
+  blockedSettingsReadReturned = false;
+  nextSettingsReadGate = oldRead.promise;
+  try {
+    await win.webContents.executeJavaScript(`document.querySelector('.copilot-edition input').click()`, true);
+    await waitFor(win.webContents, () => blockedSettingsReadStarted, 'old Copilot settings snapshot captured');
+    await win.webContents.executeJavaScript(`document.querySelector('.copilot-edition input').click()`, true);
+    await waitFor(win.webContents, () => stableWritesCompleted === 5, 'new Copilot selection persisted');
+    await waitFor(win.webContents, `document.querySelector('.copilot-edition input')?.checked === false`, 'new Copilot selection displayed');
+  } finally {
+    oldRead.release();
+    nextSettingsReadGate = null;
+  }
+  await waitFor(win.webContents, () => blockedSettingsReadReturned, 'old Copilot settings snapshot returned');
+  assert(await win.webContents.executeJavaScript(`document.querySelector('.copilot-edition input').checked === false`, true),
+    'an older settings response cannot overwrite the latest Copilot selection');
 
   await win.webContents.executeJavaScript(
     `document.querySelector('.editor-picker-trigger').click()`, true,

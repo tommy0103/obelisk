@@ -71,6 +71,35 @@ the test you added.
 
 ---
 
+## Node and Electron runtimes
+
+Use **Node 22** for repository verification, matching the current CI workflows.
+The CLI's supported runtime floor is **22.13.0**, as declared in
+`packages/cli/package.json`. This host Node runs npm, builds, typechecking, lint,
+and `npm test`.
+
+The desktop app runs on **Electron's embedded Node**; Electron 43 uses Node 24.
+Installing Node 22 on the build host does not make the app run on Node 22. See
+[ADR-0005](docs/adr/0005-app-electron-vite-ts-esm.md) for the architectural
+distinction and the historical Electron 33 / Node 20 context.
+
+Install both dependency sets with `npm ci` and `npm --prefix app ci`, then run
+the repository Node checks. Before running Electron suites, rebuild native
+modules for Electron:
+
+```bash
+cd app
+npx --no-install electron-builder install-app-deps
+npm run test:electron:all
+```
+
+If returning to host-Node tests that load native modules, restore host-Node
+dependencies first; an Electron ABI build is not interchangeable with a
+host-Node build. For packaging, electron-builder performs the Electron rebuild.
+When changing Electron or native dependencies, verify the actual packaged
+executable's `process.versions` and load its bundled native modules, rather than
+inferring the app runtime from the CI `node-version` setting.
+
 ## Renderer / Electron UI changes
 
 Proving the new element renders correctly is one third of the job. You also owe
@@ -89,7 +118,7 @@ interactions, or the full Electron suites.
   skips scroll compensation for already-measured rows when
   `scrollDirection === 'backward'`, so drift can be zero at rest and large while
   scrolling up. Test both.
-- Run `npm run test:electron:all` (all five suites), not only the suite you
+- Run `npm run test:electron:all` (all suites), not only the suite you
   added.
 - **Do not add `loading="lazy"` to virtualized rows.** Rows already mount near
   the viewport; lazy only defers decode into the scroll itself.
@@ -131,6 +160,14 @@ interactions, or the full Electron suites.
   overwrite the first.
 - **A test must actually call `discover()`.** Asserting the resolved root string
   passes even when the directory-layout assumption is wrong.
+- **Trace source-root selection through every runtime.** For defaults, explicit
+  overrides, and per-root switches, verify that settings, watch targets, worker
+  and CLI discovery agree. Cover restart and the empty selection, not just the
+  path displayed in Settings.
+- **Excluding a root is not evidence that its sessions were deleted.** Limit
+  inventory-based tombstones to roots actually scanned with a complete census.
+  Decide and test what happens to previously indexed sessions on both ordinary
+  refresh and deliberate full rebuild.
 - **Verify directory layout against the upstream source or format docs**, not
   against what your own machine happens to look like. A tool's default root and
   its custom root often have different nesting.
@@ -239,6 +276,99 @@ workload size and measurement variability. Preserve required behavior, data
 ownership, merge semantics, and recovery guarantees; check those contracts before
 extending an optimization to another path. Make remaining costs and deliberate
 tradeoffs explicit.
+
+Timeline performance probes on shared hosted CI gate renderer **work**, using
+Chromium's thread CPU duration (`tdur`) when present and conservatively using the
+complete wall duration (`dur`) otherwise. Invalid durations fail measurement.
+Examine every renderer task, not only the task with the longest wall duration.
+The native wheel probe rejects work tasks >=50ms; stationary live commits retain
+an 8.33ms work budget; patch-preparation function work may exceed its no-update
+baseline by at most 2ms. Keep wall durations, RAF gaps and native compositor gaps
+in the diagnostics, and retain a <250ms catastrophic RAF-stall guardrail on the
+native wheel probe. Blank-frame, overlap, input-coverage and reader-anchor
+assertions remain required. These checks detect application work regressions and
+severe stalls; they do not certify that every displayed frame arrives within
+50ms on a shared runner. A controlled-performance-machine requirement is not
+part of the repository's CI infrastructure.
+
+## Desktop app development and release
+
+### Run and debug the app locally
+
+`electron-vite` starts the renderer dev server and launches Electron. On first
+run, Obelisk creates `~/.obelisk/obelisk.sqlite`, indexes the available
+registered-provider transcripts, and then watches them for changes. Use
+**Settings** to select provider directories beyond the defaults. On Windows,
+Obelisk also checks common WSL distributions for the Claude Code directory.
+
+- Renderer changes use Vite hot module replacement. Open Electron DevTools with
+  `Cmd+Option+I` on macOS or `Ctrl+Shift+I` on Windows/Linux.
+- Main-process and preload logs appear in the terminal running `npm run dev`;
+  their source changes are rebuilt by electron-vite.
+- To attach a Node debugger to the Electron main process, start it with
+  `npm run dev -- --inspect=5858`, then attach your debugger to port `5858`.
+- The development app reads and updates the real `~/.obelisk` index. Back it up
+  before testing destructive rebuilds. For an isolated run, launch with a
+  disposable home directory (`HOME=/tmp/obelisk-dev npm run dev` on
+  macOS/Linux, or set a temporary `USERPROFILE` first on Windows), then select
+  fixture source directories in **Settings**.
+
+`better-sqlite3` provides prebuilt binaries for common platforms. If `npm ci`
+falls back to compiling it locally, install the platform's C/C++ build tools and
+run `npm ci` again.
+
+### Release the desktop app
+
+The **Release Desktop App** workflow builds Developer ID signed/notarized
+DMG and ZIP packages for macOS Apple Silicon (`arm64`) and Intel (`x64`), plus
+`Obelisk-<version>-linux-amd64.deb` for Linux Intel/AMD 64-bit systems. It runs
+repository checks and all six Electron suites, verifies the packaged native
+resources, and installs the Debian package on Ubuntu 22.04 and 24.04. All
+packages and update feeds are uploaded to one GitHub Release draft after the
+required build and acceptance jobs pass.
+
+The app checks and downloads updates in the background. Settings → About
+supports manual checks and retry; the sidebar notice offers View changes,
+Later, and Update & restart. macOS uses Sparkle, falling back to
+`electron-updater` only if the native bridge cannot initialize. Linux `.deb`
+installations use `DebUpdater`; replacing the system installation requests
+administrator authorization through Polkit. Cancelling leaves the staged
+update retryable. Existing 0.2.2 installations require one manual upgrade to
+this updater-enabled release. Linux arm64, AppImage and Windows update channels
+are not enabled by this workflow.
+
+The build host uses Node 22; the app runs on Electron 43's embedded Node 24.
+Artifact verification reports the embedded Electron, Node and ABI versions.
+See [the runtime explanation](docs/adr/0005-app-electron-vite-ts-esm.md) and
+[the runtime requirements above](#node-and-electron-runtimes).
+
+Configure these repository Actions secrets:
+
+| Secret | Value |
+| --- | --- |
+| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12`, including its private key |
+| `MAC_CSC_KEY_PASSWORD` | The `.p12` export password |
+| `APPLE_ID` | Apple Account email with access to the signing team |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
+| `APPLE_TEAM_ID` | The signing team's 10-character Team ID |
+| `SPARKLE_ED_PRIVATE_KEY` | Exported Sparkle EdDSA private key matching the app's trusted public key |
+
+The `SPARKLE_ED_PUBLIC_KEY` Actions variable must match
+`app/build/sparkle-public-key.txt`. Linux Debian builds need no Apple credentials.
+
+Update `app/package.json` and `app/package-lock.json` to the same version,
+merge the release changes, then push a matching tag such as `v0.2.4`.
+To retry an existing tag, select that tag as the ref in **Actions → Release
+Desktop App → Run workflow**; the optional tag input checks that selection.
+The workflow rejects version mismatches and never overwrites a published
+release. Review the draft's notes and downloads before publishing it.
+
+Use `verify_only=true` on a branch to build and verify all platforms without
+creating a tag or Release. **Build and verify Debian App** also runs directly
+on relevant PRs or by manual dispatch, leaving its verified `.deb` as an Actions
+artifact. Its two-version acceptance uses the actual package, shipped UI,
+`DebUpdater`, and real dpkg installation, with a test substitute for the
+administrator-authorization dialog. CLI npm publication remains independent.
 
 ---
 

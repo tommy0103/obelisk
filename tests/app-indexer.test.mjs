@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -965,3 +965,37 @@ test('app indexer maps Codex subagent threads onto parent sessions', () => {
   assert.equal(childResult.content, '/tmp/obelisk-app');
   db.close();
 });
+
+for (const configured of [false, true]) {
+  test(`app indexes Kiro history with a read-only database and bounded lock wait (${configured ? 'configured' : 'default'} registry)`, () => {
+    const home = makeTempDir('obelisk-app-kiro-');
+    const root = join(home, '.kiro');
+    mkdirSync(root, { recursive: true });
+    const sourcePath = join(root, 'data.sqlite3');
+    const fixture = JSON.parse(readFileSync(new URL('./fixtures/kiro/conversation.json', import.meta.url), 'utf8'));
+    const source = new DatabaseSync(sourcePath);
+    source.exec('CREATE TABLE conversations_v2 (key TEXT, conversation_id TEXT, value TEXT, created_at INTEGER, updated_at INTEGER)');
+    source.prepare('INSERT INTO conversations_v2 VALUES (?, ?, ?, ?, ?)').run(
+      fixture.key, fixture.conversation_id, JSON.stringify(fixture.value), fixture.created_at, fixture.updated_at,
+    );
+    source.close();
+    const opens = [];
+    class KiroTestDatabase extends TestDatabase {
+      constructor(path, options) {
+        super(path);
+        if (path === sourcePath) opens.push(options);
+      }
+    }
+    const dbPath = join(home, 'index.sqlite');
+    buildIndex({
+      claudeDir: join(home, '.claude'), codexDir: join(home, '.codex'), dbPath,
+      providerRoots: { kiro: root }, DatabaseImpl: KiroTestDatabase,
+      ...(configured ? { providerSettings: { providerRoots: { kiro: root } } } : {}),
+    });
+    assert.ok(opens.length > 0, 'the native Kiro store was actually opened');
+    assert.ok(opens.every(options => options.readonly === true && options.fileMustExist === true && options.timeout === 500));
+    const db = new TestDatabase(dbPath);
+    assert.ok(db.prepare("SELECT text FROM messages WHERE source='kiro' AND text='Example content'").get());
+    db.close();
+  });
+}

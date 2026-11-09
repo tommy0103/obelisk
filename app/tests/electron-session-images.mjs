@@ -48,6 +48,7 @@ const appRoot = join(here, '..');
 const sessionId = 'session-image-test';
 const channels = [
   'db:getSessions',
+  'db:getSessionCatalogue',
   'db:getSessionMessages',
   'db:getSessionToolCalls',
   'db:getSessionToolResults',
@@ -191,6 +192,9 @@ function sessionSummary() {
 
 function registerHandlers() {
   ipcMain.handle('db:getSessions', () => [sessionSummary()]);
+  ipcMain.handle('db:getSessionCatalogue', (_event, opts) => ({
+    rows: opts.quiet || opts.offset ? [] : [sessionSummary()], total: opts.quiet ? 0 : 1,
+  }));
   ipcMain.handle('db:getSessionMessages', () => messages);
   ipcMain.handle('db:getSessionToolCalls', () => []);
   ipcMain.handle('db:getSessionToolResults', () => []);
@@ -198,8 +202,8 @@ function registerHandlers() {
   ipcMain.handle('db:getSessionWorkflows', () => []);
   ipcMain.handle('db:getSessionSummaries', () => []);
   ipcMain.handle('db:getMemories', () => []);
-  ipcMain.handle('db:getProjects', () => [{ project: 'image-fixture', count: 1 }]);
-  ipcMain.handle('db:getStats', () => ({}));
+  ipcMain.handle('db:getProjects', () => [{ project: 'image-fixture', session_count: 1 }]);
+  ipcMain.handle('db:getStats', () => ({ sessions: 1 }));
   ipcMain.handle('settings:get', () => ({}));
 }
 
@@ -286,13 +290,17 @@ async function run() {
     ];
     registerHandlers();
     win = new BrowserWindow({
-      show: false,
+      // Hidden Linux windows still suspend rAF despite backgroundThrottling.
+      // Map a real foreground surface under Xvfb for the continuous gesture.
+      show: true,
       width: 1200,
       height: 800,
       webPreferences: {
         preload: join(appRoot, 'out', 'preload', 'index.js'),
         contextIsolation: true,
         nodeIntegration: false,
+        // Keep the foreground gesture running if another test window focuses.
+        backgroundThrottling: false,
       },
     });
 
@@ -481,11 +489,15 @@ async function run() {
             const residual = (top - previous.rows.get(uuid)) + (scrollTop - previous.scrollTop);
             if (Math.abs(residual) > Math.abs(maxResidual)) {
               maxResidual = residual;
-              example = { uuid, residual, scrollTop };
+              example = { uuid, residual, scrollTop, scrollDelta: scrollTop - previous.scrollTop,
+                rowDelta: top - previous.rows.get(uuid),
+                frameGap: now - previous.now,
+                translate: document.querySelector('.virtual-timeline')?.style.translate,
+                previousTranslate: previous.translate };
             }
           }
         }
-        previous = { rows, scrollTop };
+        previous = { rows, scrollTop, now, translate: document.querySelector('.virtual-timeline')?.style.translate };
         if (now - startedAt < ${durationMs}) {
           requestAnimationFrame(frame);
           return;

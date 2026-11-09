@@ -2,10 +2,10 @@
 
 **Context.** The desktop app must consume the shared TypeScript/ESM Core
 (`providers/*` + `persist`) instead of maintaining its own duplicate indexer, and
-the app itself should be TypeScript + ESM long-term. The app previously ran raw
-CommonJS on Electron's Node with only the Vue renderer built by Vite; the main
-process had no build step, and Electron's bundled Node (20 on Electron 33) can
-neither strip TypeScript nor use `node:sqlite`. Options for the main-process build
+the app itself should be TypeScript + ESM long-term. At the time of this decision,
+the app ran raw CommonJS on Electron 33's Node 20 with only the Vue renderer
+built by Vite; the main process had no build step, and that runtime could neither
+strip TypeScript nor use `node:sqlite`. Options for the main-process build
 were a hand-rolled tsc/esbuild step, `vite-plugin-electron`, or `electron-vite`.
 
 **Decision.** Adopt **electron-vite** to build all three processes (main, preload,
@@ -59,3 +59,23 @@ mocking to `node:test` `mock.module` (needs `--experimental-test-module-mocks`).
 A future contributor may be tempted to make the preload ESM or disable the
 sandbox — this ADR records that CJS preload under an on sandbox is the intended,
 secure default.
+
+**Runtime clarification (2026-10-01).** The Node 20 constraint above describes
+the historical Electron 33 app. The current app lockfile selects Electron
+43.2.0; executing its binary and the apps extracted from the arm64 DMG and ZIP
+reports **Node 24.18.0 / module ABI 148**. The app uses Electron's embedded Node,
+independently of the Node installed on the developer's machine or CI runner.
+An Electron upgrade determines the app's Node and ABI versions; a change to
+`actions/setup-node` does not.
+
+The build host runs npm, electron-vite and electron-builder. Existing CI uses
+Node 22, and Electron 43's npm package requires host Node >=22.12.0. The CLI
+has its own Node >=22.13.0 runtime requirement and uses `node:sqlite`; the app
+continues to inject `better-sqlite3` into the shared Core. The newer embedded
+Node does not change that binding decision (ADR-0001).
+
+Native modules must target the runtime that loads them. Repository Node tests
+use host-Node dependencies; Electron tests and packaged apps use modules rebuilt
+for Electron's ABI. Keep verification commands in
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md#node-and-electron-runtimes), and check
+`process.versions` through the final packaged executable when Electron changes.

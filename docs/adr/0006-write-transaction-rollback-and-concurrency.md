@@ -31,10 +31,18 @@ layers.
   retried. The default is three attempts within a one-second budget with short
   backoff. BEGIN contention is deferred to the build scheduler; an active or
   unknown post-error transaction aborts the build.
-- Per-file failures remain warnings and are reported in `skippedFiles`; finalize
+- Per-unit failures remain warnings and are reported in `skippedFiles`; finalize
   failures propagate. `affectedSessionIds` is updated only after the relevant
   commit. Force cleanup is one atomic, retryable transaction, and finalize is
   likewise retried as a complete idempotent transaction.
+- A provider-declared `atomicGroup` widens that transaction to every planned
+  unit in the same provider-scoped publication set. Work/commit BUSY retries
+  replay the entire set; a failed set publishes neither owner changes nor
+  cursors, and every member remains scheduled for replay. The causal failure
+  is reported once. Post-commit notifications run only after the complete set
+  commits; exceptions in those notifications propagate as post-commit failures,
+  never as claims that already committed data was rolled back. Other providers
+  and unrelated units retain their existing independent progress.
 - A fresh `__app_heartbeat__` is policy ownership: while it is fresh, the CLI
   opens no write connection and performs no migration, schema setup, checkpoint,
   index build, or `attune`. `__app_last_successful_build__` remains an

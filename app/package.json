@@ -1,7 +1,7 @@
 {
   "name": "obelisk",
-  "version": "0.2.3",
-  "description": "Memory management for Obelisk — let Claude Code search its own memory",
+  "version": "0.2.5",
+  "description": "Memory management for Obelisk \u2014 let Claude Code search its own memory",
   "homepage": "https://github.com/tommy0103/obelisk",
   "author": {
     "name": "Obelisk contributors",
@@ -39,7 +39,14 @@
         "dmg",
         "zip"
       ],
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "extraFiles": [
+        {
+          "from": "node_modules/electron-sparkle-updater/native/vendor/Sparkle.framework",
+          "to": "Frameworks/Sparkle.framework"
+        }
+      ],
+      "extendInfo": {}
     },
     "win": {
       "target": [
@@ -57,33 +64,64 @@
       "maintainer": "Obelisk contributors <tommy0103@users.noreply.github.com>"
     },
     "deb": {
-      "compression": "bzip2"
+      "compression": "xz",
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "libgbm1",
+        "libasound2 (>= 1.0.17) | libasound2t64",
+        "pkexec | policykit-1"
+      ]
     },
     "files": [
-      "out/**"
+      "out/**",
+      "!**/node_modules/electron-sparkle-updater/native/vendor/**",
+      "!**/node_modules/electron-sparkle-updater/native/sparkle-chain.tar.xz"
     ],
     "asarUnpack": [
       "node_modules/better-sqlite3/**/*",
-      "node_modules/@parcel/watcher/**/*"
+      "node_modules/@parcel/watcher/**/*",
+      "node_modules/electron-sparkle-updater/native/build/Release/*.node"
     ],
     "extraResources": [
       {
         "from": "../packages/core/src/schema.sql",
         "to": "scripts/schema.sql"
       }
-    ]
+    ],
+    "beforePack": "scripts/sparkle-packaging.mjs",
+    "publish": {
+      "provider": "github",
+      "owner": "tommy0103",
+      "repo": "obelisk",
+      "releaseType": "draft"
+    },
+    "dmg": {
+      "writeUpdateInfo": true
+    }
   },
   "dependencies": {
     "@parcel/watcher": "^2.6.0",
-    "better-sqlite3": "^13.0.2"
+    "better-sqlite3": "^13.0.2",
+    "electron-sparkle-updater": "0.5.1",
+    "electron-updater": "6.6.2"
   },
   "devDependencies": {
     "@tanstack/vue-virtual": "^3.13.32",
     "@types/better-sqlite3": "^7.6.13",
     "@vitejs/plugin-vue": "^5.0.0",
+    "dompurify": "3.4.16",
     "electron": "^43.2.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
+    "marked": "17.0.4",
     "vite": "^6.0.0",
     "vue": "^3.4.0",
     "vue-router": "^4.3.0"

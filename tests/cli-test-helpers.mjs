@@ -23,6 +23,10 @@ export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
   // than `~/.dsh/sessions`; a harness-exported DSH_HOME would point CLI tests
   // at the real sessions root instead of the temp HOME.
   delete childEnv.DSH_HOME;
+  // The hermes provider resolves $HERMES_HOME/state.db with higher precedence than
+  // ~/.hermes/state.db; a harness-exported HERMES_HOME would point CLI tests at the
+  // real store instead of the temp HOME.
+  delete childEnv.HERMES_HOME;
   return spawnSync(process.execPath, [
     '--disable-warning=ExperimentalWarning',
     cliEntry,

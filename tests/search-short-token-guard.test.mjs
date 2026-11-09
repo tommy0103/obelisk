@@ -179,3 +179,26 @@ test('snippet centers on the hit that head truncation would miss', () => {
   assert.ok(hits[0].snippet.startsWith('…') && hits[0].snippet.endsWith('…'));
   assert.ok(hits[0].snippet.length <= 200, 'the snippet stays a window, not the whole message');
 });
+
+test('trigram short-token paths preserve compact controls and exact project scope', () => {
+  const db = trigramDb();
+  db.exec("UPDATE sessions SET project_path='/wanted' WHERE id='s1'");
+  const api = createQueryApi(db);
+  for (const query of ['ok', 'quick ok']) {
+    const hits = api.search(query, { projectPath: '/wanted', contextLimit: 0, snippetTokens: 8 });
+    assert.ok(hits.length > 0);
+    for (const hit of hits) {
+      assert.deepEqual(hit.context, []);
+      assert.equal(hit.message.isSnippet, true);
+      // Eight trigram tokens span up to ten code points, plus edge ellipses.
+      assert.ok([...hit.message.text].length <= 12, hit.message.text);
+      assert.ok(hit.message.textLength >= hit.message.text.length - 2);
+    }
+    assert.deepEqual(api.search(query, { projectPath: '/other' }), []);
+  }
+  const broad = api.search('quick zz', { fallback: 'or', projectPath: '/wanted', contextLimit: 0 });
+  assert.ok(broad.some(hit => hit.message.uuid === 'm-quick-only'));
+  assert.ok(broad.every(hit => hit.degraded === 'like-scan'));
+  assert.deepEqual(api.search('quick zz', { fallback: 'or', projectPath: '/other' }), []);
+  db.close();
+});

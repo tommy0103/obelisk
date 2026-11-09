@@ -14,6 +14,7 @@ tools; it does not require a particular workflow skill.
 Read [CONTRIBUTING.md](CONTRIBUTING.md), starting with its
 [intake policy](CONTRIBUTING.md#before-you-open-a-pull-request),
 [cross-cutting requirements](CONTRIBUTING.md#six-things-that-decide-whether-a-pr-lands),
+[runtime requirements](CONTRIBUTING.md#node-and-electron-runtimes),
 [verification contract](CONTRIBUTING.md#verification-contract), and
 [scope and review guidance](CONTRIBUTING.md#scope-and-review).
 Then read the area-specific sections relevant to the task using the index below.
@@ -26,10 +27,10 @@ before making a decision that depends on it.
 | Area | Guidance |
 | --- | --- |
 | Architecture and shared boundaries | Applicable [ADRs](docs/adr/); for indexing, start with [provider and persistence layers](docs/adr/0001-parse-core-and-persist-layers.md) |
-| Provider discovery, parsing, and history | [Provider requirements](CONTRIBUTING.md#provider-adapters), [canonical transcript contract](docs/adr/0007-canonical-transcript-session-detail-seam.md), and [retrieval semantics](skill-doc/references/retrieval-semantics.md) |
-| Renderer and Electron | [Renderer requirements](CONTRIBUTING.md#renderer--electron-ui-changes), [main process and untrusted input](CONTRIBUTING.md#main-process-and-untrusted-input), and [Electron source/build decision](docs/adr/0005-app-electron-vite-ts-esm.md) |
+| Provider discovery, source roots, parsing, and history | [Provider requirements](CONTRIBUTING.md#provider-adapters), [indexing requirements](CONTRIBUTING.md#indexing-daemon-and-write-ownership), [canonical transcript contract](docs/adr/0007-canonical-transcript-session-detail-seam.md), and [retrieval semantics](skill-doc/references/retrieval-semantics.md) |
+| Renderer and Electron | [Renderer requirements](CONTRIBUTING.md#renderer--electron-ui-changes), [main process and untrusted input](CONTRIBUTING.md#main-process-and-untrusted-input), and [Electron source/build decision](docs/adr/0005-app-electron-vite-ts-esm.md), and [desktop update decision](docs/adr/0015-desktop-sparkle-and-electron-updater.md) |
 | Schema, indexing, and write ownership | [Schema requirements](CONTRIBUTING.md#schema-and-migrations), [indexing requirements](CONTRIBUTING.md#indexing-daemon-and-write-ownership), and [transaction and concurrency contract](docs/adr/0006-write-transaction-rollback-and-concurrency.md) |
-| CLI and query/tool interfaces | [Runtime contract](docs/adr/0002-two-tier-runtime-contract.md), authoritative [API reference](skill-doc/references/api-reference.md), [error message requirements](CONTRIBUTING.md#cli-and-tool-error-messages), and [CLI package guidance](packages/cli/README.md) |
+| CLI and query/tool interfaces | [Runtime contract](docs/adr/0002-two-tier-runtime-contract.md), [bounded retrieval decision](docs/adr/0017-bounded-messages-and-default-retrieval-surface.md), authoritative [API reference](skill-doc/references/api-reference.md), [error message requirements](CONTRIBUTING.md#cli-and-tool-error-messages), and [CLI package guidance](packages/cli/README.md) |
 | Performance changes | [Performance requirements](CONTRIBUTING.md#performance-changes) |
 | Packaging, skills, and DSH integration | [Skill artifact decision](docs/adr/0004-skill-artifact-readable-not-bundled.md), [plugin contract](docs/adr/0012-obelisk-as-dsh-optional-retrieval-plugin.md), and [plugin package guidance](packages/dsh-plugin/README.md) |
 

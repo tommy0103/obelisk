@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
@@ -32,6 +32,17 @@ function cursorState(cursor) {
   const encoded = cursor.split(':', 6)[5];
   assert.ok(encoded, 'cursor carries provider checkpoint state');
   return JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+}
+
+function touchWithChangedCtime(path, before) {
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 20; attempt++) {
+    Atomics.wait(wait, 0, 0, 10);
+    utimesSync(path, before.atime, before.mtime);
+    const touched = statSync(path);
+    if (touched.ctimeMs !== before.ctimeMs) return touched;
+  }
+  assert.fail('the touch must change ctime for this test');
 }
 
 const META = { id: '019e8951-3e7d-7343-a3e3-05bff48a317d', cwd: '/proj', git: { branch: 'main' }, cli_version: '1.2', timestamp: '2026-06-10T10:00:00Z' };
@@ -81,32 +92,48 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].git_branch, 'main');
 });
 
-test('codex v4 checkpoint resumes a cooperative append from its byte offset', () => {
-  const path = writeFixture([
-    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
-    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: '中文 😀 before offset' } },
-  ]);
-  const first = drain(parse({ key: path, sessionId: '' }, null));
-  const state = cursorState(first.ret);
-  assert.equal(state.v, 4);
-  assert.equal(typeof state.completeLineOffset, 'number');
-  assert.equal(state.completeLineOffset, first.ret.split(':')[2] * 1);
-  assert.equal(state.sourceSize, state.completeLineOffset);
-  assert.equal(typeof state.dev, 'string');
-  assert.equal(typeof state.sourceInode, 'string');
+// Real filesystem identities vary by Windows volume. Exercise both contracts
+// deterministically without requiring the host to offer a safe numeric inode.
+for (const [identity, inode, expectedPlan, verifiedPrefix] of [
+  ['safe', 123, 'cooperative-append', false],
+  ['unavailable', 0, 'verified-append', true],
+  ['unsafe', Number.MAX_SAFE_INTEGER + 1, 'verified-append', true],
+]) {
+  test(`codex v4 checkpoint resumes an append with ${identity} source identity`, async t => {
+    const fsMock = t.mock.module('node:fs', { namedExports: {
+      closeSync, existsSync, openSync, readdirSync, readSync,
+      statSync: (...args) => Object.assign(statSync(...args), { dev: 1, ino: inode }),
+    } });
+    t.after(() => fsMock.restore());
+    const { parse: parseWithIdentity } = await import(`../packages/core/src/providers/codex.ts?append-${identity}`);
+    const path = writeFixture([
+      { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+      { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: '中文 😀 before offset' } },
+    ]);
+    const first = drain(parseWithIdentity({ key: path, sessionId: '' }, null));
+    const state = cursorState(first.ret);
+    assert.equal(state.v, 4);
+    assert.equal(typeof state.completeLineOffset, 'number');
+    assert.equal(state.completeLineOffset, first.ret.split(':')[2] * 1);
+    assert.equal(state.sourceSize, state.completeLineOffset);
+    assert.equal(typeof state.dev, 'string');
+    assert.equal(typeof state.sourceInode, 'string');
 
-  const unchanged = drain(parse({ key: path, sessionId: '' }, first.ret));
-  assert.deepEqual(unchanged.values, [], 'an empty suffix emits no patch');
-  assert.equal(unchanged.ret, first.ret, 'an empty suffix does not advance the checkpoint');
+    const unchanged = drain(parseWithIdentity({ key: path, sessionId: '' }, first.ret));
+    assert.deepEqual(unchanged.values, [], 'an empty suffix emits no patch');
+    assert.equal(unchanged.ret, first.ret, 'an empty suffix does not advance the checkpoint');
 
-  appendFileSync(path, `${JSON.stringify({
-    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'after offset' },
-  })}\n`);
-  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
-  assert.deepEqual(second.values.filter(record => record.kind === 'message').map(record => record.text), ['after offset']);
-  assert.equal(second.values.some(record => record.kind === 'delete-session'), false);
-  assert.equal(cursorState(second.ret).verifiedPrefix, false);
-});
+    appendFileSync(path, `${JSON.stringify({
+      type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'after offset' },
+    })}\n`);
+    const metrics = createCodexParseMetrics();
+    const second = drain(parseWithIdentity({ key: path, sessionId: '' }, first.ret, metrics));
+    assert.deepEqual(second.values.filter(record => record.kind === 'message').map(record => record.text), ['after offset']);
+    assert.equal(second.values.some(record => record.kind === 'delete-session'), false);
+    assert.equal(metrics.plan, expectedPlan);
+    assert.equal(cursorState(second.ret).verifiedPrefix, verifiedPrefix);
+  });
+}
 
 test('codex parse() accepts a legacy #148 v4 cursor but replays it conservatively', () => {
   const path = writeFixture([
@@ -296,9 +323,7 @@ test('codex parse() heals a touched-but-unchanged source instead of re-fingerpri
   const first = drain(parse({ key: path, sessionId: '' }, null));
   const before = statSync(path);
   // cp -p / rsync -a preserve mtime and size while ctime necessarily changes.
-  utimesSync(path, before.atime, before.mtime);
-  const touched = statSync(path);
-  assert.notEqual(touched.ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+  const touched = touchWithChangedCtime(path, before);
 
   const second = drain(parse({ key: path, sessionId: '' }, first.ret));
   assert.deepEqual(second.values, [], 'a touch with no new bytes emits nothing');
@@ -321,8 +346,7 @@ test('codex strict reconcile heals a touched-but-unchanged source', () => {
   ]);
   const first = drain(parse({ key: path, sessionId: '' }, null));
   const before = statSync(path);
-  utimesSync(path, before.atime, before.mtime);
-  assert.notEqual(statSync(path).ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+  touchWithChangedCtime(path, before);
 
   const metrics = createCodexParseMetrics();
   const second = drain(parse({ key: path, sessionId: '', meta: { readMode: 'strict' } }, first.ret, metrics));
@@ -341,8 +365,7 @@ test('codex parse() patches the aggregate when a touch coincides with a title ch
   ]);
   const first = drain(parse({ key: path, sessionId: '', meta: { indexedTitle: 'Old Title' } }, null));
   const before = statSync(path);
-  utimesSync(path, before.atime, before.mtime);
-  assert.notEqual(statSync(path).ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+  touchWithChangedCtime(path, before);
 
   const second = drain(parse({
     key: path, sessionId: '',
@@ -509,6 +532,58 @@ test('codex parse() persists a session-index-only metadata refresh without repla
   assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
   assert.equal(cursorState(second.ret).indexedTitle, 'After');
 });
+
+function assertVerifiedMetadataRefresh(parseSource, readMode = 'normal') {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'unchanged source' } },
+  ]);
+  const first = drain(parseSource({
+    key: path, sessionId: '',
+    meta: { indexedTitle: 'Before', indexedUpdatedAt: '2026-06-10T11:00:00Z' },
+  }, null));
+  const refreshedUnit = {
+    key: path, sessionId: '',
+    meta: { readMode, indexedTitle: 'After', indexedUpdatedAt: '2026-06-10T12:00:00Z' },
+  };
+  const metrics = createCodexParseMetrics();
+  const second = drain(parseSource(refreshedUnit, first.ret, metrics));
+
+  assert.deepEqual(second.values.map(record => record.kind), ['session'], 'metadata changes emit only the session aggregate');
+  assert.equal(second.values[0].title, 'After');
+  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(second.values[0].message_count, first.values.find(record => record.kind === 'session').message_count);
+  assert.equal(cursorState(second.ret).indexedTitle, 'After');
+  assert.equal(cursorState(second.ret).indexedUpdatedAt, '2026-06-10T12:00:00Z');
+  assert.equal(metrics.plan, 'verified-append', 'unsupported identities and strict mode still verify the prefix');
+  assert.equal(metrics.sourceBytesRead, statSync(path).size, 'the prefix is fingerprinted once');
+  assert.equal(metrics.jsonLinesParsed, 0, 'an unchanged rollout is not replayed');
+  assert.equal(metrics.suffixBytesRead, 0);
+
+  const third = drain(parseSource(refreshedUnit, second.ret));
+  assert.deepEqual(third.values, [], 'the refreshed metadata does not emit again');
+  assert.equal(third.ret, second.ret, 'the refreshed checkpoint converges');
+}
+
+test('codex strict reconcile persists a session-index-only metadata refresh without replay', () => {
+  assertVerifiedMetadataRefresh(parse, 'strict');
+});
+
+for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
+  test(`codex metadata refresh with ${identityName} file identity persists without replay`, async t => {
+    const unsupportedStat = (...args) => {
+      const result = statSync(...args);
+      result.ino = inode;
+      return result;
+    };
+    const fsMock = t.mock.module('node:fs', {
+      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+    });
+    t.after(() => fsMock.restore());
+    const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?metadata-${identityName}-identity`);
+    assertVerifiedMetadataRefresh(parseWithoutIdentity);
+  });
+}
 
 test('codex provider discovers, watches, and reads archived sessions', () => {
   const root = makeTempDir('obelisk-codex-archive-');
