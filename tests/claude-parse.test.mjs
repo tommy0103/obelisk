@@ -229,7 +229,17 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   assert.equal(orphan.length, 1);
   const freshOrphan = assembleSessionDetail([...provider.parse(orphan[0], null)]);
   for (const unit of orphan) cursors.set(unit.key, persist(db, unit, provider.parse(unit, context.lastCursor(unit.key))));
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, freshOrphan.messages.length);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get().n, 1);
+  const orphanWorkflows = db.prepare('SELECT * FROM workflows').all();
+  for (const row of orphanWorkflows) row.agents = db.prepare('SELECT * FROM workflow_agents WHERE run_id=?').all(row.run_id);
+  assert.deepEqual(assembleSessionDetail({
+    session: db.prepare('SELECT * FROM sessions').get(),
+    messages: db.prepare('SELECT * FROM messages').all(),
+    toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+    toolResults: db.prepare('SELECT * FROM tool_results').all(),
+    subagents: db.prepare('SELECT * FROM subagents').all(),
+    workflows: orphanWorkflows,
+  }), freshOrphan);
   assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, freshOrphan.session.message_count);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM workflows').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM workflow_agents').get().n, 1);
