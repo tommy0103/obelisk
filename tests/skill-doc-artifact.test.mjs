@@ -27,7 +27,9 @@ test('build:skill produces a docs-only skill that delegates execution to the CLI
 
   const skill = readFileSync(join(artifact, 'SKILL.md'), 'utf8');
   const schema = readFileSync(join(artifact, 'references', 'schema.md'), 'utf8');
-  assert.match(skill, /Bash\(obelisk:\*\)/);
+  assert.match(skill, /Bash\(obelisk --search \*\)/);
+  assert.doesNotMatch(skill, /Bash\(obelisk:\*\)/, 'skill must not grant broad Bash(obelisk:*) permission');
+  assert.doesNotMatch(skill, /^\s*-\s*Write$/m, 'skill must not pre-approve Write');
   assert.match(skill, /obelisk --query "\$qfile"/);
   assert.match(skill, /obelisk --attune \/tmp\/register-memory\.mjs/);
   assert.match(skill, /sandbox_permissions: "require_escalated"/);

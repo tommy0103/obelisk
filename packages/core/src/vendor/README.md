@@ -48,5 +48,7 @@ copy:
    — the multi-frame zstd and chunk-row tests cover the vendored paths.
 
 Note: the container and chunk-row formats are unchanged across session format
-v0–v3 (ADR-0014); the vendored decoders needed no update for multi-version
-support.
+v0–v4 (ADR-0014); the vendored decoders needed no update for multi-version
+support. The v4 codec reuses the released V2 physical framing and only swaps
+the header version, so a `session.v4.jsonl.zstd` artifact decodes through the
+same scanner and frame decoder as v3.
