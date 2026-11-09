@@ -11,7 +11,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path';
 
 import {
   extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
@@ -429,12 +429,11 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   // session: its records land in messages while the session itself disappears
   // from the catalogue, from session detail, and from every statement that
   // joins sessions. The subagent transcript is the only surviving witness, so
-  // it publishes the row. Counting is delta because several subagents share one
-  // session id; a replay would otherwise re-add the same messages, so
-  // repairOrphanedSessionCounts restates the count from the stored rows whenever
-  // this transcript is gone.
+  // it publishes the row. Fresh per-unit snapshots use total counts so they
+  // remain canonical detail input; appends use deltas. Finalization reconciles
+  // the orphan family count from all stored sibling contributions.
   const mainTranscriptPath = isSubagent ? mainTranscriptPathOf(unit) : null;
-  const orphanedSubagent = mainTranscriptPath !== null && !existsSync(mainTranscriptPath);
+  const orphanedSubagent = mainTranscriptPath !== null && transcriptProvedMissing(mainTranscriptPath);
   if (!isSubagent || orphanedSubagent) {
     records.push({
       kind: 'session',
@@ -446,7 +445,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
       git_branch: isSubagent ? null : sm.git_branch,
       version: isSubagent ? null : sm.version,
       message_count: sm.n,
-      countMode: isSubagent ? 'delta' : (skip > 0 ? 'delta' : 'total'),
+      countMode: skip > 0 ? 'delta' : 'total',
       jsonl_path: mainTranscriptPath ?? unit.key,
       source: 'claude',
     });
@@ -464,11 +463,22 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
  * necessarily on disk any more (see the orphaned-subagent branch in parse).
  */
 function mainTranscriptPathOf(unit: IndexUnit): string | null {
-  const marker = /[\\/]subagents[\\/]/.exec(unit.key);
-  // Unrecognized layout: never guess at a path we would then call missing.
-  if (marker === null) return null;
-  const sessionDir = unit.key.slice(0, marker.index);
-  return join(dirname(sessionDir), `${String(unit.sessionId ?? '')}.jsonl`);
+  // Match the owning session directory rather than the first ancestor named
+  // subagents (the user's home or project can legally contain that name).
+  let directory = dirname(unit.key);
+  while (dirname(directory) !== directory) {
+    const parent = dirname(directory);
+    if (basename(directory) === 'subagents' && basename(parent) === unit.sessionId) {
+      return join(dirname(parent), `${unit.sessionId}.jsonl`);
+    }
+    directory = parent;
+  }
+  return null;
+}
+
+function transcriptProvedMissing(path: string): boolean {
+  try { statSync(path); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT'; }
 }
 
 function rawClaude(input: RawLookup): RawRecord | null {

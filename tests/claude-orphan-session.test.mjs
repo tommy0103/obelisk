@@ -15,10 +15,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, chmodSync, symlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { parse } from '../packages/core/src/providers/claude.ts';
+import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { parse, createClaudeProvider } from '../packages/core/src/providers/claude.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import {
   backfillSessionTitles,
@@ -90,8 +91,8 @@ test('an orphaned subagent transcript publishes the session row', () => {
   // `raw` still resolves subagent rows from `<project>/<sessionId>/subagents/`.
   assert.equal(sessions[0].jsonl_path, join(root, PROJECT, `${SESSION_ID}.jsonl`));
   assert.equal(sessions[0].message_count, 2);
-  // Several subagent transcripts share one session id, so counts accumulate.
-  assert.equal(sessions[0].countMode, 'delta');
+  // A fresh unit must also be valid direct canonical detail input.
+  assert.equal(sessions[0].countMode, 'total');
   // Nothing in the source names it; the backfill supplies a title later.
   assert.equal(sessions[0].title, null);
 });
@@ -133,6 +134,7 @@ test('orphaned subagent messages land in one browsable session row', () => {
 
   persist(db, subagentUnit(first, 'agent-a'), parse(subagentUnit(first, 'agent-a'), null));
   persist(db, subagentUnit(second, 'agent-b'), parse(subagentUnit(second, 'agent-b'), null));
+  repairOrphanedSessionCounts(db);
   refreshSessionProjectPaths(db, new Set([SESSION_ID]));
 
   const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(SESSION_ID);
@@ -202,11 +204,8 @@ test('title backfill fills blanks only, truncates, and skips message-less sessio
 });
 
 test('a replayed orphan unit recovers its count instead of growing it', () => {
-  // Orphan rows are counted with `countMode: 'delta'` (several subagents share
-  // one session id). A replay — marker bump, vanished cursor row, retried unit —
-  // adds that unit's messages again, so the stored count drifts above the rows.
-  // Nothing on the provider side can restate it: the main transcript that owned
-  // the total is gone. The repair pass derives it from the rows instead.
+  // Fresh per-unit totals do not double-count a replay. Finalization still
+  // reconciles a multi-unit orphan family after all siblings are committed.
   const root = makeTempDir('obelisk-orphan-replay-');
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
@@ -222,13 +221,98 @@ test('a replayed orphan unit recovers its count instead of growing it', () => {
   // Same unit replayed from scratch, exactly what a marker bump produces.
   persist(db, unit, parse(unit, null));
   const drifted = db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count;
-  assert.equal(drifted, 4, 'delta semantics are what makes the replay visible');
+  assert.equal(drifted, 2, 'a fresh replay restates its per-unit total');
 
-  assert.equal(repairOrphanedSessionCounts(db), 1);
+  assert.equal(repairOrphanedSessionCounts(db), 0);
   assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(SESSION_ID).message_count, 2);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(SESSION_ID).n, 2);
 
   // Idempotent: a second pass has nothing left to correct.
   assert.equal(repairOrphanedSessionCounts(db), 0);
   db.close();
+});
+
+
+function capturedMessage(uuid, text) {
+  const record = JSON.parse(readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8').trim().split('\n').at(-1));
+  record.uuid = uuid;
+  record.message.content = text;
+  return record;
+}
+
+test('fresh orphan discover and parse preserve direct canonical detail through SQLite', () => {
+  const root = makeTempDir('obelisk-orphan-canonical-');
+  const projects = join(root, 'projects');
+  const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8').trim().split('\n').at(-1);
+  const path = writeSubagentTranscript(projects, 'agent-a', [JSON.parse(captured)]);
+  const provider = createClaudeProvider({ rootDir: root });
+  const unit = provider.discover({ lastCursor: () => null }).find(unit => unit.key === path);
+  assert.ok(unit);
+  const records = [...provider.parse(unit, null)];
+  const direct = assembleSessionDetail(records);
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(SCHEMA);
+    persist(db, unit, provider.parse(unit, null));
+    const roundtrip = assembleSessionDetail({
+      session: db.prepare('SELECT * FROM sessions').get(),
+      messages: db.prepare('SELECT * FROM messages').all(),
+      toolCalls: db.prepare('SELECT * FROM tool_calls').all(),
+      toolResults: db.prepare('SELECT * FROM tool_results').all(),
+      subagents: db.prepare('SELECT * FROM subagents').all(),
+    });
+    assert.deepEqual(roundtrip, direct);
+  } finally { db.close(); }
+});
+
+test('an ancestor named subagents does not turn a live session into an orphan', () => {
+  const root = makeTempDir('obelisk-orphan-ancestor-');
+  const projects = join(root, 'subagents', '.claude', 'projects');
+  const path = writeSubagentTranscript(projects, 'agent-a', [capturedMessage('child', 'child text')]);
+  writeMainTranscript(projects, [capturedMessage('main', 'main text')]);
+  const provider = createClaudeProvider({ rootDir: join(root, 'subagents', '.claude') });
+  const unit = provider.discover({ lastCursor: () => null }).find(unit => unit.key === path);
+  assert.ok(unit);
+  assert.deepEqual(sessionRecords([...provider.parse(unit, null)]), []);
+});
+
+test('an inaccessible main transcript is not absence and keeps its authoritative count', { skip: process.platform === 'win32' }, () => {
+  const root = makeTempDir('obelisk-orphan-denied-');
+  const path = writeSubagentTranscript(root, 'agent-a', [capturedMessage('child', 'child text')]);
+  const targetDir = join(root, 'restricted');
+  mkdirSync(targetDir);
+  const target = join(targetDir, 'actual.jsonl');
+  writeFileSync(target, JSON.stringify(capturedMessage('main', 'main text')) + '\n');
+  const main = join(root, PROJECT, `${SESSION_ID}.jsonl`);
+  symlinkSync(target, main);
+  chmodSync(targetDir, 0);
+  const db = new DatabaseSync(':memory:');
+  try {
+    assert.throws(() => statSync(main), { code: 'EACCES' });
+    const unit = subagentUnit(path, 'agent-a');
+    assert.deepEqual(sessionRecords([...parse(unit, null)]), []);
+    db.exec(SCHEMA);
+    db.prepare('INSERT INTO sessions(id,message_count,jsonl_path,source) VALUES(?,?,?,?)').run(SESSION_ID, 20, main, 'claude');
+    persist(db, unit, parse(unit, null));
+    assert.equal(repairOrphanedSessionCounts(db), 0);
+    assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 20);
+  } finally { chmodSync(targetDir, 0o700); db.close(); }
+});
+
+test('metadata-only orphan input stays untitled and a returning main transcript owns its count again', () => {
+  const root = makeTempDir('obelisk-orphan-return-');
+  const path = writeSubagentTranscript(root, 'agent-a', [capturedMessage('child', 'child text')]);
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(SCHEMA);
+    persist(db, subagentUnit(path, 'agent-a'), parse(subagentUnit(path, 'agent-a'), null));
+    db.exec("UPDATE messages SET is_meta=1");
+    assert.equal(backfillSessionTitles(db), 0);
+    assert.equal(db.prepare('SELECT title FROM sessions').get().title, null);
+    const main = writeMainTranscript(root, [capturedMessage('main', 'main text')]);
+    const unit = { key: main, sessionId: SESSION_ID, project: PROJECT };
+    persist(db, unit, parse(unit, null));
+    assert.equal(repairOrphanedSessionCounts(db), 0);
+    assert.equal(db.prepare('SELECT message_count FROM sessions').get().message_count, 1);
+  } finally { db.close(); }
 });

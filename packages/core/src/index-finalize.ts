@@ -147,11 +147,8 @@ export function backfillSessionTitles(db: SqliteDb): number {
     "SELECT id FROM sessions WHERE title IS NULL OR trim(title) = ''",
   ).all();
   if (untitled.length === 0) return 0;
-  // One index seek per untitled session. A single windowed join over `messages`
-  // is shaped the other way round — it scans every message (2M rows on a real
-  // corpus) and holds the caller's write transaction for 14-17 s. Staying on
-  // idx_messages_session keeps this in the millisecond range and lets the pass
-  // run on every incremental build.
+  // Seek opening candidates by session instead of a whole-history windowed
+  // join, so ordinary incremental finalization stays scoped to untitled rows.
   const opening = db.prepare(`
     SELECT text FROM messages
     WHERE session_id = ?
@@ -170,6 +167,7 @@ export function backfillSessionTitles(db: SqliteDb): number {
     SELECT text FROM messages
     WHERE session_id = ?
       AND role = 'user'
+      AND COALESCE(is_meta, 0) = 0
       AND text IS NOT NULL AND trim(text) <> ''
       AND COALESCE(visibility, 'visible') = 'visible'
     ORDER BY timestamp IS NULL, timestamp, uuid
@@ -203,11 +201,9 @@ export function backfillSessionTitles(db: SqliteDb): number {
  * a main transcript proved absent. Other providers own their count semantics
  * and may store logical provenance such as database paths with fragments.
  *
- * Sessions rebuilt from the last surviving subagent log (see the claude
- * adapter) are counted with `countMode: 'delta'`, because several subagent
- * files share one session id. A replay — marker bump, lost cursor row, failed
- * unit retried — re-adds that unit's messages instead of replacing them, so the
- * count drifts above the rows actually stored. Nothing can correct it from the
+ * Fresh orphan units publish per-unit totals and appends publish deltas.
+ * Several subagent files share a session id, so finalization reconciles their
+ * combined count after all committed units, including replay/retry paths. Nothing can correct it from the
  * provider side, because the main transcript that used to own the total is
  * exactly what is missing.
  *
