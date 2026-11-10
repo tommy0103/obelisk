@@ -25,7 +25,7 @@
 // The database opener is injected (`HermesStoreOpener`), because Core runs under both
 // `node:sqlite` (CLI) and better-sqlite3 (Electron) — see copilot.ts for the same seam.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { SqliteDb, SqliteRow } from '../sqlite-types.ts';
 import type {
   Cursor,
@@ -62,7 +62,15 @@ const SESSION_PATH_PREFIX = 'session:';
 // provider markers do: `readRecentTranscriptHints` skips `__` keys, so it is never
 // mistaken for a transcript path, and a force rebuild recreates it with everything else.
 const STORE_GATE_PREFIX = '__hermes_store_v1__:';
-const STORE_CURSOR_TAG = 'hermes-store-v1';
+const STORE_CURSOR_TAG = 'hermes-store-v2';
+// Ordinary refreshes audit a fair, persisted slice; the first refresh after
+// this deadline performs a complete audit. Strict CLI reads never defer it.
+const AUDIT_BATCH_SESSIONS = 64;
+const AUDIT_MAX_AGE_MS = 60_000;
+// v2: the watermark counts non-NULL projected columns instead of summing their text lengths, so
+// the per-store pass reads record headers rather than every message body. The input changes once,
+// which replays a session the first time discovery compares it against an older cursor.
+const WATERMARK_VERSION = 2;
 
 // CLI-side read-only opener
 export type HermesStoreOpener = (path: string) => SqliteDb;
@@ -91,6 +99,8 @@ interface HermesUnitMeta {
   tombstone?: boolean;
   /** Set on the store-level gate unit, which carries no records. */
   storeGate?: boolean;
+  /** A source observation is acknowledged only with this unit's commit. */
+  auditToken?: string;
 }
 
 /** One session of a store read, with the identity and stored cursor discovery compares it by. */
@@ -266,6 +276,10 @@ function sessionTotalTokens(row: SqliteRow): number | null {
 function fileSignature(path: string): string {
   try {
     const stat = statSync(path);
+    // A zero-length file carries no rows. SQLite may leave an empty WAL after a checkpoint, and
+    // counting its identity would move the gate from a read that changed nothing. A zero-length
+    // database can never be certified: opening it fails before any gate is written.
+    if (stat.size === 0) return 'absent';
     return [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':');
   } catch {
     return 'absent';
@@ -303,22 +317,41 @@ function storeFileState(dbPath: string): 'present' | 'missing' | 'unreadable' {
 }
 
 interface HermesStoreCursor {
-  /** The store gate the whole store was last certified at. */
+  /** The store gate the whole store was last examined at. */
   gate: string;
   /** Digest of the session ids the store enumerated at that gate. */
   sessions: string;
+  /** True when that examination scheduled nothing, so the store can be skipped outright. */
+  complete: boolean;
+  audit: HermesAudit;
 }
 
-/** `${mtime}:0:${STORE_CURSOR_TAG}:${gate}:${sessions}`. */
+interface HermesAudit {
+  token: string;
+  after: string | null;
+  startedAt: number;
+  startGate: string;
+}
+
+/** `${mtime}:0:${STORE_CURSOR_TAG}:${gate}:${sessions}:${auditBase64}:0|1`. */
 function parseStoreCursor(cursor: Cursor): HermesStoreCursor | null {
   if (cursor === null) return null;
   const parts = cursor.split(':');
-  if (parts.length !== 5 || parts[2] !== STORE_CURSOR_TAG) return null;
-  return { gate: parts[3]!, sessions: parts[4]! };
+  if (parts.length !== 7 || parts[2] !== STORE_CURSOR_TAG || !/^[01]$/.test(parts[6]!)
+    || !/^[0-9a-f]{64}$/.test(parts[3]!) || !/^[0-9a-f]{64}$/.test(parts[4]!)) return null;
+  try {
+    const audit = JSON.parse(Buffer.from(parts[5]!, 'base64url').toString('utf8')) as Partial<HermesAudit>;
+    if (typeof audit.token !== 'string' || !/^[0-9a-f-]{36}$/.test(audit.token)
+      || (audit.after !== null && typeof audit.after !== 'string')
+      || !Number.isSafeInteger(audit.startedAt) || audit.startedAt! < 0
+      || typeof audit.startGate !== 'string' || !/^[0-9a-f]{64}$/.test(audit.startGate)) return null;
+    return { gate: parts[3]!, sessions: parts[4]!, complete: parts[6] === '1', audit: audit as HermesAudit };
+  } catch { return null; }
 }
 
-function storeCursor(dbPath: string, gate: string, sessions: string): Cursor {
-  return [String(storeMtime(dbPath)), '0', STORE_CURSOR_TAG, gate, sessions].join(':');
+function storeCursor(dbPath: string, gate: string, sessions: string, audit: HermesAudit, complete: boolean): Cursor {
+  return [String(storeMtime(dbPath)), '0', STORE_CURSOR_TAG, gate, sessions,
+    Buffer.from(JSON.stringify(audit)).toString('base64url'), complete ? '1' : '0'].join(':');
 }
 
 /**
@@ -337,14 +370,18 @@ interface HermesCursor {
   fingerprint: string;
   /** The exact digest of the session's projected rows, when one has been computed. */
   digest: string | null;
+  auditToken: string | null;
 }
 
-/** `${mtime}:0:${CURSOR_TAG}:${gate}:${fingerprint}[:${digest}]`. */
+/** `${mtime}:0:${CURSOR_TAG}:${gate}:${fingerprint}[:${digest}[:${auditToken}]]`. */
 function parseHermesCursor(cursor: Cursor): HermesCursor | null {
   if (cursor === null) return null;
   const parts = cursor.split(':');
-  if (parts.length < 5 || parts[2] !== CURSOR_TAG) return null;
-  return { gate: parts[3]!, fingerprint: parts[4]!, digest: parts[5] ?? null };
+  if (parts.length < 5 || parts.length > 7 || parts[2] !== CURSOR_TAG
+    || !/^[0-9a-f]{64}$/.test(parts[3]!) || !/^[0-9a-f]{64}$/.test(parts[4]!)
+    || (parts[5] && !/^[0-9a-f]{64}$/.test(parts[5]))
+    || (parts[6] && !/^[0-9a-f-]{36}$/.test(parts[6]))) return null;
+  return { gate: parts[3]!, fingerprint: parts[4]!, digest: parts[5] || null, auditToken: parts[6] || null };
 }
 
 function sessionCursor(
@@ -352,10 +389,12 @@ function sessionCursor(
   gate: string,
   fingerprint: string,
   digest: string | null,
+  auditToken: string | null = null,
 ): Cursor {
   // The first field stays the store mtime: persist() reads it into index_state.mtime.
   const parts = [String(storeMtime(dbPath)), '0', CURSOR_TAG, gate, fingerprint];
-  if (digest !== null) parts.push(digest);
+  if (digest !== null || auditToken !== null) parts.push(digest ?? '');
+  if (auditToken !== null) parts.push(auditToken);
   return parts.join(':');
 }
 
@@ -493,17 +532,20 @@ function readSessionRows(db: SqliteDb): SqliteRow[] {
 }
 
 /**
- * A per-session fingerprint: the mutable session fields plus the message watermark.
- * Mirrors copilot.ts's Chronicle fingerprint — parse() re-derives it and refuses to
- * write records for a session that changed after discovery.
+ * A per-session fingerprint: the mutable session fields plus a row-shape message watermark.
+ * parse() re-derives it and refuses to write records for a session that changed after discovery.
+ * The watermark reads no message body, and every aggregate below is answerable from the record
+ * header or the rowid. That rules out `timestamp`, `active` and `compacted`: upstream stores them
+ * after the large text columns, so reading any of them walks the text's overflow pages. An
+ * in-place edit to one of those, or to a body, reaches the index only through the exact digest,
+ * under the strict or bounded audit policy, including beside explained changes. `typeof` is the only NULL
+ * test SQLite answers from the header; `x IS NOT NULL` and `COUNT(x)` materialize the value.
  */
 const WATERMARK_AGGREGATES = `
-      COUNT(*) AS total, MAX(rowid) AS last_rowid, MAX(timestamp) AS last_at, MAX(id) AS last_id,
-      SUM(LENGTH(COALESCE(content, ''))) AS content_bytes,
-      SUM(LENGTH(COALESCE(tool_calls, ''))) AS calls_bytes,
-      SUM(COALESCE(active, 1)) AS active_sum,
-      SUM(COALESCE(compacted, 0)) AS compacted_sum,
-      SUM(LENGTH(COALESCE(display_kind, ''))) AS display_bytes`;
+      COUNT(*) AS total, MAX(rowid) AS last_rowid, MAX(id) AS last_id,
+      SUM(typeof(content) <> 'null') AS content_rows,
+      SUM(typeof(tool_calls) <> 'null') AS calls_rows,
+      SUM(typeof(display_kind) <> 'null') AS display_rows`;
 
 /**
  * Every session's watermark in one grouped query. Discovery runs this once per store
@@ -578,15 +620,13 @@ function sessionFingerprint(
         row['output_tokens'] ?? null,
       ],
       messages: [
+        WATERMARK_VERSION,
         Number(watermark?.['total'] ?? 0),
         watermark?.['last_rowid'] ?? null,
-        watermark?.['last_at'] ?? null,
         watermark?.['last_id'] ?? null,
-        Number(watermark?.['content_bytes'] ?? 0),
-        Number(watermark?.['calls_bytes'] ?? 0),
-        Number(watermark?.['active_sum'] ?? 0),
-        Number(watermark?.['compacted_sum'] ?? 0),
-        Number(watermark?.['display_bytes'] ?? 0),
+        Number(watermark?.['content_rows'] ?? 0),
+        Number(watermark?.['calls_rows'] ?? 0),
+        Number(watermark?.['display_rows'] ?? 0),
       ],
     }),
   );
@@ -625,11 +665,10 @@ function digestOfMessages(rows: readonly SqliteRow[]): string {
 }
 
 /**
- * The exact digest of one session's projected rows. Read-only, and run only when the
- * store gate moved but no session watermark did: the aggregates cannot attribute a
- * same-length in-place rewrite to a session, and the gate cannot say which session it
- * was. node:sqlite has no `sha3()` (SQLite ships no hash function), so this has to be
- * computed in JavaScript.
+ * The exact digest of one session's projected rows. Strict refresh verifies every
+ * unproven session; ordinary refresh rotates a bounded slice and verifies fully
+ * at its deadline. Header aggregates cannot attribute hidden edits, even beside
+ * another session's append. SQLite exposes no built-in hash, so digest in JS.
  */
 function exactSessionDigest(db: SqliteDb, sessionId: unknown): string {
   const rows = db
@@ -1058,7 +1097,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
       // The cursor carries the store gate this read happened at, the fingerprint it verified,
       // and the exact digest of the rows it projected, so the next discovery can tell an
       // untouched session from a rewritten one without re-reading it.
-      return sessionCursor(meta.dbPath, gate, fingerprint, digest);
+      return sessionCursor(meta.dbPath, gate, fingerprint, digest, meta.auditToken ?? null);
     } finally {
       try {
         db?.close();
@@ -1229,8 +1268,8 @@ export function createHermesProvider({
           // schedules still follows the per-session cursors. The hint matters even though a write
           // normally moves the gate too: it is the daemon telling us the store is worth a look.
           const hinted = changedPaths.some(path => pathInside(storeDir, path));
-          // A hint naming one session's own source path schedules exactly that session: the store
-          // is read to reach it, but no sibling is dragged in.
+          // A session source hint forces that session; sibling reconciliation still
+          // follows the strict or bounded audit policy below.
           const forcedSessions = new Set<string>();
           for (const path of changedPaths) {
             const rawSessionId = rawSessionIdFromSourcePath(dbPath, path);
@@ -1241,13 +1280,14 @@ export function createHermesProvider({
             !hinted
             && forcedSessions.size === 0
             && stored !== null
+            && stored.complete
             && stored.gate === gate
             && stored.sessions === indexedSessions
           ) {
             // Certified at this gate, and the index holds exactly the sessions that were
             // enumerated then: skip the store without opening it. A write of any kind moves the
-            // gate, and a session the index lost or gained moves the set, so neither a change
-            // nor a pending retraction can hide behind this branch.
+            // gate, a session the index lost or gained moves the set, and a partial gate means
+            // the examination scheduled work, so a pending retry cannot hide behind this branch.
             for (const session of dbIndexed) liveSessionIds.add(session.sessionId);
             continue;
           }
@@ -1271,120 +1311,114 @@ export function createHermesProvider({
               cursor: parseHermesCursor(ctx.lastCursor(`hermes-unit:${sessionId}`)),
             };
           });
-          const scheduled: { entry: StoreSessionEntry; cursor: Cursor }[] = [];
-          const candidates: { entry: StoreSessionEntry; stored: HermesCursor }[] = [];
-          // True when the digest pass could not run, so this scan never examined the sessions
-          // whose gate moved and must not certify the store at this gate.
-          let digestUnavailable = false;
-          const storeSessionIds: string[] = [];
-          for (const entry of storeSessions) {
-            const { session, cursor, rawSessionId, sessionId } = entry;
-            liveSessionIds.add(sessionId);
-            storeSessionIds.push(sessionId);
-            if (
-              !indexedIds.has(sessionId)
-              || cursor === null
-              || cursor.fingerprint !== session.fingerprint
-              || forcedSessions.has(rawSessionId)
-            ) {
-              // A new, grown or superseded session — or one the index no longer holds. A cursor
-              // can outlive its canonical session row, so matching fingerprint alone cannot
-              // certify that the session is still indexed.
-              // parse() re-derives the fingerprint it hands back, so the cursor here only has to
-              // be the one discovery believes in.
-              scheduled.push({
-                entry,
-                cursor: sessionCursor(dbPath, gate, session.fingerprint, cursor?.digest ?? null),
-              });
-              continue;
-            }
-            if (cursor.gate === gate) continue; // written at the current gate: certified unchanged
-            candidates.push({ entry, stored: cursor });
+          const ordered = [...storeSessions].sort((a, b) => a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0);
+          const lastId = ordered.at(-1)?.sessionId ?? null;
+          const now = Date.now();
+          let audit: HermesAudit = stored?.audit ?? {
+            token: randomUUID(), after: null, startedAt: now, startGate: gate,
+          };
+          const allAcknowledged = ordered.every(entry => indexedIds.has(entry.sessionId)
+            && entry.cursor?.auditToken === audit.token
+            && entry.cursor.fingerprint === entry.session.fingerprint);
+          const coveredAtGate = stored !== null && stored.gate === gate
+            && stored.sessions === sessionsDigest(ordered.map(entry => entry.sessionId))
+            && audit.after === lastId && audit.startGate === gate;
+          const expired = stored !== null && !stored.complete && !(coveredAtGate && allAcknowledged)
+            && (now < audit.startedAt || now - audit.startedAt >= AUDIT_MAX_AGE_MS);
+          const strict = ctx.readMode === 'strict' || ctx.snapshotRequired === true;
+          const fullAudit = stored === null || expired || (strict && (!coveredAtGate || hinted));
+          // A completed cycle starts another one only after its session commits
+          // acknowledged it. New writes during a cycle never reset its position
+          // or deadline, so a busy sibling cannot starve an older hidden edit.
+          if (fullAudit || (audit.after === lastId && allAcknowledged && !coveredAtGate)
+            || stored?.complete === true) {
+            audit = { token: randomUUID(), after: null, startedAt: now, startGate: gate };
           }
-
-          // For these sessions the gate moved but nothing the aggregates can see did, so only an
-          // exact digest of the projected rows can tell an in-place rewrite from an idle store.
-          // The pass runs on every scan that has candidates: skipping it whenever something else
-          // was scheduled would let a store written at least once per scan hide a same-length
-          // rewrite indefinitely. It is read-only and measured at ~250 ms over ~17k rows.
+          const scheduled: { entry: StoreSessionEntry; cursor: Cursor }[] = [];
+          const cursorUpdates: { entry: StoreSessionEntry; digest: string }[] = [];
+          const changed = new Set<string>();
+          for (const entry of ordered) {
+            liveSessionIds.add(entry.sessionId);
+            if (!indexedIds.has(entry.sessionId) || entry.cursor === null
+              || entry.cursor.fingerprint !== entry.session.fingerprint
+              || forcedSessions.has(entry.rawSessionId)) {
+              changed.add(entry.sessionId);
+              scheduled.push({ entry, cursor: sessionCursor(dbPath, gate, entry.session.fingerprint,
+                entry.cursor?.digest ?? null, audit.token) });
+            }
+          }
+          const next = fullAudit ? ordered : ordered.filter(entry => audit.after === null || entry.sessionId > audit.after)
+            .slice(0, AUDIT_BATCH_SESSIONS);
+          const selected = new Set(next.map(entry => entry.sessionId));
+          const candidates = ordered.filter(entry => !changed.has(entry.sessionId)
+            && (selected.has(entry.sessionId)
+              // A failed canonical or cursor-only commit retains its old token.
+              // Retry it even after rotation has moved past its position.
+              || (audit.after !== null && entry.sessionId <= audit.after && entry.cursor?.auditToken !== audit.token)));
+          let digestUnavailable = false;
           if (candidates.length > 0) {
             let digestDb: SqliteDb | null = null;
             try {
               digestDb = openStore(dbPath);
-              for (const { entry, stored } of candidates) {
-                const digest = exactSessionDigest(digestDb, entry.rawSessionId);
-                if (stored.digest === digest) continue;
-                scheduled.push({
-                  entry,
-                  cursor: sessionCursor(dbPath, gate, entry.session.fingerprint, digest),
-                });
+              digestDb.exec('BEGIN');
+              const observations = candidates.map(entry => ({ entry, digest: exactSessionDigest(digestDb!, entry.rawSessionId) }));
+              digestDb.exec('COMMIT');
+              if (storeGate(dbPath) !== gate) throw new Error('Hermes store changed during reconciliation');
+              for (const { entry, digest } of observations) {
+                if (entry.cursor?.digest === digest) cursorUpdates.push({ entry, digest });
+                else scheduled.push({ entry, cursor: sessionCursor(dbPath, gate, entry.session.fingerprint, digest, audit.token) });
               }
             } catch (error) {
-              // The second read is the one place a scan can fail after the store was already
-              // read, and a transient failure there must neither abort the whole provider scan
-              // (the way an unreadable store is reported, not thrown) nor let the store look
-              // certified: these sessions were never examined, so nothing is scheduled, nothing
-              // is retracted on unread evidence, and the gate row is withheld below so the next
-              // scan runs the pass again.
               reportIssue(dbPath, error);
               digestUnavailable = true;
             } finally {
-              try {
-                digestDb?.close();
-              } catch {
-                /* a failed close must not mask the scheduling decision */
-              }
+              try { digestDb?.close(); } catch { /* preserve the read error */ }
             }
           }
-
           for (const { entry, cursor } of scheduled) {
             const { session, rawSessionId, sessionId } = entry;
             const cwdRaw = stringValue(session.row['cwd']);
             const cwd = cwdRaw === null ? null : normalizeObservedCwd(cwdRaw);
             const project = projectSlugFromPath(cwd);
             units.push({
-              key: `hermes-unit:${sessionId}`,
-              sessionId,
+              key: `hermes-unit:${sessionId}`, sessionId,
               ...(project === null ? {} : { project }),
               meta: {
-                dbPath,
-                profile: session.profile,
-                profileHint,
-                rawSessionId,
-                sessionId,
-                cwd,
-                fingerprint: session.fingerprint,
-                schemaVersion: read.schemaVersion,
-                currentCursor: cursor,
+                dbPath, profile: session.profile, profileHint, rawSessionId, sessionId, cwd,
+                fingerprint: session.fingerprint, schemaVersion: read.schemaVersion,
+                currentCursor: cursor, auditToken: audit.token,
               } satisfies HermesUnitMeta,
               retractSessionIds: [sessionId],
             });
           }
-
-          if (scheduled.length === 0 && !digestUnavailable) {
-            // Nothing needs (re)writing, so this read certified the whole store at this gate.
-            // Recording that here is what lets the next scan skip the store; it is deliberately
-            // withheld while any unit is scheduled, so a unit that fails to persist is retried
-            // instead of being swallowed by a gate that already claims the store is done.
-            units.push({
-              key: gateKey,
-              // No session: this unit carries no records, only the store's gate row. An empty
-              // session id keeps it out of every "which sessions changed" set a consumer builds
-              // from the plan (`unit.sessionId` is falsy).
-              sessionId: '',
-              meta: {
-                dbPath,
-                profile: '',
-                profileHint: null,
-                rawSessionId: '',
-                sessionId: '',
-                cwd: null,
-                fingerprint: '',
-                schemaVersion: read.schemaVersion,
-                currentCursor: storeCursor(dbPath, gate, sessionsDigest(storeSessionIds)),
-                storeGate: true,
-              } satisfies HermesUnitMeta,
-            });
+          const observationUnit = (key: string, cursor: Cursor): IndexUnit => ({
+            key, sessionId: '',
+            meta: {
+              dbPath, profile: '', profileHint: null, rawSessionId: '', sessionId: '', cwd: null,
+              fingerprint: '', schemaVersion: read.schemaVersion, currentCursor: cursor, storeGate: true,
+            } satisfies HermesUnitMeta,
+          });
+          if (!digestUnavailable) {
+            const prerequisites: { key: string; cursor: string }[] = [];
+            for (const { entry } of cursorUpdates) {
+              const key = `hermes-unit:${entry.sessionId}`;
+              // Verification advances its token, not the unchanged source's
+              // position, fingerprint or digest.
+              const cursor = [...ctx.lastCursor(key)!.split(':').slice(0, 6), audit.token].join(':');
+              units.push(observationUnit(key, cursor));
+              prerequisites.push({ key, cursor });
+            }
+            const after = fullAudit ? lastId : next.at(-1)?.sessionId ?? audit.after;
+            const observed = new Set(cursorUpdates.map(({ entry }) => entry.sessionId));
+            const complete = after === lastId && audit.startGate === gate && scheduled.length === 0
+              && ordered.every(entry => indexedIds.has(entry.sessionId)
+                && (entry.cursor?.auditToken === audit.token || observed.has(entry.sessionId)));
+            const gateUnit = observationUnit(gateKey, storeCursor(dbPath, gate,
+              sessionsDigest(ordered.map(entry => entry.sessionId)), { ...audit, after }, complete));
+            // Existing cursor prerequisites make the certificate conditional
+            // on every staged acknowledgement actually committing.
+            if (complete) gateUnit.requiresCursors = prerequisites;
+            units.push(gateUnit);
           }
         }
       }

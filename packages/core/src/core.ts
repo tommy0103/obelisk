@@ -99,7 +99,7 @@ function refreshQueryIndex(): { providerRegistry: ProviderRegistry; invocationWa
   // it is their reconciliation: there is no watcher to reconcile against.
   // It therefore verifies prefixes (strict) instead of trusting cooperative
   // append checkpoints (RFC #172).
-  reportIndexIssues(buildIndex({ providerRegistry, readMode: 'strict' }));
+  reportIndexIssues(buildIndex({ providerRegistry, readMode: 'strict', ignoreRecentBuild: true }));
   return { providerRegistry };
 }
 

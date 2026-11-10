@@ -23,6 +23,8 @@
 // a SQLite-backed adapter might encode a rowid or timestamp high-water mark.
 export type Cursor = string | null;
 
+export type ProviderReadMode = 'normal' | 'strict';
+
 // One unit of work an adapter has discovered. It is not necessarily a file: for
 // a file-based source `key` is the path; for a DB-backed source it might be
 // `"${dbPath}#${internalId}"`. `meta` carries adapter-private data (e.g. the
@@ -71,6 +73,8 @@ export interface InventoryIssue {
 
 /** Context the orchestration provides to discovery. */
 export interface DiscoverContext {
+  /** Strict callers require complete reconciliation before serving the query. */
+  readMode?: ProviderReadMode;
   /** Require a complete projection: an unstable unit must fail, not return a no-op. */
   snapshotRequired?: boolean;
   /** Look up the cursor persisted for a unit key on a previous run. */
