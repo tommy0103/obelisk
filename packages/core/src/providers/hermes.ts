@@ -538,7 +538,7 @@ function readSessionRows(db: SqliteDb): SqliteRow[] {
  * header or the rowid. That rules out `timestamp`, `active` and `compacted`: upstream stores them
  * after the large text columns, so reading any of them walks the text's overflow pages. An
  * in-place edit to one of those, or to a body, reaches the index only through the exact digest,
- * which runs when the store moved without an explained session change. `typeof` is the only NULL
+ * under the strict or bounded audit policy, including beside explained changes. `typeof` is the only NULL
  * test SQLite answers from the header; `x IS NOT NULL` and `COUNT(x)` materialize the value.
  */
 const WATERMARK_AGGREGATES = `

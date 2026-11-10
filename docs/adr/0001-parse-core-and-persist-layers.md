@@ -321,7 +321,7 @@ It bypasses the CLI's recent-build debounce; daemon heartbeat and writer-lease
 arbitration still apply. Concurrent source changes fail closed through existing
 incomplete-refresh reporting and per-session snapshot checks.
 
-Ordinary incremental refresh audits 64 sessions per store in stable canonical-id
+Ordinary incremental refresh audits up to 64 fresh sessions per store in stable canonical-id
 order, in addition to detected changed sessions and retries of failed commits.
 The persisted epoch, position and start time survive restart. Writes during an
 active cycle never reset its position or deadline. The first refresh at or after
