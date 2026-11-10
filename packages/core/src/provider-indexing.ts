@@ -13,6 +13,7 @@ import type {
   IndexUnit,
   InventoryIssue,
   ProviderAdapter,
+  ProviderReadMode,
 } from './providers/types.ts';
 import type { SqliteDb } from './sqlite-types.ts';
 
@@ -44,7 +45,7 @@ export interface ProviderInventoryIssue extends InventoryIssue {
   readonly provider: string;
 }
 
-export type ProviderReadMode = 'normal' | 'strict';
+export type { ProviderReadMode } from './providers/types.ts';
 
 export interface ProviderIndexPlan {
   readonly items: ProviderIndexItem[];
@@ -298,6 +299,7 @@ export function createProviderIndexPlan(
     const retainedIds = new Set<string>();
     const previousState = (key: string) => priorIndexState?.get(key) ?? storedCheckpoint(db, key);
     const units = provider.discover({
+      readMode,
       snapshotRequired: fullReindex,
       previousCursor: key => checkpointCursor(previousState(key)),
       retainSession: id => retainedIds.add(id),

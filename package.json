@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Explicit memory infrastructure for coding agents — a queryable SQLite evidence layer over local coding-agent history, plus human-approved durable memory.",
+  "description": "Explicit memory infrastructure for coding agents \u2014 a queryable SQLite evidence layer over local coding-agent history, plus human-approved durable memory.",
   "license": "AGPL-3.0",
   "workspaces": [
     "packages/*"
@@ -17,7 +17,7 @@
     "build:cli": "npm run build --workspace @obelisk-apps/cli",
     "build:skill": "node packaging/build-skill.mjs",
     "eval:context-window": "node scripts/context-window-ab-eval.mjs",
-    "bench:hermes": "node --experimental-strip-types --experimental-sqlite scripts/hermes-refresh-benchmark.mjs",
+    "bench:hermes": "node scripts/hermes-cli-benchmark.mjs",
     "publish:skill": "npm run build:skill && packaging/publish-skill.sh"
   },
   "devDependencies": {

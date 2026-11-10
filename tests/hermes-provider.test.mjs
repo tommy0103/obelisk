@@ -71,43 +71,7 @@ function discover(provider, { cursors = new Map(), indexed = [], issues = [], ch
  * cope with: `messages.id` is an INTEGER PRIMARY KEY AUTOINCREMENT (no synthetic text ids) and
  * `codex_message_items` is where a final Responses reply can live. Fixture rows only.
  */
-const STORE_DDL = `
-  CREATE TABLE schema_version (version INTEGER NOT NULL);
-  CREATE TABLE sessions (
-    id TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT, model TEXT, model_config TEXT,
-    system_prompt TEXT, parent_session_id TEXT, started_at REAL NOT NULL, ended_at REAL,
-    end_reason TEXT, message_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0,
-    input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
-    cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0, billing_provider TEXT,
-    billing_base_url TEXT, billing_mode TEXT, estimated_cost_usd REAL, actual_cost_usd REAL,
-    cost_status TEXT, cost_source TEXT, pricing_version TEXT, title TEXT, api_call_count INTEGER DEFAULT 0,
-    handoff_state TEXT, handoff_platform TEXT, handoff_error TEXT, cwd TEXT,
-    rewind_count INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, session_key TEXT,
-    chat_id TEXT, chat_type TEXT, thread_id TEXT, git_branch TEXT, git_repo_root TEXT,
-    compression_failure_cooldown_until REAL, compression_failure_error TEXT, display_name TEXT,
-    origin_json TEXT, expiry_finalized INTEGER DEFAULT 0, compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
-    profile_name TEXT, system_prompt_hash TEXT, title_source TEXT, last_activity_at REAL,
-    last_activity_description TEXT, last_activity_provenance TEXT,
-    compression_ineffective_count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
-    last_read_at REAL, git_metadata_generation INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0,
-    compression_recovery_deadline REAL, tool_names TEXT, created_source TEXT,
-    compression_overload_streak INTEGER NOT NULL DEFAULT 0, auto_archived INTEGER NOT NULL DEFAULT 0,
-    runtime_revision INTEGER NOT NULL DEFAULT 0, runtime_generation INTEGER NOT NULL DEFAULT 0,
-    transcript_revision INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
-  );
-  CREATE TABLE messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id),
-    role TEXT NOT NULL, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT,
-    timestamp REAL NOT NULL, token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-    reasoning_content TEXT, reasoning_details TEXT, codex_reasoning_items TEXT, codex_message_items TEXT,
-    platform_message_id TEXT, observed INTEGER DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
-    compacted INTEGER NOT NULL DEFAULT 0, effect_disposition TEXT, api_content TEXT, display_kind TEXT,
-    display_metadata TEXT, _compressed_summary INTEGER NOT NULL DEFAULT 0,
-    display_identity BLOB, display_order INTEGER,
-    message_uid TEXT, absorbed_message_uids TEXT, tool_call_uids TEXT, tool_call_uid TEXT
-  );
-`;
+const STORE_DDL = readFileSync(new URL('./fixtures/hermes/store-schema.sql', import.meta.url), 'utf8');
 
 function createStore(home, { profile = null, schemaVersion = SHIPPED_SCHEMA_VERSION, wal = false } = {}) {
   const dir = profile === null ? home : join(home, 'profiles', profile);
@@ -671,10 +635,11 @@ test('parse() projects Hermes messages, thinking, tool calls and results into th
     // next discovery compares — the store gate and the session fingerprint — comes from discovery.
     assert.equal(
       cursor.split(':').slice(0, 5).join(':'),
-      unit.meta.currentCursor,
+      unit.meta.currentCursor.split(':').slice(0, 5).join(':'),
       'parse() extends the cursor discovery computed',
     );
-    assert.equal(cursor.split(':').length, 6, 'and persists the exact digest as its last field');
+    assert.equal(cursor.split(':').length, 7, 'the exact digest and committed audit token are persisted');
+    assert.equal(cursor.split(':')[6], unit.meta.auditToken);
     assert.match(cursor.split(':')[5], /^[0-9a-f]{64}$/);
   } finally {
     rmSync(layout.base, { recursive: true, force: true });
@@ -1769,13 +1734,13 @@ test('a write to one session leaves the other sessions of the store unscheduled'
     });
 
     const round = index.run();
-    assert.equal(round.plan.items.length, 2, 'the changed session plus the store gate');
-    assert.equal(round.result.committed.length, 2, 'the session and the gate both commit');
+    assert.equal(round.plan.items.length, 3, 'the changed session, unchanged audit acknowledgement and store gate');
+    assert.equal(round.result.committed.length, 3, 'canonical and observation progress commit');
     assert.deepEqual(scheduledSessionIds(round), [alphaId], 'only the session that changed is scheduled');
     assert.equal(
-      storedProviderCursor(index.db, betaKey),
-      betaCursor,
-      "the untouched session's cursor is not consumed by another session's write",
+      storedProviderCursor(index.db, betaKey).split(':').slice(0, 6).join(':'),
+      betaCursor.split(':').slice(0, 6).join(':'),
+      "the untouched session's source position and digest do not advance; only its audit token changes",
     );
 
     settle(index);
@@ -1786,13 +1751,11 @@ test('a write to one session leaves the other sessions of the store unscheduled'
   }
 });
 
-// The exact digest is reserved for an unexplained store move. An in-place body edit of a projected
-// text column — a same-length rewrite here — hidden in the same commit as another session's
-// legitimate write is not attributable from public source metadata
-// (docs/opencode-adapter-incremental-plan.md: "do not claim a universal CDC protocol"), so it is
-// reconciled on the next unexplained move instead of re-reading every session beside it. This is
-// the accepted limit of the incremental path; a rebuild reconciles it immediately.
-test('an in-place rewrite waits for an unexplained store move instead of re-reading the store', () => {
+// Regression: the exact-digest fallback used to run only in a round that scheduled nothing else,
+// so a session rewritten in place with a same-length value stayed stale for as long as any other
+// session kept being written. The aggregates cannot attribute such a rewrite, so the digest pass
+// has to run on the same scan that already has work.
+test('a same-length in-place rewrite is scheduled beside another session of the store', () => {
   const layout = fixtureHome();
   const index = indexFixture(createHermesProvider({ rootDir: layout.base, openStore }));
   try {
@@ -1805,8 +1768,7 @@ test('an in-place rewrite waits for an unexplained store move instead of re-read
     settle(index);
 
     // One commit: an appended row in Alpha, and a same-length rewrite of Beta's first row, which
-    // moves no watermark aggregate and is only visible to the exact digest. A longer or shorter
-    // rewrite is equally invisible now that the watermark no longer sums text lengths.
+    // moves no watermark aggregate and is only visible to the exact digest.
     writeStore(layout.primaryPath, db => {
       appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'Appended once', timestamp: 1767226020 });
       const row = db.prepare('SELECT id, content FROM messages WHERE session_id = ? ORDER BY rowid LIMIT 1')
@@ -1816,26 +1778,11 @@ test('an in-place rewrite waits for an unexplained store move instead of re-read
         .run(row.content.replace(/^./, char => (char === 'Z' ? 'Y' : 'Z')), row.id);
     });
 
-    const explained = index.run();
+    const round = index.run();
     assert.deepEqual(
-      scheduledSessionIds(explained),
-      [alphaId],
-      'only the explained session is read, not every sibling',
-    );
-    settle(index);
-
-    // A write the projection ignores moves the gate without moving any watermark, so the move is
-    // unexplained and the exact digest runs — which names the rewritten session.
-    writeStore(layout.primaryPath, db => {
-      db.prepare('UPDATE messages SET api_content = ? WHERE session_id = ?')
-        .run('[response interrupted]', SESSION_ALPHA);
-    });
-
-    const reconciled = index.run();
-    assert.deepEqual(
-      scheduledSessionIds(reconciled),
-      [betaId],
-      'the next unexplained move finds the same-length rewrite',
+      scheduledSessionIds(round).sort(),
+      [alphaId, betaId].sort(),
+      'the appended session and the rewritten one are both scheduled',
     );
   } finally {
     index.close();
@@ -1891,110 +1838,64 @@ test('an explained write settles and certifies the store in two cheap scans', ()
 // the store's partial examination.
 test('a failed scheduled unit leaves a partial gate and is retried on the next scan', () => {
   const layout = fixtureHome();
-  let opens = 0;
-  let failNextPrimaryOpen = false;
-  const provider = createHermesProvider({
-    rootDir: layout.base,
-    openStore: path => {
-      if (path === layout.primaryPath) {
-        opens += 1;
-        // Discovery's store read is the first open; the dirty session's parse is the second.
-        if (failNextPrimaryOpen && opens === 2) throw new Error('simulated EACCES while parsing');
-      }
-      return openStore(path);
-    },
-  });
+  let failNext = false;
+  const base = createHermesProvider({ rootDir: layout.base, openStore });
+  const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+  const provider = { ...base, parse: function* (unit, cursor) {
+    if (failNext && unit.sessionId === alphaId) throw new Error('simulated EACCES while parsing');
+    return yield* base.parse(unit, cursor);
+  } };
   const index = indexFixture(provider, { transactional: true });
   try {
     settle(index);
-    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
     writeStore(layout.primaryPath, db => {
       appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'One more line', timestamp: 1767226020 });
     });
-
     const partialGates = () => [...storedCursors(index.db).entries()]
       .filter(([key]) => key.startsWith('__hermes_store_v1__:'))
       .filter(([, cursor]) => cursor.endsWith(':0'));
-
-    opens = 0;
-    failNextPrimaryOpen = true;
+    failNext = true;
     const failed = index.run({}, () => 'skip');
     assert.equal(failed.result.failedItems.length, 1, 'the dirty session failed to persist');
     assert.equal(partialGates().length, 1, 'the gate is recorded as partial, not certified');
-
-    // The session cursor is still the one from before the write, so the next scan reads it again.
-    failNextPrimaryOpen = false;
-    const retry = index.run();
-    assert.deepEqual(scheduledSessionIds(retry), [alphaId], 'the failed session is retried');
-
+    failNext = false;
+    assert.deepEqual(scheduledSessionIds(index.run()), [alphaId], 'the failed session is retried');
     settle(index);
     assert.equal(partialGates().length, 0, 'and the store finally certifies');
-  } finally {
-    index.close();
-    rmSync(layout.base, { recursive: true, force: true });
-  }
+  } finally { index.close(); rmSync(layout.base, { recursive: true, force: true }); }
 });
 
-// A unit scheduled by the exact digest has an unchanged watermark, so a failed persist leaves no
-// cursor mismatch to retry from. The gate must be withheld for that scan, or the next one would
-// certify the store and the detected edit would stay stale until an unrelated move.
+// A hidden edit's cheap fingerprint is unchanged. Its old audit token, rather
+// than a speculative global certificate, must keep it pending after rollback.
 test('a failed digest-scheduled unit is retried on the next scan', () => {
   const layout = fixtureHome();
-  let opens = 0;
-  let failAtOpen = null;
-  const provider = createHermesProvider({
-    rootDir: layout.base,
-    openStore: path => {
-      if (path === layout.primaryPath) {
-        opens += 1;
-        // Discovery's read, the digest's read, then the rewritten session's parse.
-        if (opens === failAtOpen) throw new Error('simulated parse failure');
-      }
-      return openStore(path);
-    },
-  });
+  let failNext = false;
+  const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+  const base = createHermesProvider({ rootDir: layout.base, openStore });
+  const provider = { ...base, parse: function* (unit, cursor) {
+    if (failNext && unit.sessionId === betaId) throw new Error('simulated parse failure');
+    return yield* base.parse(unit, cursor);
+  } };
   const index = indexFixture(provider, { transactional: true });
   try {
     settle(index);
-    const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
-    // Beta needs a row of its own before it can be rewritten in place.
     writeStore(layout.primaryPath, db => {
       appendMessage(db, SESSION_BETA, 'assistant', { content: 'Beta baseline row', timestamp: 1767312060 });
     });
     settle(index);
-
-    // One commit: an appended row in Alpha and a same-length rewrite of Beta. The append explains
-    // the write, so Beta is not re-read now — only the next exact digest can see it.
     writeStore(layout.primaryPath, db => {
       appendMessage(db, SESSION_ALPHA, 'assistant', { content: 'Appended once', timestamp: 1767226020 });
-      const row = db.prepare('SELECT id, content FROM messages WHERE session_id = ? ORDER BY rowid LIMIT 1')
-        .get(SESSION_BETA);
+      const row = db.prepare('SELECT id, content FROM messages WHERE session_id = ? ORDER BY rowid LIMIT 1').get(SESSION_BETA);
       db.prepare('UPDATE messages SET content = ? WHERE id = ?')
-        .run(row.content.replace(/^./, char => (char === 'Z' ? 'Y' : 'Z')), row.id);
+        .run(row.content.replace(/^./, char => char === 'Z' ? 'Y' : 'Z'), row.id);
     });
-    settle(index);
-
-    // A non-projected write moves the gate with no watermark change, so the digest runs and finds
-    // Beta. Its persist fails, and the gate row must not claim the store was examined.
-    writeStore(layout.primaryPath, db => {
-      db.prepare('UPDATE messages SET api_content = ? WHERE session_id = ?').run('[x]', SESSION_ALPHA);
-    });
-    opens = 0;
-    failAtOpen = 3;
+    failNext = true;
     const failed = index.run({}, () => 'skip');
     assert.equal(failed.result.failedItems.length, 1, 'the digest-scheduled unit failed');
-
-    failAtOpen = null;
-    const retry = index.run();
-    assert.deepEqual(
-      scheduledSessionIds(retry),
-      [betaId],
-      'the next scan re-runs the digest and retries the failed unit',
-    );
-  } finally {
-    index.close();
-    rmSync(layout.base, { recursive: true, force: true });
-  }
+    failNext = false;
+    assert.deepEqual(scheduledSessionIds(index.run()), [betaId], 'the next scan retries the failed hidden edit');
+    settle(index);
+  } finally { index.close(); rmSync(layout.base, { recursive: true, force: true }); }
 });
 
 // A zero-length WAL carries no frames. SQLite may create or leave one after a checkpoint, and
@@ -2024,7 +1925,7 @@ test('a zero-length WAL does not move the store gate', () => {
 
 // The issue's cost shape: an explained write reads exactly one session's projected rows, however
 // many sessions the store holds. The watermark pass that precedes it reads no payload at all.
-test('an explained write reads only the dirty session\'s payload', () => {
+test('an explained write reads its changed payload and bounded sibling verification', () => {
   const layout = fixtureHome();
   let payloadReads = 0;
   const opener = injectingOpener(() => { payloadReads += 1; });
@@ -2039,7 +1940,7 @@ test('an explained write reads only the dirty session\'s payload', () => {
     payloadReads = 0;
     const round = index.run();
     assert.deepEqual(scheduledSessionIds(round), [alphaId], 'only the dirty session is scheduled');
-    assert.equal(payloadReads, 1, 'one session payload read, not the whole store');
+    assert.equal(payloadReads, 2, 'one changed session plus the sibling in this small audit batch');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
@@ -2984,4 +2885,270 @@ test('Claude orphan count repair preserves Hermes visible-message counts and log
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
   }
+});
+
+// A larger than one-batch corpus makes bounded deferral observable. Real-store
+// table definitions and provider projection stay identical to the other tests.
+function auditFixture(count = 130) {
+  const base = makeTempDir('obelisk-hermes-audit-');
+  const { db, path } = createStore(base, { wal: true });
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    const id = `audit_${String(i).padStart(5, '0')}`;
+    insertSession(db).run(id, 'cli', 'test-model', id, null,
+      1767225600, 1767225600, 'cli_close', 1, 0, '/work/audit', 'main', 'default');
+    const message = appendMessage(db, id, 'user', { content: `original-${i}`, timestamp: 1767225600 });
+    rows.push({ id, message, sessionId: hermesSessionId(id, DEFAULT_PROFILE, path) });
+  }
+  db.close();
+  let reads = 0;
+  const provider = createHermesProvider({ rootDir: base, openStore: path => {
+    const db = openStore(path);
+    return new Proxy(db, { get(target, property) {
+      if (property === 'prepare') return sql => {
+        if (/FROM messages WHERE session_id = \? ORDER BY rowid/.test(sql)) reads++;
+        return target.prepare(sql);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  } });
+  const index = indexFixture(provider, { transactional: true });
+  settle(index);
+  return { base, path, rows, index, provider, reads: () => reads, resetReads: () => { reads = 0; } };
+}
+
+for (const readMode of ['normal', 'strict']) {
+  test(`${readMode}: continuous sibling writes cannot indefinitely hide an in-place edit`, () => {
+    const f = auditFixture();
+    try {
+      const target = f.rows.at(-1);
+      const uuid = `${target.sessionId}:message:${target.message}`;
+      const expected = 'replaced-129';
+      assert.equal(expected.length, 'original-129'.length);
+      f.resetReads();
+      for (let round = 0; round < (readMode === 'strict' ? 1 : 3); round++) {
+        writeStore(f.path, db => {
+          db.exec('BEGIN');
+          appendMessage(db, f.rows[0].id, 'user', { content: `append-${round}`, timestamp: 1767226000 + round });
+          if (round === 0) db.prepare('UPDATE messages SET content=? WHERE id=?').run(expected, target.message);
+          db.exec('COMMIT');
+        });
+        const before = f.reads();
+        f.index.run({ readMode });
+        if (readMode === 'normal') assert.ok(f.reads() - before <= 65, 'at most64 fresh checks plus changed-session payload');
+      }
+      assert.equal(f.index.db.prepare('SELECT text FROM messages WHERE uuid=?').get(uuid).text, expected);
+      settle(f.index);
+      f.resetReads();
+      assert.equal(f.index.run({ readMode }).plan.items.length, 0);
+      assert.equal(f.reads(), 0, 'a certified unchanged store reads no payloads');
+    } finally { f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+  });
+}
+
+test('expired normal audits completely reconcile on the next refresh without another source write', t => {
+  const f = auditFixture();
+  const started = Date.now();
+  t.mock.method(Date, 'now', () => started);
+  try {
+    const target = f.rows.at(-1);
+    writeStore(f.path, db => {
+      appendMessage(db, f.rows[0].id, 'user', { content: 'explain', timestamp: 1767226000 });
+      db.prepare('UPDATE messages SET content=? WHERE id=?').run('deadline-repair', target.message);
+    });
+    f.index.run();
+    const uuid = `${target.sessionId}:message:${target.message}`;
+    assert.equal(f.index.db.prepare('SELECT text FROM messages WHERE uuid=?').get(uuid).text, 'original-129');
+    t.mock.method(Date, 'now', () => started + 60_001);
+    f.index.run();
+    assert.equal(f.index.db.prepare('SELECT text FROM messages WHERE uuid=?').get(uuid).text, 'deadline-repair');
+    settle(f.index);
+  } finally { t.mock.restoreAll(); f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('strict reconciliation repairs hidden time, visibility and compaction edits beside an append', () => {
+  const f = auditFixture();
+  try {
+    const last = f.rows.at(-1);
+    writeStore(f.path, db => {
+      db.exec('BEGIN');
+      appendMessage(db, f.rows[0].id, 'user', { content: 'explain', timestamp: 1767226000 });
+      db.prepare('UPDATE messages SET active=0,compacted=1,timestamp=? WHERE id=?').run(1767227000, last.message);
+      db.exec('COMMIT');
+    });
+    f.index.run({ readMode: 'strict' });
+    const row = f.index.db.prepare('SELECT visibility,timestamp FROM messages WHERE uuid=?')
+      .get(`${last.sessionId}:message:${last.message}`);
+    assert.equal(row.visibility, 'inactive');
+    assert.equal(row.timestamp, new Date(1767227000 * 1000).toISOString());
+    assert.equal(f.index.db.prepare('SELECT message_count FROM sessions WHERE id=?').get(last.sessionId).message_count, 0);
+  } finally { f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('an uncommitted cursor acknowledgement cannot certify a store', () => {
+  const f = auditFixture(3);
+  try {
+    const key = `hermes-unit:${f.rows[1].sessionId}`;
+    writeStore(f.path, db => db.prepare('UPDATE messages SET api_content=? WHERE id=?').run('physical change', f.rows[0].message));
+    const old = storedProviderCursor(f.index.db, key);
+    f.index.db.exec(`CREATE TRIGGER reject_audit BEFORE INSERT ON index_state WHEN NEW.jsonl_path = '${key}' BEGIN SELECT RAISE(ABORT, 'audit failed'); END`);
+    const failed = f.index.run({}, () => 'skip');
+    assert.ok(failed.result.failedItems.length >= 2, 'both failed acknowledgement and its dependent certificate fail');
+    assert.equal(storedProviderCursor(f.index.db, key), old);
+    f.index.db.exec('DROP TRIGGER reject_audit');
+    settle(f.index);
+    assert.equal(f.index.run().plan.items.length, 0);
+  } finally { f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('legacy and malformed store observations fall back to complete verification', () => {
+  const f = auditFixture();
+  try {
+    for (const bad of ['1:0:hermes-store-v1:old:old', '1:0:hermes-store-v2:bad:bad:broken:1']) {
+      f.index.db.prepare("UPDATE index_state SET cursor=? WHERE jsonl_path LIKE '__hermes_store_v1__:%'").run(bad);
+      const target = f.rows.at(-1);
+      writeStore(f.path, db => db.prepare('UPDATE messages SET content=? WHERE id=?').run(bad, target.message));
+      f.index.run();
+      assert.equal(f.index.db.prepare('SELECT text FROM messages WHERE uuid=?')
+        .get(`${target.sessionId}:message:${target.message}`).text, bad);
+      settle(f.index);
+    }
+  } finally { f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a new adapter instance resumes the persisted audit instead of resetting its rotation', () => {
+  const f = auditFixture();
+  try {
+    const last = f.rows.at(-1);
+    writeStore(f.path, db => {
+      appendMessage(db, f.rows[0].id, 'user', { content: 'explain', timestamp: 1767226000 });
+      db.prepare('UPDATE messages SET content=? WHERE id=?').run('restarted-repair', last.message);
+    });
+    for (let round = 0; round < 3; round++) {
+      const registry = createProviderRegistry([createHermesProvider({ rootDir: f.base, openStore })]);
+      const plan = createProviderIndexPlan(f.index.db, registry);
+      indexProviderPlan({ db: f.index.db, plan, runTransaction: (_label, work) => work(), onError: error => { throw error; } });
+    }
+    assert.equal(f.index.db.prepare('SELECT text FROM messages WHERE uuid=?')
+      .get(`${last.sessionId}:message:${last.message}`).text, 'restarted-repair');
+  } finally { f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('the existing daemon reconcile timer finishes an expired audit without new filesystem events', async t => {
+  const { createIndexerService } = await import('../app/src/main/indexer-service.ts');
+  const f = auditFixture();
+  const started = Date.now();
+  t.mock.method(Date, 'now', () => started);
+  const callbacks = new Map();
+  const intervals = [];
+  let id = 0;
+  const timers = {
+    setTimeout(fn) { const key = ++id; callbacks.set(key, fn); return key; },
+    clearTimeout(key) { callbacks.delete(key); },
+    setInterval(fn, ms) { const key = ++id; intervals.push({ key, fn, ms }); return key; },
+    clearInterval() {},
+  };
+  const reasons = [];
+  const service = createIndexerService({ timers, watchProjects: () => ({ close() {} }),
+    writeHeartbeat: () => {}, stabilityMs: 0,
+    buildIndex: async ({ reason }) => { reasons.push(reason); f.index.run(); return { complete: true }; },
+  });
+  try {
+    const last = f.rows.at(-1);
+    writeStore(f.path, db => {
+      appendMessage(db, f.rows[0].id, 'user', { content: 'explain', timestamp: 1767226000 });
+      db.prepare('UPDATE messages SET content=? WHERE id=?').run('periodic-repair', last.message);
+    });
+    f.index.run();
+    const text = () => f.index.db.prepare('SELECT text FROM messages WHERE uuid=?')
+      .get(`${last.sessionId}:message:${last.message}`).text;
+    assert.equal(text(), 'original-129');
+    service.start({ buildOnStart: false });
+    const periodic = intervals.find(timer => timer.ms === 5 * 60_000);
+    assert.ok(periodic, 'the production default installs the repeated full-inventory callback');
+    t.mock.method(Date, 'now', () => started + periodic.ms);
+    periodic.fn();
+    for (let steps = 0; callbacks.size && steps < 20; steps++) {
+      const [key, fn] = callbacks.entries().next().value;
+      callbacks.delete(key); fn();
+    }
+    await service.idle();
+    assert.deepEqual(reasons, ['reconcile']);
+    assert.equal(text(), 'periodic-repair', 'no new source event is required to reach the deadline fallback');
+    periodic.fn();
+    for (let steps = 0; callbacks.size && steps < 20; steps++) {
+      const [key, fn] = callbacks.entries().next().value;
+      callbacks.delete(key); fn();
+    }
+    await service.idle();
+    assert.deepEqual(reasons, ['reconcile', 'reconcile'], 'the refresh point is repeated, not startup-only');
+  } finally { await service.stop(); t.mock.restoreAll(); f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('strict CLI query and search reconcile same-commit hidden edits inside the recent-build window', async () => {
+  const { runCli } = await import('./cli-test-helpers.mjs');
+  const layout = fixtureHome();
+  const home = makeTempDir('obelisk-hermes-cli-strict-');
+  const storage = join(home, 'index');
+  mkdirSync(storage);
+  const roots = Object.fromEntries(['claude', 'codex', 'codexhost-antigravity', 'copilot', 'deepseek', 'hermes', 'kimi', 'kiro', 'omp', 'opencode', 'pi', 'zcode'].map(id => [id, '']));
+  roots.hermes = layout.base;
+  writeFileSync(join(storage, 'settings.json'), JSON.stringify({ providerRoots: roots }));
+  const query = join(home, 'query.mjs');
+  const env = { OBELISK_HOME: storage };
+  const call = args => {
+    const result = runCli(args, { home, env });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    return JSON.parse(result.stdout);
+  };
+  try {
+    let rowId;
+    writeStore(layout.primaryPath, db => { rowId = appendMessage(db, SESSION_BETA, 'user', { content: 'priorneedle', timestamp: 1767312060 }); });
+    const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+    writeFileSync(query, `return messages({sessionId:${JSON.stringify(betaId)}});`);
+    writeStore(layout.primaryPath, db => db.prepare('UPDATE messages SET content=?,timestamp=? WHERE id=?')
+      .run(`obelisk --query ${query}; obelisk --search searchneedle --nonce clistrictnonce254`, Date.now() / 1000, layout.ids.user));
+    const start = Date.now();
+    call(['--build']);
+    writeStore(layout.primaryPath, db => {
+      db.exec('BEGIN');
+      appendMessage(db, SESSION_ALPHA, 'user', { content: 'explained append', timestamp: 1767312061 });
+      db.prepare('UPDATE messages SET content=? WHERE id=?').run('freshneedle', rowId);
+      db.exec('COMMIT');
+    });
+    assert.ok(Date.now() - start < 30_000, 'the fixture did not wait out the debounce');
+    const result = call(['--query', query]);
+    assert.ok(result.messages.some(row => row.text === 'freshneedle'), 'the public query sees the hidden edit immediately');
+    writeStore(layout.primaryPath, db => {
+      db.exec('BEGIN');
+      appendMessage(db, SESSION_ALPHA, 'user', { content: 'another explained append', timestamp: 1767312062 });
+      db.prepare('UPDATE messages SET content=? WHERE id=?').run('searchneedle', rowId);
+      db.exec('COMMIT');
+    });
+    const found = call(['--search', 'searchneedle', '--nonce', 'clistrictnonce254']);
+    assert.ok(JSON.stringify(found).includes('searchneedle'), 'real search refreshes rather than skipping a recent build');
+  } finally { rmSync(layout.base, { recursive: true, force: true }); }
+});
+
+test('a fresh change after a long certified idle period starts a new bounded deadline', t => {
+  const f = auditFixture();
+  const started = Date.now() + 10 * 60_000;
+  t.mock.method(Date, 'now', () => started);
+  try {
+    const target = f.rows.at(-1);
+    writeStore(f.path, db => {
+      appendMessage(db, f.rows[0].id, 'user', { content: 'explain', timestamp: 1767226000 });
+      db.prepare('UPDATE messages SET content=? WHERE id=?').run('new-window', target.message);
+    });
+    f.resetReads();
+    f.index.run();
+    assert.ok(f.reads() <= 65, 'completed old work is not mistaken for an expired pending audit');
+    const text = () => f.index.db.prepare('SELECT text FROM messages WHERE uuid=?')
+      .get(`${target.sessionId}:message:${target.message}`).text;
+    assert.equal(text(), 'original-129');
+    t.mock.method(Date, 'now', () => started + 60_001);
+    f.index.run();
+    assert.equal(text(), 'new-window');
+  } finally { t.mock.restoreAll(); f.index.close(); rmSync(f.base, { recursive: true, force: true }); }
 });

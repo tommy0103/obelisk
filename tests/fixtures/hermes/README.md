@@ -44,3 +44,14 @@ Not captured here: `codex_message_items`. No row in the local store carries a va
 for that column (it is written only by the Responses transport), so its fixture stays
 synthetic in `tests/hermes-provider.test.mjs` and follows
 `agent/codex_responses_adapter.py` upstream.
+
+
+`store-schema.sql` extracts the existing test's captured version-32 table DDL
+without changing column order, types or defaults. The test helpers and the CLI
+benchmark now share that shape. Generated scalability/adversarial rows are
+explicitly synthetic; they do not replace the captured semantic fixture above.
+The benchmark adds only Hermes's ordinary `(session_id,timestamp)` and
+`(session_id,id)` indexes, corroborated by upstream
+[`hermes_state_common.py`](https://github.com/NousResearch/hermes-agent/blob/47642b7fb7e888ff7812f0ac630c52ef7848c62f/hermes_state_common.py).
+That upstream revision is schema 33; the benchmark deliberately exercises the
+older supported shape without assuming newer transcript-revision triggers.
