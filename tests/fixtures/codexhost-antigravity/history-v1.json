@@ -1,0 +1,53 @@
+{
+  "formatVersion": 1,
+  "nativeSessionId": "fd8da84c-b2c8-48f1-9ee4-755b188eab4e",
+  "turns": [
+    {
+      "nativeTurnRef": {
+        "harnessId": "antigravity",
+        "nativeSessionId": "fd8da84c-b2c8-48f1-9ee4-755b188eab4e",
+        "nativeTurnKey": "turn:1",
+        "formatVersion": 1
+      },
+      "checkpoint": {
+        "harnessId": "antigravity",
+        "nativeSessionId": "fd8da84c-b2c8-48f1-9ee4-755b188eab4e",
+        "checkpointId": "turn:1",
+        "formatVersion": 1
+      },
+      "input": [{ "type": "text", "text": "redacted user request" }],
+      "items": [
+        {
+          "item": {
+            "type": "commandExecution",
+            "itemId": "command-1",
+            "command": "redacted command",
+            "cwd": "C:\\fixture-project",
+            "output": "redacted output",
+            "exitCode": 0,
+            "durationMs": 100
+          },
+          "outcome": { "status": "succeeded" }
+        },
+        {
+          "item": {
+            "type": "toolExecution",
+            "itemId": "tool-1",
+            "toolName": "read_file",
+            "arguments": { "path": "redacted path" },
+            "output": { "content": [{ "type": "text", "text": "redacted tool result" }] },
+            "durationMs": 50
+          },
+          "outcome": { "status": "succeeded" }
+        },
+        {
+          "item": { "type": "agentMessage", "itemId": "message-1", "text": "redacted assistant response" },
+          "outcome": { "status": "succeeded" }
+        }
+      ],
+      "outcome": { "status": "succeeded" },
+      "model": { "id": "gemini-3.8-flash" }
+    }
+  ],
+  "model": { "id": "gemini-3.8-flash" }
+}

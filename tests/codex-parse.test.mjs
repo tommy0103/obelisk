@@ -374,7 +374,7 @@ test('codex parse() patches the aggregate when a touch coincides with a title ch
   const session = second.values.find(record => record.kind === 'session');
   assert.ok(session, 'the metadata change is patched in the healing pass');
   assert.equal(session.title, 'New Title');
-  assert.equal(session.ended_at, '2026-06-11T00:00:00Z');
+  assert.equal(session.ended_at, '2026-06-11T00:00:00.000Z');
   assert.equal(cursorState(second.ret).indexedTitle, 'New Title');
   assert.equal(second.ret.split(':', 6)[3], `${statSync(path).ctimeMs}`, 'the cursor heals in the same pass');
 });
@@ -498,7 +498,32 @@ test('codex provider folds session_index metadata into its canonical session rec
   const { values } = drain(provider.parse(units[0], null));
   const session = values.find(record => record.kind === 'session');
   assert.equal(session.title, 'Indexed title');
-  assert.equal(session.ended_at, '2026-06-10T11:00:00Z');
+  assert.equal(session.ended_at, '2026-06-10T11:00:00.000Z');
+});
+
+test('codex parse() normalizes zone-carrying timestamps and keeps zone-less ones verbatim', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T18:00:00+08:00', payload: { ...META, timestamp: '2026-06-10T18:00:00+08:00' } },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'no millis' } },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:02.123456Z', payload: { type: 'agent_message', message: 'micros' } },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:03', payload: { type: 'agent_message', message: 'zone-less' } },
+  ]);
+
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  const messages = values.filter(r => r.kind === 'message');
+
+  // Same contract as the claude adapter: zone-carrying values become
+  // canonical .sssZ; a zone-less value is stored verbatim rather than
+  // silently shifted.
+  assert.deepEqual(messages.map(m => [m.timestamp, m.text]), [
+    ['2026-06-10T10:00:01.000Z', 'no millis'],
+    ['2026-06-10T10:00:02.123Z', 'micros'],
+    ['2026-06-10T10:00:03', 'zone-less'],
+  ]);
+
+  const session = values.find(r => r.kind === 'session');
+  assert.equal(session.started_at, '2026-06-10T10:00:00.000Z');
+  assert.equal(session.ended_at, '2026-06-10T10:00:03');
 });
 
 test('codex provider reuses a strengthened cursor for a session-index-only refresh', () => {
@@ -529,9 +554,61 @@ test('codex parse() persists a session-index-only metadata refresh without repla
   }, first.ret));
   assert.deepEqual(second.values.map(record => record.kind), ['session']);
   assert.equal(second.values[0].title, 'After');
-  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00Z');
+  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00.000Z');
   assert.equal(cursorState(second.ret).indexedTitle, 'After');
 });
+
+function assertVerifiedMetadataRefresh(parseSource, readMode = 'normal') {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'unchanged source' } },
+  ]);
+  const first = drain(parseSource({
+    key: path, sessionId: '',
+    meta: { indexedTitle: 'Before', indexedUpdatedAt: '2026-06-10T11:00:00Z' },
+  }, null));
+  const refreshedUnit = {
+    key: path, sessionId: '',
+    meta: { readMode, indexedTitle: 'After', indexedUpdatedAt: '2026-06-10T12:00:00Z' },
+  };
+  const metrics = createCodexParseMetrics();
+  const second = drain(parseSource(refreshedUnit, first.ret, metrics));
+
+  assert.deepEqual(second.values.map(record => record.kind), ['session'], 'metadata changes emit only the session aggregate');
+  assert.equal(second.values[0].title, 'After');
+  assert.equal(second.values[0].ended_at, '2026-06-10T12:00:00.000Z');
+  assert.equal(second.values[0].message_count, first.values.find(record => record.kind === 'session').message_count);
+  assert.equal(cursorState(second.ret).indexedTitle, 'After');
+  assert.equal(cursorState(second.ret).indexedUpdatedAt, '2026-06-10T12:00:00.000Z');
+  assert.equal(metrics.plan, 'verified-append', 'unsupported identities and strict mode still verify the prefix');
+  assert.equal(metrics.sourceBytesRead, statSync(path).size, 'the prefix is fingerprinted once');
+  assert.equal(metrics.jsonLinesParsed, 0, 'an unchanged rollout is not replayed');
+  assert.equal(metrics.suffixBytesRead, 0);
+
+  const third = drain(parseSource(refreshedUnit, second.ret));
+  assert.deepEqual(third.values, [], 'the refreshed metadata does not emit again');
+  assert.equal(third.ret, second.ret, 'the refreshed checkpoint converges');
+}
+
+test('codex strict reconcile persists a session-index-only metadata refresh without replay', () => {
+  assertVerifiedMetadataRefresh(parse, 'strict');
+});
+
+for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
+  test(`codex metadata refresh with ${identityName} file identity persists without replay`, async t => {
+    const unsupportedStat = (...args) => {
+      const result = statSync(...args);
+      result.ino = inode;
+      return result;
+    };
+    const fsMock = t.mock.module('node:fs', {
+      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+    });
+    t.after(() => fsMock.restore());
+    const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?metadata-${identityName}-identity`);
+    assertVerifiedMetadataRefresh(parseWithoutIdentity);
+  });
+}
 
 test('codex provider discovers, watches, and reads archived sessions', () => {
   const root = makeTempDir('obelisk-codex-archive-');

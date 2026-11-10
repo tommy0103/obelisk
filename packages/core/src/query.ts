@@ -24,6 +24,7 @@ interface QueryOptions extends Record<string, any> {
   sessionId?: string;
   sessions?: string[];
   project?: string;
+  projectPath?: string;
   after?: string;
   before?: string;
   cwd?: string;
@@ -35,6 +36,8 @@ interface QueryOptions extends Record<string, any> {
   query?: string;
   projectLimit?: number;
   memoryLimit?: number;
+  contextLimit?: number;
+  snippetTokens?: number;
 }
 
 interface MessageQueryOptions {
@@ -141,6 +144,34 @@ function isQueryableMessage(
   if (row === undefined) return false;
   const visibility = normalizedVisibility(row.visibility);
   return visibility === 'visible' || (includeInactive && visibility === 'inactive');
+}
+
+function walkParentChain(
+  db: SqliteDb,
+  start: DbRow,
+  { includeInactive = false, includeStart = false } = {},
+): DbRow[] {
+  const findMessage = db.prepare('SELECT * FROM messages WHERE uuid=?');
+  const chain: DbRow[] = [];
+  const visited = new Set<string>();
+  let current: DbRow | undefined = start;
+  let isStart = true;
+
+  while (current) {
+    const currentUuid = String(current.uuid);
+    if (visited.has(currentUuid)) break;
+    visited.add(currentUuid);
+    if ((!isStart || includeStart) && isQueryableMessage(current, includeInactive)) {
+      chain.push(withVisibility(current));
+    }
+    isStart = false;
+
+    if (!current.parent_uuid) break;
+    const parentUuid = String(current.parent_uuid);
+    if (visited.has(parentUuid)) break;
+    current = findMessage.get(parentUuid);
+  }
+  return chain.reverse();
 }
 
 function visibilitySql(alias: string, includeInactive = false): string {
@@ -320,27 +351,40 @@ function createQueryApi(
       limit = 20,
       sessionId,
       project,
+      projectPath,
       after,
       before,
       cwd,
       source,
       includeMeta = false,
       includeInactive = false,
+      contextLimit = 6,
+      snippetTokens,
       fallback,
     } = opts;
     assertNonNegativeLimit(limit, 'search() limit');
+    if (!Number.isInteger(contextLimit) || contextLimit < 0 || contextLimit > 6) {
+      throw new RangeError('search() contextLimit must be an integer from 0 to 6');
+    }
+    if (snippetTokens !== undefined && (!Number.isInteger(snippetTokens) || snippetTokens < 1 || snippetTokens > 64)) {
+      throw new RangeError('search() snippetTokens must be an integer from 1 to 64');
+    }
     let where = 'WHERE mf.text MATCH ?';
     const filterParams: any[] = [];
     if (sessionId) { where += ' AND mf.session_id=?'; filterParams.push(sessionId); }
     if (project)   { where += ' AND s.project LIKE ?'; filterParams.push(project); }
+    if (projectPath) { where += ' AND s.project_path=?'; filterParams.push(projectPath); }
     if (after)     { where += ' AND m.timestamp>?';    filterParams.push(after); }
     if (before)    { where += ' AND m.timestamp<?';    filterParams.push(before); }
     if (cwd)       { where += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
     if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
     if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
     where += ` AND ${visibilitySql('m', includeInactive)}`;
+    const hitText = snippetTokens === undefined ? 'm.text' : `snippet(messages_fts, 2, '', '', '…', ${snippetTokens})`;
     const stmt = db.prepare(`
-      SELECT m.uuid,m.session_id,m.text,m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
+      SELECT m.uuid,m.session_id,${hitText} AS text,
+             ${snippetTokens === undefined ? 'NULL' : 'length(m.text)'} AS text_length,
+             m.content_type,m.is_meta,m.role,m.timestamp,m.model,m.cwd,
              COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,s.title as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source,
@@ -421,8 +465,9 @@ function createQueryApi(
       };
       const indexedTimestamp = typeof r.timestamp === 'string'
         && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(r.timestamp);
-      const ctx = (indexedTimestamp ? indexedContext : scanContext)
+      const ctx = contextLimit === 0 ? [] : (indexedTimestamp ? indexedContext : scanContext)
         .all(contextParams)
+        .slice(0, contextLimit)
         .map(withVisibility)
         .sort((a: DbRow, b: DbRow) => {
           if (a.timestamp === b.timestamp) return 0;
@@ -439,6 +484,7 @@ function createQueryApi(
         message: {
           uuid: r.uuid,
           text: r.text,
+          ...(snippetTokens === undefined ? {} : { textLength: r.text_length, isSnippet: true }),
           content_type: r.content_type,
           is_meta: r.is_meta || 0,
           role: r.role,
@@ -583,12 +629,7 @@ function createQueryApi(
     if (!isQueryableMessage(msg, includeInactive)) return null;
     const message = withVisibility(msg);
     const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id);
-    const chain: DbRow[] = [];
-    let cur: DbRow | undefined = msg;
-    while (cur?.parent_uuid) {
-      cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid);
-      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
-    }
+    const chain = walkParentChain(db, msg, { includeInactive });
     const subagent = msg.agent_id ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) : null;
     if (subagent) subagent.total_tokens = subagent.total_tokens ?? deriveSubagentTokens(db, msg.agent_id);
     let workflow = null;
@@ -601,14 +642,9 @@ function createQueryApi(
 
   const trace = (uuid: string, opts: QueryOptions = {}) => {
     const includeInactive = opts.includeInactive === true;
-    const chain: DbRow[] = [];
-    let cur = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-    if (!isQueryableMessage(cur, includeInactive)) return chain;
-    while (cur) {
-      if (isQueryableMessage(cur, includeInactive)) chain.unshift(withVisibility(cur));
-      cur = cur.parent_uuid ? db.prepare('SELECT * FROM messages WHERE uuid=?').get(cur.parent_uuid) : undefined;
-    }
-    return chain;
+    const message = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
+    if (!isQueryableMessage(message, includeInactive)) return [];
+    return walkParentChain(db, message, { includeInactive, includeStart: true });
   };
 
   const thread = (sid: string, opts: QueryOptions = {}) => {

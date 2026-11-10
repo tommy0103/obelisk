@@ -321,10 +321,21 @@ export function createProviderIndexPlan(
       retainedIds.add(unit.sessionId);
       for (const id of unit.retractSessionIds ?? []) retainedIds.add(id);
     }
+    const historyUnits = units.filter(unit => unit.preserveSessionHistory && unit.sessionId !== '');
+    const historyIds = new Set(historyUnits.map(unit => unit.sessionId));
+    const stagedIds = new Set<string>();
     for (const session of indexedSessions) {
-      if (!retainedIds.has(session.sessionId)) continue;
+      if (!retainedIds.has(session.sessionId) && !historyIds.has(session.sessionId)) continue;
       const unitKey = providerSessionUnitKey(provider, session);
       retainedSessions.push({ source: provider.name, sessionId: session.sessionId, unitKey, checkpoint: previousState(unitKey) });
+      stagedIds.add(session.sessionId);
+    }
+    // Older adapters may have stored child rows without ever creating their
+    // session row. The readable unit still proves their canonical owner.
+    for (const unit of historyUnits) {
+      if (stagedIds.has(unit.sessionId)) continue;
+      retainedSessions.push({ source: provider.name, sessionId: unit.sessionId, unitKey: unit.key, checkpoint: previousState(unit.key) });
+      stagedIds.add(unit.sessionId);
     }
     if (!inventoryComplete) {
       incompleteProviders.add(provider.name);
@@ -490,11 +501,13 @@ export function writeProviderIndexMarkers(
   result: ProviderIndexResult,
 ): void {
   if (result.stopped !== undefined) return;
-  const retry = db.prepare('UPDATE index_state SET replay_required = 1 WHERE jsonl_path = ?');
-  for (const session of plan.retainedSessions) retry.run(session.unitKey);
   const committed = new Set(result.committed.map(
     (item) => `${item.provider.name}\0${item.unit.key}`,
   ));
+  const retry = db.prepare('UPDATE index_state SET replay_required = 1 WHERE jsonl_path = ?');
+  for (const session of plan.retainedSessions) {
+    if (!committed.has(`${session.source}\0${session.unitKey}`)) retry.run(session.unitKey);
+  }
   // A marker records that replay was scheduled. Per-unit cursors record which
   // known sources completed it, so an incomplete inventory retries only the
   // missing or failed sources instead of every readable sibling.

@@ -59,8 +59,8 @@ test('persist writes all record kinds from one claude parse', () => {
   const ses = db.prepare('SELECT * FROM sessions WHERE id=?').get('sid-p');
   assert.equal(ses.title, 'Persist Session');
   assert.equal(ses.message_count, 3);
-  assert.equal(ses.started_at, '2026-06-10T10:00:00Z');
-  assert.equal(ses.ended_at, '2026-06-10T10:00:10Z');
+  assert.equal(ses.started_at, '2026-06-10T10:00:00.000Z');
+  assert.equal(ses.ended_at, '2026-06-10T10:00:10.000Z');
 
   // turn_duration applied via targeted UPDATE.
   assert.equal(db.prepare('SELECT turn_duration_ms FROM messages WHERE uuid=?').get('a1').turn_duration_ms, 999);

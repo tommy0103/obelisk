@@ -7,9 +7,11 @@ import { existsSync } from 'node:fs';
 import { prepareRetainedSnapshot } from './snapshot.ts';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
+  backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
   ensureFtsReady,
   refreshSessionProjectPaths,
+  repairOrphanedSessionMetadata,
 } from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
@@ -71,6 +73,55 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isReadOnlyFailure(error: unknown): boolean {
+  const source = error instanceof ProviderIndexFailure ? error.sourceError : error;
+  const detail = source as { code?: unknown; errcode?: unknown } | null;
+  // node:sqlite supplies a numeric (possibly extended) result code; other
+  // bindings use SQLITE_READONLY*. Do not classify arbitrary provider text.
+  return (typeof detail?.errcode === 'number' && (detail.errcode & 0xff) === 8)
+    || (typeof detail?.code === 'string' && /^SQLITE_READONLY(?:_|$)/.test(detail.code));
+}
+
+function indexAccessFailure(error: unknown): unknown {
+  const source = error instanceof ProviderIndexFailure ? error.sourceError : error;
+  const detail = source as { code?: unknown; errcode?: unknown } | null;
+  const readOnly = isReadOnlyFailure(error);
+  const cantOpen = (typeof detail?.errcode === 'number' && (detail.errcode & 0xff) === 14)
+    || (typeof detail?.code === 'string' && /^SQLITE_CANTOPEN(?:_|$)/.test(detail.code));
+  const denied = typeof detail?.code === 'string' && ['EACCES', 'EPERM', 'EROFS'].includes(detail.code);
+  if (!readOnly && !cantOpen && !denied) return error;
+  const failure = Object.assign(new Error(
+    `Cannot ${readOnly ? 'refresh' : 'access'} the Obelisk index at ${DB_PATH}: ${errorMessage(source)}. `
+    + (readOnly ? 'The index database, its directory and writer-lease file must be writable; ' : '')
+    + 'if this command is sandboxed, retry the same command with host-approved permissions.',
+    { cause: error },
+  ), { code: detail?.code, errcode: detail?.errcode, obelisk: (error as { obelisk?: unknown } | null)?.obelisk });
+  if (error instanceof Error) failure.stack += `\nCaused by: ${error.stack}`;
+  return failure;
+}
+
+function probeIndexWritability(db: NodeSqliteDb): void {
+  runRetryableWriteTransaction(nodeSqliteTransactionAdapter(db), () => {
+    db.prepare('UPDATE index_state SET mtime=mtime WHERE 0').run();
+  }, { label: 'index-writability' });
+}
+
+function rethrowIfIndexWriterReadOnly(db: NodeSqliteDb, error: unknown): void {
+  if (!isReadOnlyFailure(error)) return;
+  // A provider can also open a source SQLite store in read-only mode. A
+  // result code alone does not identify the database which failed. After a
+  // safe rollback, probe the shared writer before blaming the index. Never
+  // start another transaction if rollback left its state uncertain/live.
+  if (hasUnusableTransaction(error)) throw error;
+  try {
+    probeIndexWritability(db);
+  } catch (probeError) {
+    if (isReadOnlyFailure(probeError)) throw indexAccessFailure(error);
+    // A different probe failure leaves attribution unknown; preserve the
+    // primary failure and abort rather than masking it or continuing unsafely.
+    throw error;
+  }
+}
 
 // A workflow unit links to its parent Workflow tool call by matching the unique
 // run id in the tool_result text — but the run json can reach the index before
@@ -129,7 +180,7 @@ function isMissingIndexStateTable(error: unknown): boolean {
   return /no such table:\s*(?:main\.)?index_state\b/i.test(message);
 }
 
-function inspectBuildOwnership({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false }: { force?: boolean; ignoreRecentBuild?: boolean; ignoreDaemonOwnership?: boolean } = {}) {
+function readBuildOwnership({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false }: { force?: boolean; ignoreRecentBuild?: boolean; ignoreDaemonOwnership?: boolean } = {}) {
   if (!existsSync(DB_PATH)) return { skip: false };
   const db = openReadDb();
   try {
@@ -143,6 +194,14 @@ function inspectBuildOwnership({ force = false, ignoreRecentBuild = false, ignor
     throw error;
   } finally {
     db.close();
+  }
+}
+
+function inspectBuildOwnership(options: Parameters<typeof readBuildOwnership>[0]) {
+  try {
+    return readBuildOwnership(options);
+  } catch (error) {
+    throw indexAccessFailure(error);
   }
 }
 
@@ -187,10 +246,15 @@ function ensureReadableSchema(): { ready: boolean; reason?: string } {
 function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwnership = false, providerRegistry, readMode = 'normal' }: BuildIndexOptions = {}) {
   const ownership = inspectBuildOwnership({ force, ignoreRecentBuild, ignoreDaemonOwnership });
   if (ownership.skip) return ownership;
-  const lease = acquireWriterLease({
-    lockPath: writerLockPathFor(DB_PATH),
-    openDb: openWriterLeaseDb,
-  });
+  let lease;
+  try {
+    lease = acquireWriterLease({
+      lockPath: writerLockPathFor(DB_PATH),
+      openDb: openWriterLeaseDb,
+    });
+  } catch (error) {
+    throw indexAccessFailure(error);
+  }
   if (!lease) return { skip: true, reason: 'writer_busy' };
   try {
     // Ownership may change between the first read and lease acquisition.
@@ -209,10 +273,24 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       }).registry;
     }
 
-    const db = openDb();
+    let db;
+    try {
+      db = openDb();
+    } catch (error) {
+      throw indexAccessFailure(error);
+    }
     const txDb = nodeSqliteTransactionAdapter(db);
     const skippedFiles: SkippedFile[] = [];
     try {
+      try {
+        // A read/write open can succeed on a read-only SQLite file. Test an
+        // executable write before discovering/parsing the source inventory.
+        // This changes no row or progress marker and stays inside the lease.
+        probeIndexWritability(db);
+      } catch (error) {
+        if (isBeginBusyFailure(error)) return { skip: true, reason: 'database_busy' };
+        throw indexAccessFailure(error);
+      }
       const providerPlan = createProviderIndexPlan(db, registry, { force, readMode });
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
@@ -238,8 +316,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       }
 
       if (force) {
-        const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
         try {
+          const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
           runRetryableWriteTransaction(txDb, () => {
             snapshot.reset();
             const providerResult = indexProviderPlanStrict({
@@ -248,12 +326,23 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             });
             refreshSessionProjectPaths(db, null);
             backfillUnresolvedSessionProjectPathsOnce(db);
+            repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
+            backfillSessionTitles(db);
             healWorkflowParentLinks(db);
             ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
           }, { label: 'force-rebuild' });
+          // On failure the outer finally closes this connection and its temp
+          // tables. A failed staging cleanup must not replace the primary
+          // publication/rollback error before it can be attributed below.
+          snapshot.close();
         } catch (error) {
+          if (error instanceof ProviderIndexFailure) {
+            rethrowIfIndexWriterReadOnly(db, error);
+          } else if (isReadOnlyFailure(error)) {
+            throw indexAccessFailure(error);
+          }
           if (isBeginBusyFailure(error)) {
             return {
               skip: true,
@@ -289,9 +378,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               skippedFiles,
             };
           }
-          throw error;
-        } finally {
-          snapshot.close();
+          throw indexAccessFailure(error);
         }
         return {
           skip: false,
@@ -315,6 +402,9 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           ]));
         },
         onError: (error, { provider, unit }) => {
+          // Confirm whether the shared writer failed or just this source.
+          // A permission change after the initial probe must abort the batch.
+          rethrowIfIndexWriterReadOnly(db, error);
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
           if (error instanceof RetryableSourceReadError) {
@@ -350,6 +440,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           // Per-unit paths commit atomically with their provider cursors above;
           // legacy unresolved rows use one explicit, convergent backfill.
           backfillUnresolvedSessionProjectPathsOnce(db);
+          repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
+          backfillSessionTitles(db);
           healWorkflowParentLinks(db);
           ensureFtsReady(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
@@ -367,7 +459,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             skippedFiles,
           };
         }
-        throw error;
+        throw indexAccessFailure(error);
       }
       return {
         skip: false,
