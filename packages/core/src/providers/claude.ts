@@ -56,9 +56,67 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
 }
 
 export const name = 'claude';
-// v6 composes v5 canonical timestamp repair with orphan-family session rows.
-// Existing installs must replay once even when their family cursors are current.
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v6__';
+// v7 introduces namespaced session and message IDs for multi-root Claude Code.
+// Existing installs must replay once to upgrade already indexed rows.
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v7__';
+
+export function defaultClaudeSourceRoots(homeDir = homedir()): string[] {
+  const defaultRoot = join(homeDir, '.claude');
+  const roots: string[] = [defaultRoot];
+  try {
+    const entries = readdirSync(homeDir);
+    for (const entry of entries) {
+      if (entry === '.claude') continue;
+      if ((entry.startsWith('.claude-') || entry.endsWith('-claude')) && isDir(join(homeDir, entry))) {
+        const projectsDir = join(homeDir, entry, 'projects');
+        if (existsSync(projectsDir)) {
+          roots.push(join(homeDir, entry));
+        }
+      }
+    }
+  } catch { /* unreadable home directory */ }
+  return roots;
+}
+
+export function rootTagFor(rootDir: string, defaultRoot: string, allRoots?: readonly string[]): string {
+  const normalizedRoot = normalize(rootDir);
+  const normalizedDefault = normalize(defaultRoot);
+  if (normalizedRoot === normalizedDefault) return '';
+  const base = basename(normalizedRoot).replace(/^\./, '') || 'alt';
+  const duplicates = (allRoots ?? []).filter((r) => (basename(normalize(r)).replace(/^\./, '') || 'alt') === base);
+  if (duplicates.length > 1) {
+    const hash = createHash('sha256').update(normalizedRoot).digest('hex').slice(0, 6);
+    return `${base}-${hash}`;
+  }
+  return base;
+}
+
+export function canonicalSessionId(rawSessionId: string, rootTag: string): string {
+  return rootTag ? `${rootTag}:${rawSessionId}` : rawSessionId;
+}
+
+export function bareSessionId(sessionId: unknown): string {
+  const text = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '');
+  const separator = text.indexOf(':');
+  return separator === -1 ? text : text.slice(separator + 1);
+}
+
+function messageUuid(sessionId: string, rawUuid: string): string {
+  return sessionId.includes(':') ? `${sessionId}:${rawUuid}` : rawUuid;
+}
+
+function scopedId(sessionId: string, rawId: string): string {
+  return sessionId.includes(':') ? `${sessionId}:${rawId}` : rawId;
+}
+
+function extractRawUuid(messageUuid: string, sessionId?: unknown): string {
+  const sessionStr = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '');
+  if (sessionStr && messageUuid.startsWith(`${sessionStr}:`)) {
+    return messageUuid.slice(sessionStr.length + 1);
+  }
+  const idx = messageUuid.lastIndexOf(':');
+  return idx === -1 ? messageUuid : messageUuid.slice(idx + 1);
+}
 
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
@@ -82,10 +140,21 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
   return seen ? total : null;
 }
 
-function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
+function discoverAt(rootDir: string, ctx: DiscoverContext, rootTag = ''): IndexUnit[] {
   const projectsDir = join(rootDir, 'projects');
-  if (!existsSync(projectsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
-    ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
+  const hasPrior = (ctx.indexedSessions?.().length ?? 0) > 0;
+  const isPrimary = !rootTag;
+  const hasPriorInRoot = hasPrior && (
+    isPrimary || (ctx.indexedSessions?.().some((session) => {
+      const p = session.jsonlPath;
+      return typeof p === 'string' && (p.startsWith(rootDir + '/') || p.startsWith(rootDir + '\\'));
+    }) ?? false)
+  );
+  if (!existsSync(projectsDir)) {
+    if (hasPriorInRoot) {
+      ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
+    }
+    return [];
   }
   const historyPath = normalize(join(rootDir, 'history.jsonl'));
   const historyTitles = new Map<string, string>();
@@ -133,7 +202,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     if (!transcriptProvedMissing(mainPath)) continue;
     const key = join(projectsDir, file.project, file.sessionId, 'subagents');
     const members = orphanMembers.get(key) ?? [];
-    members.push({ key: file.path, sessionId: file.sessionId, project: file.project,
+    members.push({ key: file.path, sessionId: canonicalSessionId(file.sessionId, rootTag), project: file.project,
       isSubagent: true, agentId: file.agentId,
       meta: file.workflowRunId ? { workflowRunId: file.workflowRunId } : {} });
     orphanMembers.set(key, members);
@@ -143,8 +212,9 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   for (const [key, members] of orphanMembers) {
     const member = members[0]!;
     if (!inventoryComplete) { ctx.retainSession?.(member.sessionId); continue; }
-    const mainPath = join(dirname(key), '..', `${member.sessionId}.jsonl`);
-    const mainCursor = ctx.previousCursor?.(normalize(mainPath)) ?? ctx.lastCursor(normalize(mainPath));
+    const rawMainPath = join(dirname(key), '..', `${bareSessionId(member.sessionId)}.jsonl`);
+    const mainPath = normalize(rawMainPath);
+    const mainCursor = ctx.previousCursor?.(mainPath) ?? ctx.lastCursor(mainPath);
     let signature: string;
     try { signature = orphanFingerprint([...members.map(unit => unit.key), ...orphanWorkflowPaths(key)], mainCursor); }
     catch (error) {
@@ -156,7 +226,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     // A missing main file does not revoke already indexed history. Preserve
     // that evidence during force cleanup while refreshing surviving children.
     orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, preserveSessionHistory: true,
-      meta: { kind: 'orphan-family', members, signature, mainPath: normalize(mainPath), mainCursor } satisfies ClaudeOrphanFamilyMeta });
+      meta: { kind: 'orphan-family', members, signature, mainPath, mainCursor } satisfies ClaudeOrphanFamilyMeta });
   }
   const transcriptUnits = files.filter((file) => {
     if (orphanPaths.has(file.path)) return false;
@@ -169,7 +239,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       || cursorSignatureDiffers(cursor, file.path);
   }).map((f: any) => ({
     key: f.path,
-    sessionId: f.sessionId,
+    sessionId: canonicalSessionId(f.sessionId, rootTag),
     project: f.project,
     isSubagent: f.isSubagent,
     agentId: f.agentId,
@@ -218,7 +288,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         if (!relationshipChanged && cursor !== null && Number(cursor.split(':')[0]) >= mtime) continue;
         workflowUnits.push({
           key: workflowPath,
-          sessionId,
+          sessionId: canonicalSessionId(sessionId, rootTag),
           project,
           meta: { kind: 'workflow', mainTranscriptPath } satisfies ClaudeWorkflowUnitMeta,
         });
@@ -226,11 +296,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     }
   }
   return [...transcriptUnits, ...orphanUnits, ...workflowUnits.filter(unit =>
-    !orphanMembers.has(join(projectsDir, unit.project!, unit.sessionId, 'subagents')))];
+    !orphanMembers.has(join(projectsDir, unit.project!, bareSessionId(unit.sessionId), 'subagents')))];
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
-  return discoverAt(join(homedir(), '.claude'), ctx);
+  return createClaudeProvider().discover(ctx);
 }
 
 function toolResultText(content: unknown): string {
@@ -280,14 +350,15 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as ClaudeWorkflowUnitMeta;
   const progress = Array.isArray(workflow.workflowProgress) ? workflow.workflowProgress : [];
   const agents = progress.filter((item: any) => item?.type === 'workflow_agent' && item.agentId);
+  const rawParentToolUseId = workflowParentToolUseId(
+    meta.mainTranscriptPath,
+    workflow.runId,
+  );
   yield {
     kind: 'workflow',
     run_id: workflow.runId,
     session_id: unit.sessionId,
-    parent_tool_use_id: workflowParentToolUseId(
-      meta.mainTranscriptPath,
-      workflow.runId,
-    ),
+    parent_tool_use_id: rawParentToolUseId ? scopedId(unit.sessionId, rawParentToolUseId) : null,
     task_id: workflow.taskId || null,
     script: workflow.script || null,
     result_json: workflow.result ? JSON.stringify(workflow.result) : null,
@@ -301,7 +372,7 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
   for (const item of agents) {
     yield {
       kind: 'workflow_agent',
-      agent_id: `agent-${item.agentId}`,
+      agent_id: scopedId(unit.sessionId, `agent-${item.agentId}`),
       run_id: workflow.runId,
       session_id: unit.sessionId,
       phase: item.phaseTitle || null,
@@ -383,11 +454,11 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (lineNum <= skip) return;
 
     if (obj.type === 'system' && obj.subtype === 'away_summary' && obj.content) {
-      records.push({ kind: 'summary', id: obj.uuid || `${sid}-away-${ts}`, session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content });
+      records.push({ kind: 'summary', id: scopedId(sid, obj.uuid || `${bareSessionId(sid)}-away-${ts}`), session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content });
       return;
     }
     if (obj.type === 'system' && obj.subtype === 'turn_duration' && obj.parentUuid && obj.durationMs) {
-      records.push({ kind: 'message-turn-duration', uuid: obj.parentUuid, turn_duration_ms: obj.durationMs });
+      records.push({ kind: 'message-turn-duration', uuid: messageUuid(sid, obj.parentUuid), turn_duration_ms: obj.durationMs });
       return;
     }
     if (obj.type !== 'user' && obj.type !== 'assistant') return;
@@ -402,12 +473,14 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     const rawContentType = extractContentType(msg.content);
     const isMeta = extractMessageIsMeta(obj, text);
     const contentType = isMeta && isSkillInstructions(text) ? 'skill_instructions' : rawContentType;
-    const aid = isSubagent ? (unit.agentId ?? null) : (obj.agentId || null);
+    const rawAid = isSubagent ? (unit.agentId ?? null) : (obj.agentId || null);
+    const aid = rawAid ? scopedId(sid, rawAid) : null;
 
+    const msgUuid = messageUuid(sid, obj.uuid);
     if (obj.uuid) {
       records.push({
-        kind: 'message', uuid: obj.uuid, session_id: sid, type: obj.type,
-        parent_uuid: obj.parentUuid || null, timestamp: ts, role: msg.role || obj.type,
+        kind: 'message', uuid: msgUuid, session_id: sid, type: obj.type,
+        parent_uuid: obj.parentUuid ? messageUuid(sid, obj.parentUuid) : null, timestamp: ts, role: msg.role || obj.type,
         text, content_type: contentType, is_meta: (isMeta ? 1 : 0), visibility: 'visible',
         model: msg.model || null,
         is_sidechain: obj.isSidechain ? 1 : 0, agent_id: aid,
@@ -419,7 +492,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (obj.type === 'assistant' && Array.isArray(msg.content)) {
       for (const b of msg.content) {
         if (b.type === 'tool_use' && b.id)
-          records.push({ kind: 'tool_call', id: b.id, message_uuid: obj.uuid, session_id: sid, name: b.name, presentation: b.name === 'Skill' ? 'skill' : 'default', input_json: truncJson(b.input || {}) as string, file_path: filePath(b.name, b.input) });
+          records.push({ kind: 'tool_call', id: scopedId(sid, b.id), message_uuid: msgUuid, session_id: sid, name: b.name, presentation: b.name === 'Skill' ? 'skill' : 'default', input_json: truncJson(b.input || {}) as string, file_path: filePath(b.name, b.input) });
       }
     }
 
@@ -428,7 +501,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
         if (b.type !== 'tool_result' || !b.tool_use_id) continue;
         const rt = typeof b.content === 'string' ? b.content
           : Array.isArray(b.content) ? b.content.map((c: any) => c.text || '').join('\n') : '';
-        records.push({ kind: 'tool_result', tool_use_id: b.tool_use_id, message_uuid: obj.uuid, session_id: sid, content: trunc(rt), file_path: obj.toolUseResult?.filePath || null, is_error: b.is_error ? 1 : 0 });
+        records.push({ kind: 'tool_result', tool_use_id: scopedId(sid, b.tool_use_id), message_uuid: msgUuid, session_id: sid, content: trunc(rt), file_path: obj.toolUseResult?.filePath || null, is_error: b.is_error ? 1 : 0 });
       }
     }
   });
@@ -442,7 +515,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
         if (workflowRunId) {
           records.push({
             kind: 'workflow_agent',
-            agent_id: unit.agentId,
+            agent_id: scopedId(unit.sessionId, unit.agentId),
             run_id: workflowRunId,
             session_id: unit.sessionId,
             agent_type: meta.agentType || null,
@@ -453,9 +526,9 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
           const ended = subagentStats.endedAt ? new Date(subagentStats.endedAt).getTime() : null;
           records.push({
             kind: 'subagent',
-            agent_id: unit.agentId,
+            agent_id: scopedId(unit.sessionId, unit.agentId),
             session_id: unit.sessionId,
-            parent_tool_use_id: meta.toolUseId || null,
+            parent_tool_use_id: meta.toolUseId ? scopedId(unit.sessionId, meta.toolUseId) : null,
             agent_type: meta.agentType || null,
             description: meta.description || null,
             duration_ms: started !== null && ended !== null ? ended - started : null,
@@ -608,10 +681,11 @@ function mainTranscriptPathOf(unit: IndexUnit): string | null {
   // Match the owning session directory rather than the first ancestor named
   // subagents (the user's home or project can legally contain that name).
   let directory = dirname(unit.key);
+  const rawId = bareSessionId(unit.sessionId);
   while (dirname(directory) !== directory) {
     const parent = dirname(directory);
-    if (basename(directory) === 'subagents' && basename(parent) === unit.sessionId) {
-      return join(dirname(parent), `${unit.sessionId}.jsonl`);
+    if (basename(directory) === 'subagents' && basename(parent) === rawId) {
+      return join(dirname(parent), `${rawId}.jsonl`);
     }
     directory = parent;
   }
@@ -629,16 +703,19 @@ function rawClaude(input: RawLookup): RawRecord | null {
   let sourcePath = mainPath;
   if (input.agentId !== null) {
     const runId = input.workflowAgent?.['run_id'];
+    const bareId = bareSessionId(input.session?.id);
+    const rawAgentId = extractRawUuid(input.agentId, input.session?.id);
     sourcePath = typeof runId === 'string'
-      ? join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', 'workflows', runId, `${input.agentId}.jsonl`)
-      : join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', `${input.agentId}.jsonl`);
+      ? join(dirname(mainPath), bareId, 'subagents', 'workflows', runId, `${rawAgentId}.jsonl`)
+      : join(dirname(mainPath), bareId, 'subagents', `${rawAgentId}.jsonl`);
   }
   if (!existsSync(sourcePath)) return null;
   let found: string | null = null;
+  const rawMsgUuid = extractRawUuid(input.messageUuid, input.session?.id);
   readLines(sourcePath, (line: string) => {
-    if (!line.includes(input.messageUuid)) return;
+    if (!line.includes(rawMsgUuid)) return;
     try {
-      if (JSON.parse(line)?.uuid === input.messageUuid) {
+      if (JSON.parse(line)?.uuid === rawMsgUuid) {
         found = line;
         return false;
       }
@@ -661,16 +738,45 @@ function rawClaude(input: RawLookup): RawRecord | null {
     : { text: raw, totalLength: raw.length, offset: 0, limit: raw.length, hasMore: false, messageText };
 }
 
-export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: { rootDir?: string } = {}): ProviderAdapter {
+export function createClaudeProvider({
+  rootDir = join(homedir(), '.claude'),
+  sourceRoots,
+  id = name,
+  displayName = 'Claude Code',
+  vendor = 'Anthropic',
+  color = '#d97757',
+}: {
+  rootDir?: string;
+  sourceRoots?: readonly string[];
+  id?: string;
+  displayName?: string;
+  vendor?: string;
+  color?: string;
+} = {}): ProviderAdapter & { rootTagFor?: (root: string) => string } {
+  const defaultRoot = rootDir;
+  const usesRootSet = sourceRoots !== undefined;
+  const roots = usesRootSet ? [...sourceRoots] : [rootDir];
+
   return {
-    name,
-    descriptor: { id: name, name: 'Claude Code', vendor: 'Anthropic', defaultRoot: rootDir, color: '#d97757' },
-    indexVersionMarker: CLAUDE_CANONICAL_TRANSCRIPT_MARKER,
-    watchTargets: (configuredRoot) => [
-      { kind: 'tree', path: join(configuredRoot, 'projects') },
-      { kind: 'file', path: join(configuredRoot, 'history.jsonl') },
-    ],
-    discover: (ctx) => discoverAt(rootDir, ctx),
+    name: id,
+    descriptor: { id, name: displayName, vendor, defaultRoot, color },
+    indexVersionMarker: id === name
+      ? CLAUDE_CANONICAL_TRANSCRIPT_MARKER
+      : `${CLAUDE_CANONICAL_TRANSCRIPT_MARKER}:${id}`,
+    rootTagFor: (root: string) => rootTagFor(root, defaultRoot, roots),
+    watchTargets: (configuredRoot) => {
+      const activeRoots = (usesRootSet && configuredRoot === defaultRoot) ? roots : [configuredRoot];
+      return activeRoots.flatMap((root) => [
+        { kind: 'tree' as const, path: join(root, 'projects') },
+        { kind: 'file' as const, path: join(root, 'history.jsonl') },
+      ]);
+    },
+    discover: (ctx) => {
+      return roots.flatMap((root) => {
+        const tag = id !== name ? id : rootTagFor(root, defaultRoot, roots);
+        return discoverAt(root, ctx, tag);
+      });
+    },
     parse,
     raw: rawClaude,
   };

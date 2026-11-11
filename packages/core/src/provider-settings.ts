@@ -16,6 +16,7 @@ import {
 import { resolveObeliskPaths } from './paths.ts';
 import type { CopilotChronicleOpener } from './providers/copilot.ts';
 import { defaultCopilotUserDataRoots } from './providers/copilot.ts';
+import { defaultClaudeSourceRoots } from './providers/claude.ts';
 import type { HermesStoreOpener } from './providers/hermes.ts';
 import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 import type { KiroDatabaseOpener } from './providers/kiro.ts';
@@ -60,6 +61,13 @@ export function hasExplicitProviderRoot(
 }
 
 function configuredPath(value: unknown, homeDir: string): string | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const resolved = configuredPath(item, homeDir);
+      if (resolved !== null) return resolved;
+    }
+    return null;
+  }
   if (typeof value !== 'string' || value.trim().length === 0) return null;
   const trimmed = value.trim();
   const expanded = trimmed === '~'
@@ -68,6 +76,15 @@ function configuredPath(value: unknown, homeDir: string): string | null {
       ? join(homeDir, trimmed.slice(2))
       : trimmed;
   return isAbsolute(expanded) ? normalize(expanded) : null;
+}
+
+function configuredPaths(value: unknown, homeDir: string): string[] | undefined {
+  if (Array.isArray(value)) {
+    const resolved = value.map((v) => configuredPath(v, homeDir)).filter((v): v is string => v !== null);
+    return resolved.length > 0 ? resolved : undefined;
+  }
+  const single = configuredPath(value, homeDir);
+  return single !== null ? [single] : undefined;
 }
 
 export function resolveProviderRoots(
@@ -166,16 +183,27 @@ export function createConfiguredBuiltinProviderRuntime(
   if (copilotUserDataRoots?.[0]) roots.copilot = copilotUserDataRoots[0];
   const opencodeUsesAutomaticRoots = baseRoots.opencode === undefined
     && !hasExplicitProviderRoot(persisted, 'opencode');
+  const claudeUsesAutomaticRoots = baseRoots.claude === undefined
+    && !hasExplicitProviderRoot(persisted, 'claude');
+  const configuredClaudeRoots = hasExplicitProviderRoot(persisted, 'claude')
+    ? configuredPaths((persisted.providerRoots as Record<string, unknown> | undefined)?.claude ?? persisted.claudeDir, homeDir)
+    : undefined;
+  const claudeSourceRoots = claudeUsesAutomaticRoots
+    ? defaultClaudeSourceRoots(homeDir)
+    : configuredClaudeRoots;
+  if (claudeSourceRoots?.[0]) roots.claude = claudeSourceRoots[0];
   const configured = createBuiltinProviderRegistry(
     {
       ...baseRoots,
       ...roots,
       ...(copilotUsesAutomaticRoots ? { copilot: undefined } : {}),
       ...(opencodeUsesAutomaticRoots ? { opencode: undefined } : {}),
+      ...(claudeUsesAutomaticRoots ? { claude: undefined } : {}),
     },
     {
       cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
       copilotUserDataRoots,
+      claudeSourceRoots,
     },
   );
   return {
