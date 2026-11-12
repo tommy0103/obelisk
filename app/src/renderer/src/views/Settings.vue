@@ -239,7 +239,13 @@ function fmtRelative(iso) {
                 </span>
               </label>
             </div>
-            <div v-if="src.id !== 'copilot' || copilotCustomRoot" class="path-input">
+            <div v-if="src.multiRoot" class="multi-root-list">
+              <div v-for="rootPath in (src.paths || [])" :key="rootPath" class="path-input">
+                <input class="path-field" :class="{ error: src.status === 'error' }" type="text" :value="rootPath" spellcheck="false" readonly/>
+              </div>
+              <div class="form-label-hint">Configured via <code>settings.json</code> (<code>providerRoots.claude</code>).</div>
+            </div>
+            <div v-else-if="src.id !== 'copilot' || copilotCustomRoot" class="path-input">
               <input class="path-field" :class="{ error: src.status === 'error' }" type="text" :value="src.path" spellcheck="false" readonly/>
               <button class="btn" @click="browseSourcePath(src)">
                 <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
@@ -466,6 +472,7 @@ function fmtRelative(iso) {
 .copilot-edition-details { display: flex; flex-direction: column; min-width: 0; gap: 2px; font-size: 12px; }
 .copilot-edition-path { color: var(--muted); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
 .copilot-actions { display: flex; }
+.multi-root-list { display: flex; flex-direction: column; gap: 6px; }
 
 .form-row {
   display: grid; grid-template-columns: 180px 1fr;

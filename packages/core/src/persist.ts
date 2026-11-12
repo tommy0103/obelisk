@@ -190,9 +190,21 @@ function statements(db: SqliteDb) {
         duration_ms=COALESCE(excluded.duration_ms, subagents.duration_ms),
         total_tokens=COALESCE(excluded.total_tokens, subagents.total_tokens)`),
     wf: db.prepare(`
-      INSERT OR REPLACE INTO workflows
+      INSERT INTO workflows
         (run_id,session_id,parent_tool_use_id,task_id,script,result_json,timestamp,agent_count,duration_ms,total_tokens,status,workflow_name)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(run_id) DO UPDATE SET
+        session_id=excluded.session_id,
+        parent_tool_use_id=COALESCE(excluded.parent_tool_use_id, workflows.parent_tool_use_id),
+        task_id=excluded.task_id,
+        script=excluded.script,
+        result_json=excluded.result_json,
+        timestamp=excluded.timestamp,
+        agent_count=excluded.agent_count,
+        duration_ms=excluded.duration_ms,
+        total_tokens=excluded.total_tokens,
+        status=excluded.status,
+        workflow_name=excluded.workflow_name`),
     wa: db.prepare(`
       INSERT INTO workflow_agents
         (agent_id,run_id,session_id,agent_type,description,phase,label,model,state,duration_ms,tokens,tool_calls)

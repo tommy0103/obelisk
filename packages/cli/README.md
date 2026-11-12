@@ -21,6 +21,27 @@ obelisk install
 obelisk --query /tmp/query.mjs
 ```
 
+### Multiple Claude Code roots
+
+To index multiple Claude Code configuration directories (such as separate
+`CLAUDE_CONFIG_DIR` profiles), set `providerRoots.claude` in `settings.json`
+to a non-empty array of absolute or `~`-prefixed paths:
+
+```json
+{
+  "providerRoots": {
+    "claude": ["~/.claude", "~/profiles/claude-work"]
+  }
+}
+```
+
+An explicit array replaces the default `~/.claude` root; include `"~/.claude"`
+in the array if you want both indexed. A missing or unreadable root that was
+previously indexed aborts destructive full rebuilds (`obelisk --build`) to
+preserve cached history. A root deliberately removed from `providerRoots.claude`
+retains its cached sessions on ordinary incremental refreshes and is dropped
+on a full rebuild (`obelisk --build`).
+
 ### Unreadable provider settings
 
 Only a missing settings file (`ENOENT` when read) selects default provider

@@ -26,8 +26,7 @@ export function createBuiltinProviderRegistry(
     cwd,
     copilotUserDataRoots,
     claudeSourceRoots,
-    claudeHomeDir,
-    discoverClaudeSiblings,
+    claudeDefaultRoot,
     openCopilotChronicle,
     openHermesStore,
     openZcodeDatabase,
@@ -38,8 +37,7 @@ export function createBuiltinProviderRegistry(
     cwd?: string;
     copilotUserDataRoots?: readonly string[];
     claudeSourceRoots?: readonly string[];
-    claudeHomeDir?: string;
-    discoverClaudeSiblings?: boolean;
+    claudeDefaultRoot?: string;
     openCopilotChronicle?: CopilotChronicleOpener;
     openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
@@ -47,16 +45,14 @@ export function createBuiltinProviderRegistry(
     openOpencodeDatabase?: OpencodeDatabaseOpener;
   } = {},
 ): ProviderRegistry {
-  const effectiveClaudeHome = claudeHomeDir ?? homeDir;
-  const defaultClaudeRoot = effectiveClaudeHome ? join(effectiveClaudeHome, '.claude') : undefined;
-  const claudeRootDir = (
-    defaultClaudeRoot !== undefined && claudeSourceRoots?.includes(defaultClaudeRoot)
-  ) ? defaultClaudeRoot : (roots['claude'] ?? defaultClaudeRoot);
+  const fallbackClaudeDefault = homeDir ? join(homeDir, '.claude') : undefined;
+  const claudeRootDir = claudeSourceRoots !== undefined
+    ? (claudeDefaultRoot ?? fallbackClaudeDefault ?? roots['claude'])
+    : (roots['claude'] ?? claudeDefaultRoot ?? fallbackClaudeDefault);
   return createProviderRegistry([
     createClaudeProvider({
       rootDir: claudeRootDir,
       sourceRoots: claudeSourceRoots,
-      discoverSiblingRoots: discoverClaudeSiblings,
     }),
     createCodexProvider({ rootDir: roots['codex'] }),
     createCodexHostAntigravityProvider({ rootDir: roots['codexhost-antigravity'] }),

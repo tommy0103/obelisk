@@ -11,9 +11,9 @@
 
 import { createHash } from 'node:crypto';
 import { RetryableSourceReadError } from './source-read-error.ts';
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, normalize, relative, resolve, win32 } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize, posix, relative, resolve, win32 } from 'node:path';
 
 import {
   extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
@@ -60,54 +60,35 @@ export const name = 'claude';
 // Existing installs must replay once to upgrade already indexed rows.
 export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v7__';
 
-const BACKUP_DIR_SUFFIX = /(?:^|[.-])(?:backup|bak|old|archive)$/i;
-
-function isClaudeSiblingDirName(entry: string): boolean {
-  return entry !== '.claude'
-    && !BACKUP_DIR_SUFFIX.test(entry)
-    && (entry.startsWith('.claude-') || entry.endsWith('-claude'));
+function isWindowsStylePath(value: string): boolean {
+  return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\');
 }
 
-export function defaultClaudeSourceRoots(homeDir = homedir()): string[] {
-  const defaultRoot = join(homeDir, '.claude');
-  const siblings: string[] = [];
-  try {
-    const entries = readdirSync(homeDir).sort();
-    for (const entry of entries) {
-      if (!isClaudeSiblingDirName(entry)) continue;
-      if (isDir(join(homeDir, entry))) {
-        const projectsDir = join(homeDir, entry, 'projects');
-        if (existsSync(projectsDir)) {
-          siblings.push(join(homeDir, entry));
-        }
-      }
-    }
-  } catch { /* unreadable home directory */ }
-  if (siblings.length > 0 && !existsSync(join(defaultRoot, 'projects'))) {
-    return [...siblings, defaultRoot];
+export function canonicalRootPath(dir: string): string {
+  const useWin32 = process.platform === 'win32' || isWindowsStylePath(dir);
+  const pathImpl = useWin32 ? win32 : posix;
+  const norm = pathImpl.normalize(dir);
+  const parsedRoot = pathImpl.parse(norm).root;
+  if (norm.length > parsedRoot.length && (norm.endsWith('/') || (useWin32 && norm.endsWith('\\')))) {
+    return norm.slice(0, -1);
   }
-  return [defaultRoot, ...siblings];
+  return norm;
 }
 
 function sanitizeRootTag(dir: string): string {
-  return basename(normalize(dir)).replace(/^\./, '').replace(/:/g, '-') || 'alt';
+  return basename(canonicalRootPath(dir)).replace(/^\./, '').replace(/:/g, '-') || 'alt';
 }
 
-export function rootTagFor(rootDir: string, defaultRoot: string, allRoots?: readonly string[]): string {
-  const normalizedRoot = normalize(rootDir);
-  const normalizedDefault = normalize(defaultRoot);
-  if (normalizedRoot === normalizedDefault) return '';
-  const base = sanitizeRootTag(rootDir);
-  const duplicates = (allRoots ?? []).filter((r) => sanitizeRootTag(r) === base);
-  if (duplicates.length > 1) {
-    const hash = createHash('sha256').update(normalizedRoot).digest('hex').slice(0, 6);
-    return `${base}-${hash}`;
-  }
-  return base;
-}
-
-function isWindowsStylePath(value: string): boolean {
-  return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\');
+export function rootTagFor(rootDir: string, defaultRoot: string): string {
+  const normalizedRoot = canonicalRootPath(rootDir);
+  const normalizedDefault = canonicalRootPath(defaultRoot);
+  if (sameNormalizedPath(normalizedRoot, normalizedDefault)) return '';
+  const base = sanitizeRootTag(normalizedRoot);
+  const hashInput = (process.platform === 'win32' || isWindowsStylePath(normalizedRoot))
+    ? normalizedRoot.toLowerCase()
+    : normalizedRoot;
+  const hash = createHash('sha256').update(hashInput).digest('hex').slice(0, 6);
+  return `${base}-${hash}`;
 }
 
 function lexicalPathInside(root: string, candidate: string): boolean {
@@ -123,7 +104,7 @@ function lexicalPathInside(root: string, candidate: string): boolean {
   return !pathImpl.isAbsolute(rel) && !/(^|[/\\])\.\.([/\\]|$)/.test(rel);
 }
 
-function sameNormalizedPath(left: string, right: string): boolean {
+export function sameNormalizedPath(left: string, right: string): boolean {
   const useWin32 = process.platform === 'win32' || (isWindowsStylePath(left) && isWindowsStylePath(right));
   const norm = useWin32 ? win32.normalize : normalize;
   const a = norm(left);
@@ -139,7 +120,7 @@ function tryRealpath(target: string): string | null {
   }
 }
 
-function pathInside(root: string, candidate: unknown): boolean {
+export function pathInside(root: string, candidate: unknown): boolean {
   if (typeof candidate !== 'string' || candidate.length === 0) return false;
   if (lexicalPathInside(root, candidate)) return true;
   const realRoot = tryRealpath(root);
@@ -157,18 +138,6 @@ function isSafePathSegment(value: string): boolean {
     && !value.includes('/')
     && !value.includes('\\')
     && !value.includes('\0');
-}
-
-function vanishedSiblingRootFor(homeDir: string, jsonlPath: unknown): string | null {
-  if (typeof jsonlPath !== 'string' || jsonlPath.length === 0) return null;
-  if (!lexicalPathInside(homeDir, jsonlPath)) return null;
-  const useWin32 = process.platform === 'win32' || (isWindowsStylePath(homeDir) && isWindowsStylePath(jsonlPath));
-  const rel = (useWin32 ? win32.relative : relative)(homeDir, jsonlPath);
-  const parts = rel.split(/[/\\]/).filter(Boolean);
-  if (parts.length < 2) return null;
-  const [entry, sub] = parts;
-  if (!entry || sub !== 'projects' || !isClaudeSiblingDirName(entry)) return null;
-  return join(homeDir, entry);
 }
 
 export function canonicalSessionId(rawSessionId: string, rootTag: string): string {
@@ -220,17 +189,44 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
   return seen ? total : null;
 }
 
+function workflowMainSignature(mainTranscriptPath: string): string {
+  try {
+    const stat = statSync(mainTranscriptPath);
+    return `${stat.mtimeMs}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+  } catch {
+    return 'missing';
+  }
+}
+
 function discoverAt(
   rootDir: string,
   ctx: DiscoverContext,
   rootTag = '',
-  reportMissingWhenAbsent = (ctx.indexedSessions?.().length ?? 0) > 0,
+  indexed: readonly { sessionId: string; jsonlPath: string }[] = ctx.indexedSessions?.() ?? [],
+  usesRootSet = false,
 ): IndexUnit[] {
   const projectsDir = join(rootDir, 'projects');
-  if (!existsSync(projectsDir)) {
-    if (reportMissingWhenAbsent) {
+  let projectsStat: Stats | null = null;
+  let projectsStatError: NodeJS.ErrnoException | null = null;
+  try {
+    projectsStat = statSync(projectsDir);
+  } catch (error) {
+    projectsStatError = error as NodeJS.ErrnoException;
+  }
+  if (projectsStatError !== null) {
+    if (projectsStatError.code !== 'ENOENT') {
+      ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectsDir, projectsStatError));
+      return [];
+    }
+    const rootWasIndexed = indexed.some((session) => pathInside(rootDir, session.jsonlPath));
+    const rootExists = existsSync(rootDir);
+    if (rootWasIndexed || (!usesRootSet && !rootExists && indexed.length > 0)) {
       ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
     }
+    return [];
+  }
+  if (!projectsStat!.isDirectory()) {
+    ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is not a directory' });
     return [];
   }
   const historyPath = normalize(join(rootDir, 'history.jsonl'));
@@ -288,18 +284,27 @@ function discoverAt(
   const orphanUnits: IndexUnit[] = [];
   for (const [key, members] of orphanMembers) {
     const member = members[0]!;
-    if (!inventoryComplete) { ctx.retainSession?.(member.sessionId); continue; }
     const rawMainPath = join(dirname(key), '..', `${bareSessionId(member.sessionId)}.jsonl`);
     const mainPath = normalize(rawMainPath);
+    const prior = indexed.find((session) => sameNormalizedPath(session.jsonlPath, mainPath));
+    if (!inventoryComplete) {
+      ctx.retainSession?.(member.sessionId);
+      if (prior && prior.sessionId !== member.sessionId) ctx.retainSession?.(prior.sessionId);
+      continue;
+    }
     const mainCursor = ctx.previousCursor?.(mainPath) ?? ctx.lastCursor(mainPath);
     let signature: string;
     try { signature = orphanFingerprint([...members.map(unit => unit.key), ...orphanWorkflowPaths(key)], mainCursor); }
     catch (error) {
       ctx.retainSession?.(member.sessionId);
+      if (prior && prior.sessionId !== member.sessionId) ctx.retainSession?.(prior.sessionId);
       ctx.reportIncompleteInventory?.(sourceInventoryIssue(key, error));
       continue;
     }
     if (ctx.lastCursor(key) === signature) continue;
+    if (prior && prior.sessionId !== member.sessionId) {
+      ctx.retainSession?.(prior.sessionId);
+    }
     // A missing main file does not revoke already indexed history. Preserve
     // that evidence during force cleanup while refreshing surviving children.
     orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, preserveSessionHistory: true,
@@ -307,24 +312,40 @@ function discoverAt(
   }
   const transcriptUnits = files.filter((file) => {
     if (orphanPaths.has(file.path)) return false;
+    const canonicalId = canonicalSessionId(file.sessionId, rootTag);
+    const prior = !file.isSubagent
+      ? indexed.find((session) => sameNormalizedPath(session.jsonlPath, file.path))
+      : undefined;
+    const idChanged = prior !== undefined && prior.sessionId !== canonicalId;
     const normalizedPath = normalize(file.path);
-    if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath)) return false;
+    if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath) && !idChanged) return false;
     const cursor = ctx.lastCursor(file.path);
-    return historyChanged
+    return idChanged
+      || historyChanged
       || forcedPaths.has(normalizedPath)
       || cursor === null
       || cursorSignatureDiffers(cursor, file.path);
-  }).map((f: any) => ({
-    key: f.path,
-    sessionId: canonicalSessionId(f.sessionId, rootTag),
-    project: f.project,
-    isSubagent: f.isSubagent,
-    agentId: f.agentId,
-    meta: {
-      ...(f.workflowRunId ? { workflowRunId: f.workflowRunId } : {}),
-      ...(historyTitles.has(f.sessionId) ? { historyTitle: historyTitles.get(f.sessionId) } : {}),
-    },
-  }));
+  }).map((f: any) => {
+    const canonicalId = canonicalSessionId(f.sessionId, rootTag);
+    const prior = !f.isSubagent
+      ? indexed.find((session) => sameNormalizedPath(session.jsonlPath, f.path))
+      : undefined;
+    const retractSessionIds = prior !== undefined && prior.sessionId !== canonicalId
+      ? [prior.sessionId]
+      : undefined;
+    return {
+      key: f.path,
+      sessionId: canonicalId,
+      project: f.project,
+      isSubagent: f.isSubagent,
+      agentId: f.agentId,
+      ...(retractSessionIds === undefined ? {} : { retractSessionIds }),
+      meta: {
+        ...(f.workflowRunId ? { workflowRunId: f.workflowRunId } : {}),
+        ...(historyTitles.has(f.sessionId) ? { historyTitle: historyTitles.get(f.sessionId) } : {}),
+      },
+    };
+  });
 
   const workflowUnits: IndexUnit[] = [];
   if (!existsSync(projectsDir)) return [...transcriptUnits, ...orphanUnits];
@@ -345,6 +366,7 @@ function discoverAt(
       const workflowDir = join(projectPath, sessionId, 'workflows');
       if (!isDir(workflowDir)) continue;
       const mainTranscriptPath = join(projectPath, `${sessionId}.jsonl`);
+      const currentMainSig = workflowMainSignature(mainTranscriptPath);
       let files: string[];
       try { files = readdirSync(workflowDir); } catch (error) {
         ctx.reportIncompleteInventory?.(sourceInventoryIssue(workflowDir, error));
@@ -362,7 +384,10 @@ function discoverAt(
         ) continue;
         const mtime = statSync(workflowPath).mtimeMs;
         const cursor = ctx.lastCursor(workflowPath);
-        if (!relationshipChanged && cursor !== null && Number(cursor.split(':')[0]) >= mtime) continue;
+        const cursorParts = cursor?.split(':');
+        const cursorMtime = cursorParts ? Number(cursorParts[0]) : NaN;
+        const cursorMainSig = cursorParts && cursorParts.length >= 3 ? cursorParts.slice(2).join(':') : null;
+        if (!relationshipChanged && cursor !== null && cursorMtime >= mtime && cursorMainSig === currentMainSig) continue;
         workflowUnits.push({
           key: workflowPath,
           sessionId: canonicalSessionId(sessionId, rootTag),
@@ -420,11 +445,12 @@ function workflowParentToolUseId(
 
 function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
   const mtime = statSync(unit.key).mtimeMs;
-  const outCursor = `${mtime}:1`;
+  const meta = unit.meta as ClaudeWorkflowUnitMeta;
+  const mainSig = workflowMainSignature(meta.mainTranscriptPath);
+  const outCursor = `${mtime}:1:${mainSig}`;
   let workflow: any;
   try { workflow = JSON.parse(readFileSync(unit.key, 'utf8')); } catch { return outCursor; }
   if (!workflow?.runId) return outCursor;
-  const meta = unit.meta as ClaudeWorkflowUnitMeta;
   const progress = Array.isArray(workflow.workflowProgress) ? workflow.workflowProgress : [];
   const agents = progress.filter((item: any) => item?.type === 'workflow_agent' && item.agentId);
   const rawParentToolUseId = workflowParentToolUseId(
@@ -532,7 +558,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (lineNum <= skip) return;
 
     if (obj.type === 'system' && obj.subtype === 'away_summary' && obj.content) {
-      records.push({ kind: 'summary', id: scopedId(sid, obj.uuid || `${bareSessionId(sid)}-away-${ts}`), session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content });
+      records.push({ kind: 'summary', id: scopedId(sid, obj.uuid || `${bareSessionId(sid)}-away-${ts}`), session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content, visibility: 'visible' });
       return;
     }
     if (obj.type === 'system' && obj.subtype === 'turn_duration' && obj.parentUuid && obj.durationMs) {
@@ -830,7 +856,6 @@ function rawClaude(input: RawLookup): RawRecord | null {
 export function createClaudeProvider({
   rootDir = join(homedir(), '.claude'),
   sourceRoots,
-  discoverSiblingRoots = false,
   id = name,
   displayName = 'Claude Code',
   vendor = 'Anthropic',
@@ -838,7 +863,6 @@ export function createClaudeProvider({
 }: {
   rootDir?: string;
   sourceRoots?: readonly string[];
-  discoverSiblingRoots?: boolean;
   id?: string;
   displayName?: string;
   vendor?: string;
@@ -846,10 +870,7 @@ export function createClaudeProvider({
 } = {}): ProviderAdapter & { rootTagFor?: (root: string) => string } {
   const defaultRoot = rootDir;
   const usesRootSet = sourceRoots !== undefined;
-  const staticRoots = usesRootSet ? [...sourceRoots] : [rootDir];
-  const resolveActiveRoots = (): string[] => (
-    discoverSiblingRoots ? defaultClaudeSourceRoots(dirname(defaultRoot)) : staticRoots
-  );
+  const activeRoots = usesRootSet ? [...sourceRoots] : [rootDir];
 
   return {
     name: id,
@@ -857,47 +878,22 @@ export function createClaudeProvider({
     indexVersionMarker: id === name
       ? CLAUDE_CANONICAL_TRANSCRIPT_MARKER
       : `${CLAUDE_CANONICAL_TRANSCRIPT_MARKER}:${id}`,
-    rootTagFor: (root: string) => rootTagFor(root, defaultRoot, resolveActiveRoots()),
+    rootTagFor: (root: string) => rootTagFor(root, defaultRoot),
     watchTargets: (configuredRoot) => {
-      const currentRoots = resolveActiveRoots();
-      const activeRoots = (
-        (usesRootSet || discoverSiblingRoots)
-        && (sameNormalizedPath(configuredRoot, defaultRoot) || currentRoots.some((r) => sameNormalizedPath(r, configuredRoot)))
-      ) ? currentRoots : [configuredRoot];
-      return activeRoots.flatMap((root) => [
+      const targets = (
+        usesRootSet
+        && (sameNormalizedPath(configuredRoot, defaultRoot) || activeRoots.some((r) => sameNormalizedPath(r, configuredRoot)))
+      ) ? activeRoots : [configuredRoot];
+      return targets.flatMap((root) => [
         { kind: 'tree' as const, path: join(root, 'projects') },
         { kind: 'file' as const, path: join(root, 'history.jsonl') },
       ]);
     },
     discover: (ctx) => {
-      const currentRoots = resolveActiveRoots();
       const indexed = ctx.indexedSessions?.() ?? [];
-      const hasPrior = indexed.length > 0;
-      const anyRootExists = currentRoots.some((root) => existsSync(join(root, 'projects')));
-      const fallbackReportRoot = currentRoots.find((r) => sameNormalizedPath(r, defaultRoot))
-        ?? currentRoots[0]!;
-      const reportedVanished = new Set<string>();
-      if (discoverSiblingRoots) {
-        const home = dirname(defaultRoot);
-        for (const session of indexed) {
-          if (currentRoots.some((root) => pathInside(root, session.jsonlPath))) continue;
-          const vanished = vanishedSiblingRootFor(home, session.jsonlPath);
-          if (vanished !== null) {
-            const projectsDir = join(vanished, 'projects');
-            if (!existsSync(projectsDir) && !reportedVanished.has(projectsDir)) {
-              reportedVanished.add(projectsDir);
-              ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
-            }
-          }
-        }
-      }
-      return currentRoots.flatMap((root) => {
-        const tag = id !== name ? id : rootTagFor(root, defaultRoot, currentRoots);
-        const reportMissing = currentRoots.length === 1 && !discoverSiblingRoots
-          ? hasPrior
-          : (indexed.some((session) => pathInside(root, session.jsonlPath))
-            || (!anyRootExists && hasPrior && reportedVanished.size === 0 && sameNormalizedPath(root, fallbackReportRoot)));
-        return discoverAt(root, ctx, tag, reportMissing);
+      return activeRoots.flatMap((root) => {
+        const tag = id !== name ? id : rootTagFor(root, defaultRoot);
+        return discoverAt(root, ctx, tag, indexed, usesRootSet);
       });
     },
     parse,

@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, normalize } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 import {
   createBuiltinProviderRegistry,
@@ -16,7 +16,7 @@ import {
 import { resolveObeliskPaths } from './paths.ts';
 import type { CopilotChronicleOpener } from './providers/copilot.ts';
 import { defaultCopilotUserDataRoots } from './providers/copilot.ts';
-import { defaultClaudeSourceRoots } from './providers/claude.ts';
+import { canonicalRootPath } from './providers/claude.ts';
 import type { HermesStoreOpener } from './providers/hermes.ts';
 import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 import type { KiroDatabaseOpener } from './providers/kiro.ts';
@@ -68,7 +68,48 @@ function configuredPath(value: unknown, homeDir: string): string | null {
     : trimmed.startsWith('~/') || trimmed.startsWith('~\\')
       ? join(homeDir, trimmed.slice(2))
       : trimmed;
-  return isAbsolute(expanded) ? normalize(expanded) : null;
+  return isAbsolute(expanded) ? canonicalRootPath(expanded) : null;
+}
+
+export function resolveConfiguredClaudeRoots(
+  persisted: PersistedProviderSettings = {},
+  { homeDir = homedir() }: { homeDir?: string } = {},
+): { configured: boolean; roots: string[] | undefined; invalidReason?: string } {
+  if (!hasExplicitProviderRoot(persisted, 'claude')) {
+    return { configured: false, roots: undefined };
+  }
+  const persistedRootsObj = (
+    persisted.providerRoots !== null
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
+  ) ? persisted.providerRoots : {};
+  const hasModernClaude = Object.prototype.hasOwnProperty.call(persistedRootsObj, 'claude')
+    && persistedRootsObj['claude'] !== null;
+  const rawValue = hasModernClaude ? persistedRootsObj['claude'] : persisted.claudeDir;
+  if (Array.isArray(rawValue)) {
+    if (rawValue.length === 0) {
+      return { configured: true, roots: undefined, invalidReason: 'Configured claude root list must not be empty' };
+    }
+    const seen = new Set<string>();
+    const resolved: string[] = [];
+    for (const item of rawValue) {
+      const path = configuredPath(item, homeDir);
+      if (path === null) {
+        return { configured: true, roots: undefined, invalidReason: 'Configured claude root must be absolute or start with ~' };
+      }
+      const dedupeKey = process.platform === 'win32' ? path.toLowerCase() : path;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        resolved.push(path);
+      }
+    }
+    return { configured: true, roots: resolved };
+  }
+  const single = configuredPath(rawValue, homeDir);
+  if (single === null) {
+    return { configured: true, roots: undefined, invalidReason: 'Configured claude root must be absolute or start with ~' };
+  }
+  return { configured: true, roots: [single] };
 }
 
 function configuredPaths(value: unknown, homeDir: string): string[] | undefined {
@@ -79,8 +120,9 @@ function configuredPaths(value: unknown, homeDir: string): string[] | undefined 
     for (const item of value) {
       const path = configuredPath(item, homeDir);
       if (path === null) return undefined;
-      if (!seen.has(path)) {
-        seen.add(path);
+      const dedupeKey = process.platform === 'win32' ? path.toLowerCase() : path;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
         resolved.push(path);
       }
     }
@@ -160,8 +202,6 @@ export function createConfiguredBuiltinProviderRuntime(
     homeDir = homedir(),
     cwd = process.cwd(),
     baseRoots = {},
-    automaticClaudeRoots,
-    claudeHomeDir,
     openCopilotChronicle,
     openHermesStore,
     openZcodeDatabase,
@@ -171,8 +211,6 @@ export function createConfiguredBuiltinProviderRuntime(
     homeDir?: string;
     cwd?: string;
     baseRoots?: BuiltinProviderRoots;
-    automaticClaudeRoots?: boolean;
-    claudeHomeDir?: string;
     openCopilotChronicle?: CopilotChronicleOpener;
     openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
@@ -190,22 +228,9 @@ export function createConfiguredBuiltinProviderRuntime(
   if (copilotUserDataRoots?.[0]) roots.copilot = copilotUserDataRoots[0];
   const opencodeUsesAutomaticRoots = baseRoots.opencode === undefined
     && !hasExplicitProviderRoot(persisted, 'opencode');
-  const effectiveClaudeHome = claudeHomeDir ?? homeDir;
-  const claudeUsesAutomaticRoots = (automaticClaudeRoots ?? (baseRoots.claude === undefined))
-    && !hasExplicitProviderRoot(persisted, 'claude');
-  const persistedRootsObj = (
-    persisted.providerRoots !== null
-    && typeof persisted.providerRoots === 'object'
-    && !Array.isArray(persisted.providerRoots)
-  ) ? persisted.providerRoots : {};
-  const hasModernClaude = Object.prototype.hasOwnProperty.call(persistedRootsObj, 'claude')
-    && persistedRootsObj['claude'] !== null;
-  const configuredClaudeRoots = hasExplicitProviderRoot(persisted, 'claude')
-    ? configuredPaths(hasModernClaude ? persistedRootsObj['claude'] : persisted.claudeDir, homeDir)
-    : undefined;
-  const claudeSourceRoots = claudeUsesAutomaticRoots
-    ? defaultClaudeSourceRoots(effectiveClaudeHome)
-    : configuredClaudeRoots;
+  const claudeConfig = resolveConfiguredClaudeRoots(persisted, { homeDir });
+  const claudeSourceRoots = claudeConfig.roots;
+  const claudeDefaultRoot = defaults.get('claude')?.descriptor.defaultRoot;
   if (claudeSourceRoots?.[0]) roots.claude = claudeSourceRoots[0];
   const configured = createBuiltinProviderRegistry(
     {
@@ -213,21 +238,20 @@ export function createConfiguredBuiltinProviderRuntime(
       ...roots,
       ...(copilotUsesAutomaticRoots ? { copilot: undefined } : {}),
       ...(opencodeUsesAutomaticRoots ? { opencode: undefined } : {}),
-      ...(claudeUsesAutomaticRoots ? { claude: undefined } : {}),
     },
     {
       cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
       copilotUserDataRoots,
       claudeSourceRoots,
-      claudeHomeDir: effectiveClaudeHome,
-      discoverClaudeSiblings: claudeUsesAutomaticRoots,
+      claudeDefaultRoot,
     },
   );
   return {
     roots,
     registry: createProviderRegistry(configured.list().map((provider) => {
       if (roots[provider.name] !== undefined) return provider;
-      const reason = provider.descriptor.rootResolutionReason
+      const reason = (provider.name === 'claude' ? claudeConfig.invalidReason : undefined)
+        ?? provider.descriptor.rootResolutionReason
         ?? `Configured ${provider.name} root must be absolute or start with ~`;
       return {
         ...provider,

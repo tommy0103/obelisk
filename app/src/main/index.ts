@@ -25,6 +25,7 @@ import {
   getCopilotEditions,
   hasExplicitProviderRoot,
   readPersistedProviderSettings,
+  resolveConfiguredClaudeRoots,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
   resolveObeliskPaths,
@@ -117,8 +118,6 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       claude: DEFAULT_CLAUDE_DIR,
       codex: DEFAULT_CODEX_DIR,
     },
-    automaticClaudeRoots: path.basename(DEFAULT_CLAUDE_DIR) === '.claude',
-    claudeHomeDir: path.dirname(DEFAULT_CLAUDE_DIR),
     openCopilotChronicle: sourcePath => new Database(sourcePath, {
       readonly: true,
       fileMustExist: true,
@@ -345,6 +344,7 @@ function startIndexerService({ buildOnStart = false } = {}) {
         providerRoots: paths.providerRoots,
         providerSettings: paths.providerSettings,
         claudeDir: paths.claudeDir,
+        defaultClaudeDir: DEFAULT_CLAUDE_DIR,
         codexDir: paths.codexDir,
         projectsDir: paths.projectsDir,
         dbPath: paths.dbPath,
@@ -1203,8 +1203,12 @@ ipcMain.handle('settings:get', async () => {
     } catch {}
   }
   const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
+  const claudeRootConfig = resolveConfiguredClaudeRoots(persisted);
+  const claudeHasArrayConfig = Array.isArray(persisted.providerRoots?.claude);
+  const configuredClaudeList = claudeHasArrayConfig ? (claudeRootConfig.roots ?? []) : [];
   const sourcePaths = new Set([
     ...providerRegistry.catalog().map((provider) => providerRoots[provider.id] ?? provider.defaultRoot),
+    ...configuredClaudeList,
     ...(!copilotCustomRoot ? selectedCopilotEditions.map((edition) => edition.path) : []),
   ]);
   const existingPaths = new Set((await Promise.all([...sourcePaths].map(async (sourcePath) => {
@@ -1227,6 +1231,23 @@ ipcMain.handle('settings:get', async () => {
     sourceIssues: latestSourceIssues,
     pathExists: (sourcePath) => existingPaths.has(sourcePath),
   }).map((source) => {
+    if (source.id === 'claude' && claudeHasArrayConfig) {
+      if (claudeRootConfig.roots === undefined) {
+        return { ...source, multiRoot: true, paths: [] as string[] };
+      }
+      const missingPath = configuredClaudeList.find((root) => !existingPaths.has(root));
+      const allExist = missingPath === undefined;
+      return {
+        ...source,
+        multiRoot: true,
+        paths: configuredClaudeList,
+        exists: allExist,
+        ...(allExist ? {} : {
+          status: 'error',
+          statusText: `Folder not found: ${missingPath}`,
+        }),
+      };
+    }
     if (source.id !== 'copilot' || copilotCustomRoot) return source;
     if (selectedCopilotEditions.length === 0) {
       return { ...source, exists: false, status: 'warn', statusText: 'No folders selected' };
@@ -1278,6 +1299,13 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
       rename: (from, to) => fs.promises.rename(from, to),
       copyFile: (from, to) => fs.promises.copyFile(from, to),
     }, currentRead);
+    if (
+      key === 'providerRoots.claude'
+      && typeof value === 'string'
+      && Array.isArray((persisted.providerRoots as Record<string, unknown> | undefined)?.claude)
+    ) {
+      throw new Error('Multiple Claude roots are configured in settings.json; edit settings.json to update or remove them');
+    }
     const providerRootChanged = setPersistedSetting(persisted, key, value);
     savePersistedSettings(persisted);
     if (backupPath !== null) {
@@ -1376,6 +1404,7 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
       providerRoots: paths.providerRoots,
       providerSettings: paths.providerSettings,
       claudeDir: paths.claudeDir,
+      defaultClaudeDir: DEFAULT_CLAUDE_DIR,
       codexDir: paths.codexDir,
       projectsDir: paths.projectsDir,
       dbPath: tempDbPath,

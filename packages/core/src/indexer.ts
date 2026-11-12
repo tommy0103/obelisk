@@ -4,6 +4,7 @@
 // Passive-pull indexing orchestration for the Core package.
 import { RetryableSourceReadError } from './providers/source-read-error.ts';
 import { existsSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import { prepareRetainedSnapshot } from './snapshot.ts';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
@@ -19,9 +20,12 @@ import {
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readProviderSessionProvenance,
   readRecentTranscriptHints,
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
+import { CLAUDE_CANONICAL_TRANSCRIPT_MARKER } from './providers/claude.ts';
+import { needsClaudeIdentityMigration, reconcileLegacyClaudeRootIdentities } from './providers/claude-migration.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
 import { acquireWriterLease, writerLockPathFor } from './writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from './write-coordinator.ts';
@@ -132,14 +136,6 @@ function rethrowIfIndexWriterReadOnly(db: NodeSqliteDb, error: unknown): void {
 // on the next refresh instead of waiting for a force rebuild. instr() is exact
 // substring matching (no LIKE wildcards); unresolvable rows stay null.
 function healWorkflowParentLinks(db: SqliteDb): void {
-  const rawRunIdExpr = `
-    CASE
-      WHEN length(workflows.run_id) > length(workflows.session_id) + 1
-        AND instr(workflows.run_id, workflows.session_id || ':') = 1
-        THEN substr(workflows.run_id, length(workflows.session_id) + 2)
-      ELSE workflows.run_id
-    END
-  `;
   db.prepare(`
     UPDATE workflows
     SET parent_tool_use_id = (
@@ -148,7 +144,7 @@ function healWorkflowParentLinks(db: SqliteDb): void {
       JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
       WHERE tr.session_id = workflows.session_id
         AND tc.name = 'Workflow'
-        AND instr(tr.content, ${rawRunIdExpr}) > 0
+        AND instr(tr.content, workflows.run_id) > 0
       ORDER BY tr.rowid
       LIMIT 1
     )
@@ -159,7 +155,7 @@ function healWorkflowParentLinks(db: SqliteDb): void {
         JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
         WHERE tr.session_id = workflows.session_id
           AND tc.name = 'Workflow'
-          AND instr(tr.content, ${rawRunIdExpr}) > 0
+          AND instr(tr.content, workflows.run_id) > 0
       )
   `).run();
 }
@@ -299,6 +295,43 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         if (isBeginBusyFailure(error)) return { skip: true, reason: 'database_busy' };
         throw indexAccessFailure(error);
       }
+      const claudeProvider = registry.get('claude');
+      const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER;
+      const claudeWatchRoots = shouldReconcileClaude
+        ? claudeProvider.watchTargets(claudeProvider.descriptor.defaultRoot)
+          .filter((target) => target.kind === 'tree' && basename(target.path) === 'projects')
+          .map((target) => dirname(target.path))
+        : [];
+      if (!force && shouldReconcileClaude) {
+        const markerPresent = Boolean(
+          db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER),
+        );
+        if (!markerPresent && needsClaudeIdentityMigration(db, claudeProvider.descriptor.defaultRoot, claudeWatchRoots)) {
+          try {
+            runRetryableWriteTransaction(
+              txDb,
+              () => reconcileLegacyClaudeRootIdentities(db, claudeProvider.descriptor.defaultRoot, claudeWatchRoots),
+              { label: 'claude-identity-migration' },
+            );
+          } catch (error) {
+            if (isBeginBusyFailure(error)) {
+              return {
+                skip: true,
+                complete: false,
+                reason: 'database_busy',
+                incompleteProviders: [],
+                inventoryIssues: [],
+                skipped: 0,
+                skippedFiles: [],
+              };
+            }
+            throw indexAccessFailure(error);
+          }
+        }
+      }
+      const priorClaudeSessions = force && shouldReconcileClaude
+        ? readProviderSessionProvenance(db)
+        : [];
       const providerPlan = createProviderIndexPlan(db, registry, { force, readMode });
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
@@ -328,6 +361,14 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
           runRetryableWriteTransaction(txDb, () => {
             snapshot.reset();
+            if (shouldReconcileClaude) {
+              reconcileLegacyClaudeRootIdentities(
+                db,
+                claudeProvider.descriptor.defaultRoot,
+                claudeWatchRoots,
+                priorClaudeSessions,
+              );
+            }
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,
