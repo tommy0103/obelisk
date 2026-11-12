@@ -211,6 +211,25 @@ Non-default locations — a Pi `--session-dir`, an OMP custom root, an OpenCode
 data root (an explicit configured root overrides `$OPENCODE_DB`), the VS Code
 Insiders `User` directory — can be selected in the app's **Settings**.
 
+To index multiple Claude Code configuration directories (for example,
+separate `CLAUDE_CONFIG_DIR` profiles), set `providerRoots.claude` in
+`settings.json` to an array of absolute or `~`-prefixed paths:
+
+```json
+{
+  "providerRoots": {
+    "claude": ["~/.claude", "~/profiles/claude-work"]
+  }
+}
+```
+
+When an array is configured, it is the complete set of Claude Code roots (the
+default `~/.claude` directory is included only if listed). Ordinary refreshes
+retain cached history if a root is removed from the list; a full rebuild
+(`obelisk --build` or **Rebuild index** in **Settings**) publishes only the
+currently configured set. Existing Settings actions preserve the configured
+array rather than replacing it with a single folder.
+
 Adapter internals (identity hashing, supersession replay, per-provider root
 discovery) are documented in
 [retrieval semantics](skill-doc/references/retrieval-semantics.md) and the

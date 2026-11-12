@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { CLAUDE_CANONICAL_TRANSCRIPT_MARKER } from '../../../packages/core/src/providers/claude.ts';
+import { needsClaudeIdentityMigration, reconcileLegacyClaudeRootIdentities } from '../../../packages/core/src/providers/claude-migration.ts';
 import {
   backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
@@ -194,6 +196,7 @@ interface BuildIndexOptions {
   providerSettings?: PersistedProviderSettings;
   providerRegistry?: ProviderRegistry;
   claudeDir?: string;
+  defaultClaudeDir?: string;
   codexDir?: string;
   projectsDir?: string;
   dbPath?: string;
@@ -259,6 +262,7 @@ function buildIndex({
   providerSettings,
   providerRegistry,
   claudeDir = DEFAULT_CLAUDE_DIR,
+  defaultClaudeDir = undefined,
   codexDir = path.join(path.dirname(claudeDir), '.codex'),
   projectsDir = path.join(claudeDir, 'projects'),
   dbPath = DEFAULT_DB_PATH,
@@ -302,7 +306,8 @@ function buildIndex({
         priorIndexState = previous.indexState;
       }
       const defaultHome = os.homedir();
-      const compatibilityHome = path.dirname(claudeDir);
+      const effectiveDefaultClaudeDir = defaultClaudeDir ?? claudeDir;
+      const compatibilityHome = path.dirname(effectiveDefaultClaudeDir);
       const relocatedDefaults = Object.fromEntries(
         createBuiltinProviderRegistry().catalog().flatMap((descriptor) => {
           if (descriptor.requiresExplicitRoot) return [];
@@ -339,11 +344,16 @@ function buildIndex({
       )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots, { homeDir: compatibilityHome, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase })
+          ? createBuiltinProviderRegistry(roots, {
+            homeDir: compatibilityHome,
+            claudeDefaultRoot: effectiveDefaultClaudeDir,
+            openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
+          })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             homeDir: compatibilityHome,
             baseRoots: {
               ...roots,
+              claude: effectiveDefaultClaudeDir,
               ...(!hasExplicitProviderRoot(providerSettings, 'copilot') ? { copilot: undefined } : {}),
               ...(!hasExplicitProviderRoot(providerSettings, 'opencode') ? { opencode: undefined } : {}),
             },
@@ -353,6 +363,34 @@ function buildIndex({
             openKiroDatabase,
             openOpencodeDatabase,
           }).registry);
+      const claudeProvider = registry.get('claude');
+      const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER;
+      const claudeWatchRoots = shouldReconcileClaude
+        ? claudeProvider.watchTargets(claudeProvider.descriptor.defaultRoot)
+          .filter((target) => target.kind === 'tree' && path.basename(target.path) === 'projects')
+          .map((target) => path.dirname(target.path))
+        : [];
+      if (!force && shouldReconcileClaude) {
+        const markerPresent = Boolean(
+          db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER),
+        );
+        if (!markerPresent && needsClaudeIdentityMigration(db, claudeProvider.descriptor.defaultRoot, claudeWatchRoots)) {
+          try {
+            runRetryableWriteTransaction(
+              txDb,
+              () => reconcileLegacyClaudeRootIdentities(db, claudeProvider.descriptor.defaultRoot, claudeWatchRoots),
+              { label: 'claude-identity-migration' },
+            );
+          } catch (error) {
+            if (isBeginBusyFailure(error)) {
+              return deferredBuildResult('database_busy');
+            }
+            throw error;
+          }
+        }
+      }
+      const effectivePriorSessions = priorSessions
+        ?? (force && shouldReconcileClaude ? readProviderSessionProvenance(db) : undefined);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
         changedPaths,
@@ -456,6 +494,14 @@ function buildIndex({
             dropMessageFtsTriggers(db);
             messageFtsTriggersDropped = true;
             retainedSnapshot.reset();
+            if (shouldReconcileClaude) {
+              reconcileLegacyClaudeRootIdentities(
+                db,
+                claudeProvider.descriptor.defaultRoot,
+                claudeWatchRoots,
+                effectivePriorSessions,
+              );
+            }
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,

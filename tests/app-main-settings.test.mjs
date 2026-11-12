@@ -2351,3 +2351,51 @@ test('a refused settings save does not poison the next queued save', async () =>
     cleanup();
   }
 });
+
+test('multi-root providerRoots.claude array survives unrelated settings saves and rejects single-path overwrite', async () => {
+  const rootA = makeTempDir('obelisk-settings-claude-a-');
+  const rootB = makeTempDir('obelisk-settings-claude-b-');
+  const missingRoot = join(rootA, 'does-not-exist');
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({
+    settingsText: JSON.stringify({
+      providerRoots: { claude: [rootA, rootB] },
+      editorScheme: 'vscode',
+    }),
+  });
+  try {
+    // Unrelated settings save preserves the array verbatim
+    await ipcHandlers.get('settings:set')(null, 'editorScheme', 'cursor');
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(saved.providerRoots.claude, [rootA, rootB]);
+    assert.equal(saved.editorScheme, 'cursor');
+
+    // Single-string overwrite via IPC is refused
+    await assert.rejects(
+      () => ipcHandlers.get('settings:set')(null, 'providerRoots.claude', rootA),
+      /Multiple Claude roots/,
+    );
+    const afterRefusal = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(afterRefusal.providerRoots.claude, [rootA, rootB]);
+
+    // settings:get exposes multiRoot + paths and detects when a configured root is missing
+    let payload = await ipcHandlers.get('settings:get')();
+    let claudeSource = payload.sources.find((s) => s.id === 'claude');
+    assert.equal(claudeSource.multiRoot, true);
+    assert.deepEqual(claudeSource.paths, [rootA, rootB]);
+    assert.equal(claudeSource.exists, true);
+
+    writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({
+      providerRoots: { claude: [rootA, missingRoot] },
+    }));
+    payload = await ipcHandlers.get('settings:get')();
+    claudeSource = payload.sources.find((s) => s.id === 'claude');
+    assert.equal(claudeSource.multiRoot, true);
+    assert.equal(claudeSource.exists, false);
+    assert.equal(claudeSource.status, 'error');
+    assert.match(claudeSource.statusText, /Folder not found/);
+  } finally {
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
+    cleanup();
+  }
+});

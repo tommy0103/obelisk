@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, normalize } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 import {
   createBuiltinProviderRegistry,
@@ -16,6 +16,7 @@ import {
 import { resolveObeliskPaths } from './paths.ts';
 import type { CopilotChronicleOpener } from './providers/copilot.ts';
 import { defaultCopilotUserDataRoots } from './providers/copilot.ts';
+import { canonicalRootPath } from './providers/claude.ts';
 import type { HermesStoreOpener } from './providers/hermes.ts';
 import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 import type { KiroDatabaseOpener } from './providers/kiro.ts';
@@ -67,7 +68,68 @@ function configuredPath(value: unknown, homeDir: string): string | null {
     : trimmed.startsWith('~/') || trimmed.startsWith('~\\')
       ? join(homeDir, trimmed.slice(2))
       : trimmed;
-  return isAbsolute(expanded) ? normalize(expanded) : null;
+  return isAbsolute(expanded) ? canonicalRootPath(expanded) : null;
+}
+
+export function resolveConfiguredClaudeRoots(
+  persisted: PersistedProviderSettings = {},
+  { homeDir = homedir() }: { homeDir?: string } = {},
+): { configured: boolean; roots: string[] | undefined; invalidReason?: string } {
+  if (!hasExplicitProviderRoot(persisted, 'claude')) {
+    return { configured: false, roots: undefined };
+  }
+  const persistedRootsObj = (
+    persisted.providerRoots !== null
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
+  ) ? persisted.providerRoots : {};
+  const hasModernClaude = Object.prototype.hasOwnProperty.call(persistedRootsObj, 'claude')
+    && persistedRootsObj['claude'] !== null;
+  const rawValue = hasModernClaude ? persistedRootsObj['claude'] : persisted.claudeDir;
+  if (Array.isArray(rawValue)) {
+    if (rawValue.length === 0) {
+      return { configured: true, roots: undefined, invalidReason: 'Configured claude root list must not be empty' };
+    }
+    const seen = new Set<string>();
+    const resolved: string[] = [];
+    for (const item of rawValue) {
+      const path = configuredPath(item, homeDir);
+      if (path === null) {
+        return { configured: true, roots: undefined, invalidReason: 'Configured claude root must be absolute or start with ~' };
+      }
+      const dedupeKey = process.platform === 'win32' ? path.toLowerCase() : path;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        resolved.push(path);
+      }
+    }
+    return { configured: true, roots: resolved };
+  }
+  const single = configuredPath(rawValue, homeDir);
+  if (single === null) {
+    return { configured: true, roots: undefined, invalidReason: 'Configured claude root must be absolute or start with ~' };
+  }
+  return { configured: true, roots: [single] };
+}
+
+function configuredPaths(value: unknown, homeDir: string): string[] | undefined {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return undefined;
+    const seen = new Set<string>();
+    const resolved: string[] = [];
+    for (const item of value) {
+      const path = configuredPath(item, homeDir);
+      if (path === null) return undefined;
+      const dedupeKey = process.platform === 'win32' ? path.toLowerCase() : path;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        resolved.push(path);
+      }
+    }
+    return resolved;
+  }
+  const single = configuredPath(value, homeDir);
+  return single !== null ? [single] : undefined;
 }
 
 export function resolveProviderRoots(
@@ -93,10 +155,10 @@ export function resolveProviderRoots(
     const hasLegacy = Object.prototype.hasOwnProperty.call(persisted, legacyKey)
       && persisted[legacyKey] !== null;
     if (hasModern || hasLegacy) {
-      const explicit = configuredPath(
-        hasModern ? configured[modernKey] : persisted[legacyKey],
-        homeDir,
-      );
+      const rawValue = hasModern ? configured[modernKey] : persisted[legacyKey];
+      const explicit = descriptor.id === 'claude' && Array.isArray(rawValue)
+        ? configuredPaths(rawValue, homeDir)?.[0] ?? null
+        : configuredPath(rawValue, homeDir);
       return explicit === null ? [] : [[descriptor.id, explicit]];
     }
     return descriptor.requiresExplicitRoot ? [] : [[descriptor.id, descriptor.defaultRoot]];
@@ -166,6 +228,10 @@ export function createConfiguredBuiltinProviderRuntime(
   if (copilotUserDataRoots?.[0]) roots.copilot = copilotUserDataRoots[0];
   const opencodeUsesAutomaticRoots = baseRoots.opencode === undefined
     && !hasExplicitProviderRoot(persisted, 'opencode');
+  const claudeConfig = resolveConfiguredClaudeRoots(persisted, { homeDir });
+  const claudeSourceRoots = claudeConfig.roots;
+  const claudeDefaultRoot = defaults.get('claude')?.descriptor.defaultRoot;
+  if (claudeSourceRoots?.[0]) roots.claude = claudeSourceRoots[0];
   const configured = createBuiltinProviderRegistry(
     {
       ...baseRoots,
@@ -176,13 +242,16 @@ export function createConfiguredBuiltinProviderRuntime(
     {
       cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
       copilotUserDataRoots,
+      claudeSourceRoots,
+      claudeDefaultRoot,
     },
   );
   return {
     roots,
     registry: createProviderRegistry(configured.list().map((provider) => {
       if (roots[provider.name] !== undefined) return provider;
-      const reason = provider.descriptor.rootResolutionReason
+      const reason = (provider.name === 'claude' ? claudeConfig.invalidReason : undefined)
+        ?? provider.descriptor.rootResolutionReason
         ?? `Configured ${provider.name} root must be absolute or start with ~`;
       return {
         ...provider,

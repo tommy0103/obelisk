@@ -52,3 +52,8 @@ test('a refused save is caught and surfaced in Settings', () => {
   assert.match(source, /v-if="saveError"/);
   assert.match(source, /\{\{\s*saveError\s*\}\}/);
 });
+
+test('multi-root sources render read-only without a single-path Browse overwrite button', () => {
+  assert.match(source, /v-if="src\.multiRoot"/);
+  assert.match(source, /v-else-if="src\.id !== 'copilot' \|\| copilotCustomRoot"/);
+});
