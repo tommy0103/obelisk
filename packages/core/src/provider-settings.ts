@@ -61,13 +61,6 @@ export function hasExplicitProviderRoot(
 }
 
 function configuredPath(value: unknown, homeDir: string): string | null {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const resolved = configuredPath(item, homeDir);
-      if (resolved !== null) return resolved;
-    }
-    return null;
-  }
   if (typeof value !== 'string' || value.trim().length === 0) return null;
   const trimmed = value.trim();
   const expanded = trimmed === '~'
@@ -80,8 +73,18 @@ function configuredPath(value: unknown, homeDir: string): string | null {
 
 function configuredPaths(value: unknown, homeDir: string): string[] | undefined {
   if (Array.isArray(value)) {
-    const resolved = value.map((v) => configuredPath(v, homeDir)).filter((v): v is string => v !== null);
-    return resolved.length > 0 ? resolved : undefined;
+    if (value.length === 0) return undefined;
+    const seen = new Set<string>();
+    const resolved: string[] = [];
+    for (const item of value) {
+      const path = configuredPath(item, homeDir);
+      if (path === null) return undefined;
+      if (!seen.has(path)) {
+        seen.add(path);
+        resolved.push(path);
+      }
+    }
+    return resolved;
   }
   const single = configuredPath(value, homeDir);
   return single !== null ? [single] : undefined;
@@ -110,10 +113,10 @@ export function resolveProviderRoots(
     const hasLegacy = Object.prototype.hasOwnProperty.call(persisted, legacyKey)
       && persisted[legacyKey] !== null;
     if (hasModern || hasLegacy) {
-      const explicit = configuredPath(
-        hasModern ? configured[modernKey] : persisted[legacyKey],
-        homeDir,
-      );
+      const rawValue = hasModern ? configured[modernKey] : persisted[legacyKey];
+      const explicit = descriptor.id === 'claude' && Array.isArray(rawValue)
+        ? configuredPaths(rawValue, homeDir)?.[0] ?? null
+        : configuredPath(rawValue, homeDir);
       return explicit === null ? [] : [[descriptor.id, explicit]];
     }
     return descriptor.requiresExplicitRoot ? [] : [[descriptor.id, descriptor.defaultRoot]];
@@ -157,6 +160,8 @@ export function createConfiguredBuiltinProviderRuntime(
     homeDir = homedir(),
     cwd = process.cwd(),
     baseRoots = {},
+    automaticClaudeRoots,
+    claudeHomeDir,
     openCopilotChronicle,
     openHermesStore,
     openZcodeDatabase,
@@ -166,6 +171,8 @@ export function createConfiguredBuiltinProviderRuntime(
     homeDir?: string;
     cwd?: string;
     baseRoots?: BuiltinProviderRoots;
+    automaticClaudeRoots?: boolean;
+    claudeHomeDir?: string;
     openCopilotChronicle?: CopilotChronicleOpener;
     openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
@@ -183,13 +190,21 @@ export function createConfiguredBuiltinProviderRuntime(
   if (copilotUserDataRoots?.[0]) roots.copilot = copilotUserDataRoots[0];
   const opencodeUsesAutomaticRoots = baseRoots.opencode === undefined
     && !hasExplicitProviderRoot(persisted, 'opencode');
-  const claudeUsesAutomaticRoots = baseRoots.claude === undefined
+  const effectiveClaudeHome = claudeHomeDir ?? homeDir;
+  const claudeUsesAutomaticRoots = (automaticClaudeRoots ?? (baseRoots.claude === undefined))
     && !hasExplicitProviderRoot(persisted, 'claude');
+  const persistedRootsObj = (
+    persisted.providerRoots !== null
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
+  ) ? persisted.providerRoots : {};
+  const hasModernClaude = Object.prototype.hasOwnProperty.call(persistedRootsObj, 'claude')
+    && persistedRootsObj['claude'] !== null;
   const configuredClaudeRoots = hasExplicitProviderRoot(persisted, 'claude')
-    ? configuredPaths((persisted.providerRoots as Record<string, unknown> | undefined)?.claude ?? persisted.claudeDir, homeDir)
+    ? configuredPaths(hasModernClaude ? persistedRootsObj['claude'] : persisted.claudeDir, homeDir)
     : undefined;
   const claudeSourceRoots = claudeUsesAutomaticRoots
-    ? defaultClaudeSourceRoots(homeDir)
+    ? defaultClaudeSourceRoots(effectiveClaudeHome)
     : configuredClaudeRoots;
   if (claudeSourceRoots?.[0]) roots.claude = claudeSourceRoots[0];
   const configured = createBuiltinProviderRegistry(
@@ -204,6 +219,8 @@ export function createConfiguredBuiltinProviderRuntime(
       cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
       copilotUserDataRoots,
       claudeSourceRoots,
+      claudeHomeDir: effectiveClaudeHome,
+      discoverClaudeSiblings: claudeUsesAutomaticRoots,
     },
   );
   return {

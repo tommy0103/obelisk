@@ -117,6 +117,8 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       claude: DEFAULT_CLAUDE_DIR,
       codex: DEFAULT_CODEX_DIR,
     },
+    automaticClaudeRoots: path.basename(DEFAULT_CLAUDE_DIR) === '.claude',
+    claudeHomeDir: path.dirname(DEFAULT_CLAUDE_DIR),
     openCopilotChronicle: sourcePath => new Database(sourcePath, {
       readonly: true,
       fileMustExist: true,

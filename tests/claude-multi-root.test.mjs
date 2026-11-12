@@ -13,14 +13,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
   createClaudeProvider,
   defaultClaudeSourceRoots,
+  rootTagFor,
+  canonicalSessionId,
+  bareSessionId,
 } from '../packages/core/src/providers/claude.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -345,3 +349,299 @@ test('claude multi-root: watchTargets covers all configured roots', () => {
   assert.equal(paths.includes(join(root2, 'projects')), true);
   assert.equal(paths.includes(join(root2, 'history.jsonl')), true);
 });
+
+test('claude multi-root: absent default root does not emit incomplete inventory when only fork has indexed sessions', () => {
+  const fakeHome = makeTempDir('obelisk-claude-fork-only-');
+  const absentDefault = join(fakeHome, '.claude');
+  const forkRoot = join(fakeHome, '.claude-vendor');
+  const forkSessionPath = join(forkRoot, 'projects', SLUG, `${FORK_ONLY_SID}.jsonl`);
+  writeSession(join(forkRoot, 'projects', SLUG), FORK_ONLY_SID, [
+    { uuid: 'u1', type: 'user', timestamp: '2026-08-01T10:00:00.000Z', cwd: CWD, message: { role: 'user', content: 'hi' } },
+  ]);
+
+  const { createConfiguredBuiltinProviderRuntime } = require('../packages/core/src/provider-settings.ts');
+  const runtime = createConfiguredBuiltinProviderRuntime({}, { homeDir: fakeHome });
+  assert.equal(runtime.roots.claude, forkRoot, 'existing fork is selected as display root when default is absent');
+  const provider = runtime.registry.get('claude');
+
+  // watchTargets called with runtime.roots.claude still watches both roots
+  const watched = provider.watchTargets(runtime.roots.claude).map((t) => t.path);
+  assert.equal(watched.includes(join(forkRoot, 'projects')), true);
+  assert.equal(watched.includes(join(absentDefault, 'projects')), true);
+
+  // Subsequent refresh with prior fork session must NOT report absentDefault as unavailable
+  const issues = [];
+  const units = provider.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{ sessionId: `claude-vendor:${FORK_ONLY_SID}`, jsonlPath: forkSessionPath }],
+    reportIncompleteInventory: (issue) => issues.push(issue),
+  });
+  assert.deepEqual(issues, [], 'absent default root does not report incomplete inventory');
+  assert.equal(units.length, 1);
+  assert.equal(units[0].sessionId, `claude-vendor:${FORK_ONLY_SID}`);
+
+  // When an absent root previously held an indexed session, it MUST report incomplete inventory
+  const missingForkIssues = [];
+  const providerWithMissingFork = createClaudeProvider({
+    rootDir: absentDefault,
+    sourceRoots: [absentDefault, join(fakeHome, '.claude-missing'), forkRoot],
+  });
+  providerWithMissingFork.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{ sessionId: 'claude-missing:s1', jsonlPath: join(fakeHome, '.claude-missing', 'projects', SLUG, 's1.jsonl') }],
+    reportIncompleteInventory: (issue) => missingForkIssues.push(issue),
+  });
+  assert.equal(missingForkIssues.length, 1);
+  assert.equal(missingForkIssues[0].path, join(fakeHome, '.claude-missing', 'projects'));
+});
+
+test('claude multi-root: defaultClaudeSourceRoots skips backup/archive directories', () => {
+  const fakeHome = makeTempDir('obelisk-claude-backups-');
+  const defaultDir = join(fakeHome, '.claude');
+  const vendorDir = join(fakeHome, '.claude-vendor');
+  const backupDir = join(fakeHome, '.claude-backup');
+  const bakDir = join(fakeHome, '.claude-bak');
+  const oldDir = join(fakeHome, '.claude-old');
+
+  for (const dir of [defaultDir, vendorDir, backupDir, bakDir, oldDir]) {
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+  }
+
+  const roots = defaultClaudeSourceRoots(fakeHome);
+  assert.equal(roots.includes(defaultDir), true);
+  assert.equal(roots.includes(vendorDir), true);
+  assert.equal(roots.includes(backupDir), false);
+  assert.equal(roots.includes(bakDir), false);
+  assert.equal(roots.includes(oldDir), false);
+});
+
+test('claude multi-root: invalid entry in providerRoots.claude array disables provider instead of silently dropping it', () => {
+  const fakeHome = makeTempDir('obelisk-claude-invalid-arr-');
+  const validDir = join(fakeHome, '.claude-vendor');
+  mkdirSync(join(validDir, 'projects'), { recursive: true });
+
+  const { createConfiguredBuiltinProviderRuntime } = require('../packages/core/src/provider-settings.ts');
+  const runtimeMixed = createConfiguredBuiltinProviderRuntime({
+    providerRoots: { claude: [validDir, './relative-invalid'] },
+  }, { homeDir: fakeHome });
+  assert.equal(runtimeMixed.roots.claude, undefined);
+  assert.equal(runtimeMixed.registry.get('claude').descriptor.requiresExplicitRoot, true);
+  assert.deepEqual(runtimeMixed.registry.get('claude').discover({ lastCursor: () => null }), []);
+
+  const runtimeEmpty = createConfiguredBuiltinProviderRuntime({
+    providerRoots: { claude: [] },
+  }, { homeDir: fakeHome });
+  assert.equal(runtimeEmpty.roots.claude, undefined);
+  assert.equal(runtimeEmpty.registry.get('claude').descriptor.requiresExplicitRoot, true);
+});
+
+test('claude multi-root: rootTagFor sanitizes colons so bareSessionId never mis-splits', () => {
+  const tag = rootTagFor('/tmp/.claude:work', '/tmp/.claude');
+  assert.equal(tag.includes(':'), false);
+  const sid = canonicalSessionId('abc-123', tag);
+  assert.equal(bareSessionId(sid), 'abc-123');
+});
+
+test('claude multi-root: rawClaude blocks path traversal via agentId, run_id, and symlinks', () => {
+  const root = makeTempDir('obelisk-claude-raw-security-');
+  const projectDir = join(root, 'projects', SLUG);
+  const subagentsDir = join(projectDir, SHARED_SID, 'subagents');
+  const wfDir = join(subagentsDir, 'workflows', 'run-ok');
+  mkdirSync(wfDir, { recursive: true });
+
+  const mainPath = join(projectDir, `${SHARED_SID}.jsonl`);
+  writeFileSync(mainPath, JSON.stringify({ uuid: 'u1', type: 'user', message: { role: 'user', content: 'hi' } }) + '\n');
+  const secretPath = join(root, 'secret.jsonl');
+  writeFileSync(secretPath, JSON.stringify({ uuid: 'sec-1', type: 'user', message: { role: 'user', content: 'TOP_SECRET' } }) + '\n');
+
+  const validWfAgent = join(wfDir, 'agent-ok.jsonl');
+  writeFileSync(validWfAgent, JSON.stringify({ uuid: 'wf-u1', type: 'user', message: { role: 'user', content: 'wf hello' } }) + '\n');
+
+  const escapedLink = join(subagentsDir, 'escaped-link.jsonl');
+  try {
+    symlinkSync(secretPath, escapedLink);
+  } catch { /* symlink unsupported on platform */ }
+
+  const provider = createClaudeProvider({ rootDir: root });
+  const baseLookup = {
+    source: 'claude',
+    messageUuid: 'sec-1',
+    session: { id: SHARED_SID, jsonl_path: mainPath },
+    cursor: null,
+    subagent: null,
+    workflowAgent: null,
+  };
+
+  assert.equal(provider.raw({ ...baseLookup, agentId: '../../../secret' }), null, 'agentId traversal blocked');
+  assert.equal(provider.raw({ ...baseLookup, agentId: 'sub/../../../secret' }), null, 'slash in agentId blocked');
+  assert.equal(provider.raw({
+    ...baseLookup,
+    agentId: 'agent-ok',
+    workflowAgent: { run_id: '../../../../secret' },
+  }), null, 'run_id traversal blocked');
+  assert.equal(provider.raw({
+    ...baseLookup,
+    agentId: 'escaped-link',
+  }), null, 'symlink outside subagents directory blocked');
+
+  // Legitimate workflow agent with scoped run_id and agent_id works
+  const forkProvider = createClaudeProvider({
+    rootDir: '/placeholder/default',
+    sourceRoots: ['/placeholder/default', root],
+  });
+  const tag = forkProvider.rootTagFor(root);
+  const scopedSid = canonicalSessionId(SHARED_SID, tag);
+  const wfRaw = forkProvider.raw({
+    source: 'claude',
+    messageUuid: `${scopedSid}:wf-u1`,
+    session: { id: scopedSid, jsonl_path: mainPath },
+    agentId: `${scopedSid}:agent-ok`,
+    cursor: null,
+    subagent: null,
+    workflowAgent: { run_id: `${scopedSid}:run-ok` },
+  });
+  assert.ok(wfRaw);
+  assert.equal(wfRaw.messageText, 'wf hello');
+});
+
+test('claude multi-root: workflows, workflow_agents, subagents, tools, and summaries do not collide across roots and heal parent links', () => {
+  const upstreamRoot = makeTempDir('obelisk-claude-wf-up-');
+  const forkRoot = makeTempDir('obelisk-claude-wf-fk-');
+
+  const populateRoot = (rootDir, label) => {
+    const projectDir = join(rootDir, 'projects', SLUG);
+    const sessionDir = join(projectDir, SHARED_SID);
+    const subDir = join(sessionDir, 'subagents');
+    const wfDir = join(sessionDir, 'workflows');
+    mkdirSync(subDir, { recursive: true });
+    mkdirSync(wfDir, { recursive: true });
+
+    // Main transcript initially omits tool_result so healWorkflowParentLinks runs later
+    const mainPath = join(projectDir, `${SHARED_SID}.jsonl`);
+    writeFileSync(mainPath, [
+      { uuid: 'u1', type: 'user', timestamp: '2026-08-01T10:00:00Z', cwd: CWD, message: { role: 'user', content: `start ${label}` } },
+      {
+        uuid: 'a1', type: 'assistant', timestamp: '2026-08-01T10:00:05Z', cwd: CWD,
+        message: {
+          role: 'assistant', model: 'demo',
+          content: [{ type: 'tool_use', id: 'wf-call-1', name: 'Workflow', input: {} }],
+        },
+      },
+      { type: 'system', subtype: 'away_summary', uuid: 'sum-1', timestamp: '2026-08-01T10:00:06Z', content: `summary ${label}` },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+    writeFileSync(join(wfDir, 'run-shared.json'), JSON.stringify({
+      runId: 'run-shared',
+      workflowName: `wf-${label}`,
+      status: 'completed',
+      timestamp: '2026-08-01T10:00:07Z',
+      workflowProgress: [{ type: 'workflow_agent', agentId: 'wa1', label: `worker-${label}` }],
+    }));
+
+    writeFileSync(join(subDir, 'agent-sub1.jsonl'), [
+      { uuid: 'su1', type: 'user', timestamp: '2026-08-01T10:00:08Z', cwd: CWD, isSidechain: true, agentId: 'agent-sub1', message: { role: 'user', content: `sub ${label}` } },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    writeFileSync(join(subDir, 'agent-sub1.meta.json'), JSON.stringify({
+      toolUseId: 'wf-call-1',
+      agentType: 'Explore',
+      description: `desc ${label}`,
+    }));
+
+    return mainPath;
+  };
+
+  const upMain = populateRoot(upstreamRoot, 'upstream');
+  const fkMain = populateRoot(forkRoot, 'fork');
+
+  const provider = createClaudeProvider({
+    rootDir: upstreamRoot,
+    sourceRoots: [upstreamRoot, forkRoot],
+  });
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  for (const unit of provider.discover({ lastCursor: () => null })) {
+    persist(db, unit, provider.parse(unit, null));
+  }
+
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM workflows').get().c, 2, 'both workflows kept without collision');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM workflow_agents').get().c, 2, 'both workflow_agents kept');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM subagents').get().c, 2, 'both subagents kept');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM summaries').get().c, 2, 'both summaries kept');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM tool_calls').get().c, 2, 'both tool_calls kept');
+
+  // Now append tool_result containing bare run-shared to BOTH main transcripts and verify healWorkflowParentLinks heals BOTH
+  for (const mainPath of [upMain, fkMain]) {
+    const existing = readFileSync(mainPath, 'utf8');
+    writeFileSync(mainPath, existing + JSON.stringify({
+      uuid: 'u2', type: 'user', timestamp: '2026-08-01T10:00:10Z', cwd: CWD,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'wf-call-1', content: 'Run ID: run-shared done' }] },
+    }) + '\n');
+  }
+
+  const cursors = new Map();
+  // Incremental update: parse only the modified main transcripts
+  for (const unit of provider.discover({ lastCursor: (k) => cursors.get(k) ?? null })) {
+    if (unit.key === upMain || unit.key === fkMain) {
+      persist(db, unit, provider.parse(unit, null));
+    }
+  }
+  healWorkflowParentLinks(db);
+
+  const workflows = db.prepare('SELECT run_id, session_id, parent_tool_use_id FROM workflows ORDER BY session_id').all();
+  assert.equal(workflows.length, 2);
+  for (const wf of workflows) {
+    assert.ok(wf.parent_tool_use_id, `workflow ${wf.run_id} parent_tool_use_id healed`);
+    const call = db.prepare('SELECT id, session_id FROM tool_calls WHERE id = ?').get(wf.parent_tool_use_id);
+    assert.equal(call.session_id, wf.session_id, 'healed parent_tool_use_id belongs to the same session');
+  }
+});
+
+test('claude multi-root: Windows-style drive paths match case-insensitively during missing-root detection', () => {
+  const existingRoot = makeTempDir('obelisk-claude-win-other-');
+  mkdirSync(join(existingRoot, 'projects'), { recursive: true });
+  const winDefault = 'C:\\Users\\Demo\\.claude';
+  const winFork = 'C:\\Users\\Demo\\.claude-vendor';
+  const provider = createClaudeProvider({
+    rootDir: existingRoot,
+    sourceRoots: [existingRoot, winDefault, winFork],
+  });
+
+  const issues = [];
+  provider.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{
+      sessionId: `claude-vendor:${FORK_ONLY_SID}`,
+      jsonlPath: 'c:/users/demo/.claude-vendor/projects/slug/session.jsonl',
+    }],
+    reportIncompleteInventory: (issue) => issues.push(issue),
+  });
+  assert.equal(issues.length, 1, 'only the Windows fork root that had prior sessions is reported');
+  assert.equal(issues[0].path, join(winFork, 'projects'));
+});
+
+test('claude multi-root: symlinked roots do not emit false missing-inventory reports', () => {
+  const fakeHome = makeTempDir('obelisk-claude-symlink-');
+  const realVendor = join(fakeHome, 'real-vendor');
+  const linkVendor = join(fakeHome, '.claude-vendor');
+  writeSession(join(realVendor, 'projects', SLUG), FORK_ONLY_SID, [
+    { uuid: 'u-sym', type: 'user', timestamp: '2026-08-01T10:00:00.000Z', cwd: CWD, message: { role: 'user', content: 'via symlink' } },
+  ]);
+  symlinkSync(realVendor, linkVendor);
+
+  const provider = createClaudeProvider({
+    rootDir: join(fakeHome, '.claude'),
+    sourceRoots: [join(fakeHome, '.claude'), linkVendor],
+  });
+
+  const issues = [];
+  // Even if indexed session stored the realpath instead of symlink path, pathInside recognizes containment
+  provider.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{ sessionId: `claude-vendor:${FORK_ONLY_SID}`, jsonlPath: join(realVendor, 'projects', SLUG, `${FORK_ONLY_SID}.jsonl`) }],
+    reportIncompleteInventory: (issue) => issues.push(issue),
+  });
+  assert.deepEqual(issues, []);
+});
+
+

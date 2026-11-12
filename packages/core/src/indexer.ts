@@ -132,6 +132,14 @@ function rethrowIfIndexWriterReadOnly(db: NodeSqliteDb, error: unknown): void {
 // on the next refresh instead of waiting for a force rebuild. instr() is exact
 // substring matching (no LIKE wildcards); unresolvable rows stay null.
 function healWorkflowParentLinks(db: SqliteDb): void {
+  const rawRunIdExpr = `
+    CASE
+      WHEN length(workflows.run_id) > length(workflows.session_id) + 1
+        AND instr(workflows.run_id, workflows.session_id || ':') = 1
+        THEN substr(workflows.run_id, length(workflows.session_id) + 2)
+      ELSE workflows.run_id
+    END
+  `;
   db.prepare(`
     UPDATE workflows
     SET parent_tool_use_id = (
@@ -140,7 +148,7 @@ function healWorkflowParentLinks(db: SqliteDb): void {
       JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
       WHERE tr.session_id = workflows.session_id
         AND tc.name = 'Workflow'
-        AND instr(tr.content, workflows.run_id) > 0
+        AND instr(tr.content, ${rawRunIdExpr}) > 0
       ORDER BY tr.rowid
       LIMIT 1
     )
@@ -151,7 +159,7 @@ function healWorkflowParentLinks(db: SqliteDb): void {
         JOIN tool_calls tc ON tc.id = tr.tool_use_id AND tc.session_id = tr.session_id
         WHERE tr.session_id = workflows.session_id
           AND tc.name = 'Workflow'
-          AND instr(tr.content, workflows.run_id) > 0
+          AND instr(tr.content, ${rawRunIdExpr}) > 0
       )
   `).run();
 }

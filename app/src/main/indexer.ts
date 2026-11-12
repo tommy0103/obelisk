@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { defaultClaudeSourceRoots } from '../../../packages/core/src/providers/claude.ts';
 import {
   backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
@@ -337,15 +338,31 @@ function buildIndex({
       const openOpencodeDatabase = (sourcePath: string) => new (
         DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
       )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const claudeBaseName = path.basename(claudeDir);
+      const claudeLooksAutomatic = claudeBaseName === '.claude'
+        || (providerRoots.claude === claudeDir && (claudeBaseName.startsWith('.claude-') || claudeBaseName.endsWith('-claude')));
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots, { homeDir: compatibilityHome, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase })
+          ? createBuiltinProviderRegistry(roots, {
+            homeDir: compatibilityHome,
+            ...(providerRoots.claude === undefined && claudeBaseName === '.claude'
+              ? {
+                claudeSourceRoots: defaultClaudeSourceRoots(compatibilityHome),
+                claudeHomeDir: compatibilityHome,
+                discoverClaudeSiblings: true,
+              }
+              : {}),
+            openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
+          })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             homeDir: compatibilityHome,
+            automaticClaudeRoots: !hasExplicitProviderRoot(providerSettings, 'claude') && claudeLooksAutomatic,
+            claudeHomeDir: compatibilityHome,
             baseRoots: {
               ...roots,
               ...(!hasExplicitProviderRoot(providerSettings, 'copilot') ? { copilot: undefined } : {}),
               ...(!hasExplicitProviderRoot(providerSettings, 'opencode') ? { opencode: undefined } : {}),
+              ...(!hasExplicitProviderRoot(providerSettings, 'claude') && claudeLooksAutomatic ? { claude: undefined } : {}),
             },
             openCopilotChronicle,
             openHermesStore,
