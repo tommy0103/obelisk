@@ -14,11 +14,11 @@
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, normalize, relative } from 'node:path';
+import { basename, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 
 import {
-  trunc, truncJson, readLines,
-  discoverCodexJsonlFiles, normalizeObservedCwd, projectSlugFromPath,
+  trunc, truncJson, readLines, tryRealpath,
+  discoverCodexJsonlFiles, normalizeObservedCwd, projectSlugFromPath, sourceInventoryIssue,
   codexRawId, codexDbId, codexCallId, codexLineUuid, codexParentThreadId,
   codexIsGuardianThread, codexAgentNickname, codexAgentRole, codexUsage,
   codexEventText, codexMessagePayloadText, codexVisibleMessageKey,
@@ -64,10 +64,57 @@ function codexTranscriptDirs(rootDir: string): string[] {
   ];
 }
 
+export function defaultCodexHome({
+  env = process.env,
+  homeDir = homedir(),
+  cwd = process.cwd(),
+}: {
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  cwd?: string;
+} = {}): string {
+  const fromEnv = env['CODEX_HOME'];
+  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
+    const trimmed = fromEnv.trim();
+    const expanded = trimmed === '~'
+      ? homeDir
+      : trimmed.startsWith('~/') || trimmed.startsWith('~\\')
+        ? join(homeDir, trimmed.slice(2))
+        : trimmed;
+    return normalize(resolve(cwd, expanded));
+  }
+  return join(homeDir, '.codex');
+}
+
+function canonicalCodexRoot(rootDir: string): string {
+  return normalize(resolve(rootDir));
+}
+
+export function codexRootScope(rootDir: string, homeDir: string = homedir()): string | null {
+  const canonical = canonicalCodexRoot(rootDir);
+  const defaultRoot = canonicalCodexRoot(join(homeDir, '.codex'));
+  if (canonical === defaultRoot) return null;
+  const label = basename(canonical)
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24) || 'root';
+  const hash = createHash('sha256').update(`codex-root-v1\0${canonical}`).digest('hex').slice(0, 8);
+  return `${label}-${hash}`;
+}
+
+function pathInside(dir: string, targetPath: string): boolean {
+  const rel = relative(normalize(dir), normalize(targetPath));
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+function sameCodexRootPath(a: string, b: string): boolean {
+  return canonicalCodexRoot(a) === canonicalCodexRoot(b);
+}
+
 const CODEX_ZST_CURSOR_TAG = 'codex-zst-v1';
 
-function encodeCodexZstCursor(stat: Stats, completeLines: number): string {
-  return [
+function encodeCodexZstCursor(stat: Stats, completeLines: number, rootScope: string | null = null): string {
+  const parts = [
     stat.mtimeMs,
     completeLines,
     stat.size,
@@ -75,18 +122,23 @@ function encodeCodexZstCursor(stat: Stats, completeLines: number): string {
     stat.ino,
     CODEX_ZST_CURSOR_TAG,
     stat.dev,
-  ].join(':');
+  ];
+  if (rootScope !== null) parts.push(rootScope);
+  return parts.join(':');
 }
 
 // Cursor format: `${mtime}:${lines}:${completeLineOffset}:${ctimeMs}:${ino}`.
 // mtime+ctime+source identity still let discovery notice same-millisecond
 // rewrites. The provider state carries sourceSize because the outer size field
 // is now the safe restart offset, not the current EOF.
-function codexCursorSignatureDiffers(cursor: string, filePath: string): boolean {
+function codexCursorSignatureDiffers(cursor: string, filePath: string, expectedRootScope: string | null = null): boolean {
   const stat = statSync(filePath);
   const parts = cursor.split(':');
   if (isCodexCompressedPath(filePath)) {
-    return parts.length !== 7
+    const validLength = expectedRootScope === null ? parts.length === 7 : parts.length === 8;
+    const cursorScope = parts[7] ?? null;
+    return !validLength
+      || cursorScope !== expectedRootScope
       || parts[5] !== CODEX_ZST_CURSOR_TAG
       || !Number.isSafeInteger(Number(parts[1]))
       || Number(parts[1]) < 0
@@ -98,22 +150,76 @@ function codexCursorSignatureDiffers(cursor: string, filePath: string): boolean 
   }
   if (parts.length < 5) return true;
   let sourceSize = Number(parts[2]);
+  let cursorRootScope: string | null = null;
   try {
     const state = JSON.parse(Buffer.from(parts[5]!, 'base64url').toString('utf8'));
     if (Number.isSafeInteger(state?.sourceSize) && state.sourceSize >= 0) sourceSize = state.sourceSize;
+    if (typeof state?.rootScope === 'string' && state.rootScope.length > 0) cursorRootScope = state.rootScope;
   } catch { /* legacy or malformed cursor: force replay */ }
-  return Number(parts[0]) !== stat.mtimeMs
+  return cursorRootScope !== expectedRootScope
+    || Number(parts[0]) !== stat.mtimeMs
     || sourceSize !== stat.size
     || Number(parts[3]) !== stat.ctimeMs
     || Number(parts[4]) !== stat.ino;
 }
 
-function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
-  const [sessionsDir, archivedSessionsDir] = codexTranscriptDirs(rootDir);
-  if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
-    ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+function checkDirStatus(dirPath: string): 'exists' | 'missing' | { error: unknown } {
+  try {
+    statSync(dirPath);
+    return 'exists';
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return 'missing';
+    return { error };
   }
+}
+
+function discoverAtRoot(
+  rootDir: string,
+  rootScope: string | null,
+  ctx: DiscoverContext,
+  { usesRootSet = false }: { usesRootSet?: boolean } = {},
+): IndexUnit[] {
+  const [sessionsDir, archivedSessionsDir] = codexTranscriptDirs(rootDir);
+  const indexedList = ctx.indexedSessions?.() ?? [];
+  const canonical = (p: string) => normalize(p).replace(/\.zst$/, '');
+  const rootStatus = checkDirStatus(rootDir);
+  if (rootStatus !== 'exists' && rootStatus !== 'missing') {
+    ctx.reportIncompleteInventory?.(sourceInventoryIssue(rootDir, rootStatus.error));
+    return [];
+  }
+  if (rootStatus === 'missing') {
+    const hasPrior = usesRootSet
+      ? indexedList.some((s) => pathInside(rootDir, s.jsonlPath) || (rootScope !== null && s.sessionId.startsWith(`codex:${rootScope}:`)))
+      : indexedList.length > 0;
+    if (hasPrior) {
+      ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+    }
+    return [];
+  }
+  const sessionsStatus = checkDirStatus(sessionsDir);
+  if (sessionsStatus !== 'exists' && sessionsStatus !== 'missing') {
+    ctx.reportIncompleteInventory?.(sourceInventoryIssue(sessionsDir, sessionsStatus.error));
+  } else if (sessionsStatus === 'missing') {
+    const hasPriorInSessions = usesRootSet
+      ? indexedList.some((s) => pathInside(sessionsDir, s.jsonlPath))
+      : indexedList.length > 0;
+    if (hasPriorInSessions) {
+      ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+    }
+  }
+  const archivedStatus = checkDirStatus(archivedSessionsDir);
+  if (archivedStatus !== 'exists' && archivedStatus !== 'missing') {
+    ctx.reportIncompleteInventory?.(sourceInventoryIssue(archivedSessionsDir, archivedStatus.error));
+  } else if (archivedStatus === 'missing' && indexedList.some((s) => pathInside(archivedSessionsDir, s.jsonlPath))) {
+    ctx.reportIncompleteInventory?.({ path: archivedSessionsDir, error: 'Source folder is unavailable' });
+  }
+
   const sessionIndexPath = normalize(join(rootDir, 'session_index.jsonl'));
+  const sessionIndexAliases = new Set<string>([sessionIndexPath]);
+  const realRootDir = tryRealpath(rootDir);
+  if (realRootDir !== null) {
+    sessionIndexAliases.add(normalize(join(realRootDir, 'session_index.jsonl')));
+  }
   const sessionIndex = new Map<string, { title: string; updatedAt: string | null }>();
   if (existsSync(sessionIndexPath)) {
     readLines(sessionIndexPath, (line: string) => {
@@ -130,47 +236,69 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   }
   const changedFiles = new Set<string>();
   let sessionIndexChanged = false;
+  const transcriptAliases = [sessionsDir, archivedSessionsDir].map((transcriptDir) => {
+    const candidates = [normalize(transcriptDir)];
+    const realDir = tryRealpath(transcriptDir);
+    if (realDir !== null) {
+      const resolvedDir = normalize(realDir);
+      if (resolvedDir !== candidates[0]) candidates.push(resolvedDir);
+    }
+    return { transcriptDir: normalize(transcriptDir), candidates };
+  });
   for (const changedPath of ctx.changedPaths ?? []) {
     const rootRelative = isAbsolute(changedPath)
       ? normalize(changedPath)
       : normalize(join(rootDir, changedPath));
-    if (rootRelative === sessionIndexPath) sessionIndexChanged = true;
-    for (const transcriptDir of [sessionsDir, archivedSessionsDir]) {
-      const absolute = isAbsolute(changedPath)
-        ? normalize(changedPath)
-        : normalize(join(transcriptDir, changedPath));
-      const inside = relative(transcriptDir, absolute);
-      if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
-      if (isCodexTranscriptPath(absolute)) {
-        changedFiles.add(absolute);
-        if (isCodexCompressedPath(absolute)) {
-          changedFiles.add(absolute.slice(0, -'.zst'.length));
-        } else {
-          changedFiles.add(`${absolute}.zst`);
+    if (sessionIndexAliases.has(rootRelative)) sessionIndexChanged = true;
+    for (const { transcriptDir, candidates } of transcriptAliases) {
+      for (const candidateDir of candidates) {
+        const absolute = isAbsolute(changedPath)
+          ? normalize(changedPath)
+          : normalize(join(candidateDir, changedPath));
+        const inside = relative(candidateDir, absolute);
+        if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
+        const mapped = normalize(join(transcriptDir, inside));
+        if (isCodexTranscriptPath(mapped)) {
+          changedFiles.add(mapped);
+          if (isCodexCompressedPath(mapped)) {
+            changedFiles.add(mapped.slice(0, -'.zst'.length));
+          } else {
+            changedFiles.add(`${mapped}.zst`);
+          }
         }
       }
     }
   }
+  const forcedMigrationPaths = new Set<string>();
+  for (const session of indexedList) {
+    if (!pathInside(rootDir, session.jsonlPath)) continue;
+    const scopeMismatch = rootScope !== null
+      ? !session.sessionId.startsWith(`codex:${rootScope}:`)
+      : /^codex:[^:]+:/.test(session.sessionId);
+    if (scopeMismatch) forcedMigrationPaths.add(canonical(session.jsonlPath));
+  }
   const discovered: IndexUnit[] = codexTranscriptDirs(rootDir).flatMap((transcriptDir) => (
     discoverCodexJsonlFiles(transcriptDir, ctx.reportIncompleteInventory).flatMap<IndexUnit>((file) => {
       const fileChanged = changedFiles.has(normalize(file.path));
-      if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
+      const scopeMigration = forcedMigrationPaths.has(canonical(file.path));
+      if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged && !scopeMigration) return [];
       const cursor = ctx.lastCursor(file.path);
-      const unchangedSource = cursor !== null && !codexCursorSignatureDiffers(cursor, file.path);
+      const unchangedSource = cursor !== null && !codexCursorSignatureDiffers(cursor, file.path, rootScope);
       // A session-index-only refresh must update the aggregate, but a
       // strengthened cursor already contains the identity needed to construct
       // the normal-session unit. Avoid reopening every historical rollout for
       // guardian classification when its source signature is unchanged.
-      if (sessionIndexChanged && !fileChanged && unchangedSource) {
+      if (sessionIndexChanged && !fileChanged && !scopeMigration && unchangedSource) {
         const checkpoint = decodeCodexCursor(cursor);
         if (checkpoint !== null) {
           const parentId = codexParentThreadId(checkpoint.meta);
           const indexed = sessionIndex.get(checkpoint.threadRawId);
           return [{
             key: file.path,
-            sessionId: codexDbId(parentId || checkpoint.threadRawId) ?? '',
+            sessionId: codexDbId(parentId || checkpoint.threadRawId, rootScope) ?? '',
             meta: {
               source: 'codex', guardian: false, parentThreadId: parentId, threadRawId: checkpoint.threadRawId,
+              rootScope,
               indexedTitle: indexed?.title,
               indexedUpdatedAt: indexed?.updatedAt,
             },
@@ -182,7 +310,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       // matches cannot have changed status. Pre-v3 databases may still hold
       // guardian session rows; the v3 marker bump forces one full replay that
       // retracts them.
-      if (!sessionIndexChanged && !fileChanged && unchangedSource) return [];
+      if (!sessionIndexChanged && !fileChanged && !scopeMigration && unchangedSource) return [];
       let guardian: { threadRawId: string; lineNum: number } | null;
       let meta: any = null;
       try {
@@ -227,12 +355,13 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       const indexed = rawId ? sessionIndex.get(rawId) : undefined;
       return [{
         key: file.path,
-        sessionId: guardian === null ? codexDbId(parentId || rawId) ?? '' : '',
+        sessionId: guardian === null ? codexDbId(parentId || rawId, rootScope) ?? '' : '',
         meta: {
           source: 'codex',
           guardian: guardian !== null,
           parentThreadId: parentId,
           threadRawId: rawId,
+          rootScope,
           indexedTitle: indexed?.title,
           indexedUpdatedAt: indexed?.updatedAt,
           sessionIndexChanged,
@@ -240,54 +369,67 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       }];
     })
   ));
-  // Switching archive representation can replace the root inode while leaving
-  // unchanged child cursors behind. A root snapshot retracts its whole session,
-  // so publish every contributor in one transaction, even in changed-path mode.
-  const indexed = new Map((ctx.indexedSessions?.() ?? []).map(session => [session.sessionId, session]));
-  const transitions = discovered.filter(unit => {
+  // Switching archive representation or root identity scope can replace or
+  // rename the root while leaving unchanged child cursors behind. A root
+  // snapshot retracts its whole session, so publish every contributor in one
+  // transaction, even in changed-path mode.
+  const indexed = new Map(indexedList.map(session => [session.sessionId, session]));
+  const indexedByCanonicalPath = new Map(indexedList.map(session => [canonical(session.jsonlPath), session]));
+  const transitions = discovered.flatMap((unit) => {
     const meta = unit.meta as { guardian?: boolean; parentThreadId?: string | null };
-    if (meta.guardian || meta.parentThreadId || !unit.sessionId) return false;
+    if (meta.guardian || meta.parentThreadId || !unit.sessionId) return [];
+    const priorByPath = indexedByCanonicalPath.get(canonical(unit.key));
+    if (priorByPath && priorByPath.sessionId !== unit.sessionId) {
+      return [{ root: unit, retractSessionId: priorByPath.sessionId }];
+    }
     const previous = indexed.get(unit.sessionId);
-    if (!previous) return false;
-    const canonical = (path: string) => normalize(path).replace(/\.zst$/, '');
+    if (!previous) return [];
     const cursor = ctx.lastCursor(unit.key);
     const prior = decodeCodexCursor(cursor);
     const stat = statSync(unit.key);
     const rootReplaced = cursor !== null && !isCodexCompressedPath(unit.key)
       && (prior === null || prior.inode !== stat.ino || prior.dev !== String(stat.dev)
-        || (codexCursorSignatureDiffers(cursor, unit.key) && stat.size <= (prior.sourceSize ?? prior.size)));
-    return canonical(previous.jsonlPath) === canonical(unit.key)
+        || (codexCursorSignatureDiffers(cursor, unit.key, rootScope) && stat.size <= (prior.sourceSize ?? prior.size)));
+    const archiveTransition = canonical(previous.jsonlPath) === canonical(unit.key)
       && (normalize(previous.jsonlPath) !== normalize(unit.key) || rootReplaced
         || (isCodexCompressedPath(unit.key) && cursor !== null
-          && codexCursorSignatureDiffers(cursor, unit.key)));
+          && codexCursorSignatureDiffers(cursor, unit.key, rootScope)));
+    return archiveTransition ? [{ root: unit, retractSessionId: null as string | null }] : [];
   });
   if (transitions.length === 0) return discovered;
   let censusComplete = true;
-  const complete = discoverAt(rootDir, {
+  const complete = discoverAtRoot(rootDir, rootScope, {
     ...ctx, changedPaths: undefined, lastCursor: () => null, indexedSessions: () => [],
     reportIncompleteInventory: issue => {
       censusComplete = false;
       ctx.reportIncompleteInventory?.(issue);
     },
-  });
-  const replaced = new Set(transitions.map(unit => unit.sessionId));
+  }, { usesRootSet });
+  const replaced = new Set(transitions.map(entry => entry.root.sessionId));
   const remaining = discovered.filter(unit => !replaced.has(unit.sessionId));
   if (!censusComplete) {
-    for (const id of replaced) ctx.retainSession?.(id);
+    for (const entry of transitions) {
+      ctx.retainSession?.(entry.root.sessionId);
+      if (entry.retractSessionId) ctx.retainSession?.(entry.retractSessionId);
+    }
     return remaining;
   }
-  for (const root of transitions) {
+  for (const { root, retractSessionId } of transitions) {
     const family = complete.filter(unit => unit.sessionId === root.sessionId);
     if (!family.some(unit => unit.key === root.key)) {
       ctx.retainSession?.(root.sessionId);
+      if (retractSessionId) ctx.retainSession?.(retractSessionId);
       ctx.reportIncompleteInventory?.({ path: root.key, error: 'Archive transition root disappeared during contributor census' });
       continue;
     }
     family.sort((a, b) => Number(b.key === root.key) - Number(a.key === root.key));
     for (const unit of family) {
+      const isRootUnit = unit.key === root.key;
       remaining.push({
-        ...unit, atomicGroup: `archive-transition:${root.sessionId}`,
-        meta: { ...(unit.meta as object), forceSnapshot: true, replaceSnapshot: unit.key === root.key },
+        ...unit,
+        atomicGroup: retractSessionId ? `scope-migration:${root.sessionId}` : `archive-transition:${root.sessionId}`,
+        ...(isRootUnit && retractSessionId ? { retractSessionIds: [retractSessionId] } : {}),
+        meta: { ...(unit.meta as object), forceSnapshot: true, replaceSnapshot: isRootUnit },
       });
     }
   }
@@ -295,7 +437,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
 }
 
 export function discover(ctx: DiscoverContext): IndexUnit[] {
-  return discoverAt(join(homedir(), '.codex'), ctx);
+  return discoverAtRoot(defaultCodexHome(), null, ctx);
 }
 
 const CODEX_CURSOR_STATE_VERSION = 4;
@@ -316,6 +458,7 @@ const CODEX_MALFORMED_LINE_ERROR = 'Malformed JSONL line: incremental indexing i
 interface CodexCursorState {
   v: number;
   threadRawId: string;
+  rootScope?: string | null;
   meta: Record<string, any>;
   // Present only on the cooperative-capable v4 subformat. Old #148 v4
   // cursors are deliberately rejected for offset resumption.
@@ -496,6 +639,7 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
     if (!isRecord(value)
       || value.v !== CODEX_CURSOR_STATE_VERSION
       || typeof value.threadRawId !== 'string'
+      || (value.rootScope !== undefined && !nullableString(value.rootScope))
       || !isRecord(value.meta)
       || (value.completeLineOffset !== undefined && (!Number.isSafeInteger(value.completeLineOffset) || value.completeLineOffset < 0))
       || (value.sourceSize !== undefined && (!Number.isSafeInteger(value.sourceSize) || value.sourceSize < 0))
@@ -639,30 +783,33 @@ export function* parse(
 ): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
   const compressed = isCodexCompressedPath(unit.key);
-  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean; forceSnapshot?: boolean; replaceSnapshot?: boolean; [key: string]: unknown } | undefined;
-  if (sourceMeta?.forceSnapshot) {
-    // A null fresh cursor can mean a torn/unstable source, not an empty
-    // contribution. Stage and validate the whole snapshot before publishing
-    // anything; otherwise root retraction could commit without its child.
-    const freshUnit = { ...unit, meta: { ...sourceMeta, forceSnapshot: false, replaceSnapshot: false } };
-    const fresh = parse(freshUnit, null, metrics, testHooks);
-    const records: TranscriptRecord[] = [];
-    let step = fresh.next();
-    while (!step.done) { records.push(step.value); step = fresh.next(); }
-    const childId = sourceMeta.parentThreadId ? codexDbId(sourceMeta.threadRawId) : null;
-    const identified = sourceMeta.replaceSnapshot
-      ? records.some(record => record.kind === 'session' && record.id === unit.sessionId)
-      : childId !== null && records.some(record =>
-        (record.kind === 'subagent' && record.agent_id === childId && record.session_id === unit.sessionId)
-        || (record.kind === 'delete-session' && record.sessionId === childId));
-    if (step.value === null || !identified) {
-      throw new RetryableSourceReadError(unit.key, 'Archive contributor did not produce a complete stable snapshot');
-    }
-    if (sourceMeta.replaceSnapshot) yield { kind: 'delete-session', sessionId: unit.sessionId };
-    yield* records;
-    return step.value;
-  }
-  if (compressed && !sourceMeta?.guardian && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key)) {
+  const sourceMeta = unit.meta as { guardian?: boolean; sessionIndexChanged?: boolean; forceSnapshot?: boolean; replaceSnapshot?: boolean; rootScope?: string | null; [key: string]: unknown } | undefined;
+  const rootScope = typeof sourceMeta?.rootScope === 'string' && sourceMeta.rootScope.length > 0
+    ? sourceMeta.rootScope
+    : null;
+      if (sourceMeta?.forceSnapshot) {
+        // A null fresh cursor can mean a torn/unstable source, not an empty
+        // contribution. Stage and validate the whole snapshot before publishing
+        // anything; otherwise root retraction could commit without its child.
+        const freshUnit = { ...unit, meta: { ...sourceMeta, forceSnapshot: false, replaceSnapshot: false } };
+        const fresh = parse(freshUnit, null, metrics, testHooks);
+        const records: TranscriptRecord[] = [];
+        let step = fresh.next();
+        while (!step.done) { records.push(step.value); step = fresh.next(); }
+        const childId = sourceMeta.parentThreadId ? codexDbId(sourceMeta.threadRawId, rootScope) : null;
+        const identified = sourceMeta.replaceSnapshot
+          ? records.some(record => record.kind === 'session' && record.id === unit.sessionId)
+          : childId !== null && records.some(record =>
+            (record.kind === 'subagent' && record.agent_id === childId && record.session_id === unit.sessionId)
+            || (record.kind === 'delete-session' && record.sessionId === childId));
+        if (step.value === null || !identified) {
+          throw new RetryableSourceReadError(unit.key, 'Archive contributor did not produce a complete stable snapshot');
+        }
+        if (sourceMeta.replaceSnapshot) yield { kind: 'delete-session', sessionId: unit.sessionId };
+        yield* records;
+        return step.value;
+      }
+  if (compressed && !sourceMeta?.guardian && _cursor !== null && !codexCursorSignatureDiffers(_cursor, unit.key, rootScope)) {
     if (sourceMeta?.sessionIndexChanged) {
       // The archive did not change, but session_index.jsonl is a separate
       // metadata source. Read a fresh snapshot for native-title precedence and
@@ -711,6 +858,7 @@ export function* parse(
   // through to #148's fingerprinted verification/snapshot behavior.
   const cooperativeCandidate = !compressed && !guardianInvalidation && readMode === 'normal'
     && prior !== null
+    && (prior.rootScope ?? null) === rootScope
     && usableSourceIdentity(stat)
     && prior.completeLineOffset !== undefined
     && prior.sourceSize !== undefined
@@ -753,7 +901,7 @@ export function* parse(
       ? indexedMeta.indexedUpdatedAt
       : prior.endedAt;
     yield {
-      kind: 'session', id: codexDbId(prior.threadRawId) as string,
+      kind: 'session', id: codexDbId(prior.threadRawId, rootScope) as string,
       title: prior.threadTitle ?? indexedMeta?.indexedTitle ?? null,
       project: projectSlugFromPath(normalizeObservedCwd(prior.meta.cwd)),
       started_at: prior.startedAt, ended_at: endedAt, git_branch: prior.gitBranch,
@@ -783,6 +931,7 @@ export function* parse(
   if ((!cooperativeAppend && (fingerprint.bytesRead !== stat.size || !sameStat(stat, afterFingerprint)))
     || (cooperativeAppend && !sameSource(stat, afterFingerprint))) return _cursor;
   const appendCandidate = !compressed && !guardianInvalidation && (cooperativeAppend || (prior !== null
+    && (prior.rootScope ?? null) === rootScope
     && prior.verifiedPrefix === true
     && prior.threadRawId === codexRawId(prior.meta.id)
     && prior.dev === String(stat.dev)
@@ -902,7 +1051,7 @@ export function* parse(
         ? indexedMeta.indexedUpdatedAt
         : prev.endedAt;
       yield {
-        kind: 'session', id: codexDbId(prev.threadRawId) as string,
+        kind: 'session', id: codexDbId(prev.threadRawId, rootScope) as string,
         title: prev.threadTitle ?? indexedMeta?.indexedTitle ?? null,
         project: projectSlugFromPath(normalizeObservedCwd(prev.meta.cwd)),
         started_at: prev.startedAt, ended_at: endedAt, git_branch: prev.gitBranch,
@@ -945,7 +1094,7 @@ export function* parse(
   for (const key of eventMessageKeys) bloomAdd(eventMessageBloom, key);
   const previous = fast ? prior : null;
   const basicCursor = compressed
-    ? encodeCodexZstCursor(stat, completeLineCount)
+    ? encodeCodexZstCursor(stat, completeLineCount, rootScope)
     : `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}`;
   const capturedMeta = metaRecord as { lineNum: number; obj: any } | null;
   if (capturedMeta === null) return basicCursor;
@@ -958,16 +1107,16 @@ export function* parse(
     // `delete-session` is intentionally keyed by the child db id: persist()
     // deletes rows where that value is `agent_id`, while preserving the shared
     // parent session and sibling/root contributions.
-    yield { kind: 'delete-session', sessionId: codexDbId(threadRawId) as string };
+    yield { kind: 'delete-session', sessionId: codexDbId(threadRawId, rootScope) as string };
     return basicCursor;
   }
 
   const parentRawId = codexParentThreadId(meta);
-  const sessionId = codexDbId(parentRawId || threadRawId) as string;
-  const agentId = (parentRawId ? codexDbId(threadRawId) : null) as string | null;
+  const sessionId = codexDbId(parentRawId || threadRawId, rootScope) as string;
+  const agentId = (parentRawId ? codexDbId(threadRawId, rootScope) : null) as string | null;
   const isSidechain: 0 | 1 = agentId ? 1 : 0;
   const project = projectSlugFromPath(normalizeObservedCwd(meta.cwd));
-  const lineUuid = (n: number): string => codexLineUuid(threadRawId, n) as string;
+  const lineUuid = (n: number): string => codexLineUuid(threadRawId, n, rootScope) as string;
   const callMessageUuids = new Map(Object.entries(previous?.openCallMessageUuids ?? {}));
   const openCallMessageUuids = new Map(callMessageUuids);
   // A full snapshot can reconstruct open calls from the whole source even if
@@ -1076,7 +1225,7 @@ export function* parse(
       }
       if (payload.type === 'collab_agent_spawn_end' && payload.call_id && payload.new_thread_id) {
         const uuid = insertMessage({ uuid: lineUuid(currentLine), type: 'assistant', role: 'assistant', text: null, contentType: 'tool_use', timestamp: ts });
-        const toolId = codexCallId(threadRawId, payload.call_id) as string;
+        const toolId = codexCallId(threadRawId, payload.call_id, rootScope) as string;
         const description = payload.new_agent_nickname || payload.new_agent_role || 'Agent';
         const input = {
           description, subagent_type: payload.new_agent_role || 'Agent', prompt: payload.prompt || '',
@@ -1085,7 +1234,7 @@ export function* parse(
         out.push({ kind: 'tool_call', id: toolId, message_uuid: uuid, session_id: sessionId, name: 'Agent', presentation: 'default', input_json: truncJson(input) as string, file_path: null });
         callMessageUuids.set(toolId, uuid);
         rememberOpenCall(toolId, uuid);
-        out.push({ kind: 'subagent', agent_id: codexDbId(payload.new_thread_id) as string, session_id: sessionId, parent_tool_use_id: toolId, agent_type: payload.new_agent_role || null, description });
+        out.push({ kind: 'subagent', agent_id: codexDbId(payload.new_thread_id, rootScope) as string, session_id: sessionId, parent_tool_use_id: toolId, agent_type: payload.new_agent_role || null, description });
         return;
       }
       if (payload.type === 'task_complete') {
@@ -1130,14 +1279,14 @@ export function* parse(
     if (['function_call', 'custom_tool_call', 'tool_search_call', 'web_search_call'].includes(payload.type) && payload.call_id) {
       const uuid = insertMessage({ uuid: lineUuid(currentLine), type: 'assistant', role: 'assistant', text: null, contentType: 'tool_use', timestamp: ts });
       const name = payload.name || payload.tool || payload.type.replace(/_call$/, '');
-      const toolId = codexCallId(threadRawId, payload.call_id) as string;
+      const toolId = codexCallId(threadRawId, payload.call_id, rootScope) as string;
       out.push({ kind: 'tool_call', id: toolId, message_uuid: uuid, session_id: sessionId, name, presentation: name === 'Skill' ? 'skill' : 'default', input_json: truncJson(codexToolInput(payload)) as string, file_path: null });
       callMessageUuids.set(toolId, uuid);
       rememberOpenCall(toolId, uuid);
       return;
     }
     if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(payload.type) && payload.call_id) {
-      const toolId = codexCallId(threadRawId, payload.call_id) as string;
+      const toolId = codexCallId(threadRawId, payload.call_id, rootScope) as string;
       const messageUuid = callMessageUuids.get(toolId) || '';
       // Preserve the source result even when malformed input has no matching
       // call. An empty anchor is explicit evidence of the missing association;
@@ -1190,10 +1339,11 @@ export function* parse(
 
   const checkpointSize = completeLineOffset;
   const outCursor = compressed
-    ? encodeCodexZstCursor(stat, completeLineCount)
+    ? encodeCodexZstCursor(stat, completeLineCount, rootScope)
     : encodeCodexCursor(stat, completeLineCount, checkpointSize, {
         v: CODEX_CURSOR_STATE_VERSION,
         threadRawId,
+        ...(rootScope !== null ? { rootScope } : {}),
         meta,
         completeLineOffset: checkpointSize,
         sourceSize: stat.size,
@@ -1245,7 +1395,13 @@ function findCodexFile(rootDir: string, rawThreadId: string): string | null {
   while (stack.length > 0) {
     const current = stack.pop()!;
     if (!existsSync(current)) continue;
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
       const path = join(current, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
@@ -1261,19 +1417,66 @@ function findCodexFile(rootDir: string, rawThreadId: string): string | null {
   return null;
 }
 
-function rawCodex(rootDir: string, input: RawLookup): RawRecord | null {
-  const match = /^codex:([^:]+):(\d+)$/.exec(input.messageUuid);
-  if (match === null) return null;
-  const path = input.agentId === null && typeof input.session?.jsonl_path === 'string'
-    ? input.session.jsonl_path
-    : findCodexFile(rootDir, match[1]!);
+interface CodexRootEntry {
+  readonly rootDir: string;
+  readonly rootScope: string | null;
+}
+
+function parseCodexMessageUuid(messageUuid: string): { rootScope: string | null; threadRawId: string; lineNum: number } | null {
+  const bare = /^codex:([^:]+):(\d+)$/.exec(messageUuid);
+  if (bare !== null) {
+    return { rootScope: null, threadRawId: bare[1]!, lineNum: Number(bare[2]) };
+  }
+  const scoped = /^codex:([^:]+):([^:]+):(\d+)$/.exec(messageUuid);
+  if (scoped !== null) {
+    return { rootScope: scoped[1]!, threadRawId: scoped[2]!, lineNum: Number(scoped[3]) };
+  }
+  return null;
+}
+
+function deriveCodexRootFromSessionPath(jsonlPath: string): string | null {
+  const normalized = normalize(jsonlPath);
+  for (const dirName of [CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR]) {
+    const marker = `${sep}${dirName}${sep}`;
+    const idx = normalized.lastIndexOf(marker);
+    if (idx > 0) return normalized.slice(0, idx);
+  }
+  return null;
+}
+
+function rawCodex(
+  rootEntries: readonly CodexRootEntry[],
+  input: RawLookup,
+  { homeDir }: { homeDir: string },
+): RawRecord | null {
+  const parsed = parseCodexMessageUuid(input.messageUuid);
+  if (parsed === null) return null;
+  let path: string | null = null;
+  if (input.agentId === null && typeof input.session?.jsonl_path === 'string') {
+    path = input.session.jsonl_path;
+  } else {
+    const matchingRoots = rootEntries.filter((entry) => entry.rootScope === parsed.rootScope);
+    for (const entry of matchingRoots) {
+      path = findCodexFile(entry.rootDir, parsed.threadRawId);
+      if (path !== null) break;
+    }
+    if (path === null && typeof input.session?.jsonl_path === 'string') {
+      const derivedRoot = deriveCodexRootFromSessionPath(input.session.jsonl_path);
+      const derivedScopeOk = derivedRoot !== null && (
+        parsed.rootScope === null || codexRootScope(derivedRoot, homeDir) === parsed.rootScope
+      );
+      if (derivedScopeOk) {
+        path = findCodexFile(derivedRoot, parsed.threadRawId);
+      }
+    }
+  }
   const resolvedPath = path !== null ? existingCodexRepresentation(path) : null;
   if (resolvedPath === null) return null;
   let lineNumber = 0;
   let found: string | null = null;
   readCodexLines(resolvedPath, (line: string) => {
     lineNumber++;
-    if (lineNumber !== Number(match[2])) return;
+    if (lineNumber !== parsed.lineNum) return;
     found = line;
     return false;
   });
@@ -1299,18 +1502,111 @@ function rawCodex(rootDir: string, input: RawLookup): RawRecord | null {
     : { text: raw, totalLength: raw.length, offset: 0, limit: raw.length, hasMore: false, messageText };
 }
 
-export function createCodexProvider({ rootDir = join(homedir(), '.codex') }: { rootDir?: string } = {}): ProviderAdapter {
+export function createCodexProvider({
+  rootDir,
+  roots,
+  homeDir = homedir(),
+  cwd = process.cwd(),
+}: {
+  rootDir?: string;
+  roots?: readonly string[];
+  homeDir?: string;
+  cwd?: string;
+} = {}): ProviderAdapter {
+  const usesRootSet = roots !== undefined;
+  const seenCanonical = new Set<string>();
+  const rawList = usesRootSet
+    ? roots
+    : [rootDir ?? defaultCodexHome({ homeDir, cwd })];
+  const rootEntries: CodexRootEntry[] = [];
+  for (const candidate of rawList) {
+    const normalized = normalize(candidate);
+    const canonical = canonicalCodexRoot(normalized);
+    if (seenCanonical.has(canonical)) continue;
+    seenCanonical.add(canonical);
+    rootEntries.push({
+      rootDir: normalized,
+      rootScope: usesRootSet ? codexRootScope(normalized, homeDir) : null,
+    });
+  }
+  const descriptorRoot = rootDir ?? rootEntries[0]?.rootDir ?? defaultCodexHome({ homeDir, cwd });
+  const sourceRoots = rootEntries.map((entry) => entry.rootDir);
+
   return {
     name,
-    descriptor: { id: name, name: 'Codex', vendor: 'OpenAI', defaultRoot: rootDir, color: '#10a37f' },
+    descriptor: { id: name, name: 'Codex', vendor: 'OpenAI', defaultRoot: descriptorRoot, color: '#10a37f' },
     indexVersionMarker: CODEX_CANONICAL_TRANSCRIPT_MARKER,
-    watchTargets: (configuredRoot) => [
-      ...codexTranscriptDirs(configuredRoot).map((dir) => ({ kind: 'tree' as const, path: dir })),
-      { kind: 'file', path: join(configuredRoot, 'session_index.jsonl') },
-    ],
-    discover: (ctx) => discoverAt(rootDir, ctx),
+    watchTargets: (configuredRoot) => (
+      usesRootSet && sameCodexRootPath(configuredRoot, descriptorRoot) ? sourceRoots : [configuredRoot]
+    ).flatMap((root) => [
+      ...codexTranscriptDirs(root).map((dir) => ({ kind: 'tree' as const, path: dir })),
+      { kind: 'file' as const, path: join(root, 'session_index.jsonl') },
+    ]),
+    discover: (ctx) => {
+      const discovered = rootEntries.flatMap((entry) => discoverAtRoot(entry.rootDir, entry.rootScope, ctx, { usesRootSet }));
+      // A scope migration can retract an old sessionId (e.g. bare `codex:<id>`)
+      // that is simultaneously claimed by another configured root in the same pass
+      // (e.g. default `~/.codex` with an identical copied thread ID). Bind the
+      // migrating unit family and the reclaiming bare-root family into ONE
+      // atomicGroup (with retracting migration units sorted first) so both
+      // publish or roll back together in a single transaction.
+      const migrationUnits = discovered.filter((unit) => (unit.retractSessionIds?.length ?? 0) > 0);
+      if (migrationUnits.length === 0) return discovered;
+
+      const migrationGroupByRetractedId = new Map<string, string>();
+      const migrationGroupKeys = new Set<string>();
+      for (const unit of migrationUnits) {
+        if (!unit.atomicGroup) continue;
+        migrationGroupKeys.add(unit.atomicGroup);
+        for (const retractedId of unit.retractSessionIds ?? []) {
+          migrationGroupByRetractedId.set(retractedId, unit.atomicGroup);
+        }
+      }
+
+      const retractedIds = new Set(migrationGroupByRetractedId.keys());
+      const bareRoots = rootEntries.filter((entry) => entry.rootScope === null);
+      const bareReplays = bareRoots.length > 0 && retractedIds.size > 0
+        ? bareRoots
+          .flatMap((entry) => discoverAtRoot(entry.rootDir, entry.rootScope, {
+            ...ctx,
+            changedPaths: undefined,
+            lastCursor: () => null,
+            indexedSessions: () => [],
+          }, { usesRootSet }))
+          .filter((unit) => retractedIds.has(unit.sessionId))
+        : [];
+
+      const isMigratingUnit = (unit: IndexUnit): boolean => (
+        (unit.retractSessionIds?.length ?? 0) > 0
+        || (unit.atomicGroup !== undefined && migrationGroupKeys.has(unit.atomicGroup))
+      );
+
+      const filtered = discovered.filter((unit) => isMigratingUnit(unit) || !retractedIds.has(unit.sessionId));
+      const mergedReplays = bareReplays.map((unit) => {
+        const unitMeta = unit.meta as { parentThreadId?: string | null } | undefined;
+        const sharedGroup = migrationGroupByRetractedId.get(unit.sessionId) ?? `reclaim-bare:${unit.sessionId}`;
+        return {
+          ...unit,
+          atomicGroup: sharedGroup,
+          meta: {
+            ...(unit.meta as object),
+            forceSnapshot: true,
+            replaceSnapshot: !unitMeta?.parentThreadId,
+          },
+        };
+      });
+
+      return [...filtered, ...mergedReplays].sort((a, b) => {
+        const aMigrating = isMigratingUnit(a) ? 0 : 1;
+        const bMigrating = isMigratingUnit(b) ? 0 : 1;
+        if (aMigrating !== bMigrating) return aMigrating - bMigrating;
+        const aIsChild = (a.meta as { parentThreadId?: string | null } | undefined)?.parentThreadId ? 1 : 0;
+        const bIsChild = (b.meta as { parentThreadId?: string | null } | undefined)?.parentThreadId ? 1 : 0;
+        return aIsChild - bIsChild;
+      });
+    },
     parse,
-    raw: (input) => rawCodex(rootDir, input),
+    raw: (input) => rawCodex(rootEntries, input, { homeDir }),
   };
 }
 

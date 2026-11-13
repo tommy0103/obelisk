@@ -20,11 +20,13 @@ import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/sr
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { defaultCodexHome } from '../../../packages/core/src/providers/codex.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
   getCopilotEditions,
   hasExplicitProviderRoot,
   readPersistedProviderSettings,
+  resolveCodexConfiguredRoots,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
   resolveObeliskPaths,
@@ -88,7 +90,6 @@ function detectClaudeDir() {
 }
 
 const DEFAULT_CLAUDE_DIR = detectClaudeDir();
-const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');
 
 let db;
 let indexerService;
@@ -113,9 +114,9 @@ function acquireAppWriterLease(dbPath: string, waitMs = 0) {
 
 function getRuntimePaths(persisted = loadPersistedSettings()) {
   const runtime = createConfiguredBuiltinProviderRuntime(persisted, {
+    homeDir: os.homedir(),
     baseRoots: {
       claude: DEFAULT_CLAUDE_DIR,
-      codex: DEFAULT_CODEX_DIR,
     },
     openCopilotChronicle: sourcePath => new Database(sourcePath, {
       readonly: true,
@@ -135,7 +136,7 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;
   const claudeDir = providerRoots['claude'] ?? DEFAULT_CLAUDE_DIR;
-  const codexDir = providerRoots['codex'] ?? DEFAULT_CODEX_DIR;
+  const codexDir = providerRoots['codex'] ?? defaultCodexHome();
   return {
     providerRoots,
     providerSettings: persisted,
@@ -1201,9 +1202,11 @@ ipcMain.handle('settings:get', async () => {
     } catch {}
   }
   const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
+  const codexConfiguredRoots = resolveCodexConfiguredRoots(persisted);
   const sourcePaths = new Set([
     ...providerRegistry.catalog().map((provider) => providerRoots[provider.id] ?? provider.defaultRoot),
     ...(!copilotCustomRoot ? selectedCopilotEditions.map((edition) => edition.path) : []),
+    ...(codexConfiguredRoots ?? []),
   ]);
   const existingPaths = new Set((await Promise.all([...sourcePaths].map(async (sourcePath) => {
     try {
@@ -1215,11 +1218,14 @@ ipcMain.handle('settings:get', async () => {
   }))).filter((sourcePath): sourcePath is string => sourcePath !== null));
   const copilotCatalogRoot = selectedCopilotEditions.find((edition) => existingPaths.has(edition.path))
     ?? selectedCopilotEditions[0];
+  const codexCatalogRoot = codexConfiguredRoots?.find((root) => existingPaths.has(root))
+    ?? codexConfiguredRoots?.[0];
   const sources = buildSourceCatalog({
     registry: providerRegistry,
-    roots: copilotCustomRoot ? providerRoots : {
+    roots: {
       ...providerRoots,
-      copilot: copilotCatalogRoot?.path ?? '',
+      ...(!copilotCustomRoot ? { copilot: copilotCatalogRoot?.path ?? '' } : {}),
+      ...(codexCatalogRoot !== undefined ? { codex: codexCatalogRoot } : {}),
     },
     stats: sourceStats,
     sourceIssues: latestSourceIssues,
@@ -1294,7 +1300,6 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
 
     const knownLegacyRootChanged = createBuiltinProviderRegistry({
       claude: DEFAULT_CLAUDE_DIR,
-      codex: DEFAULT_CODEX_DIR,
     }).catalog().some((provider) => key === `${provider.id}Dir`);
     if (providerRootChanged || knownLegacyRootChanged) {
       await stopIndexerServiceAndWait();

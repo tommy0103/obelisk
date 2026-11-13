@@ -253,6 +253,7 @@ test('main process watches every root declared by the built-in provider registry
   const originalProfile = process.env.USERPROFILE;
   const originalAppData = process.env.APPDATA;
   const originalXdgConfig = process.env.XDG_CONFIG_HOME;
+  const originalCodexHome = process.env.CODEX_HOME;
   const originalHermesHome = process.env.HERMES_HOME;
   const originalCodexHostData = process.env.CODEXHOST_DATA_DIR;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
@@ -267,6 +268,7 @@ test('main process watches every root declared by the built-in provider registry
   process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
   process.env.APPDATA = join(home, 'AppData', 'Roaming');
   process.env.XDG_CONFIG_HOME = join(home, '.config');
+  process.env.CODEX_HOME = join(home, '.codex');
   process.env.HERMES_HOME = join(home, '.hermes');
   process.env.CODEXHOST_DATA_DIR = join(home, '.codexhost');
   const [stableCopilotRoot, insidersCopilotRoot] = defaultCopilotUserDataRoots();
@@ -400,6 +402,7 @@ test('main process watches every root declared by the built-in provider registry
     restoreEnvVar('USERPROFILE', originalProfile);
     restoreEnvVar('APPDATA', originalAppData);
     restoreEnvVar('XDG_CONFIG_HOME', originalXdgConfig);
+    restoreEnvVar('CODEX_HOME', originalCodexHome);
     restoreEnvVar('HERMES_HOME', originalHermesHome);
     restoreEnvVar('CODEXHOST_DATA_DIR', originalCodexHostData);
     rmSync(home, { recursive: true, force: true });
@@ -2351,3 +2354,103 @@ test('a refused settings save does not poison the next queued save', async () =>
     cleanup();
   }
 });
+
+test('main process watches all configured providerRoots.codex roots, honors CODEX_HOME, and preserves codex root arrays on save', async () => {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const originalCodexHome = process.env.CODEX_HOME;
+  const home = makeTempDir(`obelisk-main-codex-roots-${Date.now()}`);
+  const missingFirst = join(home, 'codex-missing');
+  const existingSecond = join(home, 'codex-work');
+  const envCodex = join(home, 'codex-env');
+  mkdirSync(join(existingSecond, 'sessions'), { recursive: true });
+  mkdirSync(join(envCodex, 'sessions'), { recursive: true });
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({
+    providerRoots: { codex: [missingFirst, existingSecond] },
+  }));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  process.env.CODEX_HOME = envCodex;
+
+  const serviceOptions = [];
+  const ipcHandlers = new Map();
+
+  class FakeDatabase {
+    function() {}
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, {
+      namedExports: {
+        createIndexerService: (options) => {
+          serviceOptions.push(options);
+          return { start() {}, stop() {}, idle: async () => {}, runBuildNow: () => Promise.resolve() };
+        },
+      },
+    }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+    assert.equal(serviceOptions.length, 1);
+    for (const root of [missingFirst, existingSecond]) {
+      assert.ok(serviceOptions[0].watchTargets.some((t) => t.kind === 'tree' && t.path === join(root, 'sessions')));
+      assert.ok(serviceOptions[0].watchTargets.some((t) => t.kind === 'tree' && t.path === join(root, 'archived_sessions')));
+      assert.ok(serviceOptions[0].watchTargets.some((t) => t.kind === 'file' && t.path === join(root, 'session_index.jsonl')));
+    }
+    assert.equal(serviceOptions[0].watchTargets.some((t) => t.path === join(envCodex, 'sessions')), false);
+
+    const settingsPayload = await ipcHandlers.get('settings:get')();
+    const codexSource = settingsPayload.sources.find((s) => s.id === 'codex');
+    assert.equal(codexSource.exists, true, 'settings:get picks the existing root from configured array');
+    assert.equal(codexSource.path, existingSecond);
+
+    // Unrelated save preserves providerRoots.codex array.
+    await ipcHandlers.get('settings:set')(null, 'editorScheme', 'cursor');
+    const persistedAfter = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(persistedAfter.providerRoots.codex, [missingFirst, existingSecond]);
+
+    // Clearing providerRoots.codex falls back to CODEX_HOME.
+    await ipcHandlers.get('settings:set')(null, 'providerRoots.codex', null);
+    assert.ok(serviceOptions.at(-1).watchTargets.some((t) => t.kind === 'tree' && t.path === join(envCodex, 'sessions')));
+    const settingsAfterClear = await ipcHandlers.get('settings:get')();
+    assert.equal(settingsAfterClear.codexDir, envCodex);
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    restoreEnvVar('CODEX_HOME', originalCodexHome);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+

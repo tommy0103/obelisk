@@ -153,6 +153,7 @@ function runFaultCli(args, home, mode) {
   `);
   const env = { ...process.env, HOME: home, USERPROFILE: home,
     APPDATA: join(home, 'AppData/Roaming'), XDG_CONFIG_HOME: join(home, '.config') };
+  delete env.CODEX_HOME;
   delete env.DSH_HOME;
   delete env.HERMES_HOME;
   return spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning',

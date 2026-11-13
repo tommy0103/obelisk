@@ -47,6 +47,17 @@ bare `~`, `~/` and `~\` home prefixes and resolves relative `DSH_HOME` values
 against the process working directory. An explicitly configured DeepSeek
 source directory takes precedence and already names the sessions directory.
 
+Codex history defaults to `$CODEX_HOME`, or `~/.codex` when `CODEX_HOME` is
+unset or blank (expanding bare `~`, `~/` and `~\` and resolving relative values
+against the process working directory). An explicit `providerRoots.codex`
+setting in `settings.json` takes precedence and accepts either a single root
+string or a non-empty array of absolute or `~`-prefixed root paths as the
+complete set of Codex roots (include `~/.codex` explicitly if you want it
+indexed alongside additional roots). Removing a root from `providerRoots.codex`
+retains cached sessions during ordinary refresh and publishes only the
+configured roots on a deliberate `--build` rebuild; an unavailable previously
+indexed root that remains configured blocks destructive rebuilds.
+
 ### Index access errors
 
 Search and query read from SQLite, but their pre-query refresh also needs write
