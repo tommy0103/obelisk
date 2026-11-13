@@ -10,6 +10,7 @@ import {
   createConfiguredBuiltinProviderRuntime,
   getCopilotEditions,
   readPersistedProviderSettings,
+  resolveCodexConfiguredRoots,
 } from '../packages/core/src/provider-settings.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import {
@@ -258,3 +259,56 @@ test('settings reader rejects malformed provider root containers', () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('providerRoots.codex accepts validated non-empty root arrays and rejects invalid arrays without fallback', () => {
+  const homeDir = '/home/probe';
+  const valid = {
+    providerRoots: {
+      codex: ['~/.codex', '~/profiles/codex-work', '/home/probe/.codex'],
+    },
+  };
+  assert.deepEqual(resolveCodexConfiguredRoots(valid, { homeDir }), [
+    normalize('/home/probe/.codex'),
+    normalize('/home/probe/profiles/codex-work'),
+  ]);
+  const runtime = createConfiguredBuiltinProviderRuntime(valid, { homeDir });
+  assert.equal(runtime.roots.codex, normalize('/home/probe/.codex'));
+  const codex = runtime.registry.get('codex');
+  assert.equal(codex.descriptor.requiresExplicitRoot, undefined);
+  assert.deepEqual(codex.watchTargets(runtime.roots.codex), [
+    { kind: 'tree', path: join(normalize('/home/probe/.codex'), 'sessions') },
+    { kind: 'tree', path: join(normalize('/home/probe/.codex'), 'archived_sessions') },
+    { kind: 'file', path: join(normalize('/home/probe/.codex'), 'session_index.jsonl') },
+    { kind: 'tree', path: join(normalize('/home/probe/profiles/codex-work'), 'sessions') },
+    { kind: 'tree', path: join(normalize('/home/probe/profiles/codex-work'), 'archived_sessions') },
+    { kind: 'file', path: join(normalize('/home/probe/profiles/codex-work'), 'session_index.jsonl') },
+  ]);
+
+  // Saving unrelated settings preserves the configured codex array.
+  assert.equal(setPersistedSetting(valid, 'editorScheme', 'cursor'), false);
+  assert.equal(setPersistedSetting(valid, 'providerRoots.claude', '/custom/claude'), true);
+  assert.deepEqual(valid.providerRoots.codex, ['~/.codex', '~/profiles/codex-work', '/home/probe/.codex']);
+
+  for (const invalidCodex of [[], [''], ['/valid', './relative'], [123]]) {
+    const invalidRuntime = createConfiguredBuiltinProviderRuntime({
+      providerRoots: { codex: invalidCodex },
+    }, {
+      homeDir,
+      baseRoots: { codex: '/default/codex' },
+    });
+    assert.equal(invalidRuntime.roots.codex, undefined);
+    const disabled = invalidRuntime.registry.get('codex');
+    assert.equal(disabled.descriptor.requiresExplicitRoot, true);
+    assert.match(disabled.descriptor.rootResolutionReason, /non-empty list/i);
+    assert.deepEqual(disabled.watchTargets('/default/codex'), []);
+    assert.deepEqual(disabled.discover({ lastCursor: () => null, indexedSessions: () => [] }), []);
+  }
+
+  // Other providers still reject array values in providerRoots.
+  const claudeArrayRuntime = createConfiguredBuiltinProviderRuntime({
+    providerRoots: { claude: ['/a', '/b'] },
+  }, { homeDir });
+  assert.equal(claudeArrayRuntime.roots.claude, undefined);
+  assert.equal(claudeArrayRuntime.registry.get('claude').descriptor.requiresExplicitRoot, true);
+});
+
