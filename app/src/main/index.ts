@@ -171,7 +171,7 @@ function migrateLegacyDbIfNeeded(
     fs.copyFileSync(legacyDbPath, paths.dbPath);
     return true;
   } catch (error) {
-    console.warn?.(`Obelisk legacy DB migration skipped: ${(error as Error).message}`);
+    console.warn(`Obelisk legacy DB migration skipped: ${(error as Error).message}`);
     return false;
   } finally {
     lease?.release();
@@ -385,7 +385,7 @@ async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
   const service = indexerService;
   if (!service) return;
   const closed = service.stop();
-  const results = await Promise.allSettled([closed, waitForIdle && typeof service.idle === 'function' ? service.idle() : undefined]);
+  const results = await Promise.allSettled([closed, waitForIdle ? service.idle() : undefined]);
   if (indexerService === service) indexerService = null;
   const failed = results.find(result => result.status === 'rejected');
   if (failed?.status === 'rejected') throw failed.reason;
@@ -410,11 +410,9 @@ async function stopBackgroundResourcesNow({ stopWorker = false } = {}) {
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
     pendingObeliskChanges.clear();
-    if (typeof watcher.close === 'function') {
-      watcherClosed = Promise.resolve(watcher.close());
-      // Attach immediately so a rejection during service.idle() is observed.
-      void watcherClosed.catch(() => {});
-    }
+    watcherClosed = watcher.close();
+    // Attach immediately so a rejection during service.idle() is observed.
+    void watcherClosed.catch(() => {});
   }
   const results = await Promise.allSettled([stopIndexerServiceAndWait(), watcherClosed]);
   if (stopWorker && indexerWorker) {
@@ -1400,7 +1398,7 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
             writerLeaseMode: writerLease ? 'caller-held' : 'acquire',
           });
         } catch (error) {
-          console.warn?.(`Obelisk DB reopen after rebuild failed: ${(error as Error).message}`);
+          console.warn(`Obelisk DB reopen after rebuild failed: ${(error as Error).message}`);
         }
       }
     } finally {
