@@ -999,3 +999,26 @@ for (const configured of [false, true]) {
     db.close();
   });
 }
+
+test('a newer-format Kiro session does not block a forced rebuild', () => {
+  // One unreadable-version file must be skipped and reported, not poison the provider.
+  const home = makeTempDir('obelisk-app-kiro-newer-');
+  const cli = join(home, '.kiro', 'sessions', 'cli');
+  mkdirSync(cli, { recursive: true });
+  const header = JSON.parse(readFileSync(new URL('./fixtures/kiro/cli.json', import.meta.url), 'utf8'));
+  const events = readFileSync(new URL('./fixtures/kiro/cli.jsonl', import.meta.url), 'utf8');
+  writeFileSync(join(cli, 'current.json'), JSON.stringify(header));
+  writeFileSync(join(cli, 'current.jsonl'), events);
+  writeFileSync(join(cli, 'newer.json'), JSON.stringify({ ...header, session_id: 'newer', session_state: { ...header.session_state, version: 'v99' } }));
+  writeFileSync(join(cli, 'newer.jsonl'), events);
+  const dbPath = join(home, 'index.sqlite');
+  const result = buildIndex({
+    claudeDir: join(home, '.claude'), codexDir: join(home, '.codex'), dbPath,
+    providerRoots: { kiro: join(home, '.kiro') }, DatabaseImpl: TestDatabase, force: true,
+  });
+  assert.equal(result.complete, true);
+  assert.ok(result.skippedFiles.some(file => file.path === join(cli, 'newer.json')), JSON.stringify(result.skippedFiles));
+  const db = new TestDatabase(dbPath);
+  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM sessions WHERE source='kiro'").get().n, 1);
+  db.close();
+});

@@ -202,6 +202,14 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
       return [];
     }
   };
+  // A known session in a format this adapter cannot read yet: report it, keep
+  // its indexed rows, and leave the rest of the inventory certified.
+  const skipped = new Set<string>();
+  const skip = (path: string, sessionId: string, error: string) => {
+    skipped.add(sessionId);
+    if (indexed.some(session => session.sessionId === sessionId)) ctx.retainSession?.(sessionId);
+    ctx.reportSkippedArtifact?.({ path, error });
+  };
   const sessionsRoot = join(root, 'sessions');
   const workspaces = entries(sessionsRoot, indexed.some(session => !session.jsonlPath.includes('#kiro:')));
   const addFile = (path: string, metadataPath: string, format: 'cli' | 'workspace') => {
@@ -210,22 +218,20 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
       const header = object(JSON.parse(readFileSync(metadataPath, 'utf8')));
       const rawId = str(format === 'cli' ? header.session_id : header.id);
       if (rawId === null) throw new Error('Kiro session id is missing');
+      const cwd = observedCwd(format === 'cli' ? header.cwd : header.workspacePaths?.[0] ?? header.rootPaths?.[0]);
+      const unsupported = (error: string, at = metadataPath) => skip(at, kiroSessionId(rawId, cwd), error);
       if (format === 'cli' && header.session_state?.version !== 'v1') {
-        throw new Error(`Unsupported Kiro CLI schema ${String(header.session_state?.version)}`);
+        return unsupported(`Unsupported Kiro CLI schema ${String(header.session_state?.version)}`);
       }
       if (format === 'cli') {
         const first = readJsonl(path, true)[0];
-        if (first !== undefined && first.version !== 'v1') throw new Error(`Unsupported Kiro CLI event version ${String(first.version)}`);
+        if (first !== undefined && first.version !== 'v1') return unsupported(`Unsupported Kiro CLI event version ${String(first.version)}`, path);
       }
       if (format === 'workspace' && header.schemaVersion !== '1.0.0') {
-        throw new Error(`Unsupported Kiro workspace schema ${String(header.schemaVersion)}`);
+        return unsupported(`Unsupported Kiro workspace schema ${String(header.schemaVersion)}`);
       }
       if (signature(filePaths(path, metadataPath, format)).signature !== before.signature) throw new Error('Kiro metadata changed during discovery');
-      sources.push({
-        format, path, metadataPath, header, rawId,
-        cwd: observedCwd(format === 'cli' ? header.cwd : header.workspacePaths?.[0] ?? header.rootPaths?.[0]),
-        ...before,
-      });
+      sources.push({ format, path, metadataPath, header, rawId, cwd, ...before });
     } catch (error) { issue(metadataPath, error); }
   };
   for (const workspace of workspaces) {
@@ -269,6 +275,7 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
   const changed = ctx.changedPaths === undefined ? undefined : new Set(ctx.changedPaths);
   const units: IndexUnit[] = [];
   for (const [sessionId, group] of groups) {
+    if (skipped.has(sessionId)) continue;
     // Prefer the newest saved snapshot. On equal timestamps, file formats
     // outrank the classic database. Do not deduplicate by prompt text.
     const updated = (source: KiroSource) => Date.parse(time(source.header.updated_at ?? source.header.lastModifiedAt) ?? '') || 0;
@@ -287,7 +294,7 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
   }
   if (complete) {
     for (const session of indexed) {
-      if (groups.has(session.sessionId)) continue;
+      if (groups.has(session.sessionId) || skipped.has(session.sessionId)) continue;
       units.push({ key: `kiro-unit:${session.sessionId}`, sessionId: session.sessionId,
         retractSessionIds: [session.sessionId], meta: { sources: [], cursor: '0:0:kiro-tombstone', tombstone: true, indexed } satisfies KiroUnitMeta });
     }

@@ -28,9 +28,10 @@ function drain(generator) {
   return { records, cursor: step.value };
 }
 
-function discover(provider, { cursors = new Map(), indexed = [], issues = [], changedPaths } = {}) {
+function discover(provider, { cursors = new Map(), indexed = [], issues = [], skipped = [], retained = [], changedPaths } = {}) {
   return provider.discover({ lastCursor: key => cursors.get(key) ?? null,
     indexedSessions: () => indexed, reportIncompleteInventory: issue => issues.push(issue),
+    reportSkippedArtifact: issue => skipped.push(issue), retainSession: id => retained.push(id),
     ...(changedPaths === undefined ? {} : { changedPaths }) });
 }
 
@@ -357,16 +358,33 @@ test('Kiro retains turn accounting when an aborted turn has no assistant message
   assert.equal(messages[0].output_tokens, 0);
 });
 
-test('Kiro reports unknown CLI event and workspace versions during discovery', () => {
+test('Kiro skips unknown CLI event and workspace versions without poisoning the inventory', () => {
   const { root, provider } = setup();
-  seedCli(root, json('cli.json'), '{"version":"v99","kind":"Prompt","data":{}}\n');
+  const { path: cliPath } = seedCli(root, json('cli.json'), '{"version":"v99","kind":"Prompt","data":{}}\n');
   const header = json('session.json'); header.schemaVersion = '99.0.0';
   seedWorkspace(root, header);
-  const issues = [];
-  assert.deepEqual(discover(provider, { issues }), []);
-  assert.equal(issues.length, 2);
-  assert.ok(issues.some(issue => /Unsupported Kiro CLI event version/.test(issue.error)));
-  assert.ok(issues.some(issue => /Unsupported Kiro workspace schema/.test(issue.error)));
+  const issues = [], skipped = [];
+  assert.deepEqual(discover(provider, { issues, skipped }), []);
+  assert.deepEqual(issues, []);
+  assert.equal(skipped.length, 2);
+  assert.ok(skipped.some(issue => issue.path === cliPath && /Unsupported Kiro CLI event version v99/.test(issue.error)));
+  assert.ok(skipped.some(issue => /Unsupported Kiro workspace schema 99\.0\.0/.test(issue.error)));
+});
+
+test('a newer-format Kiro session leaves other sessions and their tombstones certified', () => {
+  // CONTRIBUTING: version gates must tolerate the unknown (Hermes 5dbcf47, DeepSeek 63b041e).
+  const { root, provider } = setup();
+  seedCli(root);
+  const newer = json('cli.json');
+  newer.session_id = 'newer-session'; newer.session_state.version = 'v99';
+  seedCli(root, newer, readFileSync(fixture('cli.jsonl'), 'utf8'), 'newer');
+  const gone = { sessionId: 'kiro:gone', jsonlPath: join(root, 'sessions', 'cli', 'gone.jsonl') };
+  const issues = [], skipped = [];
+  const units = discover(provider, { indexed: [gone], issues, skipped });
+  assert.deepEqual(issues, []);
+  assert.equal(skipped.length, 1);
+  assert.equal(units.filter(unit => !unit.meta.tombstone).length, 1);
+  assert.deepEqual(units.filter(unit => unit.meta.tombstone).map(unit => unit.sessionId), ['kiro:gone']);
 });
 
 test('Kiro preserves the last snapshot when inventory is unavailable or a version is unknown', () => {
@@ -374,14 +392,16 @@ test('Kiro preserves the last snapshot when inventory is unavailable or a versio
   const { path, metadata } = seedCli(root);
   const [unit] = discover(provider);
   const indexed = [{ sessionId: unit.sessionId, jsonlPath: path }];
-  const issues = [];
+  const issues = [], skipped = [], retained = [];
   const header = json('cli.json'); header.session_state.version = 'v99';
   writeFileSync(metadata, JSON.stringify(header));
-  assert.deepEqual(discover(provider, { indexed, issues }), []);
-  assert.match(issues[0].error, /Unsupported Kiro CLI schema/);
+  assert.deepEqual(discover(provider, { indexed, issues, skipped, retained }), []);
+  assert.deepEqual(issues, []);
+  assert.match(skipped[0].error, /Unsupported Kiro CLI schema/);
+  assert.deepEqual(retained, [unit.sessionId]);
   rmSync(join(root, 'sessions'), { recursive: true });
   assert.deepEqual(discover(provider, { indexed, issues }), []);
-  assert.ok(issues.length > 1);
+  assert.ok(issues.length > 0);
 });
 
 test('Kiro unreadable stores and completed corrupt JSONL never publish an empty replacement', () => {
