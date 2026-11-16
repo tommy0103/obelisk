@@ -21,11 +21,6 @@ export interface SessionCatalogueOptions extends SourceQueryOptions {
   limit?: number;
 }
 
-export interface SessionCataloguePage {
-  rows: SessionMetadata[];
-  total: number;
-}
-
 export interface ActivitySessionsOptions {
   from: string;
   to: string;
