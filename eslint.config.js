@@ -56,5 +56,28 @@ export default tseslint.config(
   {
     files: ['app/src/renderer/**/*.{js,mjs}'],
     languageOptions: { globals: { ...globals.browser } },
+    rules: {
+      // CONTRIBUTING: transcript content is attacker-controlled.
+      'no-restricted-syntax': ['error',
+        {
+          selector: "AssignmentExpression[left.property.name=/^(innerHTML|outerHTML)$/]",
+          message: 'Transcript text is attacker-controlled. Build markup with renderMarkdown()/escapeHTML() in utils.js or DOM APIs.',
+        },
+        {
+          selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
+          message: 'Transcript text is attacker-controlled. Build markup with renderMarkdown()/escapeHTML() in utils.js or DOM APIs.',
+        },
+      ],
+    },
+  },
+  {
+    files: ['app/src/main/**/*.ts'],
+    rules: {
+      'no-restricted-properties': ['error', {
+        object: 'shell',
+        property: 'openPath',
+        message: 'macOS executes .app/.command/.sh files passed to shell.openPath. Resolve transcript paths with resolveFileReference() in file-reference.ts and open them in the editor.',
+      }],
+    },
   },
 );
