@@ -12,7 +12,7 @@ import { createIndexerService } from './indexer-service.ts';
 import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
-import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
+import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, resolveFileReference } from './file-reference.ts';
 import { createDeferredQuit } from './quit-teardown.ts';
 import { createUpdateLifecycle } from './update-lifecycle.ts';
 import { createUpdateService } from './update-service.ts';
@@ -1112,7 +1112,10 @@ ipcMain.handle('win:control', (event, action: WindowControlAction) => {
   if (!win) return null;
   switch (action) {
     case 'minimize': win.minimize(); return null;
-    case 'toggle-maximize': win.isMaximized() ? win.unmaximize() : win.maximize(); return null;
+    case 'toggle-maximize':
+      if (win.isMaximized()) win.unmaximize();
+      else win.maximize();
+      return null;
     case 'close': win.close(); return null;
     default: throw new Error(`win:control accepts 'minimize', 'toggle-maximize', or 'close'; received "${String(action)}"`);
   }

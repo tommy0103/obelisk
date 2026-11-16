@@ -3,12 +3,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeTempDir } from './temp-dirs.mjs';
 
-const require = createRequire(import.meta.url);
 import { createIndexerService } from '../app/src/main/indexer-service.ts';
 
 function manualTimers() {

@@ -47,6 +47,8 @@ async function preserveRejectedSettings(
       throw new Error(
         `Obelisk could not back up ${settingsPath} before replacing it (${errorMessage(copyError)}), `
         + `so it was left unchanged and the setting was not saved.`,
+        // The message carries the copy failure; the cause keeps the rename failure that forced the copy.
+        // eslint-disable-next-line preserve-caught-error
         { cause: renameError },
       );
     }
