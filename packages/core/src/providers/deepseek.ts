@@ -56,9 +56,7 @@
 //
 // Packed chunk rows (`text-chunks`/`reasoning-chunks`/`tool-call-chunks`) are
 // NOT expanded during projection: their members duplicate the step-final
-// assistant/message, which always carries the assembled content. The vendored
-// codec (../vendor/dsh-chunk-rows.ts) remains available for raw
-// reconstruction but is not on the indexing path.
+// assistant/message, which always carries the assembled content.
 //
 // Format v2/v3 notes (ADR-0014): the v2+ embedded assistant/message `stream`
 // is ignored exactly like packed rows. `system/message` (v3) is not indexed —
