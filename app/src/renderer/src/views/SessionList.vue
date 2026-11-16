@@ -305,6 +305,13 @@ function obeliskStyle(session) {
   flex-direction: column;
   gap: 4px;
 }
+.srow-obelisk {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 1.5px 1.5px 0 0;
+}
 .srow-title {
   font-size: var(--text-md);
   font-weight: 500;
@@ -351,23 +358,9 @@ function obeliskStyle(session) {
   flex-shrink: 0;
   padding-top: 2px;
   white-space: nowrap;
-}
-
-.empty {
-  flex: 1;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted-2);
-  font-size: var(--text-sm);
-  padding: 60px 20px;
-  text-align: center;
   flex-direction: column;
-  gap: 8px;
-}
-.empty .hint {
-  font-size: 11px;
-  color: var(--muted-2);
+  gap: 2px;
 }
 
 /* Onboarding empty state */

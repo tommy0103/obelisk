@@ -638,21 +638,6 @@ onUnmounted(() => {
 .row.archived .row-path, .row.archived .row-summary { color: var(--muted); }
 .row.archived .row-path .project-prefix { color: var(--muted-2); }
 
-/* Empty state */
-.empty {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted-2);
-  font-size: var(--text-sm);
-  padding: 60px 20px;
-  text-align: center;
-  flex-direction: column;
-  gap: 8px;
-}
-.empty .hint { font-size: 11px; color: var(--muted-2); }
-
 /* Detail panel styles */
 .detail-header { margin-bottom: 24px; }
 .detail-eyebrow {
