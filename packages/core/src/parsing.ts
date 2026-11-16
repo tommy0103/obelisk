@@ -47,7 +47,6 @@ interface CodexLineRecord {
   obj: JsonRecord;
 }
 
-// ---- message/text helpers ----
 /**
  * Slice a string to `limit` UTF-16 code units without leaving half of a surrogate pair at the cut.
  * A lone surrogate has no UTF-8 form, so every store that persists the text rewrites it (SQLite
@@ -234,7 +233,6 @@ function readCodexLines(
   readLines(filePath, callback);
 }
 
-// ---- project-path + discovery helpers ----
 function legacyProjectPathFromSlug(project: string | null | undefined): string | null {
   if (!project) return null;
   return '/' + project.replace(/-/g, '/').replace(/^\//, '');
@@ -365,7 +363,6 @@ function discoverCodexJsonlFiles(
   return files;
 }
 
-// ---- Codex pure helpers ----
 function codexDbId(id: unknown): string | null {
   if (!id) return null;
   const raw = String(id).replace(/^codex:/, '');
