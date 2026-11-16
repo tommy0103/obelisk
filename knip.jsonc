@@ -10,8 +10,10 @@
   ],
   "workspaces": {
     ".": {
-      "entry": ["tests/**/*.{mjs,js}", "scripts/*.mjs", "packaging/*.mjs", ".github/scripts/*.mjs"],
-      "project": ["tests/**/*.{mjs,js}", "scripts/**/*.mjs", "packaging/**/*.mjs"],
+      // npm test runs tests/*.test.mjs; a helper under tests/ that no test
+      // imports is reported. Fixtures are read as data, not imported.
+      "entry": ["tests/*.test.mjs", "scripts/*.mjs", "packaging/*.mjs", ".github/scripts/*.mjs"],
+      "project": ["tests/**/*.{mjs,js}", "!tests/fixtures/**", "scripts/**/*.mjs", "packaging/**/*.mjs"],
       // Root tests load the app's native and renderer dependencies and the DSH
       // runtime installed for packages/dsh-plugin.
       "ignoreDependencies": ["better-sqlite3", "vue", "@tanstack/vue-virtual", "@deepseek-ai/.+"]
@@ -25,7 +27,12 @@
       "entry": [
         "src/main/index.ts", "src/main/indexer-worker.ts",
         "src/preload/index.ts", "src/renderer/src/main.js",
-        "tests/*.mjs", "scripts/*.mjs", "electron.vite.config.ts"
+        // run-electron-suites.mjs runs tests/electron-*.mjs, and CI runs
+        // packaged-deb-updates.mjs by path. knip finds the runner and
+        // packaged-updates.mjs through package.json and the workflows. Any
+        // other test file must be imported by one of these.
+        "tests/electron-*.mjs", "tests/packaged-deb-updates.mjs",
+        "scripts/*.mjs", "electron.vite.config.ts"
       ],
       "project": ["src/**/*.{ts,js,mjs,vue}", "tests/**/*.mjs"],
       // @parcel/watcher is loaded by packages/adaptive-watcher, which the app
