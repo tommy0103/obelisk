@@ -4,8 +4,7 @@
 <script setup>
 import { ref, reactive, shallowRef, computed, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { state } from '../store.js';
-import { fmtTokens, fmtDuration, fmtTooltipDate, positionTooltip, escapeHTML, formatProjectLabel } from '../utils.js';
+import { fmtTokens, fmtDuration, fmtTooltipDate, formatProjectLabel } from '../utils.js';
 import ActivityLedger from '../components/ActivityLedger.vue';
 
 defineOptions({ name: 'Activity' });

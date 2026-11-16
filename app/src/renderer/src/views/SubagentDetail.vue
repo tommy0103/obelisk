@@ -2,20 +2,15 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { ref, onMounted, watch, computed } from 'vue';
-import { useRouter } from 'vue-router';
-import { state } from '../store.js';
+import { ref, reactive, onMounted, watch } from 'vue';
 import { loadSubagentDetail, isTextTruncated, loadFullText } from '../data.js';
-import { escapeHTML, fmtClockTime, renderMarkdown } from '../utils.js';
+import { fmtClockTime, renderMarkdown } from '../utils.js';
 
 defineOptions({ name: 'SubagentDetail' });
 const props = defineProps({ id: String, agentId: String });
-const router = useRouter();
 
 const messages = ref([]);
 const loading = ref(false);
-
-const parentSession = computed(() => state.sessions.find(s => s.id === props.id));
 
 onMounted(async () => { await load(); });
 watch(() => props.agentId, async (n, o) => { if (n && n !== o) { messages.value = []; await load(); } });
@@ -28,17 +23,11 @@ async function load() {
   } finally { loading.value = false; }
 }
 
-function goBack() {
-  router.push(`/sessions/${props.id}`);
-}
+const fullText = reactive(new Map());
 
-async function handleLoadFull(uuid, el) {
+async function handleLoadFull(uuid) {
   const full = await loadFullText(uuid);
-  if (full && el) {
-    const body = el.closest('.msg')?.querySelector('.markdown-msg, .markdown-compact');
-    if (body) body.outerHTML = renderMarkdown(full, { variant: 'msg' });
-    el.remove();
-  }
+  if (full) fullText.set(uuid, full);
 }
 
 function renderMsgMarkdown(msg, text, variant) {
@@ -63,7 +52,7 @@ function renderMsgMarkdown(msg, text, variant) {
 
       <div v-else class="timeline">
         <div
-          v-for="(msg, idx) in messages"
+          v-for="msg in messages"
           :key="msg.uuid"
           class="msg"
           :class="[msg.type === 'user' ? 'user' : 'assistant']"
@@ -76,6 +65,7 @@ function renderMsgMarkdown(msg, text, variant) {
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
+              <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
               <div class="thinking-body" v-html="renderMsgMarkdown(msg, msg.text, 'msg')"></div>
             </div>
           </template>
@@ -88,6 +78,7 @@ function renderMsgMarkdown(msg, text, variant) {
                 <span class="meta-label">System</span>
                 <span class="meta-preview">{{ (msg.text || '').replace(/<[^>]+>/g, '').slice(0, 80) }}</span>
               </button>
+              <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
               <div class="meta-body" v-html="renderMsgMarkdown(msg, msg.text, 'compact')"></div>
             </div>
           </template>
@@ -103,14 +94,16 @@ function renderMsgMarkdown(msg, text, variant) {
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
+              <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
               <div class="thinking-body" v-html="renderMsgMarkdown(msg, msg._thinking, 'msg')"></div>
             </div>
-            <div v-if="msg.text" v-html="renderMsgMarkdown(msg, msg.text, 'msg')"></div>
+            <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
+            <div v-if="msg.text" v-html="renderMsgMarkdown(msg, fullText.get(msg.uuid) ?? msg.text, 'msg')"></div>
             <div v-else-if="!msg.tool_calls?.length" class="msg-text empty-text">(no text content)</div>
             <button
-              v-if="isTextTruncated(msg.text)"
+              v-if="isTextTruncated(msg.text) && !fullText.has(msg.uuid)"
               class="truncated-btn"
-              @click="handleLoadFull(msg.uuid, $event.currentTarget)"
+              @click="handleLoadFull(msg.uuid)"
             >Message truncated — click to load full text</button>
 
             <!-- Tool calls -->

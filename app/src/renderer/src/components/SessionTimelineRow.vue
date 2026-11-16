@@ -59,6 +59,7 @@ function navigateToSubagent(agentId, description = '') {
           <span class="meta-preview">{{ (msg.text || '').replace(/<[^>]+>/g, '').slice(0, 80) }}</span>
         </button>
         <div class="meta-body">
+          <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
           <div v-html="presentation.messageHtml"></div>
           <button
             v-if="canLoadFullText(msg)"
@@ -114,6 +115,7 @@ function navigateToSubagent(agentId, description = '') {
           >
             <button class="toolcall-toggle" @click="toggleDisclosure(`tool:${tc.id}`, msg.uuid)">
               <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
+              <!-- eslint-disable-next-line vue/no-v-html -- static SVG from tool-renderer.js -->
               <span v-if="presentation.toolIcons.get(tc.id)" class="tool-icon" v-html="presentation.toolIcons.get(tc.id)"></span>
               <span class="tool-name">{{ tc.name }}</span>
               <span class="tool-arg">{{ presentation.toolArgPreviews.get(tc.id) }}</span>
@@ -125,6 +127,7 @@ function navigateToSubagent(agentId, description = '') {
                 <span class="spacer"></span>
                 <button class="raw-toggle" :class="{ active: disclosures.isRaw(`tool:${tc.id}`) }" @click.stop="toggleRaw(`tool:${tc.id}`, msg.uuid)">{ } Raw</button>
               </div>
+              <!-- eslint-disable-next-line vue/no-v-html -- tool markup, transcript text escaped -->
               <div class="toolcall-pretty" :class="{ hidden: disclosures.isRaw(`tool:${tc.id}`) }" v-html="presentation.toolPrettyHtml.get(tc.id)"></div>
               <div class="toolcall-raw" :class="{ show: disclosures.isRaw(`tool:${tc.id}`) }">
                 <div class="tc-section">Input</div>
@@ -163,6 +166,7 @@ function navigateToSubagent(agentId, description = '') {
             <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
             <span>SKILL.md</span>
           </button>
+          <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
           <div class="skill-md-body" v-html="presentation.skillHtml"></div>
         </div>
       </div>
@@ -176,6 +180,7 @@ function navigateToSubagent(agentId, description = '') {
           <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
           <span class="thinking-label">Thinking</span>
         </button>
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div class="thinking-body" v-html="presentation.thinkingHtml"></div>
       </div>
     </div>
@@ -198,10 +203,12 @@ function navigateToSubagent(agentId, description = '') {
           <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
           <span class="thinking-label">Thinking</span>
         </button>
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div class="thinking-body" v-html="presentation.thinkingHtml"></div>
       </div>
 
       <template v-if="msg.text">
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div v-html="presentation.messageHtml"></div>
         <button
           v-if="canLoadFullText(msg)"
@@ -243,6 +250,7 @@ function navigateToSubagent(agentId, description = '') {
                 </template>
                 <template v-if="tc.result?.content">
                   <div class="tc-section">Result</div>
+                  <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
                   <div class="agent-result" v-html="presentation.toolResultHtml.get(tc.id)"></div>
                 </template>
               </div>
@@ -288,6 +296,7 @@ function navigateToSubagent(agentId, description = '') {
             <div class="msg-tool" :class="{ open: disclosures.isOpen(`tool:${tc.id}`), 'is-error': tc.result && tc.result.is_error }" :data-view-key="`tool:${tc.id}`">
               <button class="toolcall-toggle" @click="toggleDisclosure(`tool:${tc.id}`, msg.uuid)">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
+                <!-- eslint-disable-next-line vue/no-v-html -- static SVG from tool-renderer.js -->
                 <span v-if="presentation.toolIcons.get(tc.id)" class="tool-icon" v-html="presentation.toolIcons.get(tc.id)"></span>
                 <span class="tool-name">{{ tc.name }}</span>
                 <span class="tool-arg">{{ presentation.toolArgPreviews.get(tc.id) }}</span>
@@ -299,6 +308,7 @@ function navigateToSubagent(agentId, description = '') {
                   <span class="spacer"></span>
                   <button class="raw-toggle" :class="{ active: disclosures.isRaw(`tool:${tc.id}`) }" @click.stop="toggleRaw(`tool:${tc.id}`, msg.uuid)">{ } Raw</button>
                 </div>
+                <!-- eslint-disable-next-line vue/no-v-html -- tool markup, transcript text escaped -->
                 <div class="toolcall-pretty" :class="{ hidden: disclosures.isRaw(`tool:${tc.id}`) }" v-html="presentation.toolPrettyHtml.get(tc.id)"></div>
                 <div class="toolcall-raw" :class="{ show: disclosures.isRaw(`tool:${tc.id}`) }">
                   <div class="tc-section">Input</div>
@@ -320,6 +330,7 @@ function navigateToSubagent(agentId, description = '') {
           <span class="label">Session summary</span>
           <span class="source">{{ msg.summary.source || '' }}</span>
         </button>
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div class="summary-body" v-html="presentation.summaryHtml"></div>
       </div>
     </div>

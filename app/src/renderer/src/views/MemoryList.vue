@@ -318,6 +318,7 @@ onUnmounted(() => {
     <div v-if="detailMemory" class="detail">
       <div class="detail-header">
         <div class="detail-eyebrow">
+          <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
           <span class="project-icon" v-html="FOLDER_SVG"></span>
           <span class="project-name">{{ formatProjectLabel(detailMemory.project) }}</span>
           <span v-if="detailMemory.archived" class="archived-tag">archived</span>
@@ -365,6 +366,7 @@ onUnmounted(() => {
           File not found or empty.
         </div>
         <pre v-else-if="showSource" class="markdown-source">{{ detailMarkdown }}</pre>
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div v-else class="markdown-body" v-html="renderedMarkdown"></div>
       </div>
 
@@ -439,19 +441,17 @@ onUnmounted(() => {
 
         <div class="row-body">
           <div class="row-path">
-            <span
-              v-if="dominantRowStatus(m)"
-              class="row-status"
-              :class="dominantRowStatus(m)"
-              :title="dominantRowStatus(m)"
-              v-html="statusGlyphs(dominantRowStatus(m))"
-            ></span>
+            <!-- eslint-disable-next-line vue/no-v-html -- static SVG -->
+            <span v-if="dominantRowStatus(m)" class="row-status" :class="dominantRowStatus(m)" :title="dominantRowStatus(m)" v-html="statusGlyphs(dominantRowStatus(m))"></span>
             <template v-if="showProjectPrefix">
+              <!-- eslint-disable-next-line vue/no-v-html -- escapeHTML() -->
               <span class="project-prefix" v-html="projectLabel(m)"></span>
               <span class="project-prefix-sep">/</span>
             </template>
+            <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
             <span class="path-text" v-html="pathHTML(m)"></span>
           </div>
+          <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
           <div class="row-summary" v-html="summaryHTML(m)"></div>
         </div>
 
