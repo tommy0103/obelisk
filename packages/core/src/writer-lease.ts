@@ -37,13 +37,13 @@ function isBusy(error: unknown): boolean {
   );
 }
 
-function syncSleep(ms: number): void {
+export function syncSleep(ms: number): void {
   if (ms <= 0) return;
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {
-    // If synchronous sleeping is unavailable, the bounded attempt count below
-    // still prevents an infinite acquisition loop.
+    // If synchronous sleeping is unavailable, callers' bounded attempt counts
+    // still prevent an infinite retry loop.
   }
 }
 

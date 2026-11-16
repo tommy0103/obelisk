@@ -19,6 +19,7 @@ import {
   trunc,
   truncJson,
 } from '../parsing.ts';
+import { expandTilde } from '../paths.ts';
 import type {
   Cursor,
   DiscoverContext,
@@ -130,12 +131,6 @@ function reportInventory(
     path: fallbackPath,
     error: 'Source inventory is incomplete',
   });
-}
-
-function expandTilde(path: string, homeDir: string): string {
-  if (path === '~') return homeDir;
-  if (path.startsWith('~/') || path.startsWith('~\\')) return join(homeDir, path.slice(2));
-  return path;
 }
 
 function configuredAbsolutePath(value: unknown, homeDir: string): string | null {
