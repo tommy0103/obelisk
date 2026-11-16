@@ -1,5 +1,7 @@
 // Fails `npm run lint` when a file, export, or dependency loses its last user.
 // Delete the dead code instead of adding it to an ignore list.
+// `!` marks production files: `knip --production` ignores tests, so an export
+// only tests use fails unless it carries `/** @internal Exported for tests. */`.
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
   "ignoreExportsUsedInFile": { "interface": true, "type": true },
@@ -25,8 +27,8 @@
       // so knip reaches them and still checks their exports. A main-process
       // file nothing imports is reported as unused.
       "entry": [
-        "src/main/index.ts", "src/main/indexer-worker.ts",
-        "src/preload/index.ts", "src/renderer/src/main.js",
+        "src/main/index.ts!", "src/main/indexer-worker.ts!",
+        "src/preload/index.ts!", "src/renderer/src/main.js!",
         // run-electron-suites.mjs runs tests/electron-*.mjs, and CI runs
         // packaged-deb-updates.mjs by path. knip finds the runner and
         // packaged-updates.mjs through package.json and the workflows. Any
@@ -34,20 +36,20 @@
         "tests/electron-*.mjs", "tests/packaged-deb-updates.mjs",
         "scripts/*.mjs", "electron.vite.config.ts"
       ],
-      "project": ["src/**/*.{ts,js,mjs,vue}", "tests/**/*.mjs"],
+      "project": ["src/**/*.{ts,js,mjs,vue}!", "tests/**/*.mjs"],
       // @parcel/watcher is loaded by packages/adaptive-watcher, which the app
       // bundles from source; the packaged app must still ship it.
       // builder-util and @electron/asar come with electron-builder.
       "ignoreDependencies": ["@parcel/watcher", "builder-util", "@electron/asar"]
     },
-    "packages/cli": { "entry": ["src/obelisk.ts", "scripts/*.mjs"], "project": ["src/**/*.ts"] },
-    "packages/core": { "project": ["src/**/*.ts"] },
+    "packages/cli": { "entry": ["src/obelisk.ts!", "scripts/*.mjs"], "project": ["src/**/*.ts!"] },
+    "packages/core": { "project": ["src/**/*.ts!"] },
     "packages/dsh-plugin": {
-      "entry": ["src/index.ts", "src/context-window.ts", "scripts/*.mjs"],
-      "project": ["src/**/*.ts"],
+      "entry": ["scripts/*.mjs"],
+      "project": ["src/**/*.ts!"],
       // Exercised by the root DSH plugin tests, not by the plugin source.
       "ignoreDependencies": ["@deepseek-ai/.+"]
     },
-    "packages/adaptive-watcher": { "project": ["src/**/*.ts"] }
+    "packages/adaptive-watcher": { "project": ["src/**/*.ts!"] }
   }
 }

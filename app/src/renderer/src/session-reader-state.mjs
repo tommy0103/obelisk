@@ -34,6 +34,7 @@ function cloneReaderState(state) {
   };
 }
 
+/** @internal Exported for tests. */
 export function createSessionReaderStateCache({ maxEntries = 12 } = {}) {
   if (!Number.isInteger(maxEntries) || maxEntries < 1) {
     throw new Error('Session reader state cache requires maxEntries >= 1');

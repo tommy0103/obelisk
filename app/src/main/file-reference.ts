@@ -85,7 +85,7 @@ function buildEditorUrl({ scheme, filePath, line, column }: EditorUrlOptions): s
 export {
   DEFAULT_EDITOR_SCHEME,
   buildEditorUrl,
-  fileReferenceCandidates,
-  normalizeRoots,
+  /** @internal Exported for tests. */ fileReferenceCandidates,
+  /** @internal Exported for tests. */ normalizeRoots,
   resolveFileReference,
 };

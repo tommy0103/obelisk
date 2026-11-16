@@ -24,4 +24,4 @@ function buildRecapExportQuery({ cardIdx = 0, archetype = '', filename = '' }: R
   return params.toString();
 }
 
-export { buildRecapExportQuery, cleanRecapFilename };
+export { buildRecapExportQuery, /** @internal Exported for tests. */ cleanRecapFilename };

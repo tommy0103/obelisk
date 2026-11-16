@@ -8,6 +8,7 @@ function activitySourceKey(session) {
   return source || 'claude';
 }
 
+/** @internal Exported for tests. */
 export function activitySourceLabel(session, sourceCatalog = []) {
   return sourceLabel(activitySourceKey(session), sourceCatalog);
 }

@@ -57,6 +57,7 @@ function isSafeImageSource(source) {
 // marked <= 14 calls renderer.image(href, title, text); marked >= 15 passes the
 // image token instead. Accepting both keeps an upgrade from silently turning
 // every session image into fallback text.
+/** @internal Exported for tests. */
 export function normalizeMarkdownImageToken(hrefOrToken, title, text) {
   if (hrefOrToken && typeof hrefOrToken === 'object') {
     return {
@@ -71,6 +72,7 @@ export function normalizeMarkdownImageToken(hrefOrToken, title, text) {
 // A source the app will not load is rendered through the same element with no
 // src, so a blocked image and an image that fails to load look the same to the
 // reader instead of being two different pieces of UI.
+/** @internal Exported for tests. */
 export function renderSessionMarkdownImage(hrefOrToken, title, text) {
   const token = normalizeMarkdownImageToken(hrefOrToken, title, text);
   const source = decodeMarkedAttribute(token.href).trim();
