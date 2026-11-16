@@ -51,6 +51,7 @@ the prose. `npm run lint` runs ESLint over every tracked JS/TS file (including
 | Renderer JS never assigns `innerHTML`/`outerHTML` or calls `insertAdjacentHTML` outside `renderMarkdown()` | ESLint `no-restricted-syntax` |
 | Main process never calls `shell.openPath` | ESLint `no-restricted-properties` |
 | Renderer images never use `loading="lazy"` | `tests/renderer-virtualized-rows.test.mjs` |
+| No new synchronous IO in main-process modules, no new `v-html` | Budgets in `tests/app-source-budgets.test.mjs`; lower them when you remove a use |
 | Every `app/tests/electron-*.mjs` suite runs in `test:electron:all` | `app/tests/run-electron-suites.mjs` discovers suites by name |
 | `schema.sql` changes are deliberate | sha256 pin in `tests/provider-schema-stability.test.mjs` |
 
