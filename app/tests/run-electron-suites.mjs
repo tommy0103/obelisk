@@ -18,6 +18,7 @@ const suites = [
   'electron-file-references.mjs',
   'electron-updates.mjs',
   'electron-markdown-rendering.mjs',
+  'electron-csp.mjs',
 ]
 
 const failed = []
