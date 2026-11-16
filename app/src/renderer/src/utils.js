@@ -9,9 +9,9 @@ import { markFileReferences, mayContainFileReference } from './file-references.m
 
 // --- Time / formatting ---
 
-export function pad2(n) { return String(n).padStart(2, '0'); }
+function pad2(n) { return String(n).padStart(2, '0'); }
 
-export function isSameDay(a, b) {
+function isSameDay(a, b) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
@@ -42,13 +42,6 @@ export function fmtClockTime(iso) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-export function fmtSize(bytes) {
-  if (!bytes) return '-';
-  if (bytes < 1024) return bytes + 'B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'K';
-  return (bytes / 1024 / 1024).toFixed(1) + 'M';
-}
-
 // --- HTML / Markdown ---
 
 export function escapeHTML(s) {
@@ -62,7 +55,7 @@ export function highlightPlain(text, query) {
   return safe.replace(new RegExp(q, 'gi'), m => `<mark>${m}</mark>`);
 }
 
-export function sanitizeMarkdown(html) {
+function sanitizeMarkdown(html) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
@@ -70,7 +63,7 @@ export function sanitizeMarkdown(html) {
     .replace(/\son\w+="[^"]*"/gi, '');
 }
 
-export function highlightTextNodes(rootEl, query) {
+function highlightTextNodes(rootEl, query) {
   if (!query) return;
   const q = query.toLowerCase();
   const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null);

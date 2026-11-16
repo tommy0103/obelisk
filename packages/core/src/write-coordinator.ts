@@ -68,7 +68,7 @@ export function isRetryableWriteFailure(error: unknown): boolean {
   );
 }
 
-export function runWithWriteRetry<T>(operation: () => T, {
+function runWithWriteRetry<T>(operation: () => T, {
   maxAttempts = 3,
   budgetMs = 1000,
   retryDelayMs = 25,

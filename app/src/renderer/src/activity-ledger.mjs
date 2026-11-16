@@ -3,7 +3,7 @@
 
 import { sourceLabel } from './source-catalog.mjs';
 
-export function activitySourceKey(session) {
+function activitySourceKey(session) {
   const source = typeof session?.source === 'string' ? session.source.trim().toLowerCase() : '';
   return source || 'claude';
 }

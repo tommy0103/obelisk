@@ -22,8 +22,8 @@ import type {
   TranscriptRecord,
 } from './types.ts';
 
-export const name = 'codexhost-antigravity';
-export const CODEXHOST_ANTIGRAVITY_CANONICAL_TRANSCRIPT_MARKER = '__codexhost_antigravity_canonical_transcript_v2__';
+const name = 'codexhost-antigravity';
+const CODEXHOST_ANTIGRAVITY_CANONICAL_TRANSCRIPT_MARKER = '__codexhost_antigravity_canonical_transcript_v2__';
 const CURSOR_TAG = 'codexhost-antigravity-snapshot-v1';
 const HISTORY_DIR = 'antigravity-history';
 const MAPPING_DIR = join('mapping-store', 'threads');
@@ -464,7 +464,5 @@ export function createCodexHostAntigravityProvider({
     },
   };
 }
-
-export const codexHostAntigravityProvider = createCodexHostAntigravityProvider();
 
 export { sessionId as codexhostAntigravitySessionId };

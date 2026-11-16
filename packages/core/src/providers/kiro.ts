@@ -17,8 +17,8 @@ import type {
   RawLookup, RawRecord, TranscriptRecord, WatchTarget,
 } from './types.ts';
 
-export const name = 'kiro';
-export const KIRO_CANONICAL_TRANSCRIPT_MARKER = '__kiro_canonical_transcript_v3__';
+const name = 'kiro';
+const KIRO_CANONICAL_TRANSCRIPT_MARKER = '__kiro_canonical_transcript_v3__';
 export type KiroDatabaseOpener = (path: string) => SqliteDb;
 type JsonRecord = Record<string, any>;
 type Format = 'cli' | 'workspace' | 'sqlite';
@@ -609,5 +609,3 @@ export function createKiroProvider({
     },
   };
 }
-
-export const kiroProvider = createKiroProvider();

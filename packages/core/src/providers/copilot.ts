@@ -45,7 +45,7 @@ import type {
   TranscriptRecord,
 } from './types.ts';
 
-export const name = 'copilot';
+const name = 'copilot';
 const COPILOT_CANONICAL_TRANSCRIPT_MARKER = '__copilot_canonical_transcript_v2__';
 const CURSOR_TAG = 'copilot-snapshot-v1';
 const TRANSCRIPT_VERSION = 1;
@@ -1000,5 +1000,3 @@ export function createCopilotProvider({
     raw: (input) => rawTranscript(input) ?? rawChronicle(input, openChronicle),
   };
 }
-
-export const copilotProvider = createCopilotProvider();

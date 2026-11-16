@@ -46,11 +46,11 @@ import { homedir } from 'node:os';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { normalizeObservedCwd, projectSlugFromPath, trunc } from '../parsing.ts';
 
-export const name = 'hermes';
+const name = 'hermes';
 // v7: the exact message digest now frames every projected field unambiguously. An older digest
 // could mistake a control character in reasoning text for a field boundary, certify the store,
 // and leave changed thinking text stale. Replay those sessions before trusting the new digest.
-export const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v7__';
+const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v7__';
 
 const CURSOR_TAG = 'hermes-snapshot-v2';
 const STORE_FILE = 'state.db';
@@ -183,7 +183,7 @@ function expandRoot(rootDir: string, homeDir: string): string {
   return normalize(trimmed);
 }
 
-export function defaultHermesHome(homeDir: string = homedir()): string {
+function defaultHermesHome(homeDir: string = homedir()): string {
   const fromEnv = process.env['HERMES_HOME'];
   if (typeof fromEnv === 'string' && fromEnv.trim().length > 0 && isAbsolute(fromEnv.trim())) {
     return normalize(fromEnv.trim());
@@ -1417,5 +1417,3 @@ export function createHermesProvider({
     raw: (input: RawLookup): RawRecord | null => rawHermes(input, openStore),
   };
 }
-
-export const hermesProvider = createHermesProvider();

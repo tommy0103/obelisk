@@ -209,7 +209,7 @@ export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
   return state?.replayRequired ? null : checkpointCursor(state);
 }
 
-export function providerSessionUnitKey(
+function providerSessionUnitKey(
   provider: ProviderAdapter | undefined,
   session: IndexedSession,
 ): string {

@@ -99,7 +99,7 @@ import type {
   TranscriptRecord,
 } from './types.ts';
 
-export const name = 'deepseek';
+const name = 'deepseek';
 // Replay readable trees once to repair snapshots published without a child.
 const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v5__';
 
@@ -1817,5 +1817,3 @@ export function createDeepseekProvider({ rootDir = deepseekSessionsRoot() }: { r
     raw: (input) => rawDeepseek(rootDir, input),
   };
 }
-
-export const deepseekProvider = createDeepseekProvider();
