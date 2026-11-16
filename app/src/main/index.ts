@@ -25,6 +25,7 @@ import {
   getCopilotEditions,
   hasExplicitProviderRoot,
   readPersistedProviderSettings,
+  type PersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
   resolveObeliskPaths,
@@ -55,6 +56,7 @@ import type {
   SessionToolResultRow,
   SessionWorkflowRow,
 } from '../shared/session-detail-types.ts';
+import type { SqliteRow } from '../../../packages/core/src/sqlite-types.ts';
 import { createSessionPatch } from '../shared/session-patch.mjs';
 import { assembleSessionDetail } from '../shared/session-detail-assembly.mjs';
 
@@ -92,9 +94,9 @@ function detectClaudeDir() {
 const DEFAULT_CLAUDE_DIR = detectClaudeDir();
 const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');
 
-let db;
-let indexerService;
-let indexerWorker;
+let db: Database.Database | null = null;
+let indexerService: ReturnType<typeof createIndexerService> | null = null;
+let indexerWorker: ReturnType<typeof createWorkerBuildIndex> | null = null;
 let latestSourceIssues: ProviderSourceIssue[] = [];
 let latestSettingsError: string | null = null;
 // A recovery notice is deliberately kept apart from latestSettingsError: that variable
@@ -104,6 +106,14 @@ let latestSettingsError: string | null = null;
 let latestSettingsRecovery: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
+type CountRow = { c: number };
+type FullTextMessageRow = SqliteRow & {
+  session_id: string;
+  agent_id: string | null;
+  source: string | null;
+  visibility: string | null;
+  text: string | null;
+};
 
 function acquireAppWriterLease(dbPath: string, waitMs = 0) {
   return acquireWriterLease({
@@ -180,18 +190,18 @@ function migrateLegacyDbIfNeeded(
   }
 }
 
-function rebuildTempDbPath(dbPath) {
+function rebuildTempDbPath(dbPath: string) {
   return path.join(
     path.dirname(dbPath),
     `${path.basename(dbPath)}.rebuild-${process.pid}-${Date.now()}.tmp`,
   );
 }
 
-function dbFileSet(dbPath) {
+function dbFileSet(dbPath: string) {
   return [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
 }
 
-function cleanupDbFiles(dbPath) {
+function cleanupDbFiles(dbPath: string) {
   for (const filePath of dbFileSet(dbPath)) {
     try {
       fs.rmSync(filePath, { force: true });
@@ -201,7 +211,7 @@ function cleanupDbFiles(dbPath) {
   }
 }
 
-function replaceDbWithTemp(tempDbPath, dbPath) {
+function replaceDbWithTemp(tempDbPath: string, dbPath: string) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
     fs.rmSync(sidecar, { force: true });
@@ -224,7 +234,7 @@ function resolveSchemaPath() {
   return candidates.find(p => fs.existsSync(p));
 }
 
-function migrateDb(db) {
+function migrateDb(db: Database.Database) {
   if (typeof db.exec !== 'function' || typeof db.prepare !== 'function') return;
   migrateCoreSchemaColumns(db);
   const schemaPath = resolveSchemaPath();
@@ -263,7 +273,7 @@ function openDb(
   return db;
 }
 
-function runAppDbWrite(work: () => void): boolean {
+function runAppDbWrite(work: (db: Database.Database) => void): boolean {
   updateLifecycle.assertWritable();
   if (!db) return false;
   const lease = acquireAppWriterLease(getRuntimePaths().dbPath, 250);
@@ -271,7 +281,7 @@ function runAppDbWrite(work: () => void): boolean {
     throw new Error('Obelisk index writer is busy; memory change was not applied');
   }
   try {
-    work();
+    work(db);
     return true;
   } finally {
     lease.release();
@@ -323,7 +333,7 @@ function sourceWhereClause(opts: SourceQueryOptions = {}, column = "source"): { 
   return { sql: `COALESCE(${column}, 'claude') = 'claude'`, params: [] };
 }
 
-function appendWhere(sql, params, clause) {
+function appendWhere(sql: string, clause: string) {
   if (!clause) return sql;
   return `${sql}${sql.includes(' WHERE ') ? ' AND ' : ' WHERE '}${clause}`;
 }
@@ -338,6 +348,7 @@ function startIndexerService({ buildOnStart = false } = {}) {
     projectsDir: paths.projectsDir,
     watchTargets: paths.providerRegistry.watchTargets(paths.providerRoots),
     buildIndex: async ({ reason, changedPaths, retrySessionIds }) => {
+      if (!indexerWorker) throw new Error('Obelisk indexer worker is not running');
       const result = await indexerWorker.buildIndex({
         reason,
         changedPaths,
@@ -553,7 +564,7 @@ function startObeliskWatcher() {
   return obeliskWatcher;
 }
 
-function onObeliskChange(filePath) {
+function onObeliskChange(filePath: string) {
   if (filePath.startsWith(RECAP_DIR)) {
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send('obelisk:recap-updated', filePath);
@@ -734,11 +745,11 @@ ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
   const params: unknown[] = [];
   const sourceFilter = sourceWhereClause(opts);
   if (sourceFilter.sql) {
-    sql = appendWhere(sql, params, sourceFilter.sql);
+    sql = appendWhere(sql, sourceFilter.sql);
     params.push(...sourceFilter.params);
   }
-  if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
-  if (sessionId !== undefined) { sql = appendWhere(sql, params, `id = ?`); params.push(sessionId); }
+  if (project) { sql = appendWhere(sql, `project LIKE ?`); params.push(project); }
+  if (sessionId !== undefined) { sql = appendWhere(sql, `id = ?`); params.push(sessionId); }
   sql += ` ORDER BY COALESCE(ended_at, started_at) DESC`;
   if (limit !== null) {
     sql += ' LIMIT ?';
@@ -869,14 +880,14 @@ ipcMain.handle('db:getMemories', () => {
 
 ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
   if (!db) return null;
-  const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
+  const msg = db.prepare<[unknown], FullTextMessageRow>('SELECT * FROM messages WHERE uuid=?').get(uuid);
   if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
-  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
+  const session = db.prepare<[string], SqliteRow>('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
   const subagent = msg.agent_id
-    ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
+    ? db.prepare<[string], SqliteRow>('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const workflowAgent = msg.agent_id
-    ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
+    ? db.prepare<[string], SqliteRow>('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const paths = getRuntimePaths();
   const lookup = {
@@ -920,13 +931,13 @@ ipcMain.handle('db:readMemoryFile', (_, filePath) => {
 function querySessionFileRoots(sessionId: unknown): string[] {
   if (!db || typeof sessionId !== 'string' || !sessionId) return [];
   const roots: string[] = [];
-  const rows = db.prepare(
+  const rows = db.prepare<[string], { cwd: string }>(
     `SELECT DISTINCT cwd FROM messages
      WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
        AND COALESCE(visibility, 'visible') = 'visible'`
   ).all(sessionId);
   for (const row of rows) roots.push(row.cwd);
-  const session = db.prepare(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
+  const session = db.prepare<[string], { project_path: string | null }>(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
   if (session?.project_path) roots.push(session.project_path);
   return roots;
 }
@@ -953,14 +964,14 @@ ipcMain.handle('file-ref:open', async (_, ref) => {
 });
 
 ipcMain.handle('db:archiveMemory', (_, id, reason) => {
-  return runAppDbWrite(() => {
+  return runAppDbWrite((db) => {
     db.prepare(`UPDATE memories SET deleted_at = ?, deleted_reason = ? WHERE id = ?`)
       .run(new Date().toISOString(), reason || 'Archived via panel', id);
   });
 });
 
 ipcMain.handle('db:restoreMemory', (_, id) => {
-  return runAppDbWrite(() => {
+  return runAppDbWrite((db) => {
     db.prepare(`UPDATE memories SET deleted_at = NULL, deleted_reason = NULL WHERE id = ?`).run(id);
   });
 });
@@ -981,9 +992,9 @@ ipcMain.handle('db:getStats', (_, opts = {}) => {
   if (!db) return { sessions: 0, memories: 0, memoriesArchived: 0 };
   const sourceFilter = sourceWhereClause(opts);
   const where = sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : '';
-  const sessions = db.prepare(`SELECT COUNT(*) as c FROM sessions ${where}`).get(...sourceFilter.params)?.c || 0;
-  const memories = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
-  const memoriesArchived = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NOT NULL').get()?.c || 0;
+  const sessions = db.prepare<unknown[], CountRow>(`SELECT COUNT(*) as c FROM sessions ${where}`).get(...sourceFilter.params)?.c || 0;
+  const memories = db.prepare<[], CountRow>('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
+  const memoriesArchived = db.prepare<[], CountRow>('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NOT NULL').get()?.c || 0;
   return { sessions, memories, memoriesArchived };
 });
 
@@ -993,7 +1004,7 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   // still consumed tokens, so aggregate usage intentionally includes them.
   const messageSourceFilter = sourceWhereClause(opts, 'source');
   const summarySourceFilter = sourceWhereClause(opts, 's.source');
-  const usageDays = db.prepare(`
+  const usageDays = db.prepare<unknown[], { day: string | null; tokens: number | null }>(`
     WITH usage_events AS (
       SELECT timestamp, input_tokens, output_tokens
       FROM messages
@@ -1039,7 +1050,7 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
 const EXPORT_WIDTH = 540;
 const EXPORT_HEIGHT = 675;
 
-async function createExportCapture(parentWin, query) {
+async function createExportCapture(query: string) {
   const exportWin = new BrowserWindow({
     width: EXPORT_WIDTH,
     height: EXPORT_HEIGHT,
@@ -1068,7 +1079,7 @@ async function createExportCapture(parentWin, query) {
   return image;
 }
 
-async function waitForExportReady(webContents, timeoutMs = 2500) {
+async function waitForExportReady(webContents: Electron.WebContents, timeoutMs = 2500) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
@@ -1086,7 +1097,7 @@ ipcMain.handle('capture:export', async (event, { cardIdx, archetype, filename } 
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return null;
   const query = buildRecapExportQuery({ cardIdx, archetype, filename });
-  const image = await createExportCapture(win, query);
+  const image = await createExportCapture(query);
   const { filePath } = await dialog.showSaveDialog(win, {
     defaultPath: `obelisk-recap-${cardIdx + 1}.png`,
     filters: [{ name: 'PNG', extensions: ['png'] }],
@@ -1100,7 +1111,7 @@ ipcMain.handle('capture:copy', async (event, { cardIdx, archetype, filename } = 
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return false;
   const query = buildRecapExportQuery({ cardIdx, archetype, filename });
-  const image = await createExportCapture(win, query);
+  const image = await createExportCapture(query);
   clipboard.writeImage(image);
   return true;
 });
@@ -1141,7 +1152,7 @@ function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_P
   return result.settings;
 }
 
-function savePersistedSettings(settings) {
+function savePersistedSettings(settings: PersistedProviderSettings) {
   if (!fs.existsSync(path.dirname(SETTINGS_PATH))) {
     fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
   }
@@ -1182,7 +1193,7 @@ ipcMain.handle('settings:get', async () => {
 
   if (db) {
     try {
-      const rows = db.prepare(`
+      const rows = db.prepare<[], { source: string; session_count: number; last_indexed: string | null }>(`
         SELECT COALESCE(source, 'claude') AS source,
                COUNT(*) AS session_count,
                MAX(started_at) AS last_indexed
@@ -1195,7 +1206,7 @@ ipcMain.handle('settings:get', async () => {
           lastIndexed: row.last_indexed || '',
         });
       }
-      memoryCount = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
+      memoryCount = db.prepare<[], CountRow>('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
     } catch (error) {
       // Settings stays usable so the user can repoint sources or rebuild; the zero counts
       // must not pass for an empty index.

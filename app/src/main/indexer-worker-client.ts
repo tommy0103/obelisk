@@ -4,6 +4,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
+import type { buildIndex as buildIndexInWorker } from './indexer.ts';
+import type { RawLookup } from '../../../packages/core/src/providers/types.ts';
+
+type BuildIndexArgs = NonNullable<Parameters<typeof buildIndexInWorker>[0]>;
+type BuildIndexResult = ReturnType<typeof buildIndexInWorker>;
+type WorkerOperation = 'buildIndex' | 'readZcodeMessageText' | 'readHermesMessageText' | 'readKiroMessageText' | 'readOpencodeMessageText';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -64,16 +70,17 @@ function createWorkerBuildIndex({
     return active;
   };
 
-  const request = (operation: 'buildIndex' | 'readZcodeMessageText' | 'readHermesMessageText' | 'readKiroMessageText' | 'readOpencodeMessageText', args: Record<string, unknown>) => new Promise((resolve, reject) => {
+  // The worker answers each operation with that operation's return value (indexer-worker.ts).
+  const request = <Result>(operation: WorkerOperation, args: object) => new Promise<Result>((resolve, reject) => {
     const id = nextId++;
-    pending.set(id, { resolve, reject });
+    pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
     ensureWorker().postMessage({ id, operation, args });
   });
-  const buildIndex = (args: Record<string, unknown> = {}) => request('buildIndex', args);
-  const readZcodeMessageText = (args: Record<string, unknown>) => request('readZcodeMessageText', args);
-  const readHermesMessageText = (args: Record<string, unknown>) => request('readHermesMessageText', args);
-  const readKiroMessageText = (args: Record<string, unknown>) => request('readKiroMessageText', args);
-  const readOpencodeMessageText = (args: Record<string, unknown>) => request('readOpencodeMessageText', args);
+  const buildIndex = (args: BuildIndexArgs = {}) => request<BuildIndexResult>('buildIndex', args);
+  const readZcodeMessageText = (args: RawLookup) => request<string | null>('readZcodeMessageText', args);
+  const readHermesMessageText = (args: RawLookup) => request<string | null>('readHermesMessageText', args);
+  const readKiroMessageText = (args: RawLookup & { rootDir?: string }) => request<string | null>('readKiroMessageText', args);
+  const readOpencodeMessageText = (args: RawLookup) => request<string | null>('readOpencodeMessageText', args);
 
   const stop = () => {
     const current = worker;
