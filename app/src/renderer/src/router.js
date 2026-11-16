@@ -16,6 +16,7 @@ const RecapDetail = () => import('./views/RecapDetail.vue');
 const RecapExport = () => import('./views/RecapExport.vue');
 const Settings = () => import('./views/Settings.vue');
 
+/** @type {import('vue-router').RouteRecordRaw[]} */
 const routes = [
   {
     path: '/sessions',

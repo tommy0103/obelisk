@@ -58,7 +58,7 @@ window.obelisk?.onIndexUpdated?.(() => {
   reportGlobalRefreshFailure(globalDataRefresh.invalidate());
 });
 
-window.obelisk?.onSessionUpdated?.(({ sessionId } = {}) => {
+window.obelisk?.onSessionUpdated?.(({ sessionId }) => {
   const route = router.currentRoute.value;
   const currentSessionId = route.name === 'SessionDetail' ? String(route.params.id || '') : null;
   noteSessionUpdated(sessionLiveState, sessionId, currentSessionId);

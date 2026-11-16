@@ -11,7 +11,7 @@
   "scripts": {
     "pretest": "npm run build:core && npm run build:cli && npm run build --workspace @obelisk/dsh-obelisk-plugin",
     "test": "node --experimental-test-module-mocks --test tests/*.test.mjs",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json && npm --prefix app run typecheck",
     "lint": "eslint . && knip",
     "build:core": "npm run build --workspace @obelisk/core",
     "build:cli": "npm run build --workspace @obelisk-apps/cli",

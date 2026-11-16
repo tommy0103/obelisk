@@ -21,8 +21,6 @@ function onKeydown(e) {
 onMounted(() => window.addEventListener('keydown', onKeydown));
 onUnmounted(() => window.removeEventListener('keydown', onKeydown));
 
-const homePath = (typeof process !== 'undefined' && process.env?.HOME) || '~';
-
 const showProjectPrefix = computed(() => state.projectFilter === 'all');
 const showNoise = ref(false);
 const scrollElement = ref(null);
@@ -198,7 +196,7 @@ function obeliskStyle(session) {
         </div>
         <div class="help-row">
           <span class="label">searched</span>
-          <code>{{ homePath }}</code>
+          <code>~</code>
         </div>
       </div>
     </div>
@@ -211,7 +209,7 @@ function obeliskStyle(session) {
 
     <div v-else ref="scrollElement" class="session-scroll">
       <div class="session-list" :style="{ height: `${totalSize}px` }">
-        <div v-for="item in virtualRows" :key="item.key" :data-index="item.index"
+        <div v-for="item in virtualRows" :key="item.index" :data-index="item.index"
           class="virtual-row" :style="{ transform: `translateY(${item.start}px)` }">
           <template v-if="rowAt(item.index)">
             <div :class="['srow', { noise: item.index > totals.normal, cursor: state.cursorId === rowAt(item.index).id }]"
