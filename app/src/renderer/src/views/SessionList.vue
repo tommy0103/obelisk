@@ -178,6 +178,7 @@ function obeliskStyle(session) {
 
 <template>
   <div class="session-list-wrap">
+    <!-- Empty state: no data source / debug toggle -->
     <div v-if="state.loaded && (debugEmpty || (!catalogueLoading && !itemCount && !state.query && !state.stats.sessions))" class="empty-content">
       <div class="empty-eyebrow">
         <span class="diamond"></span>
@@ -212,6 +213,7 @@ function obeliskStyle(session) {
       </div>
     </div>
 
+    <!-- Empty state: search returned nothing -->
     <div v-else-if="state.loaded && !catalogueLoading && !itemCount" class="empty">
       No sessions here.
       <span class="hint">{{ state.query ? 'Try a different search term.' : 'Press / to search.' }}</span>
