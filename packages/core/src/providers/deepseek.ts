@@ -177,8 +177,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-// ---- log reading ----
-
 /** Decode complete frames [fromFrame, frames.length) into plaintext. */
 function decodeFrames(buffer: Buffer, frames: Array<{ start: number; end: number }>, fromFrame: number): string {
   if (fromFrame >= frames.length) return '';
@@ -256,8 +254,6 @@ function readLogRecords(plaintext: string): LogRecord[] {
   }
   return records;
 }
-
-// ---- content helpers ----
 
 function joinPartText(content: unknown, partType: string): string | null {
   if (!Array.isArray(content)) return null;
@@ -989,8 +985,6 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   return units;
 }
 
-// ---- cursor checkpoint ----
-
 /** Everything the incremental parse carries about ONE member file, as a single
  * record (ADR-0014, revised): the fast-path preconditions, the parent-chain
  * seed, and the emitted-anchor bookkeeping always appear and travel together.
@@ -1701,8 +1695,6 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   yield* [...others, ...messages];
   return encodeCursor(maxMtime, totalCount, nextState);
 }
-
-// ---- raw ----
 
 function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   const uuid = input.messageUuid;
