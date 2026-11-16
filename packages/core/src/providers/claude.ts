@@ -55,7 +55,7 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
     || Number(parts[4]) !== stat.ino;
 }
 
-export const name = 'claude';
+const name = 'claude';
 // v6 composes v5 canonical timestamp repair with orphan-family session rows.
 // Existing installs must replay once even when their family cursors are current.
 export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v6__';
@@ -227,10 +227,6 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   }
   return [...transcriptUnits, ...orphanUnits, ...workflowUnits.filter(unit =>
     !orphanMembers.has(join(projectsDir, unit.project!, unit.sessionId, 'subagents')))];
-}
-
-export function discover(ctx: DiscoverContext): IndexUnit[] {
-  return discoverAt(join(homedir(), '.claude'), ctx);
 }
 
 function toolResultText(content: unknown): string {
@@ -675,5 +671,3 @@ export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: {
     raw: rawClaude,
   };
 }
-
-export const claudeProvider = createClaudeProvider();

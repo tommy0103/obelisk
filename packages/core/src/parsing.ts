@@ -536,12 +536,12 @@ function codexToolOutput(payload: JsonRecord): string | null {
 }
 
 export {
-  CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
+  CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes, readCodexBufferLines, readCodexLines,
-  legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
+  normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue, normalizeTranscriptTimestamp,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
-  readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole, parseCodexJsonInput,
+  readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole,
   codexUsage, codexEventText, codexMessagePayloadText, codexVisibleMessageKey, codexToolInput, codexToolOutput,
 };

@@ -11,14 +11,4 @@ export const PALETTES = {
   wanderer:     { tc: '#64748b', tc2: '#94a3b8', glow: 'rgba(100,116,139,0.45)', mid: 'rgba(100,116,139,0.25)', soft: 'rgba(100,116,139,0.12)' },
 };
 
-export const ARCHETYPE_NAMES = {
-  architect: 'The Architect',
-  debugger: 'The Debugger',
-  shipper: 'The Shipper',
-  curator: 'The Curator',
-  director: 'The Director',
-  cartographer: 'The Cartographer',
-  wanderer: 'The Wanderer',
-};
-
 export const ARCH_KEYS = ['architect', 'debugger', 'shipper', 'curator', 'director', 'cartographer', 'wanderer'];

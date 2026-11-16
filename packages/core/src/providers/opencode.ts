@@ -31,7 +31,6 @@ import { parseV1, parseV2, fingerprintSession } from './opencode-project.ts';
 import { checkIsSubagent, sourceTables, readSessionEntry, observeSessions, observeSession, transcriptSchema } from './opencode-source.ts';
 import type { SessionMessageRow, MessageRow, PartRow } from './opencode-source.ts';
 import { isRecord, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
-export { parseModelRef } from './opencode-decode.ts';
 
 import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey, opencodeObservationKey, opencodeObservationProofKey } from './opencode-identity.ts';
 export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
@@ -49,8 +48,8 @@ import type {
   WatchTarget,
 } from './types.ts';
 
-export const name = 'opencode';
-export const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transcript_v3__';
+const name = 'opencode';
+const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transcript_v3__';
 
 const TOMBSTONE_CURSOR = '0:0:v1:tombstone';
 
@@ -64,7 +63,7 @@ export function defaultOpencodeDataRoot(homeDir = homedir()): string {
   return join(homeDir, '.local', 'share', 'opencode');
 }
 
-export function resolveOpencodeRoot(
+function resolveOpencodeRoot(
   rootDir: string | undefined,
   homeDir: string = homedir(),
 ): { rootDir: string; singleDbFile?: string } {
@@ -97,11 +96,11 @@ export function isValidChannelDbName(filename: string): boolean {
   return /^opencode-[a-zA-Z0-9._-]+\.db$/.test(filename);
 }
 
-export function isValidChannelWalName(filename: string): boolean {
+function isValidChannelWalName(filename: string): boolean {
   return /^opencode-[a-zA-Z0-9._-]+\.db-wal$/.test(filename);
 }
 
-export function isOpencodeStoreOrWalFile(filename: string): boolean {
+function isOpencodeStoreOrWalFile(filename: string): boolean {
   return (
     filename === 'opencode.db'
     || filename === 'opencode.db-wal'
