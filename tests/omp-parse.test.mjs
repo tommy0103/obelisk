@@ -108,7 +108,8 @@ test('OMP title prelude updates the title without changing session identity', ()
   const updated = FIXTURE.replace('OMP indexed title', 'Updated OMP title');
   writeFileSync(path, updated);
 
-  const secondUnit = provider.discover({ lastCursor: () => first.cursor })[0];
+  // Same-length rewrite in the same clock tick: only the watcher hint can see it (ADR-0001).
+  const secondUnit = provider.discover({ lastCursor: () => first.cursor, changedPaths: [path] })[0];
   const second = drain(provider.parse(secondUnit, first.cursor));
   const session = second.values.find(record => record.kind === 'session');
   assert.equal(secondUnit.sessionId, firstUnit.sessionId);
