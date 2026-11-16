@@ -17,7 +17,16 @@
       "ignoreDependencies": ["better-sqlite3", "vue", "@tanstack/vue-virtual", "@deepseek-ai/.+"]
     },
     "app": {
-      "entry": ["src/main/*.ts", "src/preload/index.ts", "src/renderer/src/main.js", "tests/*.mjs", "scripts/*.mjs", "electron.vite.config.ts"],
+      // Runtime entries only: the main process, the indexer worker (started by
+      // path from indexer-worker-client.ts), preload and renderer. The other
+      // rollup inputs in electron.vite.config.ts are imported from index.ts,
+      // so knip reaches them and still checks their exports. A main-process
+      // file nothing imports is reported as unused.
+      "entry": [
+        "src/main/index.ts", "src/main/indexer-worker.ts",
+        "src/preload/index.ts", "src/renderer/src/main.js",
+        "tests/*.mjs", "scripts/*.mjs", "electron.vite.config.ts"
+      ],
       "project": ["src/**/*.{ts,js,mjs,vue}", "tests/**/*.mjs"],
       // @parcel/watcher is loaded by packages/adaptive-watcher, which the app
       // bundles from source; the packaged app must still ship it.
