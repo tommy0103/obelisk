@@ -225,9 +225,11 @@ interactions, or the full Electron suites.
   Decode the specific entities your markdown library actually emits, escape on
   the way out, and pin "decode exactly once" with a test (`&amp;lt;` must stay
   `&lt;`). ESLint rejects new `innerHTML`/`outerHTML`/`insertAdjacentHTML` sinks
-  in renderer modules; `.vue` templates (`v-html`) are not linted.
+  in renderer modules; `tests/app-source-budgets.test.mjs` caps `v-html` in
+  `.vue` templates at its current count.
 - **No synchronous IO in the main process.** A network mount or UNC path freezes
-  the whole UI. Use `fs.promises`.
+  the whole UI. Use `fs.promises`. `tests/app-source-budgets.test.mjs` fails
+  when a main-process module adds a `*Sync(` call.
 - **Do not broaden interception beyond your feature.** Catching every `file:`
   navigation when you only meant to handle markdown links affects everyone else.
 - **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
