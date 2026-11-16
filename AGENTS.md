@@ -52,6 +52,7 @@ the prose. `npm run lint` runs ESLint over every tracked JS/TS file (including
 | Main process never calls `shell.openPath` | ESLint `no-restricted-properties` |
 | Renderer images never use `loading="lazy"` | `tests/renderer-virtualized-rows.test.mjs` |
 | No new synchronous IO in main-process modules, no new `v-html` | Budgets in `tests/app-source-budgets.test.mjs`; lower them when you remove a use |
+| Tests make temp directories with `makeTempDir()` (realpath, removed on exit), never `os.tmpdir()` | ESLint `no-restricted-imports`/`no-restricted-properties` on `tests/**`; `tests/temp-dirs.test.mjs` |
 | Every `app/tests/electron-*.mjs` suite runs in `test:electron:all` | `app/tests/run-electron-suites.mjs` discovers suites by name |
 | `schema.sql` changes are deliberate | sha256 pin in `tests/provider-schema-stability.test.mjs` |
 

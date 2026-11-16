@@ -22,6 +22,10 @@ function htmlSinkSelectors(node, member, names) {
   ].map(selector => ({ selector, message: htmlSinkMessage }));
 }
 
+// Raw tmpdir() paths leak (ENOSPC) and differ from realpath on macOS, where
+// /var/folders is a symlink to /private/var/folders.
+const tmpdirMessage = 'Use makeTempDir() from tests/temp-dirs.mjs: it returns a realpath and removes the directory when the test process exits.';
+
 export default tseslint.config(
   {
     ignores: [
@@ -83,6 +87,16 @@ export default tseslint.config(
         property: 'openPath',
         message: 'macOS executes .app/.command/.sh files passed to shell.openPath. Resolve transcript paths with resolveFileReference() in file-reference.ts and open them in the editor.',
       }],
+    },
+  },
+  {
+    files: ['tests/**/*.{js,mjs,ts}'],
+    ignores: ['tests/temp-dirs.mjs'],
+    rules: {
+      'no-restricted-imports': ['error', ...['os', 'node:os'].map(name => ({
+        name, importNames: ['tmpdir'], message: tmpdirMessage,
+      }))],
+      'no-restricted-properties': ['error', { object: 'os', property: 'tmpdir', message: tmpdirMessage }],
     },
   },
 );
