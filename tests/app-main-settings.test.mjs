@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
@@ -2436,8 +2436,9 @@ test('settings reports an unreadable index instead of showing empty counts', asy
 test('opening a file reference surfaces an index failure instead of refusing silently', async () => {
   let project;
   const { ipcHandlers, openedUrls, breakIndex, cleanup } = await loadMainOverRealIndex((setup, home) => {
-    project = join(home, 'project');
-    mkdirSync(project, { recursive: true });
+    mkdirSync(join(home, 'project'), { recursive: true });
+    // Containment compares the file's realpath; macOS temp dirs sit behind /var -> /private/var.
+    project = realpathSync(join(home, 'project'));
     writeFileSync(join(project, 'notes.txt'), 'x');
     setup.prepare('INSERT INTO sessions (id, project_path) VALUES (?, ?)').run('ref-session', project);
     setup.prepare(`INSERT INTO messages (uuid, session_id, type, cwd) VALUES ('ref-m1', 'ref-session', 'user', ?)`)
