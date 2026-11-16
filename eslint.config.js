@@ -11,6 +11,17 @@ import tseslint from 'typescript-eslint';
 
 const unusedVars = ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }];
 
+const htmlSinkMessage = 'Transcript text is attacker-controlled. Build markup with renderMarkdown()/escapeHTML() in utils.js or DOM APIs.';
+
+// el.innerHTML, el['innerHTML'] and el[`innerHTML`] name the same sink.
+function htmlSinkSelectors(node, member, names) {
+  return [
+    `${node}[${member}.property.name=${names}]`,
+    `${node}[${member}.property.value=${names}]`,
+    `${node}[${member}.property.expressions.length=0][${member}.property.quasis.0.value.cooked=${names}]`,
+  ].map(selector => ({ selector, message: htmlSinkMessage }));
+}
+
 export default tseslint.config(
   {
     ignores: [
@@ -59,14 +70,8 @@ export default tseslint.config(
     rules: {
       // CONTRIBUTING: transcript content is attacker-controlled.
       'no-restricted-syntax': ['error',
-        {
-          selector: "AssignmentExpression[left.property.name=/^(innerHTML|outerHTML)$/]",
-          message: 'Transcript text is attacker-controlled. Build markup with renderMarkdown()/escapeHTML() in utils.js or DOM APIs.',
-        },
-        {
-          selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
-          message: 'Transcript text is attacker-controlled. Build markup with renderMarkdown()/escapeHTML() in utils.js or DOM APIs.',
-        },
+        ...htmlSinkSelectors('AssignmentExpression', 'left', '/^(innerHTML|outerHTML)$/'),
+        ...htmlSinkSelectors('CallExpression', 'callee', "/^insertAdjacentHTML$/"),
       ],
     },
   },
