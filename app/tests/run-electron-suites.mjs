@@ -17,6 +17,7 @@ const suites = [
   'electron-session-catalogue.mjs',
   'electron-file-references.mjs',
   'electron-updates.mjs',
+  'electron-markdown-rendering.mjs',
 ]
 
 const failed = []
