@@ -796,7 +796,6 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
     await Promise.resolve(indexerWorker.stop());
     indexerWorker = createWorkerBuildIndex();
   }
-  cleanupDbFiles(tempDbPath);
   let writerLease: ReturnType<typeof acquireWriterLease> = null;
   let rebuildWatchHints: string[] = [];
   try {
