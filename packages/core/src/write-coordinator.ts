@@ -7,6 +7,7 @@
 // without a scheduler (e.g. attune) may opt in via retryOnBeginBusy.
 
 import { runWriteTransaction, type WriteTxDb, type WriteTxOptions } from './tx.ts';
+import { syncSleep } from './writer-lease.ts';
 
 interface TransactionDiagnostics {
   phase?: string;
@@ -34,15 +35,6 @@ function diagnostics(error: unknown): TransactionDiagnostics | null {
 
 function isBusyCode(code: unknown): boolean {
   return typeof code === 'string' && code.startsWith('SQLITE_BUSY');
-}
-
-function syncSleep(ms: number): void {
-  if (ms <= 0) return;
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    // Bounded attempts still prevent an infinite retry loop.
-  }
 }
 
 export function isBeginBusyFailure(error: unknown): boolean {
