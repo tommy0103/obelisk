@@ -4,20 +4,20 @@
 // remembers it is there.
 
 import { spawnSync } from 'node:child_process'
+import { readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import electron from 'electron'
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const suites = [
-  'electron-concurrency.mjs',
-  'electron-session-images.mjs',
-  'electron-session-virtualization.mjs',
-  'electron-session-reader-state.mjs',
-  'electron-session-catalogue.mjs',
-  'electron-file-references.mjs',
-  'electron-updates.mjs',
-]
+// Every tests/electron-*.mjs is a suite unless it is listed here.
+const notSuites = new Set([
+  'electron-concurrency-child.mjs', // spawned by electron-concurrency.mjs
+  'electron-vite-schema-asset.mjs', // a node --test file run directly by CI
+])
+const suites = readdirSync(path.join(appRoot, 'tests'))
+  .filter(name => /^electron-.+\.mjs$/.test(name) && !notSuites.has(name))
+  .sort()
 
 const failed = []
 for (const suite of suites) {
