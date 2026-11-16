@@ -62,8 +62,8 @@ import type {
   WatchTarget,
 } from './types.ts';
 
-export const name = 'zcode';
-export const ZCODE_CANONICAL_TRANSCRIPT_MARKER = '__zcode_canonical_transcript_v3__';
+const name = 'zcode';
+const ZCODE_CANONICAL_TRANSCRIPT_MARKER = '__zcode_canonical_transcript_v3__';
 
 const BUSY_TIMEOUT_MS = 500;
 const require = createRequire(import.meta.url);
@@ -998,5 +998,3 @@ export function createZcodeProvider({
     raw: (input) => raw(input, openDatabase),
   };
 }
-
-export const zcodeProvider = createZcodeProvider();

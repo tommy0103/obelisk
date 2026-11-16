@@ -7,7 +7,7 @@ export function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-export function parseJson(text: unknown): JsonRecord | null {
+function parseJson(text: unknown): JsonRecord | null {
   if (typeof text !== 'string' || text.length === 0) return null;
   try {
     const value: unknown = JSON.parse(text);
