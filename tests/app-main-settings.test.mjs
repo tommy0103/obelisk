@@ -2286,7 +2286,9 @@ test('a save is refused and the file left alone when the rejected file cannot be
       rmSync(join(obeliskDir, 'write-probe'), { force: true });
       t.skip('a mode-0555 directory does not block a rename here');
       return;
-    } catch {}
+    } catch {
+      // Expected: the read-only directory refused the rename.
+    }
 
     await assert.rejects(
       () => ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed'),

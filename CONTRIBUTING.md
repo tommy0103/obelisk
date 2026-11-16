@@ -235,6 +235,12 @@ interactions, or the full Electron suites.
 - **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
   `checkJs: false`, so a `.mjs` module has no type coverage at all.
 
+## Swallowed errors
+
+- **An empty `catch` needs a comment saying why swallowing is correct.** ESLint
+  (`no-empty`) rejects a bare `catch {}`. If you cannot write that comment, the
+  error is real: let it propagate, or report it where the user will see it.
+
 ## CLI and tool error messages
 
 State what failed and the known cause, with only the context needed to diagnose

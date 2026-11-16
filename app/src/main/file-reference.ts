@@ -65,7 +65,9 @@ function resolveFileReference(query: FileReferenceQuery): string | null {
       const real = fs.realpathSync(candidate);
       if (!isWithinRoots(real, roots)) continue;
       if (fs.statSync(real).isFile()) return real;
-    } catch {}
+    } catch {
+      // Missing or unreadable candidate: try the next one.
+    }
   }
   return null;
 }

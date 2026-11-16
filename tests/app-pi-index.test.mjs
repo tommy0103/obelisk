@@ -125,7 +125,9 @@ test('an unreadable Pi directory does not block readable sessions on a fresh ind
       readdirSync(lockedDir);
       t.skip('current user can read mode-000 directories');
       return;
-    } catch {}
+    } catch {
+      // Expected: the mode-000 directory refused the read.
+    }
 
     const options = indexOptions(home, piDir);
     const first = buildIndex(options);
@@ -198,7 +200,9 @@ test('an incomplete Pi identity census preserves committed provenance over a rea
       readdirSync(lockedDir);
       t.skip('current user can read mode-000 directories');
       return;
-    } catch {}
+    } catch {
+      // Expected: the mode-000 directory refused the read.
+    }
 
     const partial = buildIndex(options);
     assert.equal(partial.complete, false);

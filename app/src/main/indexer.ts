@@ -154,7 +154,9 @@ function sessionIdFromChangedPath(projectsDir, changedPath) {
 function checkpointDb(db, mode = 'PASSIVE') {
   try {
     db.pragma(`wal_checkpoint(${mode})`);
-  } catch {}
+  } catch {
+    // The build already committed; a failed checkpoint only leaves the WAL larger.
+  }
 }
 
 function writeIndexMarker(db, key, value = Date.now()) {

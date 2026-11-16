@@ -81,7 +81,9 @@ function detectClaudeDir() {
         const claudeDir = path.join(homePath, user, '.claude');
         if (fs.existsSync(claudeDir)) return claudeDir;
       }
-    } catch {}
+    } catch {
+      // Unreadable WSL home: try the next distro.
+    }
   }
   // Fallback: native Windows path (for future native Claude Code on Windows)
   return path.join(os.homedir(), '.claude');
@@ -193,7 +195,9 @@ function cleanupDbFiles(dbPath) {
   for (const filePath of dbFileSet(dbPath)) {
     try {
       fs.rmSync(filePath, { force: true });
-    } catch {}
+    } catch {
+      // Rebuild temp names are unique, so a leftover only wastes disk.
+    }
   }
 }
 
@@ -1070,7 +1074,9 @@ async function waitForExportReady(webContents, timeoutMs = 2500) {
     try {
       const ready = await webContents.executeJavaScript('window.__OBELISK_RECAP_EXPORT_READY__ === true', true);
       if (ready) return true;
-    } catch {}
+    } catch {
+      // The export page is still loading; poll until the timeout.
+    }
     await new Promise(r => setTimeout(r, 50));
   }
   return false;
@@ -1147,7 +1153,9 @@ function savePersistedSettings(settings) {
   } catch (error) {
     try {
       fs.unlinkSync(temporaryPath);
-    } catch {}
+    } catch {
+      // The temp file may never have been written; report the original error.
+    }
     throw error;
   }
 }
