@@ -4,8 +4,6 @@
 import { state } from './store.js';
 import { markFileReferences, mayContainFileReference } from './file-references.mjs';
 
-// --- Time / formatting ---
-
 function pad2(n) { return String(n).padStart(2, '0'); }
 
 function isSameDay(a, b) {
@@ -38,8 +36,6 @@ export function fmtClockTime(iso) {
   const d = new Date(iso);
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
-
-// --- HTML / Markdown ---
 
 export function escapeHTML(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -105,8 +101,6 @@ export function renderMarkdown(text, opts = {}) {
   return container.outerHTML;
 }
 
-// --- Duration / tokens / tooltip ---
-
 export function fmtDuration(ms) {
   if (!ms) return '—';
   const s = Math.floor(ms / 1000);
@@ -148,8 +142,6 @@ export function positionTooltip(el, x, y) {
   el.style.left = left + 'px';
   el.style.top = (y - 28) + 'px';
 }
-
-// --- Project label ---
 
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';

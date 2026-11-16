@@ -624,8 +624,6 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// --- IPC Handlers ---
-
 function querySessionMessages(sessionId: string): SessionMessageRow[] {
   if (!db) return [];
   return db.prepare(`
@@ -1040,8 +1038,6 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   return { daily, totalTokens, peakDay, longestTurn };
 });
 
-// --- Capture ---
-
 const EXPORT_WIDTH = 540;
 const EXPORT_HEIGHT = 675;
 
@@ -1123,8 +1119,6 @@ ipcMain.handle('win:control', (event, action: WindowControlAction) => {
   }
 });
 
-// --- Recap files ---
-
 ipcMain.handle('recap:list', () => {
   if (!fs.existsSync(RECAP_DIR)) return [];
   return fs.readdirSync(RECAP_DIR)
@@ -1140,8 +1134,6 @@ ipcMain.handle('recap:read', (_, filename) => {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   } catch { return null; }
 });
-
-// --- Settings ---
 
 function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';

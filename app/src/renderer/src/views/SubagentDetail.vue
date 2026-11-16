@@ -69,7 +69,6 @@ function renderMsgMarkdown(msg, text, variant) {
           :class="[msg.type === 'user' ? 'user' : 'assistant']"
           :data-uuid="msg.uuid"
         >
-          <!-- Thinking -->
           <template v-if="msg.content_type === 'thinking'">
             <div class="msg-thinking">
               <button class="thinking-toggle" @click="$event.currentTarget.closest('.msg-thinking').classList.toggle('open')">
@@ -80,7 +79,6 @@ function renderMsgMarkdown(msg, text, variant) {
             </div>
           </template>
 
-          <!-- Meta -->
           <template v-else-if="msg.is_meta">
             <div class="msg-meta-collapsed">
               <button class="meta-toggle" @click="$event.currentTarget.closest('.msg-meta-collapsed').classList.toggle('open')">
@@ -92,7 +90,6 @@ function renderMsgMarkdown(msg, text, variant) {
             </div>
           </template>
 
-          <!-- Normal message -->
           <template v-else>
             <div class="msg-head">
               <span class="role">{{ msg.type === 'user' ? 'Prompt' : 'Assistant' }}</span>
@@ -113,7 +110,6 @@ function renderMsgMarkdown(msg, text, variant) {
               @click="handleLoadFull(msg.uuid, $event.currentTarget)"
             >Message truncated — click to load full text</button>
 
-            <!-- Tool calls -->
             <div v-if="msg.tool_calls?.length" class="msg-tools">
               <div v-for="tc in msg.tool_calls" :key="tc.id" class="msg-tool" :class="{ 'is-error': tc.result?.is_error }">
                 <button class="toolcall-toggle" @click="$event.currentTarget.closest('.msg-tool').classList.toggle('open')">
