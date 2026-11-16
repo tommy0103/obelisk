@@ -11,7 +11,6 @@ defineOptions({ name: 'Activity' });
 
 const router = useRouter();
 
-// --- State ---
 const activeTab = ref('daily');
 const loading = ref(true);
 const usageData = reactive({ daily: [], totalTokens: 0, peakDay: null, longestTurn: null });
@@ -55,10 +54,8 @@ function changeActivityPage(from, to, offset) {
   void fetchActivity(from, to, offset).catch(error => console.error('Failed to load activity sessions:', error));
 }
 
-// Tooltip
 const tooltip = reactive({ text: '', show: false, x: 0, y: 0 });
 
-// --- Constants ---
 const DAY_MS = 86400000;
 const NOISE_PROJECT_RE = /^(od-conn-test|[0-9a-f]{6,})/i;
 
@@ -85,7 +82,6 @@ function localDateStr(d) {
 const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const MONTHS_FULL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
-// --- Computed: heatmap grid ---
 const heatmapGrid = computed(() => {
   const today = new Date();
   let startDate = new Date(today.getTime() - 364 * DAY_MS);
@@ -118,7 +114,6 @@ const heatmapGrid = computed(() => {
   const gridWidth = (maxCol + 1) * step + 20;
   const gridHeight = 7 * step;
 
-  // Month labels
   const monthLabels = [];
   let lastMonth = -1;
   for (const c of cells) {
@@ -132,7 +127,6 @@ const heatmapGrid = computed(() => {
   return { cells, monthLabels, gridWidth, gridHeight, cellSize, step };
 });
 
-// --- Computed: streaks ---
 const currentStreak = computed(() => {
   const today = new Date();
   const dailyMap = {};
@@ -172,7 +166,6 @@ const longestStreak = computed(() => {
   return longest;
 });
 
-// --- Computed: weekly chart ---
 const weeklyBars = computed(() => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -222,7 +215,6 @@ const weeklyBars = computed(() => {
   return { bars, labels, chartWidth, chartHeight, barWidth, barGap };
 });
 
-// --- Computed: cumulative chart ---
 const cumulativeData = computed(() => {
   const sorted = [...usageData.daily].sort((a, b) => a.day.localeCompare(b.day));
   if (!sorted.length) return null;
@@ -257,7 +249,6 @@ const cumulativeData = computed(() => {
   return { linePath, areaPath, labels, dots, chartWidth, chartHeight };
 });
 
-// --- Computed: day sessions ---
 const daySessions = computed(() => {
   if (!selectedDayKey.value) return null;
   const dateKey = selectedDayKey.value;
@@ -283,7 +274,6 @@ const monthBlocksSplit = computed(() =>
   })
 );
 
-// --- Methods ---
 function switchTab(view) {
   activeTab.value = view;
 }
@@ -365,7 +355,6 @@ async function loadUsageStats() {
   }
 }
 
-// --- Lifecycle ---
 let stopUsageUpdates = () => {};
 
 onMounted(async () => {
@@ -387,7 +376,6 @@ onUnmounted(() => stopUsageUpdates());
 <template>
   <div class="usage-wrap" v-if="!loading">
     <div class="detail-wide">
-      <!-- Header with tabs -->
       <div class="usage-header">
         <span class="usage-title">Token activity</span>
         <div class="usage-view-tabs">
@@ -409,7 +397,6 @@ onUnmounted(() => stopUsageUpdates());
         </div>
       </div>
 
-      <!-- Stats bar -->
       <div class="usage-stats">
         <div class="usage-stat">
           <span class="usage-stat-value">{{ fmtTokens(usageData.totalTokens) }}</span>
@@ -433,7 +420,6 @@ onUnmounted(() => stopUsageUpdates());
         </div>
       </div>
 
-      <!-- Daily heatmap -->
       <div class="heatmap-container" v-show="activeTab === 'daily'">
         <svg
           class="heatmap"
@@ -476,7 +462,6 @@ onUnmounted(() => stopUsageUpdates());
         </div>
       </div>
 
-      <!-- Weekly bar chart -->
       <div class="chart-container" v-show="activeTab === 'weekly'">
         <svg
           class="weekly-chart"
@@ -506,7 +491,6 @@ onUnmounted(() => stopUsageUpdates());
         </svg>
       </div>
 
-      <!-- Cumulative line chart -->
       <div class="chart-container" v-show="activeTab === 'cumulative'">
         <template v-if="cumulativeData">
           <svg
@@ -539,7 +523,6 @@ onUnmounted(() => stopUsageUpdates());
         <div v-else class="empty">No data</div>
       </div>
 
-      <!-- Session activity ledger -->
       <section class="session-activity" v-if="daySessionsSplit">
         <div class="activity-month-heading">
           <h2>{{ daySessionsSplit.header }}</h2>
@@ -587,7 +570,6 @@ onUnmounted(() => stopUsageUpdates());
         <button v-if="loadedMonths > 6" class="show-more-btn" @click="loadedMonths = 0; showNextMonth()">Back to recent activity</button>
       </section>
 
-      <!-- Tooltip -->
       <div
         class="chart-tooltip"
         :class="{ show: tooltip.show }"

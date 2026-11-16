@@ -188,7 +188,6 @@ onUnmounted(() => { unsub?.(); });
       </div>
     </div>
 
-    <!-- Generate modal -->
     <div class="modal-backdrop" v-if="showGenerate" @click.self="showGenerate = false">
       <div class="modal">
         <div class="modal-head">

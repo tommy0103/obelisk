@@ -38,10 +38,7 @@ const routeSession = computed(() => {
   return getSessionSummary(route.params.id);
 });
 
-// --- Platform ---
 const platform = window.obelisk?.platform ?? null;
-
-// --- Sidebar data ---
 
 const activeCount = computed(() => state.memories.filter(m => !m.archived).length);
 const archivedCount = computed(() => state.memories.filter(m => m.archived).length);
@@ -77,8 +74,6 @@ const showNoiseProjects = ref(false);
 const totalProjectCount = computed(() => {
   return sidebarProjectsForCurrentScope('').length;
 });
-
-// --- Toolbar visibility ---
 
 const showToolbar = computed(() => {
   const r = route.name;
@@ -127,8 +122,6 @@ watch(() => windowTitle.value.scopeText, (scopeText) => {
   document.title = `${windowTitle.value.appName} — ${scopeText}`;
 }, { immediate: true });
 
-// --- Navigation helpers ---
-
 function handleSidebarRoute(routeName) {
   clearTimeout(searchTimer);
   resetListState();
@@ -161,8 +154,6 @@ function handleSidebarProject(slug) {
 function handleProjectSearch(e) {
   setProjectSearch(e.target.value);
 }
-
-// --- Search ---
 
 const searchInputRef = ref(null);
 function handleSearch(e) {
@@ -224,7 +215,6 @@ onUnmounted(() => {
 
 const isExportRoute = computed(() => route.name === 'RecapExport');
 
-// --- Source health dots ---
 const sourceDots = ref([]);
 const sourceDetails = ref([]);
 const showSourcePopover = ref(false);
@@ -237,13 +227,11 @@ async function loadSourceDots() {
 }
 loadSourceDots();
 
-// --- Recap ---
 const recapGenerateOpen = ref(false);
 function setRecapKind(k) {
   router.replace({ path: '/recap', query: { kind: k } });
 }
 
-// --- Source filter ---
 const showSourceFilter = ref(false);
 const sourceFilterWrapRef = ref(null);
 const sourceFilterActive = computed(() => state.sourceFilter !== 'all' && state.sourceFilter !== undefined);
@@ -451,7 +439,6 @@ provide('recapGenerateOpen', recapGenerateOpen);
               <span class="badge">{{ p.count }}</span>
             </button>
 
-            <!-- Noise projects fold -->
             <button v-if="noiseProjects.length" class="project-fold" :class="{ expanded: showNoiseProjects }" @click="showNoiseProjects = !showNoiseProjects">
               <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 2.5l3 3.5-3 3.5"/></svg>
               <span class="label">{{ noiseProjects.length }} test projects hidden</span>
@@ -558,7 +545,6 @@ provide('recapGenerateOpen', recapGenerateOpen);
           </div>
           <div class="toolbar-spacer"></div>
 
-          <!-- Recap toolbar actions -->
           <template v-if="route.name === 'Recap'">
             <div class="tab-group">
               <button :class="{ active: (route.query.kind || 'weekly') === 'weekly' }" @click="setRecapKind('weekly')">Weekly</button>
@@ -570,7 +556,6 @@ provide('recapGenerateOpen', recapGenerateOpen);
             </button>
           </template>
 
-          <!-- Source filter (session list only, multi-source) -->
           <div
             v-if="showToolbar && route.name === 'SessionList' && sourceDots.length > 1"
             ref="sourceFilterWrapRef"

@@ -95,7 +95,6 @@ function onKeydown(e) {
 <template>
   <div class="recap-app" :style="cssVars" @keydown="onKeydown" tabindex="0">
 
-    <!-- Stage -->
     <div class="stage">
       <div class="deck">
         <div class="card-slot" :class="{ active: currentIdx === 0, prev: currentIdx > 0 }">
@@ -151,7 +150,6 @@ function onKeydown(e) {
       </div>
     </div>
 
-    <!-- Nav -->
     <div class="nav">
       <button class="nav-arrow" :disabled="currentIdx === 0" @click="goTo(currentIdx - 1)">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
