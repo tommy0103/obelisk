@@ -98,6 +98,8 @@ export function renderMarkdown(text, opts = {}) {
             : 'markdown-body';
   const container = document.createElement('div');
   container.className = cls;
+  // The one HTML sink: marked output after sanitizeMarkdown().
+  // eslint-disable-next-line no-restricted-syntax
   container.innerHTML = html;
   // Without a cwd or session to resolve against, a reference could never be opened — leaving it
   // unmarked keeps it from looking actionable.
