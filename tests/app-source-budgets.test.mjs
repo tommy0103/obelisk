@@ -32,9 +32,7 @@ function filesUnder(dir, extension) {
 // indexer.ts gets a budget, not an exemption: index.ts imports writeHeartbeat
 // from it, which runs on the main thread.
 const syncIoBudget = {
-  'index.ts': 18,
-  'session-queries.ts': 2,
-  'recap-handlers.ts': 5,
+  'index.ts': 11,
   'rebuild-db-files.ts': 6,
   'file-reference.ts': 2,
   'indexer.ts': 8,

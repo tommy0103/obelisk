@@ -84,7 +84,7 @@ export function registerRecapHandlers({
       filters: [{ name: 'PNG', extensions: ['png'] }],
     });
     if (!filePath) return null;
-    fs.writeFileSync(filePath, image.toPNG());
+    await fs.promises.writeFile(filePath, image.toPNG());
     return filePath;
   });
 
@@ -97,19 +97,24 @@ export function registerRecapHandlers({
     return true;
   });
 
-  ipcMain.handle('recap:list', () => {
-    if (!fs.existsSync(recapDir)) return [];
-    return fs.readdirSync(recapDir)
+  ipcMain.handle('recap:list', async () => {
+    let names: string[];
+    try {
+      names = await fs.promises.readdir(recapDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    return names
       .filter(f => f.endsWith('.json'))
       .sort()
       .reverse();
   });
 
-  ipcMain.handle('recap:read', (_, filename) => {
+  ipcMain.handle('recap:read', async (_, filename) => {
     const filePath = path.join(recapDir, path.basename(filename));
-    if (!fs.existsSync(filePath)) return null;
     try {
-      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      return JSON.parse(await fs.promises.readFile(filePath, 'utf-8'));
     } catch { return null; }
   });
 }
