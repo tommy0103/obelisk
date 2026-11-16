@@ -14,7 +14,7 @@ function rendererSources(dir) {
   return readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) return rendererSources(path);
-    return /\.(vue|js|mjs|html)$/.test(entry.name) ? [path] : [];
+    return /\.(vue|js|mjs|ts|html)$/.test(entry.name) ? [path] : [];
   });
 }
 

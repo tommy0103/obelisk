@@ -54,7 +54,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['app/src/renderer/**/*.{js,mjs}'],
+    files: ['app/src/renderer/**/*.{js,mjs,ts}'],
     languageOptions: { globals: { ...globals.browser } },
     rules: {
       // CONTRIBUTING: transcript content is attacker-controlled.
