@@ -1107,7 +1107,7 @@ async function run() {
     const codexExecOutput = ${JSON.stringify(codexExecOutput)};
     const trackedPrefixes = [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')]
       .map(element => element.getAttribute('data-uuid'))
-      .filter(uuid => /^message-\d+$/.test(uuid))
+      .filter(uuid => /^message-\\d+$/.test(uuid))
       .map(uuid => 'Message ' + uuid.slice('message-'.length) + ' ');
     let calls = 0;
     let codexExecCalls = 0;
@@ -1450,7 +1450,7 @@ async function run() {
     const targetText = ${JSON.stringify(updatedReaderText)};
     const unchangedPrefixes = [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')]
       .map(element => element.getAttribute('data-uuid'))
-      .filter(uuid => uuid !== targetUuid && /^message-\d+$/.test(uuid))
+      .filter(uuid => uuid !== targetUuid && /^message-\\d+$/.test(uuid))
       .map(uuid => 'Message ' + uuid.slice('message-'.length) + ' ');
     let targetCalls = 0;
     let unchangedCalls = 0;
