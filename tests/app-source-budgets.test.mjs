@@ -28,9 +28,11 @@ function filesUnder(dir, extension) {
 }
 
 // "No synchronous IO in the main process": a network mount or UNC path
-// freezes the whole UI. indexer.ts and indexer-worker.ts run in the worker.
-const syncIoBudget = { 'index.ts': 31, 'file-reference.ts': 2 };
-const workerModules = new Set(['indexer.ts', 'indexer-worker.ts']);
+// freezes the whole UI. indexer-worker.ts only runs in the worker thread.
+// indexer.ts gets a budget, not an exemption: index.ts imports writeHeartbeat
+// from it, which runs on the main thread.
+const syncIoBudget = { 'index.ts': 31, 'file-reference.ts': 2, 'indexer.ts': 8 };
+const workerModules = new Set(['indexer-worker.ts']);
 
 test('main-process modules do not add synchronous IO calls', () => {
   const over = [];
