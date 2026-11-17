@@ -4,7 +4,7 @@
 <script setup>
 import { computed } from 'vue';
 import { isTextTruncated } from '../data.js';
-import { buildSessionTimelinePresentation } from '../session-timeline-presentation.mjs';
+import { buildSessionTimelinePresentation, handleToolOutputClick } from '../session-timeline-presentation.mjs';
 import { fmtClockTime } from '../utils.js';
 
 const props = defineProps({
@@ -125,7 +125,7 @@ function navigateToSubagent(agentId, description = '') {
                 <span class="spacer"></span>
                 <button class="raw-toggle" :class="{ active: disclosures.isRaw(`tool:${tc.id}`) }" @click.stop="toggleRaw(`tool:${tc.id}`, msg.uuid)">{ } Raw</button>
               </div>
-              <div class="toolcall-pretty" :class="{ hidden: disclosures.isRaw(`tool:${tc.id}`) }" v-html="presentation.toolPrettyHtml.get(tc.id)"></div>
+              <div class="toolcall-pretty" :class="{ hidden: disclosures.isRaw(`tool:${tc.id}`) }" @click="handleToolOutputClick" v-html="presentation.toolPrettyHtml.get(tc.id)"></div>
               <div class="toolcall-raw" :class="{ show: disclosures.isRaw(`tool:${tc.id}`) }">
                 <div class="tc-section">Input</div>
                 <pre>{{ presentation.toolInputText.get(tc.id) }}</pre>
@@ -299,7 +299,7 @@ function navigateToSubagent(agentId, description = '') {
                   <span class="spacer"></span>
                   <button class="raw-toggle" :class="{ active: disclosures.isRaw(`tool:${tc.id}`) }" @click.stop="toggleRaw(`tool:${tc.id}`, msg.uuid)">{ } Raw</button>
                 </div>
-                <div class="toolcall-pretty" :class="{ hidden: disclosures.isRaw(`tool:${tc.id}`) }" v-html="presentation.toolPrettyHtml.get(tc.id)"></div>
+                <div class="toolcall-pretty" :class="{ hidden: disclosures.isRaw(`tool:${tc.id}`) }" @click="handleToolOutputClick" v-html="presentation.toolPrettyHtml.get(tc.id)"></div>
                 <div class="toolcall-raw" :class="{ show: disclosures.isRaw(`tool:${tc.id}`) }">
                   <div class="tc-section">Input</div>
                   <pre>{{ presentation.toolInputText.get(tc.id) }}</pre>
