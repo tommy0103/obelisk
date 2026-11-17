@@ -13,9 +13,9 @@ import {
 } from 'node:path';
 
 import {
+  getTextLimit,
   normalizeObservedCwd,
   projectSlugFromPath,
-  TEXT_LIMIT,
   trunc,
   truncJson,
 } from '../parsing.ts';
@@ -909,8 +909,9 @@ function bashPresentation(message: JsonRecord): { text: string; suffix: string }
 function bashText(message: JsonRecord): string {
   const { text, suffix } = bashPresentation(message);
   if (suffix.length === 0) return trunc(text);
-  if (suffix.length >= TEXT_LIMIT) return suffix.slice(0, TEXT_LIMIT);
-  return `${text.slice(0, TEXT_LIMIT - suffix.length)}${suffix}`;
+  const limit = getTextLimit();
+  if (suffix.length >= limit) return suffix.slice(0, limit);
+  return `${text.slice(0, limit - suffix.length)}${suffix}`;
 }
 
 function fullBashText(message: JsonRecord): string {
