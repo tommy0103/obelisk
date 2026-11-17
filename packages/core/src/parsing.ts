@@ -315,12 +315,15 @@ function discoverJsonlFiles(
     const projPath = join(projectsDir, proj);
     if (!isDir(projPath)) continue;
     let entries;
-    try { entries = readdirSync(projPath); } catch (error) { reportIssue?.(sourceInventoryIssue(projPath, error)); continue; }
-    for (const f of entries) {
+    try { entries = readdirSync(projPath, { withFileTypes: true }); } catch (error) { reportIssue?.(sourceInventoryIssue(projPath, error)); continue; }
+    for (const { name: f } of entries) {
       if (f.endsWith('.jsonl'))
         files.push({ path: join(projPath, f), sessionId: f.slice(0, -6), project: proj, isSubagent: false });
     }
-    for (const sd of entries) {
+    for (const entry of entries) {
+      // A regular file cannot hold subagents/; skip the stat.
+      if (entry.isFile()) continue;
+      const sd = entry.name;
       const saDir = join(projPath, sd, 'subagents');
       if (!isDir(saDir)) continue;
       let saEntries;
