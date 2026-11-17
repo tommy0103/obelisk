@@ -10,12 +10,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { TEXT_LIMIT, getTextLimit, setTextLimit, trunc, truncJson } from '../packages/core/src/parsing.ts';
+import { TEXT_LIMIT, extractMessageIsMeta, getTextLimit, setTextLimit, trunc, truncJson } from '../packages/core/src/parsing.ts';
 import { createClaudeProvider } from '../packages/core/src/providers/claude.ts';
 import { createPiProvider } from '../packages/core/src/providers/pi.ts';
+import { createOmpProvider } from '../packages/core/src/providers/omp.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const LONG = 25_000;
@@ -35,14 +36,14 @@ function parseOnly(provider) {
   return [...provider.parse(units[0], null)];
 }
 
-function claudeRecords() {
+function claudeRecords(createProvider = createClaudeProvider) {
   const root = makeTempDir('obelisk-text-limit-claude-');
   write(join(root, 'projects', '-tmp-project', 'sid-long.jsonl'), [
     { uuid: 'u1', type: 'user', timestamp: '2026-06-10T10:00:00Z', cwd: '/tmp/project', message: { role: 'user', content: PROSE } },
     { uuid: 'a1', type: 'assistant', parentUuid: 'u1', timestamp: '2026-06-10T10:00:05Z', message: { role: 'assistant', model: 'probe', content: [{ type: 'tool_use', id: 'tc1', name: 'Bash', input: { command: COMMAND } }] } },
     { uuid: 'u2', type: 'user', parentUuid: 'a1', timestamp: '2026-06-10T10:00:10Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tc1', content: OUTPUT }] } },
   ]);
-  const records = parseOnly(createClaudeProvider({ rootDir: root }));
+  const records = parseOnly(createProvider({ rootDir: root }));
   return {
     text: records.find(record => record.kind === 'message' && record.uuid === 'u1').text,
     command: JSON.parse(records.find(record => record.kind === 'tool_call').input_json).command,
@@ -50,7 +51,7 @@ function claudeRecords() {
   };
 }
 
-function piBashText() {
+function piBashText(overrides = {}, createProvider = createPiProvider) {
   const root = makeTempDir('obelisk-text-limit-pi-');
   write(join(root, 'project', 'session.jsonl'), [
     { type: 'session', version: 3, id: 'pi-text-limit', timestamp: '2026-08-02T10:00:00.000Z', cwd: '/tmp/pi-test-project' },
@@ -69,10 +70,11 @@ function piBashText() {
         truncated: true,
         fullOutputPath: '/tmp/must-not-be-read',
         timestamp: Date.parse('2026-08-02T10:00:07.000Z'),
+        ...overrides,
       },
     },
   ]);
-  const records = parseOnly(createPiProvider({ rootDir: root }));
+  const records = parseOnly(createProvider({ rootDir: root }));
   return records.find(record => record.kind === 'message' && record.role === 'bashExecution').text;
 }
 
@@ -133,4 +135,70 @@ test('setTextLimit rejects a limit that is not a positive integer or Infinity an
     assert.throws(() => setTextLimit(limit), RangeError);
   }
   assert.equal(getTextLimit(), TEXT_LIMIT);
+});
+
+test('changing the output limit preserves Claude command and skill classification', t => {
+  t.after(() => setTextLimit(TEXT_LIMIT));
+  const root = makeTempDir('obelisk-text-limit-classification-');
+  const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line)).find(record => record.type === 'user');
+  const samples = [
+    { content: '<command-name>/review</command-name>', isMeta: false, expected: [1, 'text'] },
+    { content: 'Base directory for this skill: /tmp/skill\nInstructions', isMeta: true, expected: [1, 'skill_instructions'] },
+    { content: [{ type: 'text', text: 'Base directory for this skill: /tmp/skill\nInstructions' }], isMeta: true, expected: [1, 'skill_instructions'] },
+    // Classification retains the default indexed semantics, including at a larger output limit.
+    { content: ' '.repeat(TEXT_LIMIT) + '<command-name>/review</command-name>', isMeta: false, expected: [0, 'text'] },
+  ];
+  // Derived stress inputs retain the captured provider envelope; content is intentionally varied.
+  const records = samples.map((sample, i) => ({
+    ...captured, uuid: `classification-${i}`, isMeta: sample.isMeta,
+    message: { ...captured.message, content: sample.content },
+  }));
+  write(join(root, 'projects', '-tmp-project', 'classification.jsonl'), records);
+  for (const limit of [1, 10, TEXT_LIMIT, Infinity]) {
+    setTextLimit(limit);
+    const messages = parseOnly(createClaudeProvider({ rootDir: root })).filter(record => record.kind === 'message');
+    assert.deepEqual(messages.map(record => [record.is_meta, record.content_type]), samples.map(sample => sample.expected));
+    assert.ok(messages.every(record => record.text.length <= limit));
+    assert.equal(extractMessageIsMeta(records[0]), 1);
+  }
+});
+
+for (const [source, createProvider] of [['pi', createPiProvider], ['omp', createOmpProvider]]) {
+  test(`${source} bash truncation preserves Unicode in the body and trailing notice`, t => {
+    t.after(() => setTextLimit(TEXT_LIMIT));
+    const suffix = '\n\nCommand exited with code 1';
+    for (const limit of [39, TEXT_LIMIT]) {
+      setTextLimit(limit);
+      const prefix = 'Ran `';
+      const commandPrefix = 'c'.repeat(limit - suffix.length - prefix.length - 1);
+      const text = piBashText({ command: `${commandPrefix}😀`, output: 'ok', exitCode: 1, truncated: false }, createProvider);
+      assert.equal(text, `${prefix}${commandPrefix}${suffix}`);
+      assert.equal(Buffer.from(text).toString('utf8'), text);
+    }
+    const noticePrefix = '\n\n[Output truncated. Full output: /tmp/';
+    setTextLimit(noticePrefix.length + 1);
+    const notice = piBashText({ fullOutputPath: '/tmp/😀.txt' }, createProvider);
+    assert.equal(notice, noticePrefix);
+    assert.equal(Buffer.from(notice).toString('utf8'), notice);
+
+    setTextLimit(Infinity);
+    const whole = piBashText({ command: 'echo 😀', output: 'ok', fullOutputPath: '/tmp/😀.txt' }, createProvider);
+    assert.equal(whole, 'Ran `echo 😀`\n```\nok\n```\n\n[Output truncated. Full output: /tmp/😀.txt]');
+  });
+}
+
+test('the compiled parsing export configures compiled providers', async t => {
+  const parsing = await import('@obelisk/core/parsing');
+  const { createClaudeProvider: claude } = await import('@obelisk/core/providers/claude');
+  const { createPiProvider: pi } = await import('@obelisk/core/providers/pi');
+  const { createOmpProvider: omp } = await import('@obelisk/core/providers/omp');
+  t.after(() => parsing.setTextLimit(parsing.TEXT_LIMIT));
+  assert.equal(parsing.getTextLimit(), TEXT_LIMIT);
+  assert.equal(claudeRecords(claude).text.length, TEXT_LIMIT);
+  parsing.setTextLimit(Infinity);
+  assert.deepEqual(claudeRecords(claude), { text: PROSE, command: COMMAND, result: OUTPUT });
+  for (const provider of [pi, omp]) assert.ok(piBashText({}, provider).includes(OUTPUT));
+  parsing.setTextLimit(TEXT_LIMIT);
+  assert.equal(claudeRecords(claude).text.length, TEXT_LIMIT);
 });

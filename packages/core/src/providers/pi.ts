@@ -110,7 +110,7 @@ const SOURCE = 'pi';
 const MAX_HEADER_BYTES = 1024 * 1024;
 const BLOCK_PAD = 4;
 
-export const PI_CANONICAL_TRANSCRIPT_MARKER = '__pi_canonical_transcript_v9__';
+export const PI_CANONICAL_TRANSCRIPT_MARKER = '__pi_canonical_transcript_v10__';
 
 function inventoryIssue(sourcePath: string, error: unknown): InventoryIssue {
   const errorPath = (error as { path?: unknown } | null)?.path;
@@ -910,8 +910,8 @@ function bashText(message: JsonRecord): string {
   const { text, suffix } = bashPresentation(message);
   if (suffix.length === 0) return trunc(text);
   const limit = getTextLimit();
-  if (suffix.length >= limit) return suffix.slice(0, limit);
-  return `${text.slice(0, limit - suffix.length)}${suffix}`;
+  if (suffix.length >= limit) return trunc(suffix, limit);
+  return `${trunc(text, limit - suffix.length)}${suffix}`;
 }
 
 function fullBashText(message: JsonRecord): string {
