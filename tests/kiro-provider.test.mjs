@@ -98,16 +98,29 @@ test('Kiro V3 child file changes and deletion refresh the parent snapshot withou
   const child = join(directory, 'sub-executions', readdirSync(join(directory, 'sub-executions'))[0]);
   const indexed = [{ sessionId: unit.sessionId, jsonlPath: join(directory, 'messages.jsonl') }];
   const context = { indexed, cursors: new Map([[unit.key, first.cursor]]) };
-  writeFileSync(child, readFileSync(child, 'utf8').replace('Example child response', 'Updated child response'));
+  // A different length keeps the rewrite visible to stat metadata within one clock tick.
+  writeFileSync(child, readFileSync(child, 'utf8').replace('Example child response', 'Updated child response text'));
   const [changed] = discover(provider, context);
-  assert.ok([...provider.parse(changed, first.cursor)].some(row => row.kind === 'message' && row.text === 'Updated child response'));
+  assert.ok([...provider.parse(changed, first.cursor)].some(row => row.kind === 'message' && row.text === 'Updated child response text'));
   assert.throws(() => [...provider.parse(unit, first.cursor)], /changed after discovery/);
   rmSync(child);
   const [removed] = discover(provider, context);
   const remaining = [...provider.parse(removed, first.cursor)];
   assert.equal(remaining.filter(row => row.kind === 'message' && row.agent_id !== null).length, 1,
     'the final response saved in the parent survives removal of the child file');
-  assert.ok(!remaining.some(row => row.kind === 'message' && row.text === 'Updated child response'));
+  assert.ok(!remaining.some(row => row.kind === 'message' && row.text === 'Updated child response text'));
+});
+
+test('Kiro V3 child file watcher hints rediscover the parent even when stat metadata is unchanged', () => {
+  const { root, provider } = setup();
+  const directory = seedV3(root);
+  const [unit] = discover(provider);
+  const first = drain(provider.parse(unit, null));
+  const child = join(directory, 'sub-executions', readdirSync(join(directory, 'sub-executions'))[0]);
+  const context = { indexed: [{ sessionId: unit.sessionId, jsonlPath: join(directory, 'messages.jsonl') }],
+    cursors: new Map([[unit.key, first.cursor]]) };
+  assert.deepEqual(discover(provider, context), []);
+  assert.deepEqual(discover(provider, { ...context, changedPaths: [child] }).map(found => found.key), [unit.key]);
 });
 
 test('Kiro V3 compaction summaries and tangent sessions preserve native evidence without losing parent history', () => {

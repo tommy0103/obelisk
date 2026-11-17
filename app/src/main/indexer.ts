@@ -41,7 +41,6 @@ import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapte
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
-import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 import { resolveObeliskPaths } from '../../../packages/core/src/paths.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -606,6 +605,4 @@ function buildIndex({
 export {
   buildIndex,
   writeHeartbeat,
-  openIndexDb,
-  inferProjectPath,
 };
