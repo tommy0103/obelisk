@@ -13,6 +13,7 @@ import {
   backfillUnresolvedSessionProjectPathsOnce,
   ensureFtsReady,
   refreshSessionProjectPaths,
+  repairOrphanedSessionMetadata,
 } from '../packages/core/src/index-finalize.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { runCli } from './cli-test-helpers.mjs';
@@ -333,5 +334,43 @@ test('force rebuild restores message FTS triggers and leaves search results unch
     SELECT 'after-rebuild', session_id, 'user', 'user', 'afterrebuildneedle', 'text', source FROM messages LIMIT 1
   `).run();
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM messages_fts WHERE messages_fts MATCH 'afterrebuildneedle'").get().count, 1);
+  db.close();
+});
+
+test('orphan repair reads message rows only through the subagent index', () => {
+  const db = freshDb();
+  const session = db.prepare(`
+    INSERT INTO sessions (id, project, source, jsonl_path, message_count, started_at, ended_at)
+    VALUES (?, '-p', ?, ?, 99, '2026-08-31T00:00:00Z', '2026-08-31T00:00:09Z')
+  `);
+  const message = db.prepare(`
+    INSERT INTO messages (uuid, session_id, type, timestamp, role, text, content_type, agent_id, source)
+    VALUES (?, ?, 'user', '2026-08-31T00:00:01Z', 'user', 'x', 'text', ?, 'claude')
+  `);
+  // Gone main transcript with a subagent row: repaired. Gone main without
+  // one, another provider, and a missing path: left alone.
+  session.run('orphan', 'claude', '/gone/orphan.jsonl');
+  message.run('orphan-main', 'orphan', null);
+  message.run('orphan-child', 'orphan', 'agent-1');
+  session.run('plain', 'claude', '/gone/plain.jsonl');
+  message.run('plain-main', 'plain', null);
+  session.run('codex', 'codex', '/gone/codex.jsonl');
+  message.run('codex-child', 'codex', 'agent-2');
+  session.run('pathless', 'claude', '');
+  message.run('pathless-child', 'pathless', 'agent-3');
+
+  const statements = [];
+  const recording = { prepare: sql => { statements.push(sql); return db.prepare(sql); } };
+  assert.equal(repairOrphanedSessionMetadata(recording), 1);
+  const counts = Object.fromEntries(db.prepare('SELECT id, message_count FROM sessions').all().map(r => [r.id, r.message_count]));
+  assert.deepEqual(counts, { orphan: 2, plain: 99, codex: 99, pathless: 99 });
+
+  // Candidate selection reads message rows only for subagent messages, not
+  // every message of every Claude session.
+  const selection = statements.find(sql => /FROM sessions s\b/.test(sql));
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${selection}`).all().map(row => row.detail);
+  const messageReads = plan.filter(detail => /^(SCAN|SEARCH) m\b/.test(detail));
+  assert.ok(messageReads.length > 0, plan.join('\n'));
+  assert.ok(messageReads.every(detail => detail.includes('INDEX idx_messages_agent ')), plan.join('\n'));
   db.close();
 });

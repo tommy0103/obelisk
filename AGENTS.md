@@ -1,13 +1,9 @@
 # Working in this repository
 
-Help contributors make informed decisions and deliver changes that fit the
-project. Bring relevant conventions, established patterns, and verified facts
-into the work when they matter. Before a consequential choice, explain the
-relevant constraint, its practical effect, and the available options. Continue
-routine work within the agreed scope; ask when an unresolved decision materially
-changes behavior, compatibility, or scope. Respect decisions already made in the
-current discussion. This guidance works with the contributor's chosen agent and
-tools; it does not require a particular workflow skill.
+Before a consequential choice, state the constraint, its practical effect, and
+the options. Ask when an unresolved decision changes behavior, compatibility, or
+scope; otherwise continue within the agreed scope and respect decisions already
+made in the discussion.
 
 ## Before implementation
 
@@ -41,6 +37,27 @@ final change and use the applicable sections of the
 [PR template](.github/pull_request_template.md). Resolve commands from the current
 [root scripts](package.json) and [App scripts](app/package.json), and check the
 actual [CI workflows](.github/workflows/) before reporting what is covered.
+
+## What the tooling already enforces
+
+These rules fail a command, so follow the error message instead of re-reading
+the prose. `npm run lint` runs ESLint over every tracked JS/TS file (including
+`app/`, excluding `.vue`) and then knip.
+
+| Rule | Enforced by |
+| --- | --- |
+| No unused variables, imports, or `eslint-disable` directives | ESLint, `npm run lint` |
+| No file, export, or dependency without a user; delete dead code rather than ignoring it | knip, `npm run lint` ([knip.jsonc](knip.jsonc)) |
+| Renderer JS/TS never assigns `innerHTML`/`outerHTML` or calls `insertAdjacentHTML` outside `renderMarkdown()` | ESLint `no-restricted-syntax` |
+| Main process never calls `shell.openPath` | ESLint `no-restricted-properties` |
+| Renderer images never use `loading="lazy"` | `tests/renderer-virtualized-rows.test.mjs` |
+| No new synchronous IO in main-process modules, no new `v-html` | Budgets in `tests/app-source-budgets.test.mjs`; lower them when you remove a use |
+| Every `app/tests/electron-*.mjs` suite runs in `test:electron:all` | `app/tests/run-electron-suites.mjs` discovers suites by name |
+| `schema.sql` changes are deliberate | sha256 pin in `tests/provider-schema-stability.test.mjs` |
+
+An exception goes on the offending line as an `eslint-disable-next-line` with
+the reason above it. When a review catches a mistake that a check could catch,
+add the check and a row here.
 
 ## Keep one home for each kind of guidance
 
