@@ -32,4 +32,13 @@ test('build:core emits an importable package with its schema resource', async ()
   const copilot = await import(`${pathToFileURL(join(coreDist, 'providers', 'copilot.js')).href}?test=${Date.now()}`);
   assert.equal(typeof copilot.createCopilotProvider, 'function');
   assert.equal(copilot.createCopilotProvider().descriptor.id, 'copilot');
+
+  const usf = await import('@obelisk/core/usf');
+  const assembled = usf.assembleUsf([{
+    kind: 'message', uuid: 'package-usf', session_id: 'package-session', role: 'user',
+    timestamp: null, text: 'hello', visibility: 'visible', source: 'test',
+  }]);
+  assert.equal(assembled.sessions[0].session.turns[0].steps[0].content, 'hello');
+  assert.deepEqual(usf.validateUsf(assembled.sessions[0].session), []);
+  assert.deepEqual(usf.validateUsf(usf.publishedUsf(assembled.sessions[0].session), { profile: 'published' }), []);
 });
