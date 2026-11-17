@@ -4,7 +4,9 @@
 <script setup>
 defineProps({
   headline: String,
+  /** @type {import('vue').PropType<string[]>} */
   receipts: Array,
+  /** @type {import('vue').PropType<string[]>} */
   stats: Array,
   mostSaidPhrase: String,
   signoff: String,

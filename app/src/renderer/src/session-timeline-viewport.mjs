@@ -23,7 +23,7 @@ function estimatedTextHeight(text = '') {
   return Math.min(560, Math.ceil(String(text).length / 72) * 20);
 }
 
-export function estimateTimelineItemSize(item) {
+function estimateTimelineItemSize(item) {
   if (!item) return 96;
   if (item.kind === 'meta') return 34;
   if (item.kind === 'thinking') return 38;
@@ -43,6 +43,7 @@ export function estimateTimelineItemSize(item) {
     + (message._thinking ? 34 : 0);
 }
 
+/** @internal Exported for tests. */
 export function createViewportRangeExtractor({
   getScrollElement,
   getVirtualizer,
@@ -79,6 +80,7 @@ export function createViewportRangeExtractor({
   };
 }
 
+/** @internal Exported for tests. */
 export function resolveReaderAnchorIndex(anchor, items = []) {
   if (!items.length) return null;
   if (anchor?.itemKey) {
@@ -162,7 +164,10 @@ export function useSessionTimelineViewport({
     },
   })));
 
-  const virtualRows = computed(() => virtualizer.value.getVirtualItems());
+  // getItemKey returns a row key or index, never the bigint VirtualItem allows.
+  const virtualRows = computed(() => /** @type {Array<import('@tanstack/vue-virtual').VirtualItem & { key: string | number }>} */ (
+    virtualizer.value.getVirtualItems()
+  ));
   const totalSize = computed(() => virtualizer.value.getTotalSize());
 
   // virtual-core deliberately skips scroll compensation when an already-measured
@@ -233,6 +238,8 @@ export function useSessionTimelineViewport({
   });
 
   virtualizer.value.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
+    // Same test as TanStack's default, which has no public accessor for these.
+    // @ts-expect-error getScrollOffset and scrollAdjustments are private
     if (item.start >= instance.getScrollOffset() + instance.scrollAdjustments) return false;
     // Never measured before: the estimate is what placed the reader, so the
     // estimate-to-actual difference always has to be taken out.
@@ -519,6 +526,7 @@ export function useSessionTimelineViewport({
     tailFollowReady.value = true;
   }
 
+  /** @param {{ maxFrames?: number, isCurrent?: () => boolean }} [options] */
   async function waitForStableLayout({ maxFrames = 8, isCurrent = () => true } = {}) {
     const targetWindow = scrollElement.value?.ownerDocument?.defaultView;
     if (!targetWindow || items.value.length === 0) return true;

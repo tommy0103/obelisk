@@ -23,10 +23,8 @@ import {
   createOpencodeProvider,
   defaultOpencodeDataRoot,
   isValidChannelDbName,
-  opencodeSessionId,
-  opencodeStoreHash,
-  opencodeUnitKey,
 } from '../packages/core/src/providers/opencode.ts';
+import { opencodeSessionId, opencodeStoreHash, opencodeUnitKey } from '../packages/core/src/providers/opencode-identity.ts';
 import { openOpencodeDatabaseWithNodeSqlite } from '../packages/core/src/providers/opencode-node.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';

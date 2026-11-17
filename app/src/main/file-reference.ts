@@ -65,7 +65,9 @@ function resolveFileReference(query: FileReferenceQuery): string | null {
       const real = fs.realpathSync(candidate);
       if (!isWithinRoots(real, roots)) continue;
       if (fs.statSync(real).isFile()) return real;
-    } catch {}
+    } catch {
+      // Missing or unreadable candidate: try the next one.
+    }
   }
   return null;
 }
@@ -85,7 +87,7 @@ function buildEditorUrl({ scheme, filePath, line, column }: EditorUrlOptions): s
 export {
   DEFAULT_EDITOR_SCHEME,
   buildEditorUrl,
-  fileReferenceCandidates,
-  normalizeRoots,
+  /** @internal Exported for tests. */ fileReferenceCandidates,
+  /** @internal Exported for tests. */ normalizeRoots,
   resolveFileReference,
 };

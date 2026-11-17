@@ -154,7 +154,10 @@ function samePathWithin(ops: ContainmentPathOps, left: string, right: string): b
   return ops.caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-/** True when `candidate` (a store path, or a `<store>#session:<id>` source path) sits under `root`. */
+/**
+ * True when `candidate` (a store path, or a `<store>#session:<id>` source path) sits under `root`.
+ * @internal Exported for tests.
+ */
 export function pathInside(
   root: string,
   candidate: string,
@@ -203,6 +206,7 @@ function profileKey(row: SqliteRow, profileDir: string | null): string {
   return profileDir ?? 'default';
 }
 
+/** @internal Exported for tests. */
 export function hermesSessionId(rawSessionId: string, profile: string, dbPath: string): string {
   // Scope by the store as well as the profile, the way copilot.ts scopes chronicle sessions by
   // their root: two stores can share a profile name, and then a copied session would collide.

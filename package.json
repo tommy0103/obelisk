@@ -11,8 +11,8 @@
   "scripts": {
     "pretest": "npm run build:core && npm run build:cli && npm run build --workspace @obelisk/dsh-obelisk-plugin",
     "test": "node --experimental-test-module-mocks --test tests/*.test.mjs",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json",
-    "lint": "eslint . && knip",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p app/tsconfig.json && npm --prefix app run typecheck",
+    "lint": "eslint . && knip && knip --production",
     "build:core": "npm run build --workspace @obelisk/core",
     "build:cli": "npm run build --workspace @obelisk-apps/cli",
     "build:skill": "node packaging/build-skill.mjs",
@@ -21,11 +21,14 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@obelisk/core": "0.2.0",
     "@types/node": "^26.1.1",
     "eslint": "^10.6.0",
+    "eslint-plugin-vue": "^10.12.1",
     "globals": "^17.7.0",
     "knip": "^5.88.1",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.63.0"
+    "typescript-eslint": "^8.63.0",
+    "vue-eslint-parser": "^10.4.2"
   }
 }

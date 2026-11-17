@@ -111,7 +111,7 @@ async function cdp(expression) {
 async function until(workFn,description,ms=60_000) {
   const start=Date.now();let last;
   while(Date.now()-start<ms) {
-    try {last=await workFn();if(last)return last;} catch {}
+    try {last=await workFn();if(last)return last;} catch (error) {last=String(error);}
     await delay(100);
   }
   throw new Error(`Timed out: ${description}; last=${JSON.stringify(last)}; requests=${JSON.stringify(requests)}`);
@@ -188,7 +188,7 @@ db.prepare('INSERT INTO memories(id,path,summary,created_at) VALUES (?,?,?,?)').
   assert.equal(JSON.parse(asar.extractFile(oldApp+'/Contents/Resources/app.asar','package.json').toString()).version,'0.2.4');
   console.log(`PASS ${arch}: Update & restart replaced and relaunched 0.2.4, preserving user data`);
   await writeFile(work+'/result.json',JSON.stringify({mode,arch,ready,launched,requests},null,2));
-  try {process.kill(launched.pid,'SIGTERM');}catch {}
+  try {process.kill(launched.pid,'SIGTERM');}catch { /* already exited */ }
   await delay(500);
 } finally {
   socket?.close();if(child?.exitCode===null)child.kill('SIGTERM');
@@ -196,7 +196,7 @@ db.prepare('INSERT INTO memories(id,path,summary,created_at) VALUES (?,?,?,?)').
   await rm(work+'/test-key',{force:true});
   // Clean up only applications launched from this unique fixture directory.
   const lines=run('ps',['-axo','pid=,args=']).split('\n');
-  for(const line of lines)if(line.includes(work+'/')&&!line.includes('ps -axo')){const pid=Number(line.trim().split(/\s+/)[0]);if(pid!==process.pid)try{process.kill(pid,'SIGTERM')}catch {}}
+  for(const line of lines)if(line.includes(work+'/')&&!line.includes('ps -axo')){const pid=Number(line.trim().split(/\s+/)[0]);if(pid!==process.pid)try{process.kill(pid,'SIGTERM')}catch { /* already exited */ }}
 }
 
 console.log(`Packaged ${mode}/${arch}${migrationSource?' → arm64':''} acceptance passed`);

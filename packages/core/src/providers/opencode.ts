@@ -33,7 +33,6 @@ import type { SessionMessageRow, MessageRow, PartRow } from './opencode-source.t
 import { isRecord, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
 
 import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey, opencodeObservationKey, opencodeObservationProofKey } from './opencode-identity.ts';
-export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
 
 import { normalizeObservedCwd, projectSlugFromPath } from '../parsing.ts';
 import type { SqliteDb } from '../sqlite-types.ts';
@@ -55,6 +54,7 @@ const TOMBSTONE_CURSOR = '0:0:v1:tombstone';
 
 export type OpencodeDatabaseOpener = (dbPath: string) => SqliteDb;
 
+/** @internal Exported for tests. */
 export function defaultOpencodeDataRoot(homeDir = homedir()): string {
   const xdg = process.env.XDG_DATA_HOME;
   if (xdg !== undefined && xdg.trim().length > 0) {
@@ -92,6 +92,7 @@ function openSource(dbPath: string, opener: OpencodeDatabaseOpener): SqliteDb | 
   }
 }
 
+/** @internal Exported for tests. */
 export function isValidChannelDbName(filename: string): boolean {
   return /^opencode-[a-zA-Z0-9._-]+\.db$/.test(filename);
 }
@@ -422,7 +423,6 @@ function discoverAll(
     return units;
   }
 
-  // Automatic mode: check process.env.OPENCODE_DB
   const envDb = process.env.OPENCODE_DB;
   if (envDb !== undefined && envDb.trim().length > 0) {
     const trimmed = envDb.trim();
@@ -439,7 +439,6 @@ function discoverAll(
     return discoverAtStore(storePath, ctx, opener);
   }
 
-  // Default directory discovery
   const defaultDir = defaultOpencodeDataRoot(homeDir);
   if (!existsSync(defaultDir)) {
     const prior = (ctx.indexedSessions?.() ?? []).some(s => s.jsonlPath.startsWith(`${normalize(defaultDir)}${sep}`) || s.jsonlPath.startsWith(`${normalize(defaultDir)}#ses:`));
@@ -518,7 +517,6 @@ function* parse(
   }
 
   if (meta.kind === 'opencode-tombstone') {
-    // Tombstone verification
     const db = openSource(meta.dbPath, opener);
     if (db === null) {
       throw new RetryableSourceReadError(meta.dbPath, `opencode: session database is busy or unreadable during tombstone verification: ${meta.dbPath}`);
@@ -607,7 +605,6 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
   if (identity === null) return null;
   const { dbPath, nativeId: rawSessionId } = identity;
 
-  // Store & Session identity strict authentication
   const expectedSessionId = opencodeSessionId(rawSessionId, dbPath);
   const sessionId = typeof input.session?.id === 'string' ? input.session.id : '';
   if (sessionId !== expectedSessionId) {
@@ -631,7 +628,6 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
       const { row: sessionRow, format: sessionFormat } = entry;
       const isSubagent = checkIsSubagent(db, sessionRow.parent_id, tables);
 
-      // Verify cursor if supplied
       if (input.cursor !== undefined && input.cursor !== null) {
         const state = decodeCursor(input.cursor);
         if (state === null) return null;

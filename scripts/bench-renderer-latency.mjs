@@ -72,9 +72,11 @@ const cleanup = () => {
   if (writer) clearInterval(writer);
   if (cursorProbe) clearInterval(cursorProbe);
   if (writerStopTimeout) clearTimeout(writerStopTimeout);
-  try { cursorDb?.close(); } catch {}
-  try { ws?.close(); } catch {}
-  try { child.kill('SIGTERM'); } catch {}
+  // Runs twice (explicitly, then on exit); node:sqlite throws on a second close.
+  cursorDb?.close();
+  cursorDb = undefined;
+  ws?.close();
+  child.kill('SIGTERM');
   fs.rmSync(tmp, { recursive: true, force: true });
 };
 process.on('exit', cleanup);
@@ -95,7 +97,7 @@ async function cdpConnect() {
   if (!page) throw new Error(`no matching CDP page target (got ${targets.map((t) => t.url).join(', ')})`);
   // Never leak a socket: close any previous connection before replacing it,
   // and close the new one if the open handshake fails.
-  try { ws?.close(); } catch {}
+  ws?.close();
   const next = new WebSocket(page.webSocketDebuggerUrl);
   next.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -108,13 +110,13 @@ async function cdpConnect() {
   };
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      try { next.close(); } catch {}
+      next.close();
       reject(new Error('cdp websocket open timeout'));
     }, 5000);
     next.onopen = () => { clearTimeout(timeout); resolve(); };
     next.onerror = (error) => {
       clearTimeout(timeout);
-      try { next.close(); } catch {}
+      next.close();
       reject(error);
     };
   });

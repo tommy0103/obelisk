@@ -909,9 +909,12 @@ async function run() {
   stressGlobalCatalogue = true;
   const wheelPaint = await traceWheelPaintContinuity(win, { updateTool: true });
   stressGlobalCatalogue = false;
+  // Chromium coalesces wheel events into one per rendered frame, so a slow
+  // runner sees fewer. The update is requested on wheel 3; the gesture only
+  // has to continue past it.
   assert(
     Math.abs(wheelPaint.after - wheelPaint.before) > 500
-      && wheelPaint.wheels >= 8 && wheelPaint.screenshots >= 4,
+      && wheelPaint.wheels > 3 && wheelPaint.screenshots >= 4,
     `wheel trace exercises compositor scrolling (${JSON.stringify(wheelPaint)})`,
   );
   assert(
@@ -1102,7 +1105,9 @@ async function run() {
   await delay(250);
 
   await win.webContents.executeJavaScript(`(() => {
-    const original = window.marked.parse;
+    // Every Markdown render hands its HTML to DOMPurify, which parses it with
+    // DOMParser; counting those parses counts renders without a test hook.
+    const original = DOMParser.prototype.parseFromString;
     const originalJsonParse = JSON.parse;
     const codexExecOutput = ${JSON.stringify(codexExecOutput)};
     const trackedPrefixes = [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')]
@@ -1111,9 +1116,9 @@ async function run() {
       .map(uuid => 'Message ' + uuid.slice('message-'.length) + ' ');
     let calls = 0;
     let codexExecCalls = 0;
-    window.marked.parse = function timelineMarkdownProbe(...args) {
-      const text = String(args[0] || '');
-      if (trackedPrefixes.some(prefix => text.startsWith(prefix))) calls++;
+    DOMParser.prototype.parseFromString = function timelineMarkdownProbe(...args) {
+      const html = String(args[0] || '');
+      if (trackedPrefixes.some(prefix => html.includes('<p>' + prefix))) calls++;
       return original.apply(this, args);
     };
     JSON.parse = function timelineJsonProbe(value, ...args) {
@@ -1124,7 +1129,7 @@ async function run() {
       calls: () => calls,
       codexExecCalls: () => codexExecCalls,
       restore: () => {
-        window.marked.parse = original;
+        DOMParser.prototype.parseFromString = original;
         JSON.parse = originalJsonParse;
       },
     };
@@ -1252,6 +1257,7 @@ async function run() {
   if (!win.isFocused()) throw new Error('Live scroll probe requires a focused window');
   await win.webContents.debugger.sendCommand('Emulation.setCPUThrottlingRate', { rate: 12 });
   currentSessionTitle = 'Live metadata title';
+  const stopLiveScrollTrace = await startRendererTrace(win);
   const scrollProbe = await win.webContents.executeJavaScript(`new Promise(resolve => {
     const wrap = document.querySelector('.detail-wrap');
     const totalBeforeGesture = Number(document.querySelector('.flap-number')?.getAttribute('aria-label'));
@@ -1277,6 +1283,7 @@ async function run() {
       return originalScrollTo(...args);
     };
     const gaps = [];
+    performance.mark('obelisk-live-scroll-start');
     const startedAt = performance.now();
     let previous = startedAt;
     let previousGeometry = null;
@@ -1335,6 +1342,7 @@ async function run() {
           restore: () => { wrap.scrollTo = originalScrollTo; },
         };
         wrap.removeEventListener('scrollend', blockAutomaticScrollEnd, true);
+        performance.mark('obelisk-live-scroll-end');
         wrap.dispatchEvent(new Event('scrollend'));
         resolve({
           totalBeforeGesture,
@@ -1356,6 +1364,7 @@ async function run() {
     }
     requestAnimationFrame(frame);
   })`, true);
+  const liveScrollWork = rendererTaskMetrics(await stopLiveScrollTrace(), 'obelisk-live-scroll-start', 'obelisk-live-scroll-end');
   assert(scrollProbe.totalBeforeGesture === messageCount + stationaryAppendRuns, 'the live append starts after the renderer gesture begins');
   console.log(`SCROLL GESTURE: ${JSON.stringify(scrollProbe)}`);
   await waitFor(
@@ -1438,14 +1447,19 @@ async function run() {
       && Math.abs(readerState.anchor.offset - scrollProbe.anchor.offset) < 2,
     `live append preserves reader anchor ${scrollProbe.anchor?.uuid} (${scrollProbe.anchor?.offset}px -> ${readerState.anchor?.offset}px)`,
   );
-  assert(scrollProbe.maxFrameGap < 250, `live scroll has no catastrophic long frame (${scrollProbe.maxFrameGap.toFixed(1)}ms)`);
+  // Gate renderer CPU, not wall time: on a shared runner the frame gap also
+  // counts time the renderer was descheduled. The throttle applies to both.
+  assert(
+    liveScrollWork.maxTaskWorkMs < 250,
+    `live scroll has no catastrophic renderer task (${liveScrollWork.maxTaskWorkMs.toFixed(1)}ms work; frame gap ${scrollProbe.maxFrameGap.toFixed(1)}ms)`,
+  );
 
   await win.webContents.debugger.sendCommand('Emulation.setCPUThrottlingRate', { rate: 1 });
 
   await waitFor(win.webContents, `!document.querySelector('.flap-slot.flipping')`, 'tail append flap settlement');
   const updatedReaderText = `Updated ${scrollProbe.anchor.uuid} ${'content identity '.repeat(20)}`;
   await win.webContents.executeJavaScript(`(() => {
-    const original = window.marked.parse;
+    const original = DOMParser.prototype.parseFromString;
     const targetUuid = ${JSON.stringify(scrollProbe.anchor.uuid)};
     const targetText = ${JSON.stringify(updatedReaderText)};
     const unchangedPrefixes = [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')]
@@ -1454,15 +1468,15 @@ async function run() {
       .map(uuid => 'Message ' + uuid.slice('message-'.length) + ' ');
     let targetCalls = 0;
     let unchangedCalls = 0;
-    window.marked.parse = function timelineContentIdentityProbe(value, ...args) {
-      const text = String(value || '');
-      if (text === targetText) targetCalls++;
-      if (unchangedPrefixes.some(prefix => text.startsWith(prefix))) unchangedCalls++;
+    DOMParser.prototype.parseFromString = function timelineContentIdentityProbe(value, ...args) {
+      const html = String(value || '');
+      if (html.includes('<p>' + targetText)) targetCalls++;
+      if (unchangedPrefixes.some(prefix => html.includes('<p>' + prefix))) unchangedCalls++;
       return original.call(this, value, ...args);
     };
     window.__timelineContentIdentityProbe = {
       calls: () => ({ target: targetCalls, unchanged: unchangedCalls }),
-      restore: () => { window.marked.parse = original; },
+      restore: () => { DOMParser.prototype.parseFromString = original; },
     };
   })()`, true);
   scrollingContentUuid = scrollProbe.anchor.uuid;

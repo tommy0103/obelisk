@@ -2,7 +2,6 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
-    "outDir": "dist",
     "rootDir": "src",
     "declaration": true,
     "rewriteRelativeImportExtensions": true

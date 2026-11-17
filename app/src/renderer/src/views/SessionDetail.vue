@@ -35,7 +35,6 @@ const props = defineProps({ id: String });
 const router = useRouter();
 const route = useRoute();
 
-// --- Reactive state ---
 const liveSessionMetadata = shallowRef(null);
 const session = computed(() => (
   liveSessionMetadata.value || getSessionSummary(props.id)
@@ -59,7 +58,6 @@ let loadRevision = 0;
 let pendingReaderState = sessionReaderStateCache.get(props.id);
 let readerStatePrepared = false;
 
-// DOM refs
 const wrapRef = ref(null);
 const timelineRef = ref(null);
 const headerRef = ref(null);
@@ -140,35 +138,26 @@ async function restoreReaderStateAfterLayout() {
   readerStatePrepared = false;
 }
 
-// --- Load session on mount or when id changes ---
 const FONT_SIZE_KEY = 'obelisk:session-font-size';
 const FONT_SIZES = [12, 13, 14, 15, 16, 18];
 const fontSizeIdx = ref(FONT_SIZES.indexOf(parseInt(localStorage.getItem(FONT_SIZE_KEY)) || 14));
 if (fontSizeIdx.value < 0) fontSizeIdx.value = 2;
 const fontSize = computed(() => FONT_SIZES[fontSizeIdx.value] + 'px');
 
-function adjustFont(delta) {
-  const next = fontSizeIdx.value + delta;
-  if (next >= 0 && next < FONT_SIZES.length) {
-    fontSizeIdx.value = next;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[next]);
-  }
-}
-
 function handleZoom(e) {
   if (!(e.metaKey || e.ctrlKey)) return;
   if (e.key === '=' || e.key === '+') {
     e.preventDefault();
     if (fontSizeIdx.value < FONT_SIZES.length - 1) fontSizeIdx.value++;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   } else if (e.key === '-') {
     e.preventDefault();
     if (fontSizeIdx.value > 0) fontSizeIdx.value--;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   } else if (e.key === '0') {
     e.preventDefault();
     fontSizeIdx.value = 2;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   }
 }
 
@@ -191,7 +180,7 @@ onMounted(async () => {
   active.value = true;
   userScroll.attach(wrapRef.value);
   attachKeydown();
-  removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId } = {}) => {
+  removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId }) => {
     if (!active.value || !props.id || sessionId !== props.id) return;
     void liveReloadCoordinator.request();
   }) || null;
@@ -406,13 +395,12 @@ async function focusPendingMessage() {
   onScroll();
 }
 
-// --- Scroll / progress tracking ---
 const currentMsgIdx = ref(0);
 const totalMsgs = computed(() => timelineItems.value.length);
 let navLock = false;
 let scrollFrame = null;
 
-function onScroll(event) {
+function onScroll() {
   if (navLock) return;
   if (scrollFrame !== null) return;
   scrollFrame = requestAnimationFrame(() => {
@@ -456,7 +444,6 @@ function navTo(target) {
   }, 50);
 }
 
-// --- Full text loading ---
 async function handleLoadFullText(uuid) {
   if (fullTextLoading.has(uuid)) return;
   fullTextLoading.add(uuid);
@@ -470,7 +457,6 @@ async function handleLoadFullText(uuid) {
   }
 }
 
-// --- Subagent navigation ---
 function navigateToSubagent(agentId) {
   router.push({
     name: 'SubagentDetail',
@@ -483,20 +469,18 @@ function navigateToSubagent(agentId) {
 <template>
   <div class="detail-wrap" ref="wrapRef" @scroll="onScroll" :style="{ '--text-base': fontSize, '--text-md': fontSize }">
     <div class="detail">
-      <!-- Progress bar -->
       <div class="session-progress">
         <div class="session-progress-fill" :style="{ width: progressPct + '%' }"></div>
       </div>
 
-      <!-- Loading state -->
       <div v-if="loading || !timelineReady" class="empty first-open-loading">
         Loading session...
       </div>
 
-      <!-- Session header -->
       <template v-if="session && !loading">
         <div class="session-header" :class="{ 'is-preparing': !timelineReady }" ref="headerRef">
           <div class="session-eyebrow">
+            <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
             <span class="project-icon" v-html="FOLDER_SVG"></span>
             <span class="project-name">{{ formatProjectLabel(session.project) }}</span>
             <span class="sep">&middot;</span>
@@ -520,7 +504,6 @@ function navigateToSubagent(agentId) {
           </div>
         </div>
 
-        <!-- Message timeline -->
         <div
           ref="timelineRef"
           class="timeline virtual-timeline"
@@ -550,7 +533,6 @@ function navigateToSubagent(agentId) {
       </template>
     </div>
 
-    <!-- Pagination nav -->
     <div class="msg-nav" v-if="totalMsgs > 0">
       <button class="msg-nav-btn" @click="navTo('first')" :disabled="currentMsgIdx === 0" title="First">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4v8M7 8l4-4v8z"/></svg>

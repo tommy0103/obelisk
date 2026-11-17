@@ -1,13 +1,14 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// One flat config for every tracked JS/TS source, including the Electron app.
-// Vue single-file components are not linted. Every rule is an error: a warning
-// that CI tolerates is a rule nobody follows.
+// One flat config for every tracked JS/TS source and Vue component, including
+// the Electron app. Every rule is an error: a warning that CI tolerates is a
+// rule nobody follows.
 
 import js from '@eslint/js';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
+import pluginVue from 'eslint-plugin-vue';
 
 const unusedVars = ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }];
 
@@ -43,6 +44,7 @@ export default tseslint.config(
     linterOptions: { reportUnusedDisableDirectives: 'error' },
   },
   js.configs.recommended,
+  ...pluginVue.configs['flat/essential'],
   {
     languageOptions: {
       ecmaVersion: 2023,
@@ -50,8 +52,8 @@ export default tseslint.config(
       globals: { ...globals.node },
     },
     rules: {
-      // Best-effort probes (JSON.parse, fs.stat on a racing file) may ignore failures.
-      'no-empty': ['error', { allowEmptyCatch: true }],
+      // A catch may swallow an error only with a comment saying why it is safe to.
+      'no-empty': ['error', { allowEmptyCatch: false }],
     },
   },
   {
@@ -69,15 +71,22 @@ export default tseslint.config(
     },
   },
   {
-    files: ['app/src/renderer/**/*.{js,mjs,ts}'],
+    files: ['app/src/renderer/**/*.{js,mjs,ts,vue}'],
     languageOptions: { globals: { ...globals.browser } },
     rules: {
+      // Each v-html carries a disable comment naming what made it safe.
+      'vue/no-v-html': 'error',
       // CONTRIBUTING: transcript content is attacker-controlled.
       'no-restricted-syntax': ['error',
         ...htmlSinkSelectors('AssignmentExpression', 'left', '/^(innerHTML|outerHTML)$/'),
         ...htmlSinkSelectors('CallExpression', 'callee', "/^insertAdjacentHTML$/"),
       ],
     },
+  },
+  {
+    // Route views are never written as tags, so they cannot collide with HTML elements.
+    files: ['app/src/renderer/src/views/*.vue'],
+    rules: { 'vue/multi-word-component-names': 'off' },
   },
   {
     files: ['app/src/main/**/*.ts'],

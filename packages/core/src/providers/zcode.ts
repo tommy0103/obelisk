@@ -69,8 +69,6 @@ const BUSY_TIMEOUT_MS = 500;
 const require = createRequire(import.meta.url);
 export type ZcodeDatabaseOpener = (dbPath: string) => SqliteDb;
 
-// ---- JSON helpers ----
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -131,8 +129,6 @@ function timelineModelText(part: Record<string, unknown>, side: 'from' | 'to'): 
     isRecord(part[legacyKey]) ? part[legacyKey] as Record<string, unknown> : null,
   ).modelId;
 }
-
-// ---- source access ----
 
 function defaultOpenSource(dbPath: string): SqliteDb {
   // Keep the Node-only binding out of the Electron bundle. Rollup otherwise
@@ -200,7 +196,6 @@ const MESSAGE_ORDER = 'sequence IS NULL, sequence, time_created, rowid';
 // rowid order differs from id lexicographic order (NULL-sequence legacy rows).
 const PART_ORDER = 'sequence IS NULL, sequence, time_created, id';
 
-// ---- fingerprint ----
 //
 // Hash over the RAW rows (parse-then-hash would miss fields the projection
 // does not know). Session canonical columns + full message/part rows in
@@ -226,8 +221,6 @@ function fingerprintSession(
   }
   return hash.digest('hex').slice(0, 24);
 }
-
-// ---- cursor ----
 
 interface CursorState {
   timeUpdated: number;
@@ -255,14 +248,13 @@ function decodeCursor(cursor: Cursor): CursorState | null {
   return { timeUpdated, messageCount, fingerprint: parts[3]! };
 }
 
-// ---- discovery ----
-
 interface SessionUnitMeta {
   kind: 'zcode-session';
   dbPath: string;
   rawSessionId: string;
 }
 
+/** @internal Exported for tests. */
 export function canonicalSessionId(dbPath: string, rawSessionId: string): string {
   // The session id and cursor key must use the same stable configured path.
   // Resolving only this side lets a symlink retarget tombstone every old id
@@ -559,8 +551,6 @@ function selectActiveMessages(
   }
   return new Set(active.map(message => message.id));
 }
-
-// ---- parse ----
 
 const timestampOfMs = (time: number | null | undefined): string | null => (
   typeof time === 'number' && Number.isFinite(time) && time > 0 ? new Date(time).toISOString() : null
@@ -921,8 +911,6 @@ function toolFilePath(toolName: string, input: unknown): string | null {
   return null;
 }
 
-// ---- raw projection ----
-
 function raw(input: RawLookup, opener: ZcodeDatabaseOpener): RawRecord | null {
   if (input.source !== name || input.messageUuid === null) return null;
   // messageUuid is `${sessionId}:${messageId}[:thinkN]`; sessionId itself is
@@ -970,8 +958,6 @@ function raw(input: RawLookup, opener: ZcodeDatabaseOpener): RawRecord | null {
     db.close();
   }
 }
-
-// ---- provider ----
 
 export function createZcodeProvider({
   rootDir,

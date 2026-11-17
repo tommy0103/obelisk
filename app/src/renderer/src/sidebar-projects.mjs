@@ -27,6 +27,16 @@ function orderedProjectSlugs(projectCounts, projects, formatProjectLabel) {
   return ordered.concat(missing);
 }
 
+/**
+ * @param {object} [options]
+ * @param {string} [options.routeType] 'sessions' counts catalogue projects; anything else counts memories.
+ * @param {Array<{ project?: string }>} [options.sessions]
+ * @param {Array<{ project?: string, archived?: boolean }>} [options.memories]
+ * @param {Array<{ project: string, session_count?: number }>} [options.projects]
+ * @param {string} [options.view]
+ * @param {string} [options.search]
+ * @param {(slug: string) => string} [options.formatProjectLabel]
+ */
 export function buildSidebarProjects({
   routeType,
   sessions = [],
