@@ -1635,5 +1635,3 @@ export function createPiProvider({
   const rootResolution = resolvePiRoot(rootDir, cwd);
   return createPiFamilyProvider({ rootResolution, config: PI_FAMILY_CONFIG });
 }
-
-export const piProvider = createPiProvider();

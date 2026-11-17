@@ -47,7 +47,6 @@ interface CodexLineRecord {
   obj: JsonRecord;
 }
 
-// ---- message/text helpers ----
 /**
  * Slice a string to `limit` UTF-16 code units without leaving half of a surrogate pair at the cut.
  * A lone surrogate has no UTF-8 form, so every store that persists the text rewrites it (SQLite
@@ -258,7 +257,6 @@ function readCodexLines(
   readLines(filePath, callback);
 }
 
-// ---- project-path + discovery helpers ----
 function legacyProjectPathFromSlug(project: string | null | undefined): string | null {
   if (!project) return null;
   return '/' + project.replace(/-/g, '/').replace(/^\//, '');
@@ -389,7 +387,6 @@ function discoverCodexJsonlFiles(
   return files;
 }
 
-// ---- Codex pure helpers ----
 function codexDbId(id: unknown): string | null {
   if (!id) return null;
   const raw = String(id).replace(/^codex:/, '');
@@ -560,12 +557,12 @@ function codexToolOutput(payload: JsonRecord): string | null {
 }
 
 export {
-  CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT, getTextLimit, setTextLimit,
+  CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, getTextLimit, setTextLimit,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes, readCodexBufferLines, readCodexLines,
-  legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
+  normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue, normalizeTranscriptTimestamp,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
-  readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole, parseCodexJsonInput,
+  readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole,
   codexUsage, codexEventText, codexMessagePayloadText, codexVisibleMessageKey, codexToolInput, codexToolOutput,
 };

@@ -1,8 +1,6 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Vue 3 application entry point for Obelisk.
-
 import { createApp } from 'vue';
 import App from './App.vue';
 import router from './router.js';
@@ -13,7 +11,6 @@ import { registerSessionImageElement } from './session-image-element.js';
 import { configureMarkdownImages } from './markdown-image-renderer.js';
 import { installFileReferenceHandler } from './file-references.mjs';
 
-// Import shared renderer CSS globally
 import '../styles/base.css';
 import '../styles/sidebar.css';
 import '../styles/toolbar.css';
@@ -43,7 +40,6 @@ function reportGlobalRefreshFailure(request) {
   });
 }
 
-// Load data on startup
 router.isReady().then(() => {
   reportGlobalRefreshFailure(globalDataRefresh.initialize());
 });
@@ -52,7 +48,6 @@ router.afterEach(() => {
   reportGlobalRefreshFailure(globalDataRefresh.flush());
 });
 
-// Refresh data when window regains focus
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     reportGlobalRefreshFailure(globalDataRefresh.invalidate());

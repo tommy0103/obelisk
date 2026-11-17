@@ -184,7 +184,6 @@ function fmtRelative(iso) {
   <div class="settings-wrap">
     <div class="settings-content">
 
-      <!-- Data Sources -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Data Sources</h2>
@@ -256,7 +255,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- Index -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Index location</h2>
@@ -268,7 +266,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- Auto-refresh -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Auto-refresh</h2>
@@ -282,7 +279,6 @@ function fmtRelative(iso) {
         </label>
       </section>
 
-      <!-- Editor -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Editor</h2>
@@ -337,7 +333,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- Recap -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Recap</h2>
@@ -364,7 +359,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- About -->
       <section class="settings-section last">
         <div class="settings-section-head">
           <h2>About</h2>

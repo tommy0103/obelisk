@@ -998,5 +998,3 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
     },
   };
 }
-
-export const kimiProvider = createKimiProvider();

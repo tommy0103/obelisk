@@ -1,17 +1,12 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Utility functions ported from the vanilla JS utils.js.
-// Pure helpers with no side-effects on global state (except formatProjectLabel which reads store).
-
 import { state } from './store.js';
 import { markFileReferences, mayContainFileReference } from './file-references.mjs';
 
-// --- Time / formatting ---
+function pad2(n) { return String(n).padStart(2, '0'); }
 
-export function pad2(n) { return String(n).padStart(2, '0'); }
-
-export function isSameDay(a, b) {
+function isSameDay(a, b) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
@@ -42,15 +37,6 @@ export function fmtClockTime(iso) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-export function fmtSize(bytes) {
-  if (!bytes) return '-';
-  if (bytes < 1024) return bytes + 'B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'K';
-  return (bytes / 1024 / 1024).toFixed(1) + 'M';
-}
-
-// --- HTML / Markdown ---
-
 export function escapeHTML(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -62,7 +48,7 @@ export function highlightPlain(text, query) {
   return safe.replace(new RegExp(q, 'gi'), m => `<mark>${m}</mark>`);
 }
 
-export function sanitizeMarkdown(html) {
+function sanitizeMarkdown(html) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
@@ -70,7 +56,7 @@ export function sanitizeMarkdown(html) {
     .replace(/\son\w+="[^"]*"/gi, '');
 }
 
-export function highlightTextNodes(rootEl, query) {
+function highlightTextNodes(rootEl, query) {
   if (!query) return;
   const q = query.toLowerCase();
   const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null);
@@ -98,7 +84,7 @@ export function highlightTextNodes(rootEl, query) {
 
 export function renderMarkdown(text, opts = {}) {
   if (text == null) return '';
-  // marked is loaded globally via CDN in index.html and configured at startup.
+  // index.html loads marked as a global; main.js configures it before mount.
   const html = sanitizeMarkdown(window.marked.parse(text));
   const cls = opts.variant === 'msg' ? 'markdown-msg'
             : opts.variant === 'compact' ? 'markdown-compact'
@@ -114,8 +100,6 @@ export function renderMarkdown(text, opts = {}) {
   if (opts.query) highlightTextNodes(container, opts.query.trim());
   return container.outerHTML;
 }
-
-// --- Duration / tokens / tooltip ---
 
 export function fmtDuration(ms) {
   if (!ms) return '—';
@@ -158,8 +142,6 @@ export function positionTooltip(el, x, y) {
   el.style.left = left + 'px';
   el.style.top = (y - 28) + 'px';
 }
-
-// --- Project label ---
 
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';

@@ -17,8 +17,8 @@ import type {
   RawLookup, RawRecord, TranscriptRecord, WatchTarget,
 } from './types.ts';
 
-export const name = 'kiro';
-export const KIRO_CANONICAL_TRANSCRIPT_MARKER = '__kiro_canonical_transcript_v3__';
+const name = 'kiro';
+const KIRO_CANONICAL_TRANSCRIPT_MARKER = '__kiro_canonical_transcript_v3__';
 export type KiroDatabaseOpener = (path: string) => SqliteDb;
 type JsonRecord = Record<string, any>;
 type Format = 'cli' | 'workspace' | 'sqlite';
@@ -128,10 +128,14 @@ function signature(paths: readonly string[]): { signature: string; mtime: number
   return { signature: hash(JSON.stringify(members)), mtime };
 }
 
-function sourceSignature(source: KiroSource) {
-  return signature(source.format === 'sqlite'
+function memberPaths(source: KiroSource): string[] {
+  return source.format === 'sqlite'
     ? [source.path, `${source.path}-wal`]
-    : filePaths(source.path, source.metadataPath!, source.format));
+    : filePaths(source.path, source.metadataPath!, source.format);
+}
+
+function sourceSignature(source: KiroSource) {
+  return signature(memberPaths(source));
 }
 
 function childPaths(path: string): string[] {
@@ -262,6 +266,7 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
     const id = kiroSessionId(source.rawId, source.cwd);
     groups.set(id, [...(groups.get(id) ?? []), source]);
   }
+  const changed = ctx.changedPaths === undefined ? undefined : new Set(ctx.changedPaths);
   const units: IndexUnit[] = [];
   for (const [sessionId, group] of groups) {
     // Prefer the newest saved snapshot. On equal timestamps, file formats
@@ -272,7 +277,8 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
     const currentCursor = cursor(group);
     const key = `kiro-unit:${sessionId}`;
     const prior = indexed.find(session => session.sessionId === sessionId);
-    const hinted = ctx.changedPaths?.some(path => group.some(source => [source.path, source.metadataPath, `${source.path}-wal`, sourcePath(source)].includes(path))) ?? false;
+    const hinted = changed !== undefined
+      && group.some(source => [...memberPaths(source), sourcePath(source)].some(path => changed.has(path)));
     if (!hinted && ctx.lastCursor(key) === currentCursor && (ctx.indexedSessions === undefined || prior !== undefined)) continue;
     // Incomplete inventory cannot certify switching from an old source copy.
     if (!complete && prior !== undefined && prior.jsonlPath !== sourcePath(group[0]!)) continue;
@@ -609,5 +615,3 @@ export function createKiroProvider({
     },
   };
 }
-
-export const kiroProvider = createKiroProvider();

@@ -76,7 +76,7 @@ export interface DiscoveredSessionEntry {
 
 type SessionTable = 'session_v2' | 'session';
 
-export function sessionSelect(table: SessionTable): string {
+function sessionSelect(table: SessionTable): string {
   // Metadata tables and wire formats have separate lifecycles: before the V2
   // split (v1.19.3), modern session_message rows also belonged to `session`.
   return `SELECT id, project_id, parent_id, directory, title, version, revert, cost,
@@ -84,7 +84,7 @@ export function sessionSelect(table: SessionTable): string {
     time_created, time_updated, time_archived, agent, model FROM ${table}`;
 }
 
-export function sessionFormat(
+function sessionFormat(
   db: SqliteDb,
   tables: ReadonlySet<string>,
   table: SessionTable,

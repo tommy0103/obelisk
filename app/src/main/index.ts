@@ -171,7 +171,7 @@ function migrateLegacyDbIfNeeded(
     fs.copyFileSync(legacyDbPath, paths.dbPath);
     return true;
   } catch (error) {
-    console.warn?.(`Obelisk legacy DB migration skipped: ${(error as Error).message}`);
+    console.warn(`Obelisk legacy DB migration skipped: ${(error as Error).message}`);
     return false;
   } finally {
     lease?.release();
@@ -385,7 +385,7 @@ async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
   const service = indexerService;
   if (!service) return;
   const closed = service.stop();
-  const results = await Promise.allSettled([closed, waitForIdle && typeof service.idle === 'function' ? service.idle() : undefined]);
+  const results = await Promise.allSettled([closed, waitForIdle ? service.idle() : undefined]);
   if (indexerService === service) indexerService = null;
   const failed = results.find(result => result.status === 'rejected');
   if (failed?.status === 'rejected') throw failed.reason;
@@ -410,11 +410,9 @@ async function stopBackgroundResourcesNow({ stopWorker = false } = {}) {
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
     pendingObeliskChanges.clear();
-    if (typeof watcher.close === 'function') {
-      watcherClosed = Promise.resolve(watcher.close());
-      // Attach immediately so a rejection during service.idle() is observed.
-      void watcherClosed.catch(() => {});
-    }
+    watcherClosed = watcher.close();
+    // Attach immediately so a rejection during service.idle() is observed.
+    void watcherClosed.catch(() => {});
   }
   const results = await Promise.allSettled([stopIndexerServiceAndWait(), watcherClosed]);
   if (stopWorker && indexerWorker) {
@@ -623,8 +621,6 @@ app.on('window-all-closed', () => {
   if (!updateLifecycle.isBlocked()) void stopBackgroundResources({ stopWorker: true }).catch(error => console.warn('Obelisk cleanup failed:', error));
   if (process.platform !== 'darwin') app.quit();
 });
-
-// --- IPC Handlers ---
 
 function querySessionMessages(sessionId: string): SessionMessageRow[] {
   if (!db) return [];
@@ -1040,8 +1036,6 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   return { daily, totalTokens, peakDay, longestTurn };
 });
 
-// --- Capture ---
-
 const EXPORT_WIDTH = 540;
 const EXPORT_HEIGHT = 675;
 
@@ -1120,8 +1114,6 @@ ipcMain.handle('win:control', (event, action: WindowControlAction) => {
   }
 });
 
-// --- Recap files ---
-
 ipcMain.handle('recap:list', () => {
   if (!fs.existsSync(RECAP_DIR)) return [];
   return fs.readdirSync(RECAP_DIR)
@@ -1137,8 +1129,6 @@ ipcMain.handle('recap:read', (_, filename) => {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   } catch { return null; }
 });
-
-// --- Settings ---
 
 function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
@@ -1400,7 +1390,7 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
             writerLeaseMode: writerLease ? 'caller-held' : 'acquire',
           });
         } catch (error) {
-          console.warn?.(`Obelisk DB reopen after rebuild failed: ${(error as Error).message}`);
+          console.warn(`Obelisk DB reopen after rebuild failed: ${(error as Error).message}`);
         }
       }
     } finally {

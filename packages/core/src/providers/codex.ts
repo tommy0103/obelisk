@@ -42,7 +42,7 @@ import type {
   RawRecord,
 } from './types.ts';
 
-export const name = 'codex';
+const name = 'codex';
 // v5 replays v3/v4 rows once so transcript timestamps and session bounds
 // use canonical UTC milliseconds after timestamp normalization.
 const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v5__';
@@ -292,10 +292,6 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     }
   }
   return remaining;
-}
-
-export function discover(ctx: DiscoverContext): IndexUnit[] {
-  return discoverAt(join(homedir(), '.codex'), ctx);
 }
 
 const CODEX_CURSOR_STATE_VERSION = 4;
@@ -1313,5 +1309,3 @@ export function createCodexProvider({ rootDir = join(homedir(), '.codex') }: { r
     raw: (input) => rawCodex(rootDir, input),
   };
 }
-
-export const codexProvider = createCodexProvider();
