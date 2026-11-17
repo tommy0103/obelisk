@@ -4,7 +4,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { PALETTES, ARCH_KEYS } from '../components/recap/archetypes.js';
+import { PALETTES } from '../components/recap/archetypes.js';
 import { CORNER_SEALS } from '../components/recap/seals.js';
 
 defineOptions({ name: 'RecapList' });
@@ -114,6 +114,7 @@ onUnmounted(() => { unsub?.(); });
               :style="{ '--node-glow': glowColor(r.persona?.archetype) }"
               @click="openRecap(r._filename)"
             >
+              <!-- eslint-disable-next-line vue/no-v-html -- static SVG from seals.js -->
               <div class="recap-node" v-html="sealSvg(r.persona?.archetype)"></div>
               <div class="recap-card">
                 <div class="recap-body">

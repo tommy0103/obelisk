@@ -7,7 +7,6 @@ import { useRouter, useRoute } from 'vue-router';
 import {
   state,
   getSessionSummary,
-  FOLDER_SVG,
   resetListState,
   setView,
   setProject,
@@ -15,7 +14,6 @@ import {
   setQuery,
   setProjectSearch,
   toggleSort,
-  toggleIncludeMessageBodies,
   MINIMIZE_SVG,
   RESTORE_SVG,
   MAXIMIZE_SVG,
@@ -82,9 +80,7 @@ const showToolbar = computed(() => {
   return r === 'SessionList' || r === 'MemoryList';
 });
 
-const showSearchMsgsToggle = computed(() => {
-  return route.name === 'SessionList';
-});
+// --- Window title ---
 
 const maximized = ref(false);
 function windowControl(action) { window.obelisk?.windowControl?.(action); }
@@ -92,7 +88,7 @@ function onTitlebarDbClick() { if (platform === 'linux') windowControl('toggle-m
 
 const windowTitle = computed(() => {
   const appName = 'Obelisk';
-  let scopeText = '';
+  let scopeText;
   if (route.name === 'Activity') {
     scopeText = 'Activity';
   } else if (route.name === 'Recap') {
@@ -170,10 +166,6 @@ function handleSearch(e) {
 
 function handleToggleSort() {
   toggleSort();
-}
-
-function handleToggleSearchMsgs() {
-  toggleIncludeMessageBodies();
 }
 
 function handleGlobalKeydown(event) {
@@ -272,12 +264,15 @@ provide('recapGenerateOpen', recapGenerateOpen);
       </div>
       <div v-if="platform === 'linux'" class='titlebar-controls' @dblclick.stop>
         <button type="button" class="titlebar-btn" aria-label="Minimize" @click="windowControl('minimize')">
+          <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
           <span class="titlebar-icon" v-html="MINIMIZE_SVG"></span>
         </button>
         <button type="button" class="titlebar-btn" aria-label="Maximize or restore" @click="windowControl('toggle-maximize')">
+          <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
           <span class="titlebar-icon" v-html="maximized ? RESTORE_SVG : MAXIMIZE_SVG"></span>
         </button>
         <button type="button" class="titlebar-btn titlebar-btn-close" aria-label="Close" @click="windowControl('close')">
+          <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
           <span class="titlebar-icon" v-html="CLOSE_SVG"></span>
         </button>
       </div>
