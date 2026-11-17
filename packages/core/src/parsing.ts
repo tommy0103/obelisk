@@ -47,7 +47,6 @@ interface CodexLineRecord {
   obj: JsonRecord;
 }
 
-// ---- message/text helpers ----
 /**
  * Slice a string to `limit` UTF-16 code units without leaving half of a surrogate pair at the cut.
  * A lone surrogate has no UTF-8 form, so every store that persists the text rewrites it (SQLite
@@ -61,11 +60,35 @@ function sliceText(s: string, limit: number): string {
   return s.slice(0, splitsPair ? limit - 1 : limit);
 }
 
-function trunc(s: any): any {
-  return typeof s === 'string' ? sliceText(s, TEXT_LIMIT) : s;
+// The limit every adapter applies to the text it emits. TEXT_LIMIT is the default and is what
+// the Obelisk index is built with; the app and the skill docs describe indexed text by it.
+let textLimit: number = TEXT_LIMIT;
+
+/** The limit adapters currently apply to emitted text, in UTF-16 code units. */
+function getTextLimit(): number {
+  return textLimit;
 }
 
-function truncJson(obj: JsonValue, limit = TEXT_LIMIT): string | null {
+/**
+ * Change the limit adapters apply to emitted text; `Infinity` emits text whole.
+ *
+ * For a caller that parses transcripts without persisting them to the Obelisk index and needs
+ * complete records. The setting is process-wide. Rows written under a different limit differ
+ * from what the provider index markers attest, so a process that persists to the index must
+ * keep the default.
+ */
+function setTextLimit(limit: number): void {
+  if (limit !== Infinity && (!Number.isInteger(limit) || limit < 1)) {
+    throw new RangeError('setTextLimit() limit must be a positive integer or Infinity');
+  }
+  textLimit = limit;
+}
+
+function trunc(s: any, limit = textLimit): any {
+  return typeof s === 'string' ? sliceText(s, limit) : s;
+}
+
+function truncJson(obj: JsonValue, limit = textLimit): string | null {
   if (obj === null || obj === undefined) return null;
   const walk = (v: JsonValue): JsonValue => {
     if (typeof v === 'string') return v.length > limit ? sliceText(v, limit) + '...[truncated]' : v;
@@ -80,15 +103,15 @@ function truncJson(obj: JsonValue, limit = TEXT_LIMIT): string | null {
   return JSON.stringify(walk(obj));
 }
 
-function extractText(content: JsonValue): string | null {
-  if (typeof content === 'string') return trunc(content);
+function extractText(content: JsonValue, limit = textLimit): string | null {
+  if (typeof content === 'string') return trunc(content, limit);
   if (!Array.isArray(content)) return null;
   const parts: string[] = [];
   for (const b of content) {
     if (b.type === 'text' && b.text) parts.push(b.text);
     else if (b.type === 'thinking' && b.thinking) parts.push(b.thinking);
   }
-  return parts.length ? trunc(parts.join('\n')) : null;
+  return parts.length ? trunc(parts.join('\n'), limit) : null;
 }
 
 function extractContentType(content: JsonValue): string {
@@ -110,7 +133,7 @@ function extractContentType(content: JsonValue): string {
 const COMMAND_ENVELOPE_RE = /^\s*(<command-name>[^<]+<\/command-name>|<(?:task-notification|system-reminder)\b|<local-command(?:\b|-))/;
 const SKILL_INSTRUCTIONS_RE = /^\s*Base directory for this skill(?:\s*:|\s*\r?\n)/;
 
-function extractMessageIsMeta(record: JsonRecord, text: string | null = extractText(record?.message?.content)): 0 | 1 {
+function extractMessageIsMeta(record: JsonRecord, text: string | null = extractText(record?.message?.content, TEXT_LIMIT)): 0 | 1 {
   const msg = record?.message || {};
   if (record?.isMeta === true || msg.isMeta === true) return 1;
   return typeof text === 'string' && COMMAND_ENVELOPE_RE.test(text) ? 1 : 0;
@@ -234,7 +257,6 @@ function readCodexLines(
   readLines(filePath, callback);
 }
 
-// ---- project-path + discovery helpers ----
 function legacyProjectPathFromSlug(project: string | null | undefined): string | null {
   if (!project) return null;
   return '/' + project.replace(/-/g, '/').replace(/^\//, '');
@@ -365,7 +387,6 @@ function discoverCodexJsonlFiles(
   return files;
 }
 
-// ---- Codex pure helpers ----
 function codexDbId(id: unknown): string | null {
   if (!id) return null;
   const raw = String(id).replace(/^codex:/, '');
@@ -536,7 +557,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 }
 
 export {
-  CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT,
+  CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, getTextLimit, setTextLimit,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes, readCodexBufferLines, readCodexLines,
   normalizeObservedCwd, projectSlugFromPath, inferProjectPath,

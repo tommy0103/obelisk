@@ -1,13 +1,8 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Utility functions ported from the vanilla JS utils.js.
-// Pure helpers with no side-effects on global state (except formatProjectLabel which reads store).
-
 import { state } from './store.js';
 import { markFileReferences, mayContainFileReference } from './file-references.mjs';
-
-// --- Time / formatting ---
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 
@@ -41,8 +36,6 @@ export function fmtClockTime(iso) {
   const d = new Date(iso);
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
-
-// --- HTML / Markdown ---
 
 export function escapeHTML(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -91,7 +84,7 @@ function highlightTextNodes(rootEl, query) {
 
 export function renderMarkdown(text, opts = {}) {
   if (text == null) return '';
-  // marked is loaded globally via CDN in index.html and configured at startup.
+  // index.html loads marked as a global; main.js configures it before mount.
   const html = sanitizeMarkdown(window.marked.parse(text));
   const cls = opts.variant === 'msg' ? 'markdown-msg'
             : opts.variant === 'compact' ? 'markdown-compact'
@@ -109,8 +102,6 @@ export function renderMarkdown(text, opts = {}) {
   if (opts.query) highlightTextNodes(container, opts.query.trim());
   return container.outerHTML;
 }
-
-// --- Duration / tokens / tooltip ---
 
 export function fmtDuration(ms) {
   if (!ms) return '—';
@@ -153,8 +144,6 @@ export function positionTooltip(el, x, y) {
   el.style.left = left + 'px';
   el.style.top = (y - 28) + 'px';
 }
-
-// --- Project label ---
 
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';
