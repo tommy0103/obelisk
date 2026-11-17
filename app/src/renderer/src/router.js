@@ -1,7 +1,6 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Vue Router configuration for Obelisk.
 // Routes map to the main content views; sidebar navigation drives route changes.
 
 import { createRouter, createWebHashHistory } from 'vue-router';
@@ -17,6 +16,7 @@ const RecapDetail = () => import('./views/RecapDetail.vue');
 const RecapExport = () => import('./views/RecapExport.vue');
 const Settings = () => import('./views/Settings.vue');
 
+/** @type {import('vue-router').RouteRecordRaw[]} */
 const routes = [
   {
     path: '/sessions',
@@ -77,7 +77,6 @@ const routes = [
     redirect: '/memory'
   },
   {
-    // Catch-all redirect
     path: '/:pathMatch(.*)*',
     redirect: '/memory'
   }

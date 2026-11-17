@@ -29,6 +29,8 @@
       "entry": [
         "src/main/index.ts!", "src/main/indexer-worker.ts!",
         "src/preload/index.ts!", "src/renderer/src/main.js!",
+        // Global Window declarations for vue-tsc; nothing imports them.
+        "src/renderer/src/env.d.ts!",
         // run-electron-suites.mjs runs tests/electron-*.mjs, and CI runs
         // packaged-deb-updates.mjs by path. knip finds the runner and
         // packaged-updates.mjs through package.json and the workflows. Any

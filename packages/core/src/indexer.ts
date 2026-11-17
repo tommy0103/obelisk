@@ -5,10 +5,11 @@
 import { RetryableSourceReadError } from './providers/source-read-error.ts';
 import { existsSync } from 'node:fs';
 import { prepareRetainedSnapshot } from './snapshot.ts';
-import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
+import { DB_PATH, installSchema, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
   backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
+  dropMessageFtsTriggers,
   ensureFtsReady,
   refreshSessionProjectPaths,
   repairOrphanedSessionMetadata,
@@ -319,6 +320,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         try {
           const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
           runRetryableWriteTransaction(txDb, () => {
+            // The forced FTS rebuild below replaces per-row trigger work.
+            dropMessageFtsTriggers(db);
             snapshot.reset();
             const providerResult = indexProviderPlanStrict({
               db,
@@ -329,6 +332,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             repairOrphanedSessionMetadata(db, providerPlan.items.filter(({ unit }) => unit.preserveSessionHistory).map(({ unit }) => unit.sessionId));
             backfillSessionTitles(db);
             healWorkflowParentLinks(db);
+            installSchema(db);
             ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);

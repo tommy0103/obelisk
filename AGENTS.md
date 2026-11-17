@@ -50,7 +50,8 @@ in production mode (`!` entries in [knip.jsonc](knip.jsonc), tests excluded).
 | No unused variables, imports, or `eslint-disable` directives | ESLint, `npm run lint` |
 | No file, export, or dependency without a user; delete dead code rather than ignoring it | knip, `npm run lint` ([knip.jsonc](knip.jsonc)) |
 | No production export whose only user is a test; tests import the defining module, and a deliberate test seam carries `/** @internal Exported for tests. */` | `knip --production`, `npm run lint` |
-| Renderer JS/TS never assigns `innerHTML`/`outerHTML` or calls `insertAdjacentHTML` outside `renderMarkdown()` | ESLint `no-restricted-syntax` |
+| Renderer JS/TS/Vue never assigns `innerHTML`/`outerHTML` or calls `insertAdjacentHTML` outside `renderMarkdown()` | ESLint `no-restricted-syntax` |
+| Every `v-html` names why it is safe | ESLint `vue/no-v-html` |
 | Main process never calls `shell.openPath` | ESLint `no-restricted-properties` |
 | Renderer images never use `loading="lazy"` | `tests/renderer-virtualized-rows.test.mjs` |
 | No new synchronous IO in main-process modules, no new `v-html` | Budgets in `tests/app-source-budgets.test.mjs`; lower them when you remove a use |

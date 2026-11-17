@@ -9,23 +9,23 @@ import PathCard from '../components/recap/PathCard.vue';
 import VibeCard from '../components/recap/VibeCard.vue';
 import WorkflowCard from '../components/recap/WorkflowCard.vue';
 import ClosingCard from '../components/recap/ClosingCard.vue';
-import { PALETTES, ARCH_KEYS } from '../components/recap/archetypes.js';
-import recapJson from '../mock/recap-2026-W24.json';
+import { PALETTES } from '../components/recap/archetypes.js';
+import { sampleRecap } from '../mock/sample-recap.js';
 
 const route = useRoute();
-const recapData = ref(recapJson);
+const recapData = ref(sampleRecap);
 window.__OBELISK_RECAP_EXPORT_READY__ = false;
-const cardIdx = computed(() => parseInt(route.query.card) || 0);
+const cardIdx = computed(() => parseInt(String(route.query.card)) || 0);
 const exportFilename = computed(() => typeof route.query.file === 'string' ? route.query.file : '');
-const archKey = computed(() => route.query.arch || recapData.value.persona?.archetype || recapJson.persona.archetype);
+const archKey = computed(() => (typeof route.query.arch === 'string' && route.query.arch) || recapData.value.persona?.archetype || sampleRecap.persona.archetype);
 const palette = computed(() => PALETTES[archKey.value] || PALETTES.architect);
 const total = computed(() => recapData.value.cards?.length || 5);
 
-const cover = computed(() => recapData.value.cards?.[0] || recapJson.cards[0]);
-const path = computed(() => recapData.value.cards?.[1] || recapJson.cards[1]);
-const vibe = computed(() => recapData.value.cards?.[2] || recapJson.cards[2]);
-const workflow = computed(() => recapData.value.cards?.[3] || recapJson.cards[3]);
-const closing = computed(() => recapData.value.cards?.[4] || recapJson.cards[4]);
+const cover = computed(() => recapData.value.cards?.[0] || sampleRecap.cards[0]);
+const path = computed(() => recapData.value.cards?.[1] || sampleRecap.cards[1]);
+const vibe = computed(() => recapData.value.cards?.[2] || sampleRecap.cards[2]);
+const workflow = computed(() => recapData.value.cards?.[3] || sampleRecap.cards[3]);
+const closing = computed(() => recapData.value.cards?.[4] || sampleRecap.cards[4]);
 
 const cssVars = computed(() => ({
   '--tc': palette.value.tc,
@@ -56,10 +56,10 @@ async function loadExportRecap(filename) {
       if (seq === loadSeq && data?.cards?.length) {
         recapData.value = data;
       } else if (seq === loadSeq) {
-        recapData.value = recapJson;
+        recapData.value = sampleRecap;
       }
     } else if (seq === loadSeq) {
-      recapData.value = recapJson;
+      recapData.value = sampleRecap;
     }
   } finally {
     if (seq === loadSeq) await markExportReady();

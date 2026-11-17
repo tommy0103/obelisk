@@ -1,7 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { app, BrowserWindow, ipcMain, clipboard, dialog, shell, type IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, ipcMain, clipboard, dialog, shell } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -11,20 +11,23 @@ import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
 import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
-import { buildRecapExportQuery } from './recap-capture-query.ts';
+import { registerSessionQueryHandlers, querySessionFileRoots } from './session-queries.ts';
+import { registerRecapHandlers } from './recap-handlers.ts';
+import { cleanupDbFiles, rebuildTempDbPath, replaceDbWithTemp } from './rebuild-db-files.ts';
+import { isSameDocumentNavigation, isSameOrigin, safeProtocol } from './window-navigation.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, resolveFileReference } from './file-reference.ts';
 import { createDeferredQuit } from './quit-teardown.ts';
 import { createUpdateLifecycle } from './update-lifecycle.ts';
 import { createUpdateService } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
-import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
   getCopilotEditions,
   hasExplicitProviderRoot,
   readPersistedProviderSettings,
+  type PersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
 import {
   resolveObeliskPaths,
@@ -36,27 +39,7 @@ import {
   type ProviderSourceIssue,
 } from './provider-settings.ts';
 import { preserveRejectedSettings } from './settings-preservation.ts';
-import type {
-  SessionPatchCursor,
-  SessionPatchSnapshot,
-  SessionMetadata,
-  SessionCatalogueOptions,
-  ActivitySessionsOptions,
-  SessionsQueryOptions,
-  SourceQueryOptions,
-  WindowControlAction,
-} from '../shared/ipc-types.ts';
-import type {
-  SessionDetailAssemblyInput,
-  SessionMessageRow,
-  SessionSubagentRow,
-  SessionSummaryRow,
-  SessionToolCallRow,
-  SessionToolResultRow,
-  SessionWorkflowRow,
-} from '../shared/session-detail-types.ts';
-import { createSessionPatch } from '../shared/session-patch.mjs';
-import { assembleSessionDetail } from '../shared/session-detail-assembly.mjs';
+import type { WindowControlAction } from '../shared/ipc-types.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OBELISK_PATHS = resolveObeliskPaths();
@@ -81,7 +64,9 @@ function detectClaudeDir() {
         const claudeDir = path.join(homePath, user, '.claude');
         if (fs.existsSync(claudeDir)) return claudeDir;
       }
-    } catch {}
+    } catch {
+      // Unreadable WSL home: try the next distro.
+    }
   }
   // Fallback: native Windows path (for future native Claude Code on Windows)
   return path.join(os.homedir(), '.claude');
@@ -90,9 +75,9 @@ function detectClaudeDir() {
 const DEFAULT_CLAUDE_DIR = detectClaudeDir();
 const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');
 
-let db;
-let indexerService;
-let indexerWorker;
+let db: Database.Database | null = null;
+let indexerService: ReturnType<typeof createIndexerService> | null = null;
+let indexerWorker: ReturnType<typeof createWorkerBuildIndex> | null = null;
 let latestSourceIssues: ProviderSourceIssue[] = [];
 let latestSettingsError: string | null = null;
 // A recovery notice is deliberately kept apart from latestSettingsError: that variable
@@ -178,40 +163,6 @@ function migrateLegacyDbIfNeeded(
   }
 }
 
-function rebuildTempDbPath(dbPath) {
-  return path.join(
-    path.dirname(dbPath),
-    `${path.basename(dbPath)}.rebuild-${process.pid}-${Date.now()}.tmp`,
-  );
-}
-
-function dbFileSet(dbPath) {
-  return [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
-}
-
-function cleanupDbFiles(dbPath) {
-  for (const filePath of dbFileSet(dbPath)) {
-    try {
-      fs.rmSync(filePath, { force: true });
-    } catch {}
-  }
-}
-
-function replaceDbWithTemp(tempDbPath, dbPath) {
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
-    try {
-      fs.rmSync(sidecar, { force: true });
-    } catch {}
-  }
-  fs.renameSync(tempDbPath, dbPath);
-  for (const suffix of ['-wal', '-shm']) {
-    const tempSidecar = `${tempDbPath}${suffix}`;
-    if (!fs.existsSync(tempSidecar)) continue;
-    fs.renameSync(tempSidecar, `${dbPath}${suffix}`);
-  }
-}
-
 function resolveSchemaPath() {
   const candidates = [
     path.join(__dirname, 'schema.sql'),
@@ -222,7 +173,7 @@ function resolveSchemaPath() {
   return candidates.find(p => fs.existsSync(p));
 }
 
-function migrateDb(db) {
+function migrateDb(db: Database.Database) {
   if (typeof db.exec !== 'function' || typeof db.prepare !== 'function') return;
   migrateCoreSchemaColumns(db);
   const schemaPath = resolveSchemaPath();
@@ -261,7 +212,7 @@ function openDb(
   return db;
 }
 
-function runAppDbWrite(work: () => void): boolean {
+function runAppDbWrite(work: (db: Database.Database) => void): boolean {
   updateLifecycle.assertWritable();
   if (!db) return false;
   const lease = acquireAppWriterLease(getRuntimePaths().dbPath, 250);
@@ -269,7 +220,7 @@ function runAppDbWrite(work: () => void): boolean {
     throw new Error('Obelisk index writer is busy; memory change was not applied');
   }
   try {
-    work();
+    work(db);
     return true;
   } finally {
     lease.release();
@@ -315,17 +266,6 @@ function notifyIndexUpdated(result: {
   }
 }
 
-function sourceWhereClause(opts: SourceQueryOptions = {}, column = "source"): { sql: string; params: unknown[] } {
-  if (opts.source === 'all') return { sql: '', params: [] };
-  if (opts.source) return { sql: `COALESCE(${column}, 'claude') = ?`, params: [opts.source] };
-  return { sql: `COALESCE(${column}, 'claude') = 'claude'`, params: [] };
-}
-
-function appendWhere(sql, params, clause) {
-  if (!clause) return sql;
-  return `${sql}${sql.includes(' WHERE ') ? ' AND ' : ' WHERE '}${clause}`;
-}
-
 function startIndexerService({ buildOnStart = false } = {}) {
   if (updateLifecycle.isBlocked()) return null;
   if (indexerService) return indexerService;
@@ -336,6 +276,7 @@ function startIndexerService({ buildOnStart = false } = {}) {
     projectsDir: paths.projectsDir,
     watchTargets: paths.providerRegistry.watchTargets(paths.providerRoots),
     buildIndex: async ({ reason, changedPaths, retrySessionIds }) => {
+      if (!indexerWorker) throw new Error('Obelisk indexer worker is not running');
       const result = await indexerWorker.buildIndex({
         reason,
         changedPaths,
@@ -424,30 +365,6 @@ async function stopBackgroundResourcesNow({ stopWorker = false } = {}) {
   closeDb();
   const failed = results.find(result => result.status === 'rejected');
   if (failed?.status === 'rejected') throw failed.reason;
-}
-
-function safeProtocol(url: string): string {
-  try { return new URL(url).protocol; } catch { return ''; }
-}
-
-function isSameOrigin(url: string, currentUrl: string): boolean {
-  try {
-    return new URL(url).origin === new URL(currentUrl).origin;
-  } catch {
-    return false;
-  }
-}
-
-// Reloads and in-app routing keep the same origin and pathname; anything else is a real
-// navigation away from the renderer document.
-function isSameDocumentNavigation(url: string, currentUrl: string): boolean {
-  try {
-    const target = new URL(url);
-    const current = new URL(currentUrl);
-    return target.origin === current.origin && target.pathname === current.pathname;
-  } catch {
-    return false;
-  }
 }
 
 function createWindow() {
@@ -551,7 +468,7 @@ function startObeliskWatcher() {
   return obeliskWatcher;
 }
 
-function onObeliskChange(filePath) {
+function onObeliskChange(filePath: string) {
   if (filePath.startsWith(RECAP_DIR)) {
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send('obelisk:recap-updated', filePath);
@@ -622,320 +539,11 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// --- IPC Handlers ---
-
-function querySessionMessages(sessionId: string): SessionMessageRow[] {
-  if (!db) return [];
-  return db.prepare(`
-    SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
-           m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
-           m.content_type, m.is_meta, m.visibility, m.source
-    FROM messages m
-    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
-      AND COALESCE(m.visibility, 'visible') = 'visible'
-    ORDER BY m.timestamp, m.uuid
-  `).all(sessionId) as SessionMessageRow[];
-}
-
-function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
-  if (!db) return [];
-  // Insertion order is the provider's source order, and the assembled session detail keeps a
-  // message's calls the way they arrive here: `tool_calls` carries a `(session_id, name)` index, so
-  // an explicit order is what stops the planner from returning them sorted by tool name (ADR-0007).
-  return db.prepare(`
-    SELECT tc.* FROM messages m
-    CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
-    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
-      AND COALESCE(m.visibility, 'visible') = 'visible'
-      AND tc.session_id = ?
-    ORDER BY tc.rowid
-  `).all(sessionId, sessionId) as SessionToolCallRow[];
-}
-
-function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
-  if (!db) return [];
-  return db.prepare(`
-    SELECT tr.* FROM messages m
-    CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
-    WHERE m.session_id = ? AND (m.agent_id IS NULL OR m.agent_id = m.session_id)
-      AND COALESCE(m.visibility, 'visible') = 'visible'
-      AND tr.session_id = ?
-  `).all(sessionId, sessionId) as SessionToolResultRow[];
-}
-
-function querySessionSubagents(sessionId: string): SessionSubagentRow[] {
-  if (!db) return [];
-  return db.prepare(`SELECT * FROM subagents WHERE session_id = ?`).all(sessionId) as SessionSubagentRow[];
-}
-
-function querySessionWorkflows(sessionId: string): SessionWorkflowRow[] {
-  if (!db) return [];
-  const workflows = db.prepare(`SELECT * FROM workflows WHERE session_id = ?`).all(sessionId) as SessionWorkflowRow[];
-  for (const workflow of workflows) {
-    workflow.agents = db.prepare(`SELECT * FROM workflow_agents WHERE run_id = ?`).all(workflow.run_id) as SessionWorkflowRow['agents'];
-  }
-  return workflows;
-}
-
-function querySessionSummaries(sessionId: string): SessionSummaryRow[] {
-  if (!db) return [];
-  return db.prepare(`
-    SELECT * FROM summaries
-    WHERE session_id = ? AND COALESCE(visibility, 'visible') = 'visible'
-  `).all(sessionId) as SessionSummaryRow[];
-}
-
-function querySessionSnapshot(sessionId: string): SessionDetailAssemblyInput {
-  return {
-    messages: querySessionMessages(sessionId),
-    toolCalls: querySessionToolCalls(sessionId),
-    toolResults: querySessionToolResults(sessionId),
-    subagents: querySessionSubagents(sessionId),
-    workflows: querySessionWorkflows(sessionId),
-    summaries: querySessionSummaries(sessionId),
-  };
-}
-
-function querySessionDisplaySnapshot(sessionId: string): SessionPatchSnapshot {
-  const snapshot = querySessionSnapshot(sessionId);
-  const detail = assembleSessionDetail(snapshot);
-  return {
-    messages: detail.messages,
-    workflows: detail.workflows,
-    summaries: detail.summaries,
-  };
-}
-
-const SESSION_METADATA_COLUMNS = [
-  'id',
-  'title',
-  'project',
-  'project_path',
-  'started_at',
-  'ended_at',
-  'git_branch',
-  'version',
-  'message_count',
-  'jsonl_path',
-  'source',
-].join(', ');
-
-function querySessionMetadata(sessionId: string): SessionMetadata | null {
-  if (!db) return null;
-  return (
-    db.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId) as SessionMetadata | undefined
-  ) || null;
-}
-
-ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
-  if (!db) return [];
-  const { project, sessionId, limit = 200 } = opts;
-  let sql = `SELECT ${SESSION_METADATA_COLUMNS} FROM sessions`;
-  const params: unknown[] = [];
-  const sourceFilter = sourceWhereClause(opts);
-  if (sourceFilter.sql) {
-    sql = appendWhere(sql, params, sourceFilter.sql);
-    params.push(...sourceFilter.params);
-  }
-  if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
-  if (sessionId !== undefined) { sql = appendWhere(sql, params, `id = ?`); params.push(sessionId); }
-  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC`;
-  if (limit !== null) {
-    sql += ' LIMIT ?';
-    params.push(limit);
-  }
-  return db.prepare(sql).all(...params);
-});
-
-ipcMain.handle('db:getSessionCatalogue', (_, opts: SessionCatalogueOptions = {}) => {
-  if (!db) return { rows: [], total: 0 };
-  const limit = Number.isSafeInteger(opts.limit) ? Math.max(1, Math.min(opts.limit!, 100)) : 100;
-  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
-  const clauses: string[] = [];
-  const params: unknown[] = [];
-  const sourceFilter = sourceWhereClause(opts);
-  if (sourceFilter.sql) { clauses.push(sourceFilter.sql); params.push(...sourceFilter.params); }
-  if (opts.project && opts.project !== 'all') { clauses.push('project = ?'); params.push(opts.project); }
-  if (opts.quiet) clauses.push("(title IS NULL OR title = '')");
-  else clauses.push("title IS NOT NULL AND title != ''");
-  const query = opts.query?.trim().toLowerCase();
-  if (query) {
-    clauses.push('catalogue_contains(title, project, git_branch, ?)');
-    params.push(query);
-  }
-  const where = `WHERE ${clauses.join(' AND ')}`;
-  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions ${where}`).get(...params) as { count: number }).count;
-  const direction = opts.descending === false ? 'ASC' : 'DESC';
-  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions ${where}
-    ORDER BY COALESCE(ended_at, started_at) ${direction}, id ${direction} LIMIT ? OFFSET ?`)
-    .all(...params, limit, offset);
-  return { rows, total };
-});
-
-ipcMain.handle('db:getActivitySessions', (_, opts: ActivitySessionsOptions) => {
-  if (!db) return { rows: [], total: 0 };
-  if (!/^\d{4}-\d\d-\d\d/.test(opts?.from) || !/^\d{4}-\d\d-\d\d/.test(opts?.to)) {
-    throw new Error('Activity date range must use ISO dates');
-  }
-  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
-  const where = 's.started_at < ? AND COALESCE(s.ended_at, s.started_at) >= ?';
-  const params = [opts.to, opts.from];
-  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions s WHERE ${where}`).get(...params) as { count: number }).count;
-  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS.split(', ').map(column => `s.${column}`).join(', ')},
-    EXISTS (SELECT 1 FROM sessions earlier WHERE earlier.project = s.project
-      AND earlier.id != s.id AND earlier.started_at < s.started_at) AS has_earlier
-    FROM sessions s WHERE ${where}
-    ORDER BY COALESCE(s.ended_at, s.started_at) DESC, s.id DESC LIMIT 200 OFFSET ?`)
-    .all(...params, offset);
-  return { rows, total };
-});
-
-ipcMain.handle('db:getSessionMessages', (_, sessionId) => {
-  return querySessionMessages(sessionId);
-});
-
-ipcMain.handle('db:getSessionToolCalls', (_, sessionId) => {
-  return querySessionToolCalls(sessionId);
-});
-
-ipcMain.handle('db:getSessionToolResults', (_, sessionId) => {
-  return querySessionToolResults(sessionId);
-});
-
-ipcMain.handle('db:getSessionSubagents', (_, sessionId) => {
-  return querySessionSubagents(sessionId);
-});
-
-ipcMain.handle('db:getSessionWorkflows', (_, sessionId) => {
-  return querySessionWorkflows(sessionId);
-});
-
-ipcMain.handle('db:getSessionPatch', (
-  _event: IpcMainInvokeEvent,
-  sessionId: string,
-  cursor: SessionPatchCursor,
-) => {
-  if (!db) return null;
-  return {
-    ...createSessionPatch(querySessionDisplaySnapshot(sessionId), cursor),
-    session: querySessionMetadata(sessionId),
-  };
-});
-
-ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
-  if (!db) return [];
-  return db.prepare(`
-    SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
-           m.is_sidechain, m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
-           m.content_type, m.is_meta, m.visibility, m.source
-    FROM messages m
-    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-    ORDER BY m.timestamp, m.uuid
-  `).all(agentId);
-});
-
-ipcMain.handle('db:getSubagentToolCalls', (_, agentId) => {
-  if (!db) return [];
-  // Same as querySessionToolCalls: insertion order, not the `(session_id, name)` index order.
-  return db.prepare(`
-    SELECT tc.* FROM tool_calls tc
-    JOIN messages m ON m.uuid = tc.message_uuid
-    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-    ORDER BY tc.rowid
-  `).all(agentId);
-});
-
-ipcMain.handle('db:getSubagentToolResults', (_, agentId) => {
-  if (!db) return [];
-  return db.prepare(`
-    SELECT tr.* FROM tool_results tr
-    JOIN messages m ON m.uuid = tr.message_uuid
-    WHERE m.agent_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-  `).all(agentId);
-});
-
-ipcMain.handle('db:getSessionSummaries', (_, sessionId) => {
-  return querySessionSummaries(sessionId);
-});
-
-ipcMain.handle('db:getMemories', () => {
-  if (!db) return [];
-  return db.prepare(`
-    SELECT m.id, m.session_id, m.project, m.message_start, m.message_end, m.path, m.anchors,
-           m.summary, m.created_at, m.deleted_at, m.deleted_reason, s.title AS session_title
-    FROM memories m LEFT JOIN sessions s ON s.id = m.session_id ORDER BY m.created_at DESC
-  `).all();
-});
-
-ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
-  if (!db) return null;
-  const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
-  if (!msg || (msg.visibility ?? 'visible') !== 'visible') return null;
-  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
-  const subagent = msg.agent_id
-    ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
-    : null;
-  const workflowAgent = msg.agent_id
-    ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
-    : null;
-  const paths = getRuntimePaths();
-  const lookup = {
-    source: msg.source || session?.source || 'claude',
-    messageUuid: String(uuid),
-    session,
-    agentId: msg.agent_id || null,
-    cursor: storedSessionCursor(db, paths.providerRegistry, session),
-    subagent,
-    workflowAgent,
-  };
-  // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
-  if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode') {
-    try {
-      const messageText = lookup.source === 'zcode'
-        ? await indexerWorker?.readZcodeMessageText(lookup)
-        : lookup.source === 'kiro'
-          ? await indexerWorker?.readKiroMessageText({ ...lookup, rootDir: paths.providerRoots.kiro })
-          : lookup.source === 'opencode'
-            ? await indexerWorker?.readOpencodeMessageText(lookup)
-            : await indexerWorker?.readHermesMessageText(lookup);
-      return messageText ?? msg.text ?? null;
-    } catch {
-      return msg.text ?? null;
-    }
-  }
-  const raw = paths.providerRegistry.raw(lookup);
-  return raw?.messageText ?? msg.text ?? null;
-});
-
-ipcMain.handle('db:readMemoryFile', (_, filePath) => {
-  try {
-    if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf-8');
-    return null;
-  } catch { return null; }
-});
-
-// Every root this session actually worked in. A reference is only opened if it lands inside
-// one of them, so untrusted transcript text cannot reach a file outside the session's own
-// projects. Scoping is deliberately per session, not corpus-wide.
-function querySessionFileRoots(sessionId: unknown): string[] {
-  if (!db || typeof sessionId !== 'string' || !sessionId) return [];
-  const roots: string[] = [];
-  try {
-    const rows = db.prepare(
-      `SELECT DISTINCT cwd FROM messages
-       WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-         AND COALESCE(visibility, 'visible') = 'visible'`
-    ).all(sessionId);
-    for (const row of rows) roots.push(row.cwd);
-    const session = db.prepare(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
-    if (session?.project_path) roots.push(session.project_path);
-  } catch {}
-  return roots;
-}
+registerSessionQueryHandlers({ ipcMain, getDb: () => db, getRuntimePaths, getIndexerWorker: () => indexerWorker, runAppDbWrite });
 
 ipcMain.handle('file-ref:open', async (_, ref) => {
   const { sessionId, path: rawPath, cwd, line, column } = ref || {};
-  const roots = querySessionFileRoots(sessionId);
+  const roots = querySessionFileRoots(db, sessionId);
   // The renderer-supplied cwd only counts if this session actually recorded it.
   const scopedCwd = typeof cwd === 'string' && roots.includes(cwd) ? cwd : null;
   const filePath = resolveFileReference({ rawPath, cwd: scopedCwd, roots });
@@ -954,157 +562,14 @@ ipcMain.handle('file-ref:open', async (_, ref) => {
   }
 });
 
-ipcMain.handle('db:archiveMemory', (_, id, reason) => {
-  return runAppDbWrite(() => {
-    db.prepare(`UPDATE memories SET deleted_at = ?, deleted_reason = ? WHERE id = ?`)
-      .run(new Date().toISOString(), reason || 'Archived via panel', id);
-  });
-});
-
-ipcMain.handle('db:restoreMemory', (_, id) => {
-  return runAppDbWrite(() => {
-    db.prepare(`UPDATE memories SET deleted_at = NULL, deleted_reason = NULL WHERE id = ?`).run(id);
-  });
-});
-
-ipcMain.handle('db:getProjects', (_, opts = {}) => {
-  if (!db) return [];
-  const sourceFilter = sourceWhereClause(opts);
-  const where = sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : '';
-  return db.prepare(`
-    SELECT project, project_path, COUNT(*) as session_count,
-           MAX(COALESCE(ended_at, started_at)) as last_active
-    FROM sessions ${where ? `${where} AND` : 'WHERE'} project IS NOT NULL
-    GROUP BY project ORDER BY last_active DESC
-  `).all(...sourceFilter.params);
-});
-
-ipcMain.handle('db:getStats', (_, opts = {}) => {
-  if (!db) return { sessions: 0, memories: 0, memoriesArchived: 0 };
-  const sourceFilter = sourceWhereClause(opts);
-  const where = sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : '';
-  const sessions = db.prepare(`SELECT COUNT(*) as c FROM sessions ${where}`).get(...sourceFilter.params)?.c || 0;
-  const memories = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
-  const memoriesArchived = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NOT NULL').get()?.c || 0;
-  return { sessions, memories, memoriesArchived };
-});
-
-ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
-  if (!db) return { daily: [], totalTokens: 0, peakDay: null, longestTurn: null };
-  // Visibility controls evidence display, not accounting. Abandoned model calls
-  // still consumed tokens, so aggregate usage intentionally includes them.
-  const messageSourceFilter = sourceWhereClause(opts, 'source');
-  const summarySourceFilter = sourceWhereClause(opts, 's.source');
-  const usageDays = db.prepare(`
-    WITH usage_events AS (
-      SELECT timestamp, input_tokens, output_tokens
-      FROM messages
-      WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
-        ${messageSourceFilter.sql ? `AND ${messageSourceFilter.sql}` : ''}
-      UNION ALL
-      SELECT su.timestamp, su.input_tokens, su.output_tokens
-      FROM summaries su
-      LEFT JOIN sessions s ON s.id = su.session_id
-      WHERE (su.input_tokens IS NOT NULL OR su.output_tokens IS NOT NULL)
-        ${summarySourceFilter.sql ? `AND ${summarySourceFilter.sql}` : ''}
-    )
-    SELECT DATE(timestamp) as day,
-           SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
-    FROM usage_events
-    GROUP BY DATE(timestamp)
-    ORDER BY day
-  `).all(...messageSourceFilter.params, ...summarySourceFilter.params);
-
-  const totalTokens = usageDays.reduce((total, row) => total + (row.tokens || 0), 0);
-  const daily: Array<{ day: string; tokens: number }> = [];
-  for (const row of usageDays) {
-    if (row.day !== null) daily.push({ day: row.day, tokens: row.tokens || 0 });
-  }
-
-  let peakDay: { day: string; tokens: number } | null = null;
-  for (const day of daily) {
-    if (!peakDay || day.tokens > peakDay.tokens) peakDay = day;
-  }
-
-  const longestTurn = db.prepare(`
-    SELECT turn_duration_ms, uuid, session_id, timestamp
-    FROM messages
-    WHERE turn_duration_ms IS NOT NULL
-      ${messageSourceFilter.sql ? `AND ${messageSourceFilter.sql}` : ''}
-    ORDER BY turn_duration_ms DESC
-    LIMIT 1
-  `).get(...messageSourceFilter.params) || null;
-
-  return { daily, totalTokens, peakDay, longestTurn };
-});
-
-// --- Capture ---
-
-const EXPORT_WIDTH = 540;
-const EXPORT_HEIGHT = 675;
-
-async function createExportCapture(parentWin, query) {
-  const exportWin = new BrowserWindow({
-    width: EXPORT_WIDTH,
-    height: EXPORT_HEIGHT,
-    show: false,
-    webPreferences: {
-      preload: path.join(__dirname, '..', 'preload', 'index.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      offscreen: true,
-      deviceScaleFactor: 2,
-    } as Electron.WebPreferences,
-  });
-
-  const isDev = process.argv.includes('--dev') || !!process.env.ELECTRON_RENDERER_URL;
-  const url = isDev
-    ? `${process.env.ELECTRON_RENDERER_URL || 'http://localhost:5173'}/#/recap-export?${query}`
-    : `file://${path.join(__dirname, '..', 'renderer', 'index.html')}#/recap-export?${query}`;
-
-  await exportWin.loadURL(url);
-  await waitForExportReady(exportWin.webContents);
-
-  const image = await exportWin.webContents.capturePage({
-    x: 0, y: 0, width: EXPORT_WIDTH, height: EXPORT_HEIGHT,
-  });
-  exportWin.close();
-  return image;
-}
-
-async function waitForExportReady(webContents, timeoutMs = 2500) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    try {
-      const ready = await webContents.executeJavaScript('window.__OBELISK_RECAP_EXPORT_READY__ === true', true);
-      if (ready) return true;
-    } catch {}
-    await new Promise(r => setTimeout(r, 50));
-  }
-  return false;
-}
-
-ipcMain.handle('capture:export', async (event, { cardIdx, archetype, filename } = {}) => {
-  const win = BrowserWindow.fromWebContents(event.sender);
-  if (!win) return null;
-  const query = buildRecapExportQuery({ cardIdx, archetype, filename });
-  const image = await createExportCapture(win, query);
-  const { filePath } = await dialog.showSaveDialog(win, {
-    defaultPath: `obelisk-recap-${cardIdx + 1}.png`,
-    filters: [{ name: 'PNG', extensions: ['png'] }],
-  });
-  if (!filePath) return null;
-  fs.writeFileSync(filePath, image.toPNG());
-  return filePath;
-});
-
-ipcMain.handle('capture:copy', async (event, { cardIdx, archetype, filename } = {}) => {
-  const win = BrowserWindow.fromWebContents(event.sender);
-  if (!win) return false;
-  const query = buildRecapExportQuery({ cardIdx, archetype, filename });
-  const image = await createExportCapture(win, query);
-  clipboard.writeImage(image);
-  return true;
+registerRecapHandlers({
+  ipcMain,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  recapDir: RECAP_DIR,
+  preloadPath: path.join(__dirname, '..', 'preload', 'index.js'),
+  rendererIndexPath: path.join(__dirname, '..', 'renderer', 'index.html'),
 });
 
 ipcMain.handle('win:control', (event, action: WindowControlAction) => {
@@ -1121,25 +586,9 @@ ipcMain.handle('win:control', (event, action: WindowControlAction) => {
   }
 });
 
-// --- Recap files ---
-
-ipcMain.handle('recap:list', () => {
-  if (!fs.existsSync(RECAP_DIR)) return [];
-  return fs.readdirSync(RECAP_DIR)
-    .filter(f => f.endsWith('.json'))
-    .sort()
-    .reverse();
-});
-
-ipcMain.handle('recap:read', (_, filename) => {
-  const filePath = path.join(RECAP_DIR, path.basename(filename));
-  if (!fs.existsSync(filePath)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-  } catch { return null; }
-});
-
-// --- Settings ---
+function pathExists(filePath: string): Promise<boolean> {
+  return fs.promises.access(filePath).then(() => true, () => false);
+}
 
 function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
@@ -1147,19 +596,19 @@ function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_P
   return result.settings;
 }
 
-function savePersistedSettings(settings) {
-  if (!fs.existsSync(path.dirname(SETTINGS_PATH))) {
-    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
-  }
+async function savePersistedSettings(settings: PersistedProviderSettings) {
+  await fs.promises.mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
   const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
-    fs.renameSync(temporaryPath, SETTINGS_PATH);
+    await fs.promises.writeFile(temporaryPath, JSON.stringify(settings, null, 2));
+    await fs.promises.rename(temporaryPath, SETTINGS_PATH);
     latestSettingsError = null;
   } catch (error) {
     try {
-      fs.unlinkSync(temporaryPath);
-    } catch {}
+      await fs.promises.unlink(temporaryPath);
+    } catch {
+      // The temp file may never have been written; report the original error.
+    }
     throw error;
   }
 }
@@ -1181,11 +630,12 @@ ipcMain.handle('settings:get', async () => {
   } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
+  let indexError: string | null = null;
   const sourceStats = new Map<string, { sessionCount: number; lastIndexed: string }>();
 
   if (db) {
     try {
-      const rows = db.prepare(`
+      const rows = db.prepare<[], { source: string; session_count: number; last_indexed: string | null }>(`
         SELECT COALESCE(source, 'claude') AS source,
                COUNT(*) AS session_count,
                MAX(started_at) AS last_indexed
@@ -1198,8 +648,12 @@ ipcMain.handle('settings:get', async () => {
           lastIndexed: row.last_indexed || '',
         });
       }
-      memoryCount = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
-    } catch {}
+      memoryCount = db.prepare<[], { c: number }>('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
+    } catch (error) {
+      // Settings stays usable so the user can repoint sources or rebuild; the zero counts
+      // must not pass for an empty index.
+      indexError = `Index database could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
   const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
   const sourcePaths = new Set([
@@ -1258,6 +712,7 @@ ipcMain.handle('settings:get', async () => {
     status: connected ? 'ok' : 'error',
     statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
     settingsRecovery: latestSettingsRecovery,
+    indexError,
   };
 });
 
@@ -1278,7 +733,7 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
       copyFile: (from, to) => fs.promises.copyFile(from, to),
     }, currentRead);
     const providerRootChanged = setPersistedSetting(persisted, key, value);
-    savePersistedSettings(persisted);
+    await savePersistedSettings(persisted);
     if (backupPath !== null) {
       latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
       console.warn(latestSettingsRecovery);
@@ -1328,8 +783,8 @@ ipcMain.handle('settings:browseFolder', async (event) => {
   return null;
 });
 
-ipcMain.handle('settings:revealPath', (_, p) => {
-  if (fs.existsSync(p)) shell.showItemInFolder(p);
+ipcMain.handle('settings:revealPath', async (_, p) => {
+  if (await pathExists(p)) shell.showItemInFolder(p);
 });
 
 ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () => {
@@ -1343,7 +798,6 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
     await Promise.resolve(indexerWorker.stop());
     indexerWorker = createWorkerBuildIndex();
   }
-  cleanupDbFiles(tempDbPath);
   let writerLease: ReturnType<typeof acquireWriterLease> = null;
   let rebuildWatchHints: string[] = [];
   try {
@@ -1378,7 +832,7 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
       codexDir: paths.codexDir,
       projectsDir: paths.projectsDir,
       dbPath: tempDbPath,
-      preserveDbPath: fs.existsSync(paths.dbPath) ? paths.dbPath : null,
+      preserveDbPath: await pathExists(paths.dbPath) ? paths.dbPath : null,
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });

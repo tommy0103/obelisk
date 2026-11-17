@@ -16,8 +16,6 @@ const router = useRouter();
 const listWrapRef = ref(null);
 const undoCountdown = ref(0);
 
-// --- Filtered/sorted memories ---
-
 const visibleMemories = computed(() => {
   const q = state.query.trim().toLowerCase();
   return state.memories
@@ -32,16 +30,12 @@ const visibleMemories = computed(() => {
 
 const showProjectPrefix = computed(() => state.projectFilter === 'all');
 
-// --- Detail state ---
-
 const detailMemory = computed(() => props.id ? state.memories.find(memory => memory.id === props.id) : null);
 const detailMarkdown = ref(null);
 const showSource = ref(false);
 const loadingMarkdown = ref(false);
 
 const showDetail = computed(() => Boolean(props.id));
-
-// --- Row helpers ---
 
 function dominantRowStatus(m) {
   if (m.health === 'broken') return 'broken';
@@ -103,8 +97,6 @@ function projectLabel(m) {
   return escapeHTML(formatProjectLabel(m.project));
 }
 
-// --- Selection ---
-
 function toggleSelection(id, { range = false } = {}) {
   const s = new Set(state.selection);
   if (range && state.cursorId) {
@@ -123,8 +115,6 @@ function toggleSelection(id, { range = false } = {}) {
   state.cursorId = id;
   setSelection(s);
 }
-
-// --- Cursor navigation ---
 
 function moveCursor(direction, extendSelection = false) {
   const items = visibleMemories.value;
@@ -160,8 +150,6 @@ function ensureVisible() {
   }
 }
 
-// --- Open detail ---
-
 let detailLoadVersion = 0;
 async function loadDetail(memory) {
   const version = ++detailLoadVersion;
@@ -191,8 +179,6 @@ function toggleSourceView() {
   showSource.value = !showSource.value;
 }
 
-// --- Row click ---
-
 function onRowClick(m, event) {
   if (event.shiftKey || event.metaKey || event.ctrlKey) {
     toggleSelection(m.id, { range: event.shiftKey });
@@ -201,8 +187,6 @@ function onRowClick(m, event) {
   state.cursorId = m.id;
   openDetail(m);
 }
-
-// --- Archive/restore with undo ---
 
 const undoSnapshot = ref(null);
 let undoTimer = null;
@@ -256,8 +240,6 @@ function startUndoTimer() {
   }, 1000);
 }
 
-// --- Detail action ---
-
 function detailArchiveRestore() {
   if (!detailMemory.value) return;
   if (detailMemory.value.archived) {
@@ -267,15 +249,11 @@ function detailArchiveRestore() {
   }
 }
 
-// --- Detail markdown rendering ---
-
 const renderedMarkdown = computed(() => {
   if (detailMarkdown.value == null) return null;
   if (showSource.value) return null; // handled by pre block in template
   return renderMarkdown(detailMarkdown.value, { variant: 'body' });
 });
-
-// --- Keyboard handler ---
 
 function onKeydown(e) {
   const tagName = e.target?.tagName;
@@ -313,11 +291,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- Detail panel overlay -->
   <div v-if="showDetail" class="detail-wrap">
     <div v-if="detailMemory" class="detail">
       <div class="detail-header">
         <div class="detail-eyebrow">
+          <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
           <span class="project-icon" v-html="FOLDER_SVG"></span>
           <span class="project-name">{{ formatProjectLabel(detailMemory.project) }}</span>
           <span v-if="detailMemory.archived" class="archived-tag">archived</span>
@@ -365,6 +343,7 @@ onUnmounted(() => {
           File not found or empty.
         </div>
         <pre v-else-if="showSource" class="markdown-source">{{ detailMarkdown }}</pre>
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div v-else class="markdown-body" v-html="renderedMarkdown"></div>
       </div>
 
@@ -406,7 +385,6 @@ onUnmounted(() => {
     <div v-else class="empty">{{ state.loaded ? 'Memory not found.' : 'Loading...' }}</div>
   </div>
 
-  <!-- List panel -->
   <div v-else ref="listWrapRef" class="list-wrap">
     <div v-if="!visibleMemories.length" class="empty">
       No memories{{ state.view === 'archived' ? ' archived' : '' }} here.
@@ -439,19 +417,17 @@ onUnmounted(() => {
 
         <div class="row-body">
           <div class="row-path">
-            <span
-              v-if="dominantRowStatus(m)"
-              class="row-status"
-              :class="dominantRowStatus(m)"
-              :title="dominantRowStatus(m)"
-              v-html="statusGlyphs(dominantRowStatus(m))"
-            ></span>
+            <!-- eslint-disable-next-line vue/no-v-html -- static SVG -->
+            <span v-if="dominantRowStatus(m)" class="row-status" :class="dominantRowStatus(m)" :title="dominantRowStatus(m)" v-html="statusGlyphs(dominantRowStatus(m))"></span>
             <template v-if="showProjectPrefix">
+              <!-- eslint-disable-next-line vue/no-v-html -- escapeHTML() -->
               <span class="project-prefix" v-html="projectLabel(m)"></span>
               <span class="project-prefix-sep">/</span>
             </template>
+            <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
             <span class="path-text" v-html="pathHTML(m)"></span>
           </div>
+          <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
           <div class="row-summary" v-html="summaryHTML(m)"></div>
         </div>
 
@@ -477,7 +453,6 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Undo toast -->
     <Transition name="undo-fade">
       <div v-if="undoSnapshot" class="undo-toast" @click="undoAction">
         {{ undoSnapshot.action === 'archive' ? 'Archived' : 'Restored' }}
@@ -662,21 +637,6 @@ onUnmounted(() => {
 
 .row.archived .row-path, .row.archived .row-summary { color: var(--muted); }
 .row.archived .row-path .project-prefix { color: var(--muted-2); }
-
-/* Empty state */
-.empty {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted-2);
-  font-size: var(--text-sm);
-  padding: 60px 20px;
-  text-align: center;
-  flex-direction: column;
-  gap: 8px;
-}
-.empty .hint { font-size: 11px; color: var(--muted-2); }
 
 /* Detail panel styles */
 .detail-header { margin-bottom: 24px; }

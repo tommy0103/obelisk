@@ -225,8 +225,9 @@ interactions, or the full Electron suites.
   Decode the specific entities your markdown library actually emits, escape on
   the way out, and pin "decode exactly once" with a test (`&amp;lt;` must stay
   `&lt;`). ESLint rejects new `innerHTML`/`outerHTML`/`insertAdjacentHTML` sinks
-  in renderer modules; `tests/app-source-budgets.test.mjs` caps `v-html` in
-  `.vue` templates at its current count.
+  in renderer modules and `.vue` scripts. ESLint `vue/no-v-html` makes each
+  `v-html` carry a disable comment naming what made it safe, and
+  `tests/app-source-budgets.test.mjs` caps `v-html` at its current count.
 - **No synchronous IO in the main process.** A network mount or UNC path freezes
   the whole UI. Use `fs.promises`. `tests/app-source-budgets.test.mjs` fails
   when a main-process module adds a `*Sync(` call.
@@ -234,6 +235,12 @@ interactions, or the full Electron suites.
   navigation when you only meant to handle markdown links affects everyone else.
 - **Main and preload sources are TypeScript** (ADR-0005). `app/tsconfig.json` sets
   `checkJs: false`, so a `.mjs` module has no type coverage at all.
+
+## Swallowed errors
+
+- **An empty `catch` needs a comment saying why swallowing is correct.** ESLint
+  (`no-empty`) rejects a bare `catch {}`. If you cannot write that comment, the
+  error is real: let it propagate, or report it where the user will see it.
 
 ## CLI and tool error messages
 

@@ -43,7 +43,7 @@ function renderFileContent(text, label = 'File contents', stripLineNumbers = tru
   return `<div class="file-content">
     <div class="file-content-head"><span class="label">${escapeHtml(label)}</span><span class="meta">${total} lines</span></div>
     <div class="file-content-body ${collapsed ? 'collapsed' : ''}"><div class="gutter">${gutter}</div><div class="code">${escapeHtml(lines.join('\n'))}</div></div>
-    ${collapsed ? `<button class="file-content-expand" onclick="this.previousElementSibling.classList.toggle('collapsed');this.textContent=this.previousElementSibling.classList.contains('collapsed')?'Show all ${total} lines':'Collapse'">Show all ${total} lines</button>` : ''}
+    ${collapsed ? `<button class="file-content-expand" data-lines="${total}">Show all ${total} lines</button>` : ''}
   </div>`;
 }
 
@@ -89,7 +89,7 @@ function renderValue(value) {
   if (typeof value === 'string') {
     if (/^https?:\/\//.test(value)) return `<span class="literal-string">${escapeHtml(value)}</span>`;
     if (value.length > 120) {
-      return `<span class="lit-string-long" onclick="this.classList.toggle('open')">"${escapeHtml(value.slice(0, 120))}<span class="long-rest">${escapeHtml(value.slice(120))}</span>"<button class="more-btn">+${value.length - 120}</button></span>`;
+      return `<span class="lit-string-long">"${escapeHtml(value.slice(0, 120))}<span class="long-rest">${escapeHtml(value.slice(120))}</span>"<button class="more-btn">+${value.length - 120}</button></span>`;
     }
     return `<span class="literal-string">"${escapeHtml(value)}"</span>`;
   }
@@ -170,7 +170,7 @@ function renderOutput(output, isError) {
   if (!output) return '<div style="padding:8px;color:var(--muted-2);font-style:italic;font-size:11px;">No output.</div>';
 
   let parsed = null;
-  try { parsed = JSON.parse(output); } catch {}
+  try { parsed = JSON.parse(output); } catch { /* not JSON: rendered as text below */ }
   if (parsed !== null && typeof parsed === 'object') {
     if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(item => item && typeof item === 'object' && !Array.isArray(item))) {
       return renderAutoTable(parsed);
@@ -186,7 +186,7 @@ function renderOutput(output, isError) {
     const gutter = lines.map((_, index) => index + 1).join('\n');
     return `<div class="file-content">
       <div class="file-content-body ${collapsed ? 'collapsed' : ''}"><div class="gutter">${gutter}</div><div class="code">${escapeHtml(output)}</div></div>
-      ${collapsed ? `<button class="file-content-expand" onclick="this.previousElementSibling.classList.toggle('collapsed');this.textContent=this.previousElementSibling.classList.contains('collapsed')?'Show all ${total} lines':'Collapse'">Show all ${total} lines</button>` : ''}
+      ${collapsed ? `<button class="file-content-expand" data-lines="${total}">Show all ${total} lines</button>` : ''}
     </div>`;
   }
 
@@ -247,6 +247,10 @@ function groupWorkflowAgents(workflow) {
   return phases;
 }
 
+/**
+ * @param {any} item
+ * @param {{ query?: string, expandedText?: string }} [options]
+ */
 export function buildSessionTimelinePresentation(item, { query = '', expandedText } = {}) {
   const message = item?.message || {};
   const toolCalls = item?.kind === 'workflow-tools'
@@ -299,4 +303,16 @@ export function buildSessionTimelinePresentation(item, { query = '', expandedTex
       ? groupWorkflowAgents(item.workflowCall?.workflow)
       : {},
   };
+}
+
+// The CSP blocks inline handlers, so the toggles in the tool markup above are
+// handled by the row that mounts it.
+export function handleToolOutputClick(event) {
+  const expand = event.target.closest('.file-content-expand');
+  if (expand) {
+    const collapsed = expand.previousElementSibling.classList.toggle('collapsed');
+    expand.textContent = collapsed ? `Show all ${expand.dataset.lines} lines` : 'Collapse';
+    return;
+  }
+  event.target.closest('.lit-string-long')?.classList.toggle('open');
 }

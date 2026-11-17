@@ -423,7 +423,6 @@ function discoverAll(
     return units;
   }
 
-  // Automatic mode: check process.env.OPENCODE_DB
   const envDb = process.env.OPENCODE_DB;
   if (envDb !== undefined && envDb.trim().length > 0) {
     const trimmed = envDb.trim();
@@ -440,7 +439,6 @@ function discoverAll(
     return discoverAtStore(storePath, ctx, opener);
   }
 
-  // Default directory discovery
   const defaultDir = defaultOpencodeDataRoot(homeDir);
   if (!existsSync(defaultDir)) {
     const prior = (ctx.indexedSessions?.() ?? []).some(s => s.jsonlPath.startsWith(`${normalize(defaultDir)}${sep}`) || s.jsonlPath.startsWith(`${normalize(defaultDir)}#ses:`));
@@ -519,7 +517,6 @@ function* parse(
   }
 
   if (meta.kind === 'opencode-tombstone') {
-    // Tombstone verification
     const db = openSource(meta.dbPath, opener);
     if (db === null) {
       throw new RetryableSourceReadError(meta.dbPath, `opencode: session database is busy or unreadable during tombstone verification: ${meta.dbPath}`);
@@ -608,7 +605,6 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
   if (identity === null) return null;
   const { dbPath, nativeId: rawSessionId } = identity;
 
-  // Store & Session identity strict authentication
   const expectedSessionId = opencodeSessionId(rawSessionId, dbPath);
   const sessionId = typeof input.session?.id === 'string' ? input.session.id : '';
   if (sessionId !== expectedSessionId) {
@@ -632,7 +628,6 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
       const { row: sessionRow, format: sessionFormat } = entry;
       const isSubagent = checkIsSubagent(db, sessionRow.parent_id, tables);
 
-      // Verify cursor if supplied
       if (input.cursor !== undefined && input.cursor !== null) {
         const state = decodeCursor(input.cursor);
         if (state === null) return null;
