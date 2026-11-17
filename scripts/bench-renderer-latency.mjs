@@ -171,11 +171,9 @@ try {
     const text = `gui append ${i}`;
     const start = performance.now();
     fs.appendFileSync(liveFile, `${line(i)}\n`);
-    // eslint-disable-next-line no-await-in-loop
     await waitFor(async () => visibleNow(text), `${text} visible`, 20000);
     isolated.push(performance.now() - start);
     console.log(`A append ${i} -> visible: ${isolated[isolated.length - 1].toFixed(0)} ms`);
-    // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 200));
   }
   console.log(`A isolated-burst latency ms: p50=${percentile(isolated, 50).toFixed(0)} p95=${percentile(isolated, 95).toFixed(0)}`);
@@ -227,10 +225,8 @@ try {
         indexedAt.set(a.i, performance.now());
       }
     }
-    // eslint-disable-next-line no-await-in-loop
     const hits = await Promise.all(missing.map(async (a) => ((await visibleNow(a.text)) ? a.i : null)));
     for (const hit of hits) if (hit !== null) visibleAt.set(hit, performance.now());
-    // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 100));
   }
   clearInterval(cursorProbe);

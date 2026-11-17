@@ -7,12 +7,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
+import { discoverJsonlFiles } from '../packages/core/src/parsing.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
@@ -471,4 +472,28 @@ test('a legacy two-part cursor keeps the mtime-only gate until it upgrades', () 
     1,
     'a legacy cursor behind the current mtime is reselected',
   );
+});
+
+test('discovery finds subagent and workflow transcripts under session directories and directory symlinks', () => {
+  const root = makeTempDir('obelisk-claude-discover-');
+  const project = join(root, 'projects', 'proj');
+  const outside = join(root, 'elsewhere');
+  mkdirSync(join(project, 's1', 'subagents', 'workflows', 'run1'), { recursive: true });
+  mkdirSync(join(outside, 'subagents'), { recursive: true });
+  writeFileSync(join(project, 's1.jsonl'), '');
+  writeFileSync(join(project, 'notes.txt'), '');
+  writeFileSync(join(project, 's1', 'subagents', 'a1.jsonl'), '');
+  writeFileSync(join(project, 's1', 'subagents', 'workflows', 'run1', 'w1.jsonl'), '');
+  writeFileSync(join(outside, 'subagents', 'a2.jsonl'), '');
+  symlinkSync(outside, join(project, 's2'), 'dir');
+
+  const found = discoverJsonlFiles(join(root, 'projects'))
+    .map(({ path, ...rest }) => ({ path: path.slice(project.length + 1), ...rest }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  assert.deepEqual(found, [
+    { path: 's1.jsonl', sessionId: 's1', project: 'proj', isSubagent: false },
+    { path: join('s1', 'subagents', 'a1.jsonl'), sessionId: 's1', project: 'proj', isSubagent: true, agentId: 'a1' },
+    { path: join('s1', 'subagents', 'workflows', 'run1', 'w1.jsonl'), sessionId: 's1', project: 'proj', isSubagent: true, agentId: 'w1', workflowRunId: 'run1' },
+    { path: join('s2', 'subagents', 'a2.jsonl'), sessionId: 's2', project: 'proj', isSubagent: true, agentId: 'a2' },
+  ]);
 });

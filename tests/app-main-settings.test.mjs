@@ -49,7 +49,6 @@ class SqliteCompatDatabase {
 // relative to the main module's directory) and mock that URL. Relative deps are
 // resolved against the main module URL directly.
 const mainUrl = new URL('../app/src/main/index.ts', import.meta.url);
-const mainPath = fileURLToPath(mainUrl);
 const mainDir = fileURLToPath(new URL('.', mainUrl));
 
 function esmResolve(specifier) {
