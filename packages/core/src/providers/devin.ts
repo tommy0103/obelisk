@@ -21,10 +21,13 @@
 //
 // Each unit replaces one whole session. The cursor fingerprints the session
 // row, its subagent heads and per-session node aggregates (count, max row id,
-// byte sizes, max created_at). octet_length reads record headers, not payloads,
-// so an unchanged census stays cheap on a large store. A rewrite that keeps
-// every aggregate, including byte length, is not detected until the session
-// changes again or the index is rebuilt.
+// byte sizes, max created_at), plus a digest of the session's node bytes.
+// octet_length reads record headers, not payloads, so an unhinted census
+// compares aggregates only and stays cheap on a large store. When a watcher
+// hint names the store and no aggregate moved, the write is unexplained: every
+// session's node bytes are digested and only a mismatch is replayed. A rewrite
+// that keeps every aggregate and lands in the same scan as an aggregate-visible
+// change waits for the next unexplained hint or a rebuild.
 
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -202,14 +205,30 @@ function fingerprint(session: SessionRow, aggregate: NodeAggregate | undefined, 
   ])).digest('hex').slice(0, 24);
 }
 
-function encodeCursor(session: SessionRow, aggregate: NodeAggregate | undefined, print: string): string {
-  // Leading numeric fields follow persist's index_state mtime/lines_processed convention.
-  return `${(session.last_activity_at ?? 0) * 1000}:${aggregate?.n ?? 0}:${CURSOR_TAG}:${print}`;
+// The exact bytes of every node row parse reads, framed so no two row sets
+// hash alike. Blobs skip text decoding, which is most of the cost.
+function contentDigest(db: SqliteDb, rawSessionId: string): string {
+  const statement = db.prepare('SELECT node_id, parent_node_id, created_at, CAST(chat_message AS BLOB) AS chat, '
+    + 'CAST(metadata AS BLOB) AS meta FROM message_nodes WHERE session_id = ? ORDER BY node_id');
+  const hash = createHash('sha256');
+  for (const row of statement.iterate?.(rawSessionId) ?? statement.all(rawSessionId)) {
+    const chat = row.chat as Uint8Array;
+    const meta = row.meta as Uint8Array | null;
+    hash.update(JSON.stringify([row.node_id, row.parent_node_id, row.created_at, chat.length, meta?.length ?? null]));
+    hash.update(chat);
+    if (meta !== null) hash.update(meta);
+  }
+  return hash.digest('hex').slice(0, 24);
 }
 
-function cursorPrint(cursor: Cursor): string | null {
+function encodeCursor(session: SessionRow, aggregate: NodeAggregate | undefined, print: string, digest: string): string {
+  // Leading numeric fields follow persist's index_state mtime/lines_processed convention.
+  return `${(session.last_activity_at ?? 0) * 1000}:${aggregate?.n ?? 0}:${CURSOR_TAG}:${print}:${digest}`;
+}
+
+function decodeCursor(cursor: Cursor): { print: string; digest: string } | null {
   const parts = cursor?.split(':');
-  return parts?.length === 4 && parts[2] === CURSOR_TAG ? parts[3]! : null;
+  return parts?.length === 5 && parts[2] === CURSOR_TAG ? { print: parts[3]!, digest: parts[4]! } : null;
 }
 
 function openStore(dbPath: string, opener: DevinDatabaseOpener): SqliteDb | null {
@@ -239,9 +258,10 @@ function storeState(dbPath: string): 'present' | 'missing' | 'inaccessible' {
 }
 
 function discoverAt(dbPath: string, ctx: DiscoverContext, opener: DevinDatabaseOpener): IndexUnit[] {
-  if (ctx.changedPaths !== undefined) {
+  const hinted = ctx.changedPaths !== undefined;
+  if (hinted) {
     const store = normalize(dbPath);
-    const touched = ctx.changedPaths.some((changed) => {
+    const touched = ctx.changedPaths!.some((changed) => {
       const path = isAbsolute(changed) ? normalize(changed) : store;
       return path === store || path === `${store}-wal` || store.startsWith(path + sep);
     });
@@ -281,20 +301,25 @@ function discoverAt(dbPath: string, ctx: DiscoverContext, opener: DevinDatabaseO
     }
 
     const units: IndexUnit[] = [];
+    const unit = (session: SessionRow, sessionId: string, key: string): IndexUnit => ({
+      key,
+      sessionId,
+      project: projectSlugFromPath(normalizeObservedCwd(session.working_directory)) ?? undefined,
+      retractSessionIds: [sessionId],
+      meta: { dbPath, rawSessionId: session.id } satisfies DevinUnitMeta,
+    });
     const live = new Set<string>();
+    const unchanged: { session: SessionRow; sessionId: string; key: string; digest: string }[] = [];
     for (const session of sessions) {
       const sessionId = devinSessionId(dbPath, session.id);
       const key = unitKey(dbPath, session.id);
       live.add(sessionId);
-      const print = fingerprint(session, aggregates.get(session.id), heads.get(session.id) ?? []);
-      if (cursorPrint(ctx.lastCursor(key)) === print) continue;
-      units.push({
-        key,
-        sessionId,
-        project: projectSlugFromPath(normalizeObservedCwd(session.working_directory)) ?? undefined,
-        retractSessionIds: [sessionId],
-        meta: { dbPath, rawSessionId: session.id } satisfies DevinUnitMeta,
-      });
+      const prior = decodeCursor(ctx.lastCursor(key));
+      if (prior?.print === fingerprint(session, aggregates.get(session.id), heads.get(session.id) ?? [])) {
+        unchanged.push({ session, sessionId, key, digest: prior.digest });
+      } else {
+        units.push(unit(session, sessionId, key));
+      }
     }
     for (const session of indexed) {
       if (live.has(session.sessionId)) continue;
@@ -304,6 +329,17 @@ function discoverAt(dbPath: string, ctx: DiscoverContext, opener: DevinDatabaseO
         retractSessionIds: [session.sessionId],
         meta: { dbPath, rawSessionId: '', tombstone: true } satisfies DevinUnitMeta,
       });
+    }
+    if (hinted && units.length === 0) {
+      // The watcher saw a write no aggregate explains: compare exact bytes.
+      db.exec('BEGIN');
+      try {
+        for (const { session, sessionId, key, digest } of unchanged) {
+          if (contentDigest(db, session.id) !== digest) units.push(unit(session, sessionId, key));
+        }
+      } finally {
+        db.exec('COMMIT');
+      }
     }
     return units;
   } catch (error) {
@@ -334,7 +370,8 @@ function readSession(db: SqliteDb, rawSessionId: string): SessionSnapshot | null
     ).all(rawSessionId) as NodeRow[];
     const heads = readHeads(db, rawSessionId).get(rawSessionId) ?? [];
     const present = aggregate.n > 0 ? aggregate : undefined;
-    return { session, nodes, heads, cursor: encodeCursor(session, present, fingerprint(session, present, heads)) };
+    const cursor = encodeCursor(session, present, fingerprint(session, present, heads), contentDigest(db, rawSessionId));
+    return { session, nodes, heads, cursor };
   } finally {
     db.exec('COMMIT');
   }

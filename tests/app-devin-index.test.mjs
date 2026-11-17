@@ -346,6 +346,30 @@ test('incremental updates re-index only the changed session and equal a fresh bu
     [{ uuid: `${heron}:c2-regenerated`, text: 'hello back, edited' }]);
 });
 
+test('a store hint re-plans a rewrite the aggregates cannot see; without a hint the census stays aggregate-only', () => {
+  const home = makeTempDir('obelisk-devin-rewrite-');
+  const { root, dbPath } = seedRoot(home);
+  const store = new Store(dbPath);
+  store.session('calm-heron');
+  store.node('calm-heron', 1, null, assistant('c1', T0 + 1, 'old answer'));
+  store.head('calm-heron', 1, T0 + 1);
+  const provider = createDevinProvider({ rootDir: root });
+  const [unit] = collect(provider).units;
+  const { cursor } = parseAll(provider, unit);
+  const lastCursor = key => (key === unit.key ? cursor : null);
+  const hint = { lastCursor, changedPaths: [`${dbPath}-wal`] };
+  assert.deepEqual(collect(provider, hint).units, [], 'a hint with nothing rewritten schedules nothing');
+
+  store.db.prepare('UPDATE message_nodes SET chat_message = ? WHERE session_id = ? AND node_id = 1')
+    .run(JSON.stringify(assistant('c1', T0 + 1, 'new answer')), 'calm-heron');
+  assert.deepEqual(collect(provider, { lastCursor }).units, [], 'an unhinted census reads aggregates only');
+  const units = collect(provider, hint).units;
+  assert.deepEqual(units.map(u => u.key), [unit.key]);
+  const texts = parseAll(provider, units[0]).records.filter(r => r.kind === 'message').map(r => r.text);
+  assert.ok(texts.includes('new answer'), JSON.stringify(texts));
+  store.close();
+});
+
 test('hiding or deleting a session retracts it; an unreadable store retracts nothing', () => {
   const home = makeTempDir('obelisk-devin-retract-');
   const { root, dbPath } = seedRoot(home);
