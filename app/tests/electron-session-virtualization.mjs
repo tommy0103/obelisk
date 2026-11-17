@@ -909,9 +909,12 @@ async function run() {
   stressGlobalCatalogue = true;
   const wheelPaint = await traceWheelPaintContinuity(win, { updateTool: true });
   stressGlobalCatalogue = false;
+  // Chromium coalesces wheel events into one per rendered frame, so a slow
+  // runner sees fewer. The update is requested on wheel 3; the gesture only
+  // has to continue past it.
   assert(
     Math.abs(wheelPaint.after - wheelPaint.before) > 500
-      && wheelPaint.wheels >= 8 && wheelPaint.screenshots >= 4,
+      && wheelPaint.wheels > 3 && wheelPaint.screenshots >= 4,
     `wheel trace exercises compositor scrolling (${JSON.stringify(wheelPaint)})`,
   );
   assert(
@@ -1252,6 +1255,7 @@ async function run() {
   if (!win.isFocused()) throw new Error('Live scroll probe requires a focused window');
   await win.webContents.debugger.sendCommand('Emulation.setCPUThrottlingRate', { rate: 12 });
   currentSessionTitle = 'Live metadata title';
+  const stopLiveScrollTrace = await startRendererTrace(win);
   const scrollProbe = await win.webContents.executeJavaScript(`new Promise(resolve => {
     const wrap = document.querySelector('.detail-wrap');
     const totalBeforeGesture = Number(document.querySelector('.flap-number')?.getAttribute('aria-label'));
@@ -1277,6 +1281,7 @@ async function run() {
       return originalScrollTo(...args);
     };
     const gaps = [];
+    performance.mark('obelisk-live-scroll-start');
     const startedAt = performance.now();
     let previous = startedAt;
     let previousGeometry = null;
@@ -1335,6 +1340,7 @@ async function run() {
           restore: () => { wrap.scrollTo = originalScrollTo; },
         };
         wrap.removeEventListener('scrollend', blockAutomaticScrollEnd, true);
+        performance.mark('obelisk-live-scroll-end');
         wrap.dispatchEvent(new Event('scrollend'));
         resolve({
           totalBeforeGesture,
@@ -1356,6 +1362,7 @@ async function run() {
     }
     requestAnimationFrame(frame);
   })`, true);
+  const liveScrollWork = rendererTaskMetrics(await stopLiveScrollTrace(), 'obelisk-live-scroll-start', 'obelisk-live-scroll-end');
   assert(scrollProbe.totalBeforeGesture === messageCount + stationaryAppendRuns, 'the live append starts after the renderer gesture begins');
   console.log(`SCROLL GESTURE: ${JSON.stringify(scrollProbe)}`);
   await waitFor(
@@ -1438,7 +1445,12 @@ async function run() {
       && Math.abs(readerState.anchor.offset - scrollProbe.anchor.offset) < 2,
     `live append preserves reader anchor ${scrollProbe.anchor?.uuid} (${scrollProbe.anchor?.offset}px -> ${readerState.anchor?.offset}px)`,
   );
-  assert(scrollProbe.maxFrameGap < 250, `live scroll has no catastrophic long frame (${scrollProbe.maxFrameGap.toFixed(1)}ms)`);
+  // Gate renderer CPU, not wall time: on a shared runner the frame gap also
+  // counts time the renderer was descheduled. The throttle applies to both.
+  assert(
+    liveScrollWork.maxTaskWorkMs < 250,
+    `live scroll has no catastrophic renderer task (${liveScrollWork.maxTaskWorkMs.toFixed(1)}ms work; frame gap ${scrollProbe.maxFrameGap.toFixed(1)}ms)`,
+  );
 
   await win.webContents.debugger.sendCommand('Emulation.setCPUThrottlingRate', { rate: 1 });
 
