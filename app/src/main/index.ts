@@ -200,9 +200,7 @@ function cleanupDbFiles(dbPath) {
 function replaceDbWithTemp(tempDbPath, dbPath) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
-    try {
-      fs.rmSync(sidecar, { force: true });
-    } catch {}
+    fs.rmSync(sidecar, { force: true });
   }
   fs.renameSync(tempDbPath, dbPath);
   for (const suffix of ['-wal', '-shm']) {
@@ -918,16 +916,14 @@ ipcMain.handle('db:readMemoryFile', (_, filePath) => {
 function querySessionFileRoots(sessionId: unknown): string[] {
   if (!db || typeof sessionId !== 'string' || !sessionId) return [];
   const roots: string[] = [];
-  try {
-    const rows = db.prepare(
-      `SELECT DISTINCT cwd FROM messages
-       WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-         AND COALESCE(visibility, 'visible') = 'visible'`
-    ).all(sessionId);
-    for (const row of rows) roots.push(row.cwd);
-    const session = db.prepare(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
-    if (session?.project_path) roots.push(session.project_path);
-  } catch {}
+  const rows = db.prepare(
+    `SELECT DISTINCT cwd FROM messages
+     WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
+       AND COALESCE(visibility, 'visible') = 'visible'`
+  ).all(sessionId);
+  for (const row of rows) roots.push(row.cwd);
+  const session = db.prepare(`SELECT project_path FROM sessions WHERE id = ?`).get(sessionId);
+  if (session?.project_path) roots.push(session.project_path);
   return roots;
 }
 
@@ -1173,6 +1169,7 @@ ipcMain.handle('settings:get', async () => {
   } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
+  let indexError: string | null = null;
   const sourceStats = new Map<string, { sessionCount: number; lastIndexed: string }>();
 
   if (db) {
@@ -1191,7 +1188,11 @@ ipcMain.handle('settings:get', async () => {
         });
       }
       memoryCount = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
-    } catch {}
+    } catch (error) {
+      // Settings stays usable so the user can repoint sources or rebuild; the zero counts
+      // must not pass for an empty index.
+      indexError = `Index database could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
   const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
   const sourcePaths = new Set([
@@ -1250,6 +1251,7 @@ ipcMain.handle('settings:get', async () => {
     status: connected ? 'ok' : 'error',
     statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
     settingsRecovery: latestSettingsRecovery,
+    indexError,
   };
 });
 

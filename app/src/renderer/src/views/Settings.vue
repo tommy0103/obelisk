@@ -28,6 +28,7 @@ const rebuilding = ref(false);
 const rebuildError = ref('');
 const settingsRecovery = ref('');
 const saveError = ref('');
+const indexError = ref('');
 const version = ref('');
 let stopIndexUpdates = null;
 let settingsRequestVersion = 0;
@@ -65,6 +66,7 @@ async function loadSettings({ preserveRecapPath = false } = {}) {
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
   settingsRecovery.value = s.settingsRecovery || '';
+  indexError.value = s.indexError || '';
   version.value = s.version || '';
   settingsLoaded = true;
 }
@@ -193,6 +195,11 @@ function fmtRelative(iso) {
         <div v-if="saveError" class="status-row error settings-save-error">
           <span class="status-dot error"></span>
           <span>{{ saveError }}</span>
+        </div>
+
+        <div v-if="indexError" class="status-row error settings-index-error">
+          <span class="status-dot error"></span>
+          <span>{{ indexError }}</span>
         </div>
 
         <div v-if="settingsRecovery" class="status-row warn settings-recovery">
