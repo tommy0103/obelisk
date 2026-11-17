@@ -77,4 +77,3 @@ export function setQuery(q) {
 export function setProjectSearch(q) {
   state.projectSearch = q;
 }
-
