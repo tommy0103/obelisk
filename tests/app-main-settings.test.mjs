@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
@@ -49,7 +49,6 @@ class SqliteCompatDatabase {
 // relative to the main module's directory) and mock that URL. Relative deps are
 // resolved against the main module URL directly.
 const mainUrl = new URL('../app/src/main/index.ts', import.meta.url);
-const mainPath = fileURLToPath(mainUrl);
 const mainDir = fileURLToPath(new URL('.', mainUrl));
 
 function esmResolve(specifier) {
@@ -87,7 +86,7 @@ async function importMain() {
 // Electron named-export namespace. ESM named imports are validated at load time,
 // so every export the app imports ('app', 'BrowserWindow', 'ipcMain', 'clipboard',
 // 'dialog', 'nativeImage', 'shell') must be present, even if unused by a test.
-function electronNamespace({ app, BrowserWindow, ipcMain }) {
+function electronNamespace({ app, BrowserWindow, ipcMain, shell }) {
   return {
     app: { isPackaged: false, getVersion: () => '0.2.3', ...(app ?? { whenReady: () => Promise.resolve(), on() {}, quit() {} }) },
     BrowserWindow,
@@ -95,7 +94,7 @@ function electronNamespace({ app, BrowserWindow, ipcMain }) {
     clipboard: {},
     dialog: {},
     nativeImage: {},
-    shell: {},
+    shell: shell ?? {},
   };
 }
 
@@ -2287,7 +2286,9 @@ test('a save is refused and the file left alone when the rejected file cannot be
       rmSync(join(obeliskDir, 'write-probe'), { force: true });
       t.skip('a mode-0555 directory does not block a rename here');
       return;
-    } catch {}
+    } catch {
+      // Expected: the read-only directory refused the rename.
+    }
 
     await assert.rejects(
       () => ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed'),
@@ -2349,5 +2350,179 @@ test('a refused settings save does not poison the next queued save', async () =>
     assert.equal(saved.recapDir, '/before');
   } finally {
     cleanup();
+  }
+});
+
+// Loads the real main process over a real index, so a test can break the index underneath it
+// the way a damaged or foreign database would, and watch what the renderer is told.
+async function loadMainOverRealIndex(seed) {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-index-errors-${Date.now()}-${Math.random()}`);
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const setup = new DatabaseSync(dbPath);
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  seed?.(setup, home);
+  setup.close();
+
+  const ipcHandlers = new Map();
+  const appHandlers = new Map();
+  const openedUrls = [];
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      app: captureAppHandlers(appHandlers), BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+      shell: { openExternal: async (url) => { openedUrls.push(url); } },
+    }) }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+  const cleanup = async () => {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    await closeMainProcessDb(appHandlers);
+    rmSync(home, { recursive: true, force: true });
+  };
+  try {
+    await importMain();
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  const breakIndex = (sql) => {
+    const external = new DatabaseSync(dbPath);
+    external.exec(sql);
+    external.close();
+  };
+  return { ipcHandlers, home, openedUrls, breakIndex, cleanup };
+}
+
+// Settings must keep loading when the index is unreadable, but zero counts alone would read
+// as an empty index. The failure has to reach the page.
+test('settings reports an unreadable index instead of showing empty counts', async () => {
+  const { ipcHandlers, breakIndex, cleanup } = await loadMainOverRealIndex();
+  try {
+    assert.equal((await ipcHandlers.get('settings:get')()).indexError, null, 'a healthy index reports no error');
+
+    breakIndex('DROP TABLE memories');
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.match(settings.indexError, /no such table: memories/);
+    assert.ok(Array.isArray(settings.sources), 'the rest of Settings still loads');
+  } finally {
+    await cleanup();
+  }
+});
+
+// An index failure used to look like "this session recorded no roots", so the click silently
+// did nothing. It must reach the caller as the database error it is.
+test('opening a file reference surfaces an index failure instead of refusing silently', async () => {
+  let project;
+  const { ipcHandlers, openedUrls, breakIndex, cleanup } = await loadMainOverRealIndex((setup, home) => {
+    mkdirSync(join(home, 'project'), { recursive: true });
+    // Containment compares the file's realpath; macOS temp dirs sit behind /var -> /private/var.
+    project = realpathSync(join(home, 'project'));
+    writeFileSync(join(project, 'notes.txt'), 'x');
+    setup.prepare('INSERT INTO sessions (id, project_path) VALUES (?, ?)').run('ref-session', project);
+    setup.prepare(`INSERT INTO messages (uuid, session_id, type, cwd) VALUES ('ref-m1', 'ref-session', 'user', ?)`)
+      .run(project);
+  });
+  const ref = { sessionId: 'ref-session', path: 'notes.txt', cwd: project };
+  try {
+    const opened = await ipcHandlers.get('file-ref:open')(null, ref);
+    assert.equal(opened.opened, true, 'a reference inside the recorded cwd opens');
+    assert.equal(openedUrls.length, 1);
+
+    breakIndex('DROP TABLE messages');
+    await assert.rejects(() => ipcHandlers.get('file-ref:open')(null, ref), /no such table: messages/);
+    assert.equal(openedUrls.length, 1, 'nothing is opened on a failed lookup');
+  } finally {
+    await cleanup();
+  }
+});
+
+// A rebuilt index is renamed over the live one. A stale -wal left beside it would be replayed
+// into the new file on open, so a sidecar that cannot be removed must stop the swap.
+test('a rebuild that cannot remove the live WAL fails and leaves the live index alone', async () => {
+  const home = makeTempDir(`obelisk-main-rebuild-wal-${Date.now()}`);
+  const obeliskDir = join(home, '.obelisk');
+  const liveDbPath = join(obeliskDir, 'obelisk.sqlite');
+  mkdirSync(obeliskDir, { recursive: true });
+  writeFileSync(liveDbPath, 'live db');
+  // A non-empty directory is a portable stand-in for a sidecar the OS refuses to delete.
+  mkdirSync(join(`${liveDbPath}-wal`, 'held'), { recursive: true });
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+
+  const ipcHandlers = new Map();
+  class FakeDatabase {
+    constructor(dbPath) {
+      this.lockDb = dbPath.endsWith('writer.lock.sqlite') ? new DatabaseSync(dbPath) : null;
+    }
+    function() {}
+    pragma() {}
+    exec(sql) { return this.lockDb?.exec(sql); }
+    close() { this.lockDb?.close(); }
+    prepare() { return { get: () => null, all: () => [], run: () => ({}) }; }
+  }
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setWindowOpenHandler() {}, getURL() { return ''; }, setZoomLevel() {}, openDevTools() {}, send() {} };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } },
+    }) }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: {
+      createWorkerBuildIndex: () => ({
+        buildIndex: async (args) => {
+          writeFileSync(args.dbPath, 'rebuilt temp db');
+          return { files: 1, affectedSessionIds: [], complete: true, inventoryIssues: [], skippedFiles: [], watchHints: [] };
+        },
+        stop() { return Promise.resolve(); },
+      }),
+    } }],
+  ]);
+
+  try {
+    await importMain();
+    await assert.rejects(() => ipcHandlers.get('settings:rebuildIndex')(), /directory/i);
+    assert.equal(readFileSync(liveDbPath, 'utf8'), 'live db', 'the live index was not replaced');
+  } finally {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
   }
 });

@@ -7,6 +7,7 @@ defineProps({
   deck: String,
   summary: String,
   stats: String,
+  /** @type {import('vue').PropType<import('../../recap').WorkflowItem[]>} */
   items: Array,
   verdict: String,
   idx: { type: Number, default: 4 },

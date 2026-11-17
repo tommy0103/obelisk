@@ -1,0 +1,55 @@
+// Fails `npm run lint` when a file, export, or dependency loses its last user.
+// Delete the dead code instead of adding it to an ignore list.
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "ignoreExportsUsedInFile": { "interface": true, "type": true },
+  "ignoreBinaries": [
+    // Installed in app/node_modules, which CI enters with npm --prefix app / npx.
+    "electron", "electron-vite",
+    "packaging/publish-skill.sh"
+  ],
+  "workspaces": {
+    ".": {
+      // npm test runs tests/*.test.mjs; a helper under tests/ that no test
+      // imports is reported. Fixtures are read as data, not imported.
+      "entry": ["tests/*.test.mjs", "scripts/*.mjs", "packaging/*.mjs", ".github/scripts/*.mjs"],
+      "project": ["tests/**/*.{mjs,js}", "!tests/fixtures/**", "scripts/**/*.mjs", "packaging/**/*.mjs"],
+      // Root tests load the app's native and renderer dependencies and the DSH
+      // runtime installed for packages/dsh-plugin.
+      "ignoreDependencies": ["better-sqlite3", "vue", "@tanstack/vue-virtual", "@deepseek-ai/.+"]
+    },
+    "app": {
+      // Runtime entries only: the main process, the indexer worker (started by
+      // path from indexer-worker-client.ts), preload and renderer. The other
+      // rollup inputs in electron.vite.config.ts are imported from index.ts,
+      // so knip reaches them and still checks their exports. A main-process
+      // file nothing imports is reported as unused.
+      "entry": [
+        "src/main/index.ts", "src/main/indexer-worker.ts",
+        "src/preload/index.ts", "src/renderer/src/main.js",
+        // Global Window declarations for vue-tsc; nothing imports them.
+        "src/renderer/src/env.d.ts",
+        // run-electron-suites.mjs runs tests/electron-*.mjs, and CI runs
+        // packaged-deb-updates.mjs by path. knip finds the runner and
+        // packaged-updates.mjs through package.json and the workflows. Any
+        // other test file must be imported by one of these.
+        "tests/electron-*.mjs", "tests/packaged-deb-updates.mjs",
+        "scripts/*.mjs", "electron.vite.config.ts"
+      ],
+      "project": ["src/**/*.{ts,js,mjs,vue}", "tests/**/*.mjs"],
+      // @parcel/watcher is loaded by packages/adaptive-watcher, which the app
+      // bundles from source; the packaged app must still ship it.
+      // builder-util and @electron/asar come with electron-builder.
+      "ignoreDependencies": ["@parcel/watcher", "builder-util", "@electron/asar"]
+    },
+    "packages/cli": { "entry": ["src/obelisk.ts", "scripts/*.mjs"], "project": ["src/**/*.ts"] },
+    "packages/core": { "project": ["src/**/*.ts"] },
+    "packages/dsh-plugin": {
+      "entry": ["src/index.ts", "src/context-window.ts", "scripts/*.mjs"],
+      "project": ["src/**/*.ts"],
+      // Exercised by the root DSH plugin tests, not by the plugin source.
+      "ignoreDependencies": ["@deepseek-ai/.+"]
+    },
+    "packages/adaptive-watcher": { "project": ["src/**/*.ts"] }
+  }
+}

@@ -6,7 +6,7 @@ import { computed, ref, shallowRef, watch, nextTick, onMounted, onUnmounted } fr
 import { useVirtualizer } from '@tanstack/vue-virtual';
 import { useRouter } from 'vue-router';
 import { state } from '../store.js';
-import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
+import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime } from '../utils.js';
 
 defineOptions({ name: 'SessionList' });
 
@@ -20,8 +20,6 @@ function onKeydown(e) {
 }
 onMounted(() => window.addEventListener('keydown', onKeydown));
 onUnmounted(() => window.removeEventListener('keydown', onKeydown));
-
-const homePath = (typeof process !== 'undefined' && process.env?.HOME) || '~';
 
 const showProjectPrefix = computed(() => state.projectFilter === 'all');
 const showNoise = ref(false);
@@ -140,16 +138,6 @@ function timeLabel(session) {
   return fmtListTime(ts);
 }
 
-function lastActiveLabel(session) {
-  const ts = new Date(session.ended_at || session.started_at || 0).getTime();
-  return fmtListTime(ts);
-}
-
-function createdLabel(session) {
-  const ts = new Date(session.started_at || 0).getTime();
-  return fmtRelative(ts);
-}
-
 function openSession(session) {
   router.push({ name: 'SessionDetail', params: { id: session.id } });
 }
@@ -208,7 +196,7 @@ function obeliskStyle(session) {
         </div>
         <div class="help-row">
           <span class="label">searched</span>
-          <code>{{ homePath }}</code>
+          <code>~</code>
         </div>
       </div>
     </div>
@@ -221,16 +209,18 @@ function obeliskStyle(session) {
 
     <div v-else ref="scrollElement" class="session-scroll">
       <div class="session-list" :style="{ height: `${totalSize}px` }">
-        <div v-for="item in virtualRows" :key="item.key" :data-index="item.index"
+        <div v-for="item in virtualRows" :key="item.index" :data-index="item.index"
           class="virtual-row" :style="{ transform: `translateY(${item.start}px)` }">
           <template v-if="rowAt(item.index)">
             <div :class="['srow', { noise: item.index > totals.normal, cursor: state.cursorId === rowAt(item.index).id }]"
               :data-session-id="rowAt(item.index).id" @click="openSession(rowAt(item.index))">
               <div v-if="item.index < totals.normal" class="srow-obelisk" :style="obeliskStyle(rowAt(item.index))"></div>
               <div class="srow-body">
+                <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
                 <div class="srow-title" v-html="titleHTML(rowAt(item.index))"></div>
                 <div class="srow-meta">
                   <template v-if="showProjectPrefix">
+                    <!-- eslint-disable-next-line vue/no-v-html -- escapeHTML() -->
                     <span class="project-tag" v-html="projectLabel(rowAt(item.index))"></span>
                     <span class="dot"></span>
                   </template>

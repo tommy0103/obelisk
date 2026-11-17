@@ -69,3 +69,11 @@ export interface AppliedSessionPatch {
 }
 
 export type WindowControlAction = 'minimize' | 'toggle-maximize' | 'close';
+
+export interface WindowState {
+  maximized: boolean;
+}
+
+export interface SessionUpdatedEvent {
+  sessionId: string;
+}

@@ -4,7 +4,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { PALETTES, ARCH_KEYS } from '../components/recap/archetypes.js';
+import { PALETTES } from '../components/recap/archetypes.js';
 import { CORNER_SEALS } from '../components/recap/seals.js';
 
 defineOptions({ name: 'RecapList' });
@@ -24,7 +24,7 @@ const byYear = computed(() => {
     if (!map[y]) map[y] = [];
     map[y].push(r);
   }
-  return Object.entries(map).sort((a, b) => b[0] - a[0]);
+  return Object.entries(map).sort((a, b) => Number(b[0]) - Number(a[0]));
 });
 
 function glowColor(arch) {
@@ -71,7 +71,9 @@ async function copyCmd() {
     await navigator.clipboard.writeText(generateCmd.value);
     cmdCopied.value = true;
     setTimeout(() => { cmdCopied.value = false; }, 1600);
-  } catch {}
+  } catch {
+    // Clipboard denied: the command stays on screen to copy by hand.
+  }
 }
 
 async function loadRecaps() {
@@ -112,6 +114,7 @@ onUnmounted(() => { unsub?.(); });
               :style="{ '--node-glow': glowColor(r.persona?.archetype) }"
               @click="openRecap(r._filename)"
             >
+              <!-- eslint-disable-next-line vue/no-v-html -- static SVG from seals.js -->
               <div class="recap-node" v-html="sealSvg(r.persona?.archetype)"></div>
               <div class="recap-card">
                 <div class="recap-body">

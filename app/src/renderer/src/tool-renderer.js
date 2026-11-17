@@ -209,7 +209,9 @@ function extractInputTextBlocks(raw) {
         };
       }
     }
-  } catch {}
+  } catch {
+    // Not JSON: scan the raw text for text fields below.
+  }
 
   const marker = '"text":"';
   const texts = [];
