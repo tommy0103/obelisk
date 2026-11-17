@@ -414,3 +414,110 @@ test('validation reports what the format does not allow', () => {
   assert.match(problems, /1\.5 is not an integer/);
   assert.match(problems, /"masks" is only allowed in the published form/);
 });
+
+test('validation rejects malformed field values and incomplete content parts', () => {
+  const { session: valid } = only([session(), message('ask', 'user', 'hello', 1)]);
+  const cases = [
+    (s) => { s.turns = {}; },
+    (s) => { s.id = 42; },
+    (s) => { s.title = []; },
+    (s) => { s.git_branch = false; },
+    (s) => { s.harness.name = null; },
+    (s) => { s.harness.version = 1; },
+    (s) => { s.turns[0].steps[0].skill = null; },
+    (s) => { s.turns[0].steps[0].extra = []; },
+    (s) => { s.turns[0].steps[0].content = [{ type: 'text' }]; },
+    (s) => { s.turns[0].steps[0].content = [{ type: 'text', text: 'hi', unknown: true }]; },
+    (s) => { s.turns[0].steps[0].content = [{ type: 'image' }]; },
+    (s) => { s.turns[0].steps[0].content = [{ type: 'file', media_type: 'text/plain', blob: { sha256: 'x', bytes: -1 } }]; },
+    (s) => { s.turns[0].steps[0] = { by: 'agent', kind: 'text', id: 'a', at: null, content: '', usage: null }; },
+    (s) => { s.turns[0].steps[0] = { by: 'agent', kind: 'text', id: 'a', at: null, content: '', usage: { output: '1' } }; },
+    (s) => { s.turns[0].steps[0] = { by: 'agent', kind: 'tool', id: 'a', at: null, tool: { id: 1, name: false, input: {} } }; },
+    (s) => { s.turns[0].steps[0] = { by: 'agent', kind: 'run', id: 'a', at: null, run: { agent: { id: null }, steps: [] } }; },
+    (s) => { s.turns[0].steps[0].extra = { '\ud800': 'invalid key' }; },
+    (s) => { s.turns[0].steps[0].extra = { missing: undefined }; },
+  ];
+  for (const mutate of cases) {
+    const broken = structuredClone(valid);
+    mutate(broken);
+    assert.ok(validateUsf(broken).length > 0, String(mutate));
+  }
+});
+
+test('an orphan result survives even when its carrier message is absent', () => {
+  const { session: usf, stats } = only([session(), result('missing-call', 'missing-message', 'retained')]);
+  assert.deepEqual(stepsOf(usf), [{ by: 'harness', kind: 'result', id: 'missing-call', at: null, content: 'retained' }]);
+  assert.equal(stats.resultsWithoutCall, 1);
+});
+
+test('subagent-only records still produce a session without a session header', () => {
+  const { session: usf } = only([message('task', 'user', 'retained', 1, { agent_id: 'child', is_sidechain: 1 })]);
+  assert.equal(usf.id, SESSION);
+  assert.deepEqual(stepsOf(usf).map(label), ['agent/run', 'harness/task']);
+});
+
+test('a detached subtree is emitted once even when descendants arrive before their parent', () => {
+  const records = [
+    session({ id: 'grandchild' }),
+    message('leaf', 'assistant', 'retained', 3, { session_id: 'grandchild' }),
+    session({ id: 'child' }),
+    message('task', 'user', 'task', 2, { session_id: 'child' }),
+    { kind: 'subagent', session_id: 'absent', agent_id: 'child' },
+    { kind: 'subagent', session_id: 'child', agent_id: 'grandchild' },
+  ];
+  const assembly = assembleUsf(records);
+  assert.deepEqual(assembly.sessions.map(({ session: s, detached }) => [s.id, detached]), [['child', true]]);
+  assert.equal(stepsOf(assembly.sessions[0].session).filter((s) => s.id === 'leaf').length, 1);
+});
+
+test('a child with no main messages still carries its nested agents', () => {
+  const { session: usf } = only([
+    session(), session({ id: 'child' }),
+    { kind: 'subagent', session_id: SESSION, agent_id: 'child' },
+    { kind: 'subagent', session_id: 'child', agent_id: 'leaf' },
+    message('leaf-task', 'user', 'retained', 2, { session_id: 'child', agent_id: 'leaf' }),
+  ]);
+  assert.ok(stepsOf(usf).some((s) => s.id === 'leaf-task'));
+});
+
+test('unlinked runs are placed by time across offsets without reordering provider steps', () => {
+  const { session: usf } = only([
+    session(), message('ask', 'user', 'ask', 1), message('answer', 'assistant', 'answer', 9),
+    { kind: 'subagent', session_id: SESSION, agent_id: 'child' },
+    message('task', 'user', 'task', 3, { agent_id: 'child', timestamp: '2026-06-10T11:00:03+01:00' }),
+  ]);
+  assert.deepEqual(usf.turns[0].steps.map((s) => s.id), ['ask', 'child', 'answer']);
+});
+
+test('validation accepts complete multipart content and published metadata', () => {
+  const { session: usf } = only([session(), message('ask', 'user', 'hello', 1)]);
+  usf.turns[0].steps[0].content = [
+    { type: 'text', text: 'hello' },
+    { type: 'image', media_type: 'image/png', blob: { sha256: 'a'.repeat(64), bytes: 10 } },
+    { type: 'file', media_type: 'text/plain', blob: { sha256: 'b'.repeat(64), bytes: 0 } },
+  ];
+  assert.deepEqual(validateUsf(usf), []);
+  Object.assign(usf.turns[0], { v: 1, id: 'turn-hash', parent: null });
+  assert.deepEqual(validateUsf(usf, { profile: 'published' }), []);
+  for (const metadata of [{ v: '1' }, { id: 1 }, { parent: [] }]) {
+    const broken = structuredClone(usf);
+    Object.assign(broken.turns[0], metadata);
+    assert.ok(validateUsf(broken, { profile: 'published' }).length > 0);
+  }
+});
+
+test('validation reports cyclic and non-JSON input without throwing', () => {
+  const { session: usf } = only([session(), message('ask', 'user', 'hello', 1)]);
+  for (const value of [1n, () => {}, new Date(), usf]) {
+    usf.turns[0].steps[0].extra = { value };
+    assert.ok(validateUsf(usf).length > 0);
+  }
+});
+
+test('cyclic subagent sessions are rejected instead of duplicating their records', () => {
+  assert.throws(() => assembleUsf([
+    session({ id: 'a' }), session({ id: 'b' }),
+    { kind: 'subagent', session_id: 'a', agent_id: 'b' },
+    { kind: 'subagent', session_id: 'b', agent_id: 'a' },
+  ]), /acyclic subagent session relationships/);
+});

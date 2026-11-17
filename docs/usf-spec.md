@@ -216,6 +216,18 @@ harness 用助手的身份写的通知（切换模型的提示之类）也是 `h
 | `summary` 的 `source` | 没有统一的词表：`away_summary`、`compaction`、`kiro:compaction`、`pi:compaction`、`copilot`。Kiro 把分支对话（tangent）的回答也记成了压缩 |
 | 图片 | 只有 Pi 给了一个占位的文字，其余不给 |
 
+### 5.2 使用参考实现
+
+构建 core 后，从 `@obelisk/core/usf` 导入 `assembleUsf`、`publishedUsf` 和 `validateUsf`。调用方先收集相关 session 的所有 unit，以 `provider.parse(unit, null)` 完整解析，再把记录交给 `assembleUsf(records)`。返回值包含 `sessions`、重复消息计数和未承载的记录种类计数。
+
+装配器不截断文本，但也不能恢复 adapter 已经截掉的内容。需要全文时，调用方须在解析前通过 `@obelisk/core/parsing` 的 `setTextLimit(Infinity)` 关闭解析上限，完成后恢复原值；这是进程级设置，不应与索引任务并发修改。
+
+`publishedUsf` 只过滤非当前可见的步骤；它不遮盖秘密、不生成回合哈希，也不保证结果已经可以对外发布。`validateUsf` 检查结构、字段类型和格式约束，不检查内容是否已经脱敏，也不验证 blob 是否存在或回合哈希是否正确。
+
+没有消息头的工具结果仍保留为 `harness/result`，时间为 `null`。只有子 agent 消息或主消息为空的子 session 仍保留其后代。脱离父级的子树按祖先先于后代装配，避免输入顺序导致重复导出；循环的 session 父子关系会被拒绝。无关联调用的 `run` 按实际时间（考虑时区偏移）插入，不重排已有步骤。
+
+仓库内的 `tests/usf.test.mjs` 覆盖 Codex、DeepSeek、OMP、Pi 的 fixture 和格式回归，`tests/core-package-build.test.mjs` 覆盖构建后包的导出入口；它们由 `npm test` 和 CLI CI 的完整仓库测试执行。5.1 中的 12-adapter 端到端探针位于仓库外的 Cairn 原型，不是本仓库 CI 的覆盖承诺。
+
 ## 6. 确定的写法
 
 对回合算哈希时，写法用 RFC 8785（JSON Canonicalization Scheme）：键按 UTF-16 码元排序，没有空白，字符串按 ECMAScript 的 `JSON.stringify` 转义。字符串必须是合法的 Unicode。

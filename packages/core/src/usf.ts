@@ -179,6 +179,7 @@ interface SessionRecords {
   agents: AgentRecords[];
   /** The session is also some other session's sub-agent. */
   child: boolean;
+  parent: string | null;
 }
 
 const SEP = '\u0000';
@@ -256,6 +257,9 @@ function groupRecords(records: Iterable<TranscriptRecord>) {
     }
   }
 
+  const ids = new Set<string>(sessionRecords.keys());
+  for (const key of lists.keys()) ids.add(key.split(SEP)[1]);
+
   // The sub-agents a session's calls can start, and theirs in turn.
   const agentsOf = (sessionId: string, seen = new Set([sessionId])): AgentRecords[] => {
     const out: AgentRecords[] = [];
@@ -264,7 +268,7 @@ function groupRecords(records: Iterable<TranscriptRecord>) {
       const own = lists.get(agentKey(sessionId, note.agent_id));
       const asSession = own ? undefined : lists.get(sessionKey(note.agent_id));
       out.push({ agentId: note.agent_id, records: own ?? asSession ?? [], note });
-      if (asSession && !seen.has(note.agent_id)) {
+      if (!own && ids.has(note.agent_id) && !seen.has(note.agent_id)) {
         seen.add(note.agent_id);
         out.push(...agentsOf(note.agent_id, seen));
       }
@@ -279,17 +283,16 @@ function groupRecords(records: Iterable<TranscriptRecord>) {
     return out;
   };
 
-  const children = new Set<string>();
-  for (const note of notes.values()) if (note.agent_id !== note.session_id) children.add(note.agent_id);
-  const ids = new Set<string>(sessionRecords.keys());
-  for (const key of lists.keys()) if (key.startsWith(`session${SEP}`)) ids.add(key.split(SEP)[1]);
+  const parents = new Map<string, string>();
+  for (const note of notes.values()) if (note.agent_id !== note.session_id) parents.set(note.agent_id, note.session_id);
 
   const sessions: SessionRecords[] = [...ids].map((id) => ({
     sessionId: id,
     record: sessionRecords.get(id) ?? null,
     main: lists.get(sessionKey(id)) ?? [],
     agents: agentsOf(id),
-    child: children.has(id),
+    child: parents.has(id),
+    parent: parents.get(id) ?? null,
   }));
   return { sessions, duplicateMessages, notCarried };
 }
@@ -465,6 +468,12 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
           step.run = { agent: describe(agent), steps: stepsOf(agent.records, false, agent.agentId) };
         }
         steps.push(step);
+      } else if (record.kind === 'tool_result' && !messages.has(record.message_uuid) && !calls.has(record.tool_use_id)) {
+        stats.resultsWithoutCall++;
+        steps.push({
+          by: 'harness', kind: 'result', id: record.tool_use_id, at: null, content: record.content ?? '',
+          ...(record.is_error ? { extra: { error: true } } : {}),
+        });
       } else if (record.kind === 'summary') {
         const usage = usageOf(record);
         steps.push({
@@ -487,7 +496,7 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
       const inner = stepsOf(agent.records, false, agent.agentId);
       const at = inner.find((step) => step.at !== null)?.at ?? null;
       const step: UsfRunStep = { by: 'agent', kind: 'run', id: agent.agentId, at, run: { agent: describe(agent), steps: inner } };
-      const before = at === null ? -1 : steps.findIndex((other) => other.at !== null && other.at > at);
+      const before = at === null ? -1 : steps.findIndex((other) => other.at !== null && Date.parse(other.at) > Date.parse(at));
       steps.splice(before < 0 ? steps.length : before, 0, step);
     }
     return steps;
@@ -537,6 +546,23 @@ export function assembleUsf(records: Iterable<TranscriptRecord>): UsfAssembly {
   const { sessions, duplicateMessages, notCarried } = groupRecords(records);
   const out: AssembledUsfSession[] = [];
   const placed = new Set<string>();
+  const byId = new Map(sessions.map((session) => [session.sessionId, session]));
+  // Assemble ancestors before descendants even when provider units arrive in
+  // the opposite order. Otherwise detached grandchildren would be emitted twice.
+  const ordered: SessionRecords[] = [];
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (session: SessionRecords): void => {
+    if (visited.has(session.sessionId)) return;
+    if (visiting.has(session.sessionId)) throw new Error('USF assembly requires acyclic subagent session relationships');
+    visiting.add(session.sessionId);
+    const parent = session.parent === null ? undefined : byId.get(session.parent);
+    if (parent) visit(parent);
+    visiting.delete(session.sessionId);
+    visited.add(session.sessionId);
+    ordered.push(session);
+  };
+  for (const session of sessions) visit(session);
   for (const session of sessions) {
     if (session.child) continue;
     const result = assembleSession(session);
@@ -545,7 +571,7 @@ export function assembleUsf(records: Iterable<TranscriptRecord>): UsfAssembly {
   }
   // A child session is a run inside its parent. One whose parent is not among
   // the records stands alone.
-  for (const session of sessions) {
+  for (const session of ordered) {
     if (!session.child || placed.has(session.sessionId)) continue;
     const result = assembleSession(session);
     out.push({ ...result.assembled, detached: true });
@@ -576,28 +602,70 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
   const bad = (where: string, what: string) => { if (problems.length < 50) problems.push(`${where}: ${what}`); };
   const object = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {});
   const only = (where: string, v: unknown, required: readonly string[], optional: readonly string[]) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) bad(where, 'value is not an object');
     const fields = object(v);
-    for (const key of required) if (!(key in fields)) bad(where, `"${key}" is missing`);
+    for (const key of required) if (!Object.hasOwn(fields, key)) bad(where, `"${key}" is missing`);
     for (const key of Object.keys(fields)) {
       if (!required.includes(key) && !optional.includes(key)) bad(where, `"${key}" is not a field of the format`);
     }
   };
+  const textFields = (where: string, v: unknown, required: readonly string[], optional: readonly string[] = []) => {
+    const fields = object(v);
+    for (const key of [...required, ...optional.filter((key) => key in fields)]) {
+      if (typeof fields[key] !== 'string') bad(where, `"${key}" is not text`);
+    }
+  };
   const time = (where: string, v: unknown) => { if (v !== null && !isUsfTime(v)) bad(where, '"at" is neither a time nor null'); };
   // Numbers are integers; text is well-formed Unicode.
+  const ancestors = new Set<object>();
+  let nonJson = false;
   const scalars = (where: string, v: unknown): void => {
     if (typeof v === 'number') { if (!Number.isSafeInteger(v)) bad(where, `${v} is not an integer`); }
     else if (typeof v === 'string') { if (LONE_SURROGATE.test(v)) bad(where, 'text is not well-formed Unicode'); }
-    else if (Array.isArray(v)) v.forEach((item, i) => scalars(`${where}[${i}]`, item));
-    else if (v && typeof v === 'object') for (const [key, item] of Object.entries(v)) scalars(`${where}.${key}`, item);
+    else if (v && typeof v === 'object') {
+      if (ancestors.has(v)) { nonJson = true; bad(where, 'cyclic value is not JSON'); return; }
+      ancestors.add(v);
+      if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) scalars(`${where}[${i}]`, v[i]);
+      } else {
+        if (Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) { nonJson = true; bad(where, 'value is not a JSON object'); }
+        for (const [key, item] of Object.entries(v)) {
+          if (LONE_SURROGATE.test(key)) bad(where, 'key is not well-formed Unicode');
+          scalars(`${where}.${key}`, item);
+        }
+      }
+      ancestors.delete(v);
+    } else if (v !== null && typeof v !== 'boolean') { nonJson = true; bad(where, 'value is not JSON'); }
   };
+  // Reject non-JSON and cyclic input before walking recursive run structures.
+  scalars('session', value);
+  if (nonJson) return problems;
   const content = (where: string, v: unknown) => {
     if (typeof v === 'string') return;
     if (!Array.isArray(v)) { bad(where, 'content is neither text nor a list of parts'); return; }
     v.forEach((part, i) => {
-      if (!['text', 'image', 'file'].includes(object(part).type as string)) bad(`${where}[${i}]`, 'unknown kind of part');
+      const at = `${where}[${i}]`;
+      const fields = object(part);
+      if (fields.type === 'text') {
+        only(at, part, ['type', 'text'], []);
+        textFields(at, part, ['text']);
+      } else if (fields.type === 'image' || fields.type === 'file') {
+        only(at, part, ['type', 'media_type', 'blob'], []);
+        textFields(at, part, ['media_type']);
+        only(`${at}.blob`, fields.blob, ['sha256', 'bytes'], []);
+        const blob = object(fields.blob);
+        if (typeof blob.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(blob.sha256)) bad(`${at}.blob`, '"sha256" is not a SHA-256 hex digest');
+        if (!Number.isSafeInteger(blob.bytes) || (blob.bytes as number) < 0) bad(`${at}.blob`, '"bytes" is not a nonnegative integer');
+      } else bad(at, 'unknown kind of part');
     });
   };
-  const usage = (where: string, v: unknown) => { if (v !== undefined) only(where, v, [], ['input', 'cached', 'output']); };
+  const usage = (where: string, v: unknown) => {
+    if (v === undefined) return;
+    only(where, v, [], ['input', 'cached', 'output']);
+    for (const [key, count] of Object.entries(object(v))) {
+      if (!Number.isSafeInteger(count)) bad(where, `"${key}" is not an integer`);
+    }
+  };
   const masks = (where: string, step: Record<string, unknown>): string[] => {
     if (!('masks' in step)) return [];
     if (profile !== 'published') { bad(where, '"masks" is only allowed in the published form'); return ['masks']; }
@@ -618,6 +686,7 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
     const fields = object(v);
     only(where, v, ['agent', 'steps'], []);
     only(`${where}.agent`, fields.agent, ['id'], ['type', 'description']);
+    textFields(`${where}.agent`, fields.agent, ['id'], ['type', 'description']);
     checkSteps(where, fields.steps, false);
   };
   const checkSteps = (where: string, list: unknown, top: boolean): void => {
@@ -626,6 +695,8 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
       const at = `${where}.steps[${i}]`;
       const step = object(entry);
       const extra = masks(at, step);
+      textFields(at, step, ['id'], ['skill', 'model']);
+      if ('extra' in step && (!step.extra || typeof step.extra !== 'object' || Array.isArray(step.extra))) bad(at, '"extra" is not an object');
       if (ids.has(step.id)) bad(at, `id "${String(step.id)}" is used twice`);
       ids.add(step.id);
       if (typeof step.id !== 'string') bad(at, '"id" is not text');
@@ -652,6 +723,7 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
         if ('presentation' in step && step.presentation !== 'skill') bad(at, `unknown presentation ${JSON.stringify(step.presentation)}`);
         if ('file' in step && typeof step.file !== 'string') bad(at, '"file" is not text');
         only(`${at}.tool`, step.tool, ['id', 'name', 'input'], []);
+        textFields(`${at}.tool`, step.tool, ['id', 'name']);
         if ('result' in step) {
           const result = object(step.result);
           only(`${at}.result`, step.result, ['at', 'content', 'error'], []);
@@ -672,13 +744,22 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
 
   const session = object(value);
   only('session', value, ['usf', 'harness', 'id', 'title', 'git_branch', 'turns'], []);
+  textFields('session', value, ['id']);
+  for (const key of ['title', 'git_branch']) {
+    if (session[key] !== null && typeof session[key] !== 'string') bad('session', `"${key}" is neither text nor null`);
+  }
   if (session.usf !== USF_VERSION) bad('session', `version ${JSON.stringify(session.usf)} is not ${USF_VERSION}`);
   only('session.harness', session.harness, ['name'], ['version']);
+  textFields('session.harness', session.harness, ['name'], ['version']);
+  if (!Array.isArray(session.turns)) bad('session', '"turns" is not a list');
   const turns = Array.isArray(session.turns) ? session.turns : [];
   turns.forEach((entry, t) => {
     const where = `turns[${t}]`;
     const turn = object(entry);
     only(where, entry, ['steps'], profile === 'published' ? ['v', 'parent', 'id'] : []);
+    if ('v' in turn && !Number.isSafeInteger(turn.v)) bad(where, '"v" is not an integer');
+    if ('id' in turn && typeof turn.id !== 'string') bad(where, '"id" is not text');
+    if ('parent' in turn && turn.parent !== null && typeof turn.parent !== 'string') bad(where, '"parent" is neither text nor null');
     checkSteps(where, turn.steps, true);
     const steps = Array.isArray(turn.steps) ? turn.steps : [];
     const starts = steps
@@ -687,6 +768,5 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
     if (starts.length > 1) bad(where, 'more than one submission in a turn');
     if (t > 0 && starts[0] !== 0) bad(where, 'a turn after the first does not start with a submission');
   });
-  scalars('session', value);
   return problems;
 }
