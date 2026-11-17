@@ -5,7 +5,7 @@
 // Electron-ABI better-sqlite3 that the app uses in production.
 import { app } from 'electron';
 import { spawn } from 'node:child_process';
-import { copyFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -169,6 +169,34 @@ async function run() {
   assert(zcodeResult.complete === true, 'the Electron ZCode inventory is complete');
   assert(zcodeSessions === 17, `the Electron binding indexes all 17 ZCode sessions, got ${zcodeSessions}`);
   zcodeIndex.close();
+
+  console.log('--- Test 6: Devin store opens through the Electron SQLite binding ---');
+  const devinRoot = join(home, 'devin', 'cli');
+  mkdirSync(devinRoot, { recursive: true });
+  const devinStore = new Database(join(devinRoot, 'sessions.db'));
+  devinStore.pragma('journal_mode = WAL');
+  devinStore.exec(readFileSync(new URL('../../tests/fixtures/devin/schema.sql', import.meta.url), 'utf8'));
+  devinStore.prepare(`INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, created_at, last_activity_at, title, main_chain_id)
+    VALUES ('electron-otter', '/work', 'windsurf', 'model', 'bypass', 1794000000, 1794000001, 'Electron', 2)`).run();
+  const devinNode = devinStore.prepare('INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at) VALUES (?, ?, ?, ?, ?)');
+  devinNode.run('electron-otter', 1, null, JSON.stringify({ message_id: 'u1', role: 'user', content: 'hello', metadata: { is_user_input: true, created_at: '2026-11-06T20:00:00Z' } }), 1794000000);
+  devinNode.run('electron-otter', 2, 1, JSON.stringify({ message_id: 'a1', role: 'assistant', content: 'hi', tool_calls: [], metadata: { created_at: '2026-11-06T20:00:01Z' } }), 1794000001);
+  const devinIndexPath = join(home, 'devin-index.sqlite');
+  const devinResult = buildIndex({
+    force: true,
+    claudeDir: join(home, '.missing-claude'),
+    codexDir: join(home, '.missing-codex'),
+    projectsDir: join(home, '.missing-claude', 'projects'),
+    providerRoots: { devin: devinRoot },
+    dbPath: devinIndexPath,
+    DatabaseImpl: Database,
+  });
+  devinStore.close();
+  const devinIndex = new Database(devinIndexPath, { readonly: true });
+  const devinMessages = devinIndex.prepare("SELECT COUNT(*) c FROM messages WHERE source='devin' AND visibility='visible'").get().c;
+  assert(devinResult.complete === true, 'the Electron Devin inventory is complete');
+  assert(devinMessages === 2, `the Electron binding indexes both Devin messages while the store is open, got ${devinMessages}`);
+  devinIndex.close();
 
   rmSync(home, { recursive: true, force: true });
   console.log('---');

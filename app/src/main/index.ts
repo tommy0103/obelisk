@@ -887,15 +887,17 @@ ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
     workflowAgent,
   };
   // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
-  if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode') {
+  if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode' || lookup.source === 'devin') {
     try {
       const messageText = lookup.source === 'zcode'
         ? await indexerWorker?.readZcodeMessageText(lookup)
         : lookup.source === 'kiro'
           ? await indexerWorker?.readKiroMessageText({ ...lookup, rootDir: paths.providerRoots.kiro })
-          : lookup.source === 'opencode'
-            ? await indexerWorker?.readOpencodeMessageText(lookup)
-            : await indexerWorker?.readHermesMessageText(lookup);
+          : lookup.source === 'devin'
+            ? await indexerWorker?.readDevinMessageText({ ...lookup, rootDir: paths.providerRoots.devin })
+            : lookup.source === 'opencode'
+              ? await indexerWorker?.readOpencodeMessageText(lookup)
+              : await indexerWorker?.readHermesMessageText(lookup);
       return messageText ?? msg.text ?? null;
     } catch {
       return msg.text ?? null;
