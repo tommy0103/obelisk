@@ -16,7 +16,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path';
 
 import {
-  extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
+  TEXT_LIMIT, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
   filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir, sourceInventoryIssue,
   normalizeTranscriptTimestamp,
 } from '../parsing.ts';
@@ -394,10 +394,13 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (obj.version) sm.version = obj.version;
     sm.n++;
 
-    const text = extractText(msg.content);
+    const fullText = extractText(msg.content, Infinity);
+    const text = trunc(fullText);
+    // Preserve canonical classification independently of the caller's output budget.
+    const classificationText = trunc(fullText, TEXT_LIMIT);
     const rawContentType = extractContentType(msg.content);
-    const isMeta = extractMessageIsMeta(obj, text);
-    const contentType = isMeta && isSkillInstructions(text) ? 'skill_instructions' : rawContentType;
+    const isMeta = extractMessageIsMeta(obj, classificationText);
+    const contentType = isMeta && isSkillInstructions(classificationText) ? 'skill_instructions' : rawContentType;
     const aid = isSubagent ? (unit.agentId ?? null) : (obj.agentId || null);
 
     if (obj.uuid) {

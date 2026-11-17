@@ -23,6 +23,7 @@ import {
   PI_CANONICAL_TRANSCRIPT_MARKER,
 } from '../packages/core/src/providers/pi.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { createOmpProvider } from '../packages/core/src/providers/omp.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
@@ -69,6 +70,50 @@ function indexOptions(home, piDir) {
     dbPath: join(home, '.obelisk', 'obelisk.sqlite'),
     DatabaseImpl: TestDatabase,
   };
+}
+
+for (const [source, createProvider, oldMarker] of [
+  ['pi', createPiProvider, '__pi_canonical_transcript_v9__'],
+  ['omp', createOmpProvider, '__omp_canonical_transcript_v1__'],
+]) {
+  test(`${source} replays old Unicode-truncated bash rows once after the marker upgrade`, () => {
+    const home = makeTempDir(`obelisk-${source}-unicode-replay-`);
+    const root = join(home, 'sessions');
+    const path = writeFixture(root);
+    const records = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const parent = records.at(-1);
+    const suffix = '\n\nCommand exited with code 1';
+    const prefix = 'Ran `';
+    const commandPrefix = 'c'.repeat(10000 - suffix.length - prefix.length - 1);
+    // Stress the captured session at the old UTF-16 cut boundary.
+    records.push({
+      type: 'message', id: 'unicode-bash', parentId: parent.id, timestamp: parent.timestamp,
+      message: { role: 'bashExecution', command: `${commandPrefix}😀`, output: 'ok', exitCode: 1, cancelled: false, truncated: false, timestamp: parent.message.timestamp },
+    });
+    writeFileSync(path, records.map(record => JSON.stringify(record)).join('\n') + '\n');
+    const provider = createProvider({ rootDir: root });
+    const options = {
+      ...indexOptions(home, root),
+      providerRegistry: createProviderRegistry([provider]),
+      providerRoots: { [source]: root },
+    };
+    const sessionId = provider.discover({ lastCursor: () => null })[0].sessionId;
+    buildIndex(options);
+    const expected = `${prefix}${commandPrefix}${suffix}`;
+    let db = new TestDatabase(options.dbPath);
+    db.prepare("UPDATE messages SET text=? WHERE source=? AND role='bashExecution'")
+      .run(`${prefix}${commandPrefix}�${suffix}`, source);
+    db.prepare('UPDATE index_state SET jsonl_path=? WHERE jsonl_path=?').run(oldMarker, provider.indexVersionMarker);
+    db.close();
+
+    const replay = buildIndex(options);
+    assert.deepEqual(replay.affectedSessionIds, [sessionId]);
+    db = new TestDatabase(options.dbPath);
+    assert.equal(db.prepare("SELECT text FROM messages WHERE source=? AND role='bashExecution'").get(source).text, expected);
+    assert.equal(db.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(provider.indexVersionMarker).c, 1);
+    db.close();
+    assert.deepEqual(buildIndex(options).affectedSessionIds, []);
+  });
 }
 
 test('app build indexes Pi through the registry and replays complete session snapshots', () => {

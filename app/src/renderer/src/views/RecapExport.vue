@@ -9,7 +9,7 @@ import PathCard from '../components/recap/PathCard.vue';
 import VibeCard from '../components/recap/VibeCard.vue';
 import WorkflowCard from '../components/recap/WorkflowCard.vue';
 import ClosingCard from '../components/recap/ClosingCard.vue';
-import { PALETTES, ARCH_KEYS } from '../components/recap/archetypes.js';
+import { PALETTES } from '../components/recap/archetypes.js';
 import recapJson from '../mock/recap-2026-W24.json';
 
 const route = useRoute();

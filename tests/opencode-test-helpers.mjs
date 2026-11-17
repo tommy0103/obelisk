@@ -14,6 +14,9 @@ export function upstreamStore(version = 'v1.19.3', filename = 'opencode.db', dir
   const dir = directory ?? makeTempDir('opencode-upstream-');
   const path = join(dir, filename);
   const db = new DatabaseSync(path);
+  // OpenCode stores run in WAL mode. Without WAL, an update rewrites pages in
+  // place and a same-tick write leaves size, mtime and ctime unchanged.
+  db.exec('PRAGMA journal_mode = WAL;');
   db.exec(readFileSync(new URL(`./fixtures/opencode/upstream-${version}.sql`, import.meta.url), 'utf8'));
   db.prepare('INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) VALUES (?, ?, ?, ?, ?)')
     .run('p', '/workspace/synthetic', 1000, 1000, '[]');
