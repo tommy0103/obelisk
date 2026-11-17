@@ -13,9 +13,9 @@ import {
 } from 'node:path';
 
 import {
+  getTextLimit,
   normalizeObservedCwd,
   projectSlugFromPath,
-  TEXT_LIMIT,
   trunc,
   truncJson,
 } from '../parsing.ts';
@@ -110,7 +110,7 @@ const SOURCE = 'pi';
 const MAX_HEADER_BYTES = 1024 * 1024;
 const BLOCK_PAD = 4;
 
-export const PI_CANONICAL_TRANSCRIPT_MARKER = '__pi_canonical_transcript_v9__';
+export const PI_CANONICAL_TRANSCRIPT_MARKER = '__pi_canonical_transcript_v10__';
 
 function inventoryIssue(sourcePath: string, error: unknown): InventoryIssue {
   const errorPath = (error as { path?: unknown } | null)?.path;
@@ -909,8 +909,9 @@ function bashPresentation(message: JsonRecord): { text: string; suffix: string }
 function bashText(message: JsonRecord): string {
   const { text, suffix } = bashPresentation(message);
   if (suffix.length === 0) return trunc(text);
-  if (suffix.length >= TEXT_LIMIT) return suffix.slice(0, TEXT_LIMIT);
-  return `${text.slice(0, TEXT_LIMIT - suffix.length)}${suffix}`;
+  const limit = getTextLimit();
+  if (suffix.length >= limit) return trunc(suffix, limit);
+  return `${trunc(text, limit - suffix.length)}${suffix}`;
 }
 
 function fullBashText(message: JsonRecord): string {

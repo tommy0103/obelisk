@@ -52,13 +52,13 @@ test('main-process modules do not add synchronous IO calls', () => {
   assert.deepEqual(under, []);
 });
 
-// Transcript content is attacker-controlled; every v-html is an HTML sink that
-// the JS lint rule cannot see.
-const vHtmlBudget = 31;
+// Transcript content is attacker-controlled. vue/no-v-html makes each v-html
+// name why it is safe; this budget keeps new ones from being waved through.
+const vHtmlBudget = 30;
 
 test('renderer templates do not add v-html sinks', () => {
   const perFile = filesUnder(rendererDir, '.vue')
-    .map(path => [relative(repoRoot, path), count(path, /\bv-html\b/g)])
+    .map(path => [relative(repoRoot, path), count(path, /\sv-html="/g)])
     .filter(([, used]) => used > 0);
   const used = perFile.reduce((sum, [, n]) => sum + n, 0);
   assert.ok(used <= vHtmlBudget, `${used} v-html uses, budget ${vHtmlBudget}; render through renderMarkdown()/escapeHTML(): ${JSON.stringify(perFile)}`);

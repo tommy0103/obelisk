@@ -29,6 +29,7 @@ const sealSvg = computed(() => CORNER_SEALS[props.archKey] || '');
       <span class="diamond"></span>
       <span>{{ badge }}</span>
     </div>
+    <!-- eslint-disable-next-line vue/no-v-html -- static SVG from seals.js -->
     <div class="cover-seal-corner" v-html="sealSvg"></div>
     <div class="cover-body">
       <div class="cover-archetype">{{ title }}</div>
@@ -49,7 +50,7 @@ const sealSvg = computed(() => CORNER_SEALS[props.archKey] || '');
         </div>
       </div>
 
-      <div class="cover-footer" v-html="footer"></div>
+      <div class="cover-footer">{{ footer }}</div>
     </div>
   </article>
 </template>
@@ -141,6 +142,4 @@ const sealSvg = computed(() => CORNER_SEALS[props.archKey] || '');
   font-family: var(--font-mono); font-size: 13px; color: var(--muted);
   display: flex; gap: 14px; font-variant-numeric: tabular-nums;
 }
-.cover-footer :deep(strong) { color: var(--fg); font-weight: 500; }
-.cover-footer :deep(.sep) { color: var(--muted-3); }
 </style>
