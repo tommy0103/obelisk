@@ -23,7 +23,7 @@ function estimatedTextHeight(text = '') {
   return Math.min(560, Math.ceil(String(text).length / 72) * 20);
 }
 
-export function estimateTimelineItemSize(item) {
+function estimateTimelineItemSize(item) {
   if (!item) return 96;
   if (item.kind === 'meta') return 34;
   if (item.kind === 'thinking') return 38;
@@ -43,6 +43,7 @@ export function estimateTimelineItemSize(item) {
     + (message._thinking ? 34 : 0);
 }
 
+/** @internal Exported for tests. */
 export function createViewportRangeExtractor({
   getScrollElement,
   getVirtualizer,
@@ -79,6 +80,7 @@ export function createViewportRangeExtractor({
   };
 }
 
+/** @internal Exported for tests. */
 export function resolveReaderAnchorIndex(anchor, items = []) {
   if (!items.length) return null;
   if (anchor?.itemKey) {

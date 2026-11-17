@@ -388,7 +388,8 @@ administrator-authorization dialog. CLI npm publication remains independent.
 Every PR:
 
 1. `npm test`, `npm run typecheck` (root and app tsconfig), `npm run lint`
-   (ESLint, then knip for unused files, exports, and dependencies) — all
+   (ESLint, then knip for unused files, exports, and dependencies, in full and
+   production mode) — all
    green. Quote the **numbers** in the PR description.
 2. Touching `app/` also requires `npm run test:electron:all`.
 3. **After merging main, re-run everything.** Conclusions from before the merge —

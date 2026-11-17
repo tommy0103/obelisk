@@ -193,6 +193,7 @@ function renderOutput(output, isError) {
   return `<div class="result-chip ${isError ? 'error' : ''}">${escapeHtml(output)}</div>`;
 }
 
+/** @internal Exported for tests. */
 export function renderPrettyTool(toolCall) {
   const args = parseToolInput(toolCall);
   const result = toolCall.result || {};
