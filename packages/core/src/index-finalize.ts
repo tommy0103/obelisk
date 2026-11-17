@@ -219,8 +219,8 @@ export function repairOrphanedSessionMetadata(db: SqliteDb, familySessionIds: It
     SELECT s.id, s.jsonl_path, s.message_count, s.started_at, s.ended_at FROM sessions s
     WHERE COALESCE(s.source, 'claude') = 'claude'
       AND s.jsonl_path IS NOT NULL AND s.jsonl_path <> ''
-      AND EXISTS (SELECT 1 FROM messages m
-                  WHERE m.session_id = s.id AND m.agent_id IS NOT NULL)
+      AND s.id IN (SELECT m.session_id FROM messages m INDEXED BY idx_messages_agent
+                   WHERE m.agent_id IS NOT NULL)
   `).all();
   // A valid child transcript may contain metadata only. It proves the family
   // exists without producing an agent_id message row; cached main history must

@@ -31,7 +31,12 @@ function filesUnder(dir, extension) {
 // freezes the whole UI. indexer-worker.ts only runs in the worker thread.
 // indexer.ts gets a budget, not an exemption: index.ts imports writeHeartbeat
 // from it, which runs on the main thread.
-const syncIoBudget = { 'index.ts': 31, 'file-reference.ts': 2, 'indexer.ts': 8 };
+const syncIoBudget = {
+  'index.ts': 11,
+  'rebuild-db-files.ts': 6,
+  'file-reference.ts': 2,
+  'indexer.ts': 8,
+};
 const workerModules = new Set(['indexer-worker.ts']);
 
 test('main-process modules do not add synchronous IO calls', () => {

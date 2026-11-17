@@ -210,8 +210,10 @@ exec /usr/bin/sudo -- "$@"
   await new Promise(resolve => server.close(resolve));
   try {
     const records = (await readFile(launches, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-    for (const record of records) { try { process.kill(record.pid, 'SIGKILL'); } catch {} }
-  } catch {}
+    for (const record of records) {
+      try { process.kill(record.pid, 'SIGKILL'); } catch { /* already exited */ }
+    }
+  } catch { /* no launch log: the app never launched */ }
   child?.kill('SIGKILL');
   // Keep only bounded evidence for Actions; never persist disposable user data.
   for (const name of ['home','bin']) await rm(path.join(work, name), { recursive: true, force: true });

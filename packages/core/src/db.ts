@@ -38,9 +38,13 @@ function openDb(): NodeSqliteDb {
   const db = new DatabaseSync(DB_PATH);
   configureConnection(db, { busyTimeoutMs: 250 });
   migrateCoreSchemaColumns(db);
+  installSchema(db);
+  return db;
+}
+
+function installSchema(db: SqliteDb): void {
   db.exec(SCHEMA);
   migrateCoreSchemaColumns(db);
-  return db;
 }
 
 // Queries and daemon-arbitration checks must never migrate/configure the index.
@@ -148,4 +152,4 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 
-export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, openDb, openReadDb, openAttuneDb, probeAttuneMemoryLayer, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
+export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, installSchema, openDb, openReadDb, openAttuneDb, probeAttuneMemoryLayer, openWriterLeaseDb, rebuildMemoryFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
