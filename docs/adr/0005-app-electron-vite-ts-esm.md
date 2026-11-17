@@ -79,3 +79,10 @@ use host-Node dependencies; Electron tests and packaged apps use modules rebuilt
 for Electron's ABI. Keep verification commands in
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md#node-and-electron-runtimes), and check
 `process.versions` through the final packaged executable when Electron changes.
+
+**Amendment (2026-11-17): app main and preload use `noImplicitAny`.** The lenient
+setting hid untyped database handles and worker results, not just helper noise.
+`app/tsconfig.json` now sets `noImplicitAny: true`. SQLite rows are typed per
+query through `prepare<Params, Row>`, and `any` stays only at the provider
+parsing boundary. The root project still excludes the app-importing tests because
+each project keeps its own compiler options, not because app files are lenient.
