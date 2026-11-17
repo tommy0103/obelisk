@@ -586,24 +586,26 @@ ipcMain.handle('win:control', (event, action: WindowControlAction) => {
   }
 });
 
+function pathExists(filePath: string): Promise<boolean> {
+  return fs.promises.access(filePath).then(() => true, () => false);
+}
+
 function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
   if (latestSettingsError !== null) console.warn(latestSettingsError);
   return result.settings;
 }
 
-function savePersistedSettings(settings: PersistedProviderSettings) {
-  if (!fs.existsSync(path.dirname(SETTINGS_PATH))) {
-    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
-  }
+async function savePersistedSettings(settings: PersistedProviderSettings) {
+  await fs.promises.mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
   const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
-    fs.renameSync(temporaryPath, SETTINGS_PATH);
+    await fs.promises.writeFile(temporaryPath, JSON.stringify(settings, null, 2));
+    await fs.promises.rename(temporaryPath, SETTINGS_PATH);
     latestSettingsError = null;
   } catch (error) {
     try {
-      fs.unlinkSync(temporaryPath);
+      await fs.promises.unlink(temporaryPath);
     } catch {
       // The temp file may never have been written; report the original error.
     }
@@ -731,7 +733,7 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
       copyFile: (from, to) => fs.promises.copyFile(from, to),
     }, currentRead);
     const providerRootChanged = setPersistedSetting(persisted, key, value);
-    savePersistedSettings(persisted);
+    await savePersistedSettings(persisted);
     if (backupPath !== null) {
       latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
       console.warn(latestSettingsRecovery);
@@ -781,8 +783,8 @@ ipcMain.handle('settings:browseFolder', async (event) => {
   return null;
 });
 
-ipcMain.handle('settings:revealPath', (_, p) => {
-  if (fs.existsSync(p)) shell.showItemInFolder(p);
+ipcMain.handle('settings:revealPath', async (_, p) => {
+  if (await pathExists(p)) shell.showItemInFolder(p);
 });
 
 ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () => {
@@ -830,7 +832,7 @@ ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () =>
       codexDir: paths.codexDir,
       projectsDir: paths.projectsDir,
       dbPath: tempDbPath,
-      preserveDbPath: fs.existsSync(paths.dbPath) ? paths.dbPath : null,
+      preserveDbPath: await pathExists(paths.dbPath) ? paths.dbPath : null,
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });

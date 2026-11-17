@@ -380,10 +380,9 @@ export function registerSessionQueryHandlers({ ipcMain, getDb, getRuntimePaths, 
     return raw?.messageText ?? msg.text ?? null;
   });
 
-  ipcMain.handle('db:readMemoryFile', (_, filePath) => {
+  ipcMain.handle('db:readMemoryFile', async (_, filePath) => {
     try {
-      if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf-8');
-      return null;
+      return await fs.promises.readFile(filePath, 'utf-8');
     } catch { return null; }
   });
 
