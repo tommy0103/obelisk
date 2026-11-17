@@ -298,6 +298,45 @@ test('ordinary Core build skips corpus-wide FTS and project-path work', () => {
   db.close();
 });
 
+test('force rebuild restores message FTS triggers and leaves search results unchanged', () => {
+  const home = makeTempDir('obelisk-force-rebuild-fts-');
+  const piDir = join(home, '.pi', 'agent', 'sessions', 'project');
+  mkdirSync(piDir, { recursive: true });
+  copyFileSync(REAL_PI_FIXTURE, join(piDir, 'session.jsonl'));
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const triggers = db => db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name").all();
+  const search = () => {
+    const result = runCli(['--search', 'probe'], { home });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return JSON.parse(result.stdout).map(hit => [hit.message.uuid, hit.rank]);
+  };
+
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  let db = new DatabaseSync(dbPath);
+  const triggersBefore = triggers(db);
+  assert.deepEqual(triggersBefore.filter(t => t.name.startsWith('messages_fts_')).map(t => t.name).sort(),
+    ['messages_fts_ad', 'messages_fts_ai', 'messages_fts_au']);
+  db.close();
+  const resultsBefore = search();
+  assert.ok(resultsBefore.length > 0);
+
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  db = new DatabaseSync(dbPath);
+  assert.deepEqual(triggers(db), triggersBefore);
+  db.exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)");
+  db.close();
+  assert.deepEqual(search(), resultsBefore);
+
+  // The restored triggers maintain FTS for later incremental writes.
+  db = new DatabaseSync(dbPath);
+  db.prepare(`
+    INSERT INTO messages (uuid, session_id, type, role, text, content_type, source)
+    SELECT 'after-rebuild', session_id, 'user', 'user', 'afterrebuildneedle', 'text', source FROM messages LIMIT 1
+  `).run();
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM messages_fts WHERE messages_fts MATCH 'afterrebuildneedle'").get().count, 1);
+  db.close();
+});
+
 test('orphan repair reads message rows only through the subagent index', () => {
   const db = freshDb();
   const session = db.prepare(`
