@@ -358,13 +358,94 @@ test('the kind of harness content comes from canonical fields, never from parsin
   assert.deepEqual(usf.turns[0].steps.slice(1).map((step) => [step.kind, step.skill]), [['other', undefined], ['skill', 'review']]);
 });
 
-test('steps keep the order the provider gave the records, not the order of their timestamps', () => {
+test('steps keep the order the provider gave the messages, not the order of their timestamps', () => {
   const { session: usf } = only([
     session(),
     message('ask', 'user', 'first in the stream', 5),
     message('answer', 'assistant', 'second in the stream', 2),
   ]);
   assert.deepEqual(usf.turns[0].steps.map((step) => step.id), ['ask', 'answer']);
+});
+
+test('a tool call stands where its message is, wherever the provider yields the call record', () => {
+  const messages = [
+    message('ask-1', 'user', 'first', 1),
+    message('use-1', 'assistant', null, 2, { content_type: 'tool_use' }),
+    message('back-1', 'user', null, 3, { content_type: 'tool_result' }),
+    message('answer-1', 'assistant', 'one', 4),
+    message('ask-2', 'user', 'second', 5),
+    message('use-2', 'assistant', 'reading again', 6),
+    message('answer-2', 'assistant', 'two', 8),
+  ];
+  const others = [
+    call('call-1', 'use-1'),
+    result('call-1', 'back-1', 'a'),
+    call('call-2', 'use-2'),
+    result('call-2', 'use-2', 'b'),
+  ];
+  const expected = [
+    ['human', 'agent/tool', 'agent/text'],
+    ['human', 'agent/text', 'agent/tool', 'agent/text'],
+  ];
+  // Providers yield the records that are not messages before the messages
+  // (DeepSeek, ZCode), after them (Kimi) or between them (Claude, Codex).
+  const interleaved = [messages[0], messages[1], others[0], messages[2], others[1], messages[3], messages[4], messages[5], others[2], others[3], messages[6]];
+  for (const records of [[...others, ...messages], [...messages, ...others], interleaved]) {
+    const { session: usf } = only([session(), ...records]);
+    assert.deepEqual(usf.turns.map((turn) => turn.steps.map(label)), expected);
+    assert.deepEqual(usf.turns[0].steps[1].result, { at: at(3), content: 'a', error: false });
+  }
+});
+
+test('deepseek: no tool call comes before the submission that led to it', () => {
+  const assembly = assembleUsf(deepseekRecords());
+  let withTools = 0;
+  for (const { session: usf } of assembly.sessions) {
+    const steps = usf.turns.flatMap((turn) => turn.steps);
+    const firstTool = steps.findIndex((step) => step.kind === 'tool');
+    const firstHuman = steps.findIndex((step) => step.by === 'human');
+    if (firstTool < 0 || firstHuman < 0) continue;
+    withTools++;
+    assert.ok(firstHuman < firstTool, `${usf.id}: the first tool step is at ${firstTool}, the first submission at ${firstHuman}`);
+  }
+  assert.ok(withTools > 0, 'the fixture has sessions with tool calls');
+});
+
+test('relocating calls preserves summary position, usage, visibility and nested runs', () => {
+  const messages = [
+    message('ask', 'user', 'first', 5),
+    message('use', 'assistant', 'checking', 2, { model: 'model', input_tokens: 10, output_tokens: 4, visibility: 'inactive' }),
+    { kind: 'summary', id: 'compact', session_id: SESSION, source: 'compaction', timestamp: at(9), content: 'context' },
+    message('task', 'user', 'inspect', 3, { agent_id: 'child', is_sidechain: 1 }),
+    message('child-use', 'assistant', null, 4, { agent_id: 'child', content_type: 'tool_use', output_tokens: 2 }),
+    message('answer', 'assistant', 'done', 6),
+  ];
+  const calls = [call('spawn', 'use'), call('second', 'use'), call('inner', 'child-use')];
+  const note = { kind: 'subagent', session_id: SESSION, agent_id: 'child', parent_tool_use_id: 'spawn' };
+  const before = only([session(), note, ...calls, ...messages]).session;
+  const after = only([session(), note, ...messages, ...calls]).session;
+  assert.deepEqual(before, after, 'call yield timing must not change the assembled session');
+  assert.deepEqual(validateUsf(before), []);
+  assert.deepEqual(before.turns[0].steps.map((s) => s.id), ['ask', 'use', 'spawn', 'second', 'compact', 'answer']);
+  assert.deepEqual(before.turns[0].steps[1].usage, { input: 10, output: 4 });
+  for (const tool of before.turns[0].steps.slice(2, 4)) {
+    assert.equal(tool.usage, undefined, 'the text step already accounts for this message');
+    assert.equal(tool.model, 'model');
+    assert.equal(tool.state, 'inactive');
+  }
+  const run = before.turns[0].steps[2].run;
+  assert.deepEqual(run.steps.map((s) => s.id), ['task', 'inner']);
+  assert.deepEqual(run.steps[1].usage, { output: 2 });
+});
+
+test('calls without their owning message keep their stream position and result', () => {
+  const { session: usf } = only([
+    session(), message('ask', 'user', 'go', 1), call('orphan', 'missing'),
+    message('answer', 'assistant', 'done', 2), result('orphan', 'missing', 'kept'),
+  ]);
+  assert.deepEqual(usf.turns[0].steps.map((s) => s.id), ['ask', 'orphan', 'answer']);
+  assert.equal(usf.turns[0].steps[1].at, null);
+  assert.deepEqual(usf.turns[0].steps[1].result, { at: null, content: 'kept', error: false });
 });
 
 test('a timestamp that cannot be read as a time is null', () => {

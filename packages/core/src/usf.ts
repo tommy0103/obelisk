@@ -344,10 +344,19 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
     const results = new Map<string, ToolResultRecord>();
     const brought = new Map<string, ToolResultRecord[]>();
     const calls = new Set<string>();
-    const makesCalls = new Set<string>();
+    const callsOf = new Map<string, ToolCallRecord[]>();
+    for (const record of records) if (record.kind === 'message') messages.set(record.uuid, record);
     for (const record of records) {
-      if (record.kind === 'message') messages.set(record.uuid, record);
-      else if (record.kind === 'tool_call') { calls.add(record.id); makesCalls.add(record.message_uuid); }
+      if (record.kind === 'tool_call') {
+        calls.add(record.id);
+        // Providers yield calls before, after or between the messages. Their
+        // canonical message_uuid relationship, not their yield position,
+        // determines where they belong in the session.
+        if (messages.has(record.message_uuid)) {
+          const list = callsOf.get(record.message_uuid);
+          if (list) list.push(record); else callsOf.set(record.message_uuid, [record]);
+        }
+      }
       else if (record.kind === 'tool_result') {
         results.set(record.tool_use_id, record);
         const list = brought.get(record.message_uuid);
@@ -361,6 +370,46 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
       const usage = usageGiven.has(message.uuid) ? null : usageOf(message);
       if (usage) usageGiven.add(message.uuid);
       return { ...(message.model ? { model: message.model } : {}), ...(usage ? { usage } : {}) };
+    };
+
+    const toolStep = (record: ToolCallRecord): UsfToolStep => {
+      const message = messages.get(record.message_uuid);
+      const result = results.get(record.id);
+      // A sub-agent hangs on one call only, the first that names it.
+      const started = startedBy.get(record.id);
+      const agent = started && !placed.has(started.agentId) ? started : null;
+      let input: unknown;
+      try { input = JSON.parse(record.input_json); } catch { input = record.input_json ?? null; }
+      const step: UsfToolStep = {
+        by: 'agent', kind: 'tool', id: record.id, at: time(message?.timestamp),
+        ...stateOf(message?.visibility),
+        ...(message?.skill ? { skill: message.skill } : {}),
+        ...from(message),
+        ...(record.presentation === 'skill' ? { presentation: 'skill' as const } : {}),
+        tool: { id: record.id, name: record.name, input },
+      };
+      // The file the call works on, as the provider worked it out.
+      const file = record.file_path ?? result?.file_path;
+      if (file) step.file = file;
+      if (result) {
+        step.result = {
+          at: time(messages.get(result.message_uuid)?.timestamp),
+          content: result.content ?? '',
+          error: !!result.is_error,
+        };
+      }
+      if (agent) {
+        placed.add(agent.agentId);
+        step.run = { agent: describe(agent), steps: stepsOf(agent.records, false, agent.agentId) };
+      }
+      return step;
+    };
+    // Where a step that has a time but no place of its own goes: before the
+    // first step that is later, at the end when none is.
+    const placeByTime = (steps: UsfStep[], step: UsfStep): void => {
+      const at = step.at;
+      const before = at === null ? -1 : steps.findIndex((other) => other.at !== null && Date.parse(other.at) > Date.parse(at));
+      steps.splice(before < 0 ? steps.length : before, 0, step);
     };
 
     const steps: UsfStep[] = [];
@@ -417,7 +466,7 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
           // A message that only carries tool calls has no step of its own: the
           // calls are the steps. Any other message stays, also when no text
           // was kept for it: it still says that the model was called there.
-          if (record.text != null || !makesCalls.has(record.uuid)) {
+          if (record.text != null || !callsOf.has(record.uuid)) {
             if (record.text == null) stats.emptyContent++;
             steps.push({
               by: 'agent', kind: record.content_type === 'thinking' ? 'reasoning' : 'text',
@@ -427,6 +476,7 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
         } else {
           steps.push({ by: 'harness', ...base, kind: 'other', content: text });
         }
+        for (const made of callsOf.get(record.uuid) ?? []) steps.push(toolStep(made));
         // A result whose call is not among the records is kept where its message is.
         for (const result of carried) {
           if (calls.has(result.tool_use_id)) continue;
@@ -438,36 +488,8 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
           });
         }
       } else if (record.kind === 'tool_call') {
-        const message = messages.get(record.message_uuid);
-        const result = results.get(record.id);
-        // A sub-agent hangs on one call only, the first that names it.
-        const started = startedBy.get(record.id);
-        const agent = started && !placed.has(started.agentId) ? started : null;
-        let input: unknown;
-        try { input = JSON.parse(record.input_json); } catch { input = record.input_json ?? null; }
-        const step: UsfToolStep = {
-          by: 'agent', kind: 'tool', id: record.id, at: time(message?.timestamp),
-          ...stateOf(message?.visibility),
-          ...(message?.skill ? { skill: message.skill } : {}),
-          ...from(message),
-          ...(record.presentation === 'skill' ? { presentation: 'skill' as const } : {}),
-          tool: { id: record.id, name: record.name, input },
-        };
-        // The file the call works on, as the provider worked it out.
-        const file = record.file_path ?? result?.file_path;
-        if (file) step.file = file;
-        if (result) {
-          step.result = {
-            at: time(messages.get(result.message_uuid)?.timestamp),
-            content: result.content ?? '',
-            error: !!result.is_error,
-          };
-        }
-        if (agent) {
-          placed.add(agent.agentId);
-          step.run = { agent: describe(agent), steps: stepsOf(agent.records, false, agent.agentId) };
-        }
-        steps.push(step);
+        // A call whose message is not among the records stays where it was yielded.
+        if (!messages.has(record.message_uuid)) steps.push(toolStep(record));
       } else if (record.kind === 'tool_result' && !messages.has(record.message_uuid) && !calls.has(record.tool_use_id)) {
         stats.resultsWithoutCall++;
         steps.push({
@@ -476,6 +498,9 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
         });
       } else if (record.kind === 'summary') {
         const usage = usageOf(record);
+        // A summary stays where the provider yielded it among the messages.
+        // Its time cannot place it: a compaction summary stands before the
+        // history it kept, and is written after it.
         steps.push({
           by: 'harness', id: record.id, at: time(record.timestamp), ...stateOf(record.visibility),
           ...(usage ? { usage } : {}),
@@ -496,8 +521,7 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
       const inner = stepsOf(agent.records, false, agent.agentId);
       const at = inner.find((step) => step.at !== null)?.at ?? null;
       const step: UsfRunStep = { by: 'agent', kind: 'run', id: agent.agentId, at, run: { agent: describe(agent), steps: inner } };
-      const before = at === null ? -1 : steps.findIndex((other) => other.at !== null && Date.parse(other.at) > Date.parse(at));
-      steps.splice(before < 0 ? steps.length : before, 0, step);
+      placeByTime(steps, step);
     }
     return steps;
   };
@@ -539,8 +563,10 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
  * Assemble the sessions of a canonical record stream into USF, in local form.
  *
  * `records` are the records of every unit of the sessions concerned, each from
- * a fresh full parse (cursor = null), in the order the provider gave them. The
- * order of steps is that order; it is not re-sorted by time.
+ * a fresh full parse (cursor = null), in the order the provider gave them.
+ * Messages and summaries keep that order; calls follow their owning message.
+ * Calls without a message retain their yield position. Unlinked subagent runs
+ * are inserted by time without re-sorting the existing steps.
  */
 export function assembleUsf(records: Iterable<TranscriptRecord>): UsfAssembly {
   const { sessions, duplicateMessages, notCarried } = groupRecords(records);
