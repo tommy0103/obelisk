@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync, appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -1022,3 +1022,63 @@ test('a newer-format Kiro session does not block a forced rebuild', () => {
   assert.deepEqual(db.prepare("SELECT count(*) AS n FROM sessions WHERE source='kiro'").get().n, 1);
   db.close();
 });
+
+for (const force of [false, true]) {
+  test(`an indexed Kiro session survives an upgrade that drops its cwd (${force ? 'forced' : 'ordinary'} rebuild)`, () => {
+    // The skipped file's header no longer derives the indexed id; its path must.
+    const home = makeTempDir('obelisk-app-kiro-upgrade-');
+    const cli = join(home, '.kiro', 'sessions', 'cli');
+    mkdirSync(cli, { recursive: true });
+    const header = JSON.parse(readFileSync(new URL('./fixtures/kiro/cli.json', import.meta.url), 'utf8'));
+    writeFileSync(join(cli, 'sample.json'), JSON.stringify(header));
+    writeFileSync(join(cli, 'sample.jsonl'), readFileSync(new URL('./fixtures/kiro/cli.jsonl', import.meta.url), 'utf8'));
+    const dbPath = join(home, 'index.sqlite');
+    const options = {
+      claudeDir: join(home, '.claude'), codexDir: join(home, '.codex'), dbPath,
+      providerRoots: { kiro: join(home, '.kiro') }, DatabaseImpl: TestDatabase,
+    };
+    buildIndex(options);
+    const rows = () => {
+      const db = new TestDatabase(dbPath);
+      try {
+        return {
+          sessions: db.prepare("SELECT id FROM sessions WHERE source='kiro'").all().map(row => row.id),
+          messages: db.prepare("SELECT count(*) AS n FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE source='kiro')").get().n,
+        };
+      } finally { db.close(); }
+    };
+    const before = rows();
+    assert.equal(before.sessions.length, 1);
+    assert.ok(before.messages > 0);
+    const { cwd: _cwd, ...upgraded } = header;
+    writeFileSync(join(cli, 'sample.json'), JSON.stringify({ ...upgraded, session_state: { ...header.session_state, version: 'v99' } }));
+    const result = buildIndex({ ...options, force });
+    assert.ok(result.skippedFiles.some(file => file.path === join(cli, 'sample.json')), JSON.stringify(result.skippedFiles));
+    assert.deepEqual(rows(), before);
+  });
+
+  test(`an unattributed newer-format Kiro file withholds Kiro deletions (${force ? 'forced' : 'ordinary'} rebuild)`, () => {
+    // The newer file may be another copy of the vanished session; nothing certifies it is not.
+    const home = makeTempDir('obelisk-app-kiro-unattributed-');
+    const cli = join(home, '.kiro', 'sessions', 'cli');
+    mkdirSync(cli, { recursive: true });
+    const header = JSON.parse(readFileSync(new URL('./fixtures/kiro/cli.json', import.meta.url), 'utf8'));
+    const events = readFileSync(new URL('./fixtures/kiro/cli.jsonl', import.meta.url), 'utf8');
+    writeFileSync(join(cli, 'sample.json'), JSON.stringify(header));
+    writeFileSync(join(cli, 'sample.jsonl'), events);
+    const dbPath = join(home, 'index.sqlite');
+    const options = {
+      claudeDir: join(home, '.claude'), codexDir: join(home, '.codex'), dbPath,
+      providerRoots: { kiro: join(home, '.kiro') }, DatabaseImpl: TestDatabase,
+    };
+    buildIndex(options);
+    writeFileSync(join(cli, 'other.json'), JSON.stringify({ ...header, session_id: 'other', session_state: { ...header.session_state, version: 'v99' } }));
+    writeFileSync(join(cli, 'other.jsonl'), events);
+    rmSync(join(cli, 'sample.json')); rmSync(join(cli, 'sample.jsonl'));
+    const result = buildIndex({ ...options, force });
+    assert.equal(result.complete, true);
+    const db = new TestDatabase(dbPath);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM sessions WHERE source='kiro'").get().n, 1);
+    db.close();
+  });
+}

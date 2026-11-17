@@ -371,20 +371,37 @@ test('Kiro skips unknown CLI event and workspace versions without poisoning the 
   assert.ok(skipped.some(issue => /Unsupported Kiro workspace schema 99\.0\.0/.test(issue.error)));
 });
 
-test('a newer-format Kiro session leaves other sessions and their tombstones certified', () => {
+test('a newer-format Kiro file keeps other sessions certified and withholds deletions', () => {
   // CONTRIBUTING: version gates must tolerate the unknown (Hermes 5dbcf47, DeepSeek 63b041e).
+  // The newer file backs no indexed path, so it may be another copy of the vanished session.
   const { root, provider } = setup();
   seedCli(root);
   const newer = json('cli.json');
   newer.session_id = 'newer-session'; newer.session_state.version = 'v99';
   seedCli(root, newer, readFileSync(fixture('cli.jsonl'), 'utf8'), 'newer');
   const gone = { sessionId: 'kiro:gone', jsonlPath: join(root, 'sessions', 'cli', 'gone.jsonl') };
-  const issues = [], skipped = [];
-  const units = discover(provider, { indexed: [gone], issues, skipped });
+  const issues = [], skipped = [], retained = [];
+  const units = discover(provider, { indexed: [gone], issues, skipped, retained });
   assert.deepEqual(issues, []);
   assert.equal(skipped.length, 1);
   assert.equal(units.filter(unit => !unit.meta.tombstone).length, 1);
-  assert.deepEqual(units.filter(unit => unit.meta.tombstone).map(unit => unit.sessionId), ['kiro:gone']);
+  assert.deepEqual(units.filter(unit => unit.meta.tombstone), []);
+  assert.deepEqual(retained, ['kiro:gone']);
+});
+
+test('Kiro retains an indexed session by source path when its newer header drops the cwd', () => {
+  const { root, provider } = setup();
+  const { path, metadata } = seedCli(root);
+  const [unit] = discover(provider);
+  const indexed = [{ sessionId: unit.sessionId, jsonlPath: path }];
+  const header = json('cli.json');
+  delete header.cwd; header.session_state.version = 'v99';
+  writeFileSync(metadata, JSON.stringify(header));
+  const issues = [], skipped = [], retained = [];
+  assert.deepEqual(discover(provider, { indexed, issues, skipped, retained }), []);
+  assert.deepEqual(issues, []);
+  assert.deepEqual(skipped.map(issue => issue.path), [metadata]);
+  assert.deepEqual(retained, [unit.sessionId]);
 });
 
 test('Kiro preserves the last snapshot when inventory is unavailable or a version is unknown', () => {
