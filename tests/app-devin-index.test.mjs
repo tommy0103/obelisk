@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, normalize } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { buildIndex } from '../app/src/main/indexer.ts';
@@ -134,8 +134,9 @@ function seedRichSession(store, id = 'brave-otter') {
   store.head(id, 25, T0 + 23);
 }
 
+// The platform's default store under `home`, with no XDG_DATA_HOME or APPDATA override.
 function seedRoot(home) {
-  const root = join(home, '.local', 'share', 'devin', 'cli');
+  const root = defaultDevinRoot({ homeDir: home, env: {} });
   mkdirSync(root, { recursive: true });
   return { root, dbPath: join(root, 'sessions.db') };
 }
@@ -208,8 +209,9 @@ test('discover() finds every visible session in the default store and skips hidd
   store.head('quiet-fox', 1, T0);
   store.close();
 
-  const previous = process.env.XDG_DATA_HOME;
+  const previous = { XDG_DATA_HOME: process.env.XDG_DATA_HOME, APPDATA: process.env.APPDATA };
   delete process.env.XDG_DATA_HOME;
+  delete process.env.APPDATA;
   try {
     const { units, issues } = collect(createDevinProvider({ homeDir: home }));
     assert.deepEqual(issues, []);
@@ -217,7 +219,7 @@ test('discover() finds every visible session in the default store and skips hidd
     assert.equal(units[0].key, `${dbPath}#devin:brave-otter`);
     assert.equal(units[0].project, '-work-app');
   } finally {
-    if (previous !== undefined) process.env.XDG_DATA_HOME = previous;
+    for (const [key, value] of Object.entries(previous)) if (value !== undefined) process.env[key] = value;
   }
 });
 
@@ -250,7 +252,7 @@ test('parse() projects the main chain once, attributes the subagent chain, and k
   assert.equal(byUuid.get('a1').output_tokens, 40);
   assert.equal(byUuid.get('a1:thinking').content_type, 'thinking');
   assert.equal(byUuid.get('a4').model, 'synthetic-model-b');
-  assert.equal(byUuid.get('u1').cwd, '/work/app');
+  assert.equal(byUuid.get('u1').cwd, normalize('/work/app'));
 
   const calls = records.filter(record => record.kind === 'tool_call');
   assert.deepEqual(calls.map(call => [call.id, call.message_uuid, call.name, call.file_path]), [
@@ -453,7 +455,7 @@ test('the CLI indexes the default Devin store and finds a message through search
     agents: sql("SELECT agent_id, parent_tool_use_id FROM subagents WHERE agent_id LIKE 'devin:%' ORDER BY agent_id")
       .map(row => [row.agent_id, row.parent_tool_use_id]),
   };`);
-  const result = runCli(['--query', join(home, 'q.mjs')], { home, env: { XDG_DATA_HOME: join(home, '.local', 'share') } });
+  const result = runCli(['--query', join(home, 'q.mjs')], { home, env: { APPDATA: join(home, 'AppData', 'Roaming') } });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const out = JSON.parse(result.stdout);
   const sid = devinSessionId(dbPath, 'brave-otter');
