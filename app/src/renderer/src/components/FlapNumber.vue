@@ -70,6 +70,7 @@ onUnmounted(() => {
       aria-hidden="true"
     >
       <span v-if="!state.animating || !slot.changed" class="flap-digit stable">{{ slot.to }}</span>
+      <!-- eslint-disable-next-line vue/no-template-key -- Vue 3 keys v-if branches on <template>; a new key restarts the flip. -->
       <template v-else :key="state.version">
         <span class="flap-digit flap-new-top">{{ slot.to }}</span>
         <span class="flap-digit flap-old-bottom">{{ slot.from }}</span>

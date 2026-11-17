@@ -151,15 +151,6 @@ export function fmtTooltipDate(isoDay) {
   return `${months[d.getMonth()]} ${day}${suffix}, ${d.getFullYear()}`;
 }
 
-export function positionTooltip(el, x, y) {
-  const pad = 12;
-  const rect = el.getBoundingClientRect();
-  let left = x + pad;
-  if (left + rect.width > window.innerWidth - pad) left = x - rect.width - pad;
-  el.style.left = left + 'px';
-  el.style.top = (y - 28) + 'px';
-}
-
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';
   const projectPath = state.projects.find(project => project.project === slug)?.project_path;
