@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@obelisk/core": "0.2.0",
     "@types/node": "^26.1.1",
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
