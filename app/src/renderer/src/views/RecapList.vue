@@ -24,7 +24,7 @@ const byYear = computed(() => {
     if (!map[y]) map[y] = [];
     map[y].push(r);
   }
-  return Object.entries(map).sort((a, b) => b[0] - a[0]);
+  return Object.entries(map).sort((a, b) => Number(b[0]) - Number(a[0]));
 });
 
 function glowColor(arch) {

@@ -246,6 +246,10 @@ function groupWorkflowAgents(workflow) {
   return phases;
 }
 
+/**
+ * @param {any} item
+ * @param {{ query?: string, expandedText?: string }} [options]
+ */
 export function buildSessionTimelinePresentation(item, { query = '', expandedText } = {}) {
   const message = item?.message || {};
   const toolCalls = item?.kind === 'workflow-tools'

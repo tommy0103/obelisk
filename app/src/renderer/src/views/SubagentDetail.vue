@@ -25,6 +25,10 @@ async function load() {
 
 const fullText = reactive(new Map());
 
+function toggleOpen(event, selector) {
+  /** @type {HTMLElement} */ (event.currentTarget).closest(selector).classList.toggle('open');
+}
+
 async function handleLoadFull(uuid) {
   const full = await loadFullText(uuid);
   if (full) fullText.set(uuid, full);
@@ -60,7 +64,7 @@ function renderMsgMarkdown(msg, text, variant) {
         >
           <template v-if="msg.content_type === 'thinking'">
             <div class="msg-thinking">
-              <button class="thinking-toggle" @click="$event.currentTarget.closest('.msg-thinking').classList.toggle('open')">
+              <button class="thinking-toggle" @click="toggleOpen($event, '.msg-thinking')">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
@@ -71,7 +75,7 @@ function renderMsgMarkdown(msg, text, variant) {
 
           <template v-else-if="msg.is_meta">
             <div class="msg-meta-collapsed">
-              <button class="meta-toggle" @click="$event.currentTarget.closest('.msg-meta-collapsed').classList.toggle('open')">
+              <button class="meta-toggle" @click="toggleOpen($event, '.msg-meta-collapsed')">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="meta-label">System</span>
                 <span class="meta-preview">{{ (msg.text || '').replace(/<[^>]+>/g, '').slice(0, 80) }}</span>
@@ -87,7 +91,7 @@ function renderMsgMarkdown(msg, text, variant) {
               <span class="when">{{ msg.timestamp ? fmtClockTime(msg.timestamp) : '' }}</span>
             </div>
             <div v-if="msg._thinking" class="msg-thinking">
-              <button class="thinking-toggle" @click="$event.currentTarget.closest('.msg-thinking').classList.toggle('open')">
+              <button class="thinking-toggle" @click="toggleOpen($event, '.msg-thinking')">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
@@ -105,7 +109,7 @@ function renderMsgMarkdown(msg, text, variant) {
 
             <div v-if="msg.tool_calls?.length" class="msg-tools">
               <div v-for="tc in msg.tool_calls" :key="tc.id" class="msg-tool" :class="{ 'is-error': tc.result?.is_error }">
-                <button class="toolcall-toggle" @click="$event.currentTarget.closest('.msg-tool').classList.toggle('open')">
+                <button class="toolcall-toggle" @click="toggleOpen($event, '.msg-tool')">
                   <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                   <span class="tool-name">{{ tc.name }}</span>
                   <span class="tool-arg">{{ getToolArgPreview(tc) }}</span>

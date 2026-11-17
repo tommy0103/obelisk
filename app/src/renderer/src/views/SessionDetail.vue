@@ -149,15 +149,15 @@ function handleZoom(e) {
   if (e.key === '=' || e.key === '+') {
     e.preventDefault();
     if (fontSizeIdx.value < FONT_SIZES.length - 1) fontSizeIdx.value++;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   } else if (e.key === '-') {
     e.preventDefault();
     if (fontSizeIdx.value > 0) fontSizeIdx.value--;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   } else if (e.key === '0') {
     e.preventDefault();
     fontSizeIdx.value = 2;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   }
 }
 
@@ -180,7 +180,7 @@ onMounted(async () => {
   active.value = true;
   userScroll.attach(wrapRef.value);
   attachKeydown();
-  removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId } = {}) => {
+  removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId }) => {
     if (!active.value || !props.id || sessionId !== props.id) return;
     void liveReloadCoordinator.request();
   }) || null;

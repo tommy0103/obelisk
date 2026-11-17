@@ -11,6 +11,7 @@ const props = defineProps({
   title: String,
   claim: String,
   subtitle: String,
+  /** @type {import('vue').PropType<number[]>} */
   activity: Array,
   footer: String,
   idx: { type: Number, default: 1 },

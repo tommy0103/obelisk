@@ -4,9 +4,13 @@
 <script setup>
 defineProps({
   title: String,
+  /** @type {import('vue').PropType<import('../../recap').VoiceLine[]>} */
   voiceLines: Array,
+  /** @type {import('vue').PropType<import('../../recap').VoiceLine[]>} */
   observations: Array,
+  /** @type {import('vue').PropType<import('../../recap').VibeMeter>} */
   meter: Object,
+  /** @type {import('vue').PropType<import('../../recap').VibeQuote>} */
   quote: Object,
   idx: { type: Number, default: 3 },
   total: { type: Number, default: 5 },

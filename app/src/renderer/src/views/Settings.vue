@@ -102,7 +102,8 @@ async function browseSourcePath(source) {
   }
 }
 
-async function toggleCopilotEdition(edition, enabled) {
+async function toggleCopilotEdition(edition, event) {
+  const enabled = /** @type {HTMLInputElement} */ (event.target).checked;
   edition.enabled = enabled;
   await saveSetting(`copilotEditions.${edition.id}`, enabled);
   await loadSettings();
@@ -238,7 +239,7 @@ function fmtRelative(iso) {
           <div class="source-card-body">
             <div v-if="src.id === 'copilot' && !copilotCustomRoot" class="copilot-editions">
               <label v-for="edition in copilotEditions" :key="edition.id" class="copilot-edition">
-                <input type="checkbox" :checked="edition.enabled" @change="toggleCopilotEdition(edition, $event.target.checked)" />
+                <input type="checkbox" :checked="edition.enabled" @change="toggleCopilotEdition(edition, $event)" />
                 <span class="copilot-edition-details">
                   <span>{{ edition.name }}</span>
                   <span class="copilot-edition-path">{{ edition.path }}</span>
@@ -303,7 +304,7 @@ function fmtRelative(iso) {
                 class="editor-picker-trigger"
                 :class="{ open: editorMenuOpen }"
                 aria-haspopup="listbox"
-                :aria-expanded="String(editorMenuOpen)"
+                :aria-expanded="editorMenuOpen"
                 aria-controls="editor-picker-menu"
                 @click="editorMenuOpen = !editorMenuOpen"
               >
@@ -326,7 +327,7 @@ function fmtRelative(iso) {
                   class="editor-picker-option"
                   :class="{ selected: editor.id === editorScheme }"
                   role="option"
-                  :aria-selected="String(editor.id === editorScheme)"
+                  :aria-selected="editor.id === editorScheme"
                   @click="chooseEditor(editor.id)"
                 >
                   <span>{{ editor.label }}</span>

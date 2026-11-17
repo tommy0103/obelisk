@@ -97,7 +97,7 @@ const windowTitle = computed(() => {
     scopeText = `Recap · ${route.params.id}`;
   } else if (route.name === 'Settings') {
     scopeText = 'Settings';
-  } else if (route.name?.startsWith('Session')) {
+  } else if (typeof route.name === 'string' && route.name.startsWith('Session')) {
     if (route.name === 'SessionDetail' || route.name === 'SubagentDetail') {
       const s = routeSession.value;
       scopeText = s ? `Sessions · ${s.title}` : 'Sessions';
@@ -200,7 +200,7 @@ onMounted(() => {
   window.addEventListener('keydown', handleGlobalKeydown);
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   stopSourceUpdates = window.obelisk?.onIndexUpdated?.(() => loadSourceDots()) ?? null;
-  stopWindowState = window.obelisk?.onWindowState?.((s) => { maximized.value = !!s?.maximized; }) ?? null;
+  stopWindowState = window.obelisk?.onWindowState?.((s) => { maximized.value = s.maximized; }) ?? null;
 });
 onUnmounted(() => {
   disconnectUpdates?.();
