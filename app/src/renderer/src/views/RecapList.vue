@@ -71,7 +71,9 @@ async function copyCmd() {
     await navigator.clipboard.writeText(generateCmd.value);
     cmdCopied.value = true;
     setTimeout(() => { cmdCopied.value = false; }, 1600);
-  } catch {}
+  } catch {
+    // Clipboard denied: the command stays on screen to copy by hand.
+  }
 }
 
 async function loadRecaps() {

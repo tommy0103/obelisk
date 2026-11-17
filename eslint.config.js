@@ -48,8 +48,8 @@ export default tseslint.config(
       globals: { ...globals.node },
     },
     rules: {
-      // Best-effort probes (JSON.parse, fs.stat on a racing file) may ignore failures.
-      'no-empty': ['error', { allowEmptyCatch: true }],
+      // A catch may swallow an error only with a comment saying why it is safe to.
+      'no-empty': ['error', { allowEmptyCatch: false }],
     },
   },
   {

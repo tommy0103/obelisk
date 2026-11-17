@@ -170,7 +170,7 @@ function renderOutput(output, isError) {
   if (!output) return '<div style="padding:8px;color:var(--muted-2);font-style:italic;font-size:11px;">No output.</div>';
 
   let parsed = null;
-  try { parsed = JSON.parse(output); } catch {}
+  try { parsed = JSON.parse(output); } catch { /* not JSON: rendered as text below */ }
   if (parsed !== null && typeof parsed === 'object') {
     if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(item => item && typeof item === 'object' && !Array.isArray(item))) {
       return renderAutoTable(parsed);
