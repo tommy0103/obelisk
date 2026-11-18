@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Hermes Agent, Kiro, Kimi Code, OMP, OpenCode, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
+Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Devin, Hermes Agent, Kiro, Kimi Code, OMP, OpenCode, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
 
 **English** · [中文](README.zh-CN.md)
 
@@ -165,8 +165,8 @@ where the source tool has the concept:
 | **Sessions** | Title, project, timestamps, git branch, source | all providers |
 | **Messages** | Full text, model, token usage, parent chain | all providers |
 | **Tool calls** | Tool name, input, file paths | all providers |
-| **Subagents** | Agent type, description, full conversation | Claude Code, Codex, DeepSeek Harness, Hermes Agent, Kiro V3, Kimi Code, OpenCode, ZCode |
-| **Summaries** | Session summaries emitted by the provider | Kiro V3, Kimi Code, OpenCode |
+| **Subagents** | Agent type, description, full conversation | Claude Code, Codex, DeepSeek Harness, Devin, Hermes Agent, Kiro V3, Kimi Code, OpenCode, ZCode |
+| **Summaries** | Session summaries emitted by the provider | Devin, Kiro V3, Kimi Code, OpenCode |
 | **Workflows** | Workflow script, result, and per-agent transcripts | Claude Code |
 | **Memories** | Conclusions linked to source sessions | registered markdown files |
 
@@ -184,6 +184,7 @@ non-Claude IDs are provider-prefixed so they cannot collide.
 | Codex | `~/.codex/sessions`, `~/.codex/archived_sessions` |
 | GitHub Copilot | VS Code `User` data roots (Chronicle store + workspace transcripts) |
 | DeepSeek Harness | `~/.dsh/sessions` (or `$DSH_HOME/sessions`) |
+| Devin | `~/.local/share/devin/cli/sessions.db` (or `$XDG_DATA_HOME/devin/cli`; `%APPDATA%\devin\cli` on Windows), shared by Devin CLI and Desktop |
 | Hermes Agent | `~/.hermes/state.db` (or `$HERMES_HOME/state.db`) |
 | Kiro | `~/.kiro/sessions` and the platform `kiro-cli/data.sqlite3` store |
 | Kimi Code | `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`) |
@@ -204,6 +205,7 @@ rows that normal queries omit; supported query helpers can opt in with
 | Kimi Code | Undo/clear can attest supersession; preservation is a follow-up |
 | Hermes Agent | Superseded history is not split: compaction-archived and rewound rows are both stored as `inactive` |
 | OpenCode | Session revert state attests inactive history |
+| Devin | Messages no live chain reaches (rewound turns, compacted history) are inactive |
 | Claude Code | The source does not attest rewind or current-leaf state |
 | Codex | Sessions have no branching semantics |
 

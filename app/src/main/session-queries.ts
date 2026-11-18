@@ -362,15 +362,17 @@ export function registerSessionQueryHandlers({ ipcMain, getDb, getRuntimePaths, 
       workflowAgent,
     };
     // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
-    if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode') {
+    if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode' || lookup.source === 'devin') {
       try {
         const messageText = lookup.source === 'zcode'
           ? await getIndexerWorker()?.readZcodeMessageText(lookup)
           : lookup.source === 'kiro'
             ? await getIndexerWorker()?.readKiroMessageText({ ...lookup, rootDir: paths.providerRoots.kiro })
-            : lookup.source === 'opencode'
-              ? await getIndexerWorker()?.readOpencodeMessageText(lookup)
-              : await getIndexerWorker()?.readHermesMessageText(lookup);
+            : lookup.source === 'devin'
+              ? await getIndexerWorker()?.readDevinMessageText({ ...lookup, rootDir: paths.providerRoots.devin })
+              : lookup.source === 'opencode'
+                ? await getIndexerWorker()?.readOpencodeMessageText(lookup)
+                : await getIndexerWorker()?.readHermesMessageText(lookup);
         return messageText ?? msg.text ?? null;
       } catch {
         return msg.text ?? null;

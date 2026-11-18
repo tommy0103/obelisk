@@ -25,7 +25,7 @@ for (const runtime of ['Core', 'App', 'built CLI']) for (const nested of [false,
     const rootA = nested ? join(mappingRootB, 'excluded-a') : join(home, 'excluded-a');
     const config = join(home, 'config', 'obelisk', 'settings.json');
     const dbPath = join(home, 'data', 'obelisk', 'obelisk.sqlite');
-    const roots = Object.fromEntries(['claude', 'codex', 'copilot', 'deepseek', 'hermes', 'kimi', 'kiro', 'omp', 'opencode', 'pi', 'zcode']
+    const roots = Object.fromEntries(['claude', 'codex', 'copilot', 'deepseek', 'devin', 'hermes', 'kimi', 'kiro', 'omp', 'opencode', 'pi', 'zcode']
       .map(id => [id, '']));
     roots[sourceId] = rootA;
     const settings = { providerRoots: roots };

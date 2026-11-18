@@ -27,6 +27,9 @@ export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
   // ~/.hermes/state.db; a harness-exported HERMES_HOME would point CLI tests at the
   // real store instead of the temp HOME.
   delete childEnv.HERMES_HOME;
+  // The devin provider reads $XDG_DATA_HOME/devin before ~/.local/share/devin;
+  // keep an inherited value from pointing CLI tests at a real store.
+  if (!('XDG_DATA_HOME' in env)) delete childEnv.XDG_DATA_HOME;
   return spawnSync(process.execPath, [
     '--disable-warning=ExperimentalWarning',
     cliEntry,

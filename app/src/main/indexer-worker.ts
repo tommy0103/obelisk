@@ -8,6 +8,7 @@ import { createHermesProvider } from '../../../packages/core/src/providers/herme
 import { createZcodeProvider } from '../../../packages/core/src/providers/zcode.ts';
 import { createKiroProvider } from '../../../packages/core/src/providers/kiro.ts';
 import { createOpencodeProvider } from '../../../packages/core/src/providers/opencode.ts';
+import { createDevinProvider } from '../../../packages/core/src/providers/devin.ts';
 import type { RawLookup } from '../../../packages/core/src/providers/types.ts';
 
 if (!parentPort) throw new Error('indexer-worker must run as a worker thread');
@@ -43,7 +44,12 @@ port.on('message', ({ id, operation, args }: { id: number; operation?: string; a
               rootDir: typeof args?.rootDir === 'string' ? args.rootDir : undefined,
               openDatabase: sourcePath => new Database(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 }),
             }).raw(args as unknown as RawLookup)?.messageText ?? null
-            : buildIndex(args || {});
+            : operation === 'readDevinMessageText'
+              ? createDevinProvider({
+                rootDir: typeof args?.rootDir === 'string' ? args.rootDir : undefined,
+                openDatabase: sourcePath => new Database(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 }),
+              }).raw(args as unknown as RawLookup)?.messageText ?? null
+              : buildIndex(args || {});
     port.postMessage({ id, result });
   } catch (error) {
     port.postMessage({

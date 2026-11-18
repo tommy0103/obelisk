@@ -9,7 +9,7 @@ import type { RawLookup } from '../../../packages/core/src/providers/types.ts';
 
 type BuildIndexArgs = NonNullable<Parameters<typeof buildIndexInWorker>[0]>;
 type BuildIndexResult = ReturnType<typeof buildIndexInWorker>;
-type WorkerOperation = 'buildIndex' | 'readZcodeMessageText' | 'readHermesMessageText' | 'readKiroMessageText' | 'readOpencodeMessageText';
+type WorkerOperation = 'buildIndex' | 'readZcodeMessageText' | 'readHermesMessageText' | 'readKiroMessageText' | 'readOpencodeMessageText' | 'readDevinMessageText';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -81,6 +81,7 @@ function createWorkerBuildIndex({
   const readHermesMessageText = (args: RawLookup) => request<string | null>('readHermesMessageText', args);
   const readKiroMessageText = (args: RawLookup & { rootDir?: string }) => request<string | null>('readKiroMessageText', args);
   const readOpencodeMessageText = (args: RawLookup) => request<string | null>('readOpencodeMessageText', args);
+  const readDevinMessageText = (args: RawLookup & { rootDir?: string }) => request<string | null>('readDevinMessageText', args);
 
   const stop = () => {
     const current = worker;
@@ -90,7 +91,7 @@ function createWorkerBuildIndex({
     return termination;
   };
 
-  return { buildIndex, readZcodeMessageText, readHermesMessageText, readKiroMessageText, readOpencodeMessageText, stop };
+  return { buildIndex, readZcodeMessageText, readHermesMessageText, readKiroMessageText, readOpencodeMessageText, readDevinMessageText, stop };
 }
 
 export { createWorkerBuildIndex };
