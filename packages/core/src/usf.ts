@@ -804,7 +804,9 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
       .map((step, i) => (object(step).by === 'human' && !object(step).state ? i : -1))
       .filter((i) => i >= 0);
     if (starts.length > 1) bad(where, 'more than one submission in a turn');
-    if (starts.length > 0 && session.started_by === 'agent') bad(where, 'a session started by an agent has a human step');
+    if (session.started_by === 'agent' && steps.some(step => object(step).by === 'human')) {
+      bad(where, 'a session started by an agent has a human step');
+    }
     if (t > 0 && starts[0] !== 0) bad(where, 'a turn after the first does not start with a submission');
   });
   return problems;

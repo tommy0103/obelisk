@@ -794,6 +794,7 @@ export function* parse(
     && fingerprint.prefixMatches));
   const eventMessageKeys = new Set<string>();
   const appendedEventMessageKeys = new Set<string>();
+  const appendedUserPromptKeys = new Set<string>();
   const appendedResponseMessageKeys = new Set<string>();
   let metaRecord: { lineNum: number; obj: any } | null = !appendCandidate
     ? null
@@ -838,7 +839,10 @@ export function* parse(
           if (text !== null) {
             const key = visibleMessageDigest(payload.type === 'user_message' ? 'user' : 'assistant', text);
             eventMessageKeys.add(key);
-            if (collectAppendedResponses) appendedEventMessageKeys.add(key);
+            if (collectAppendedResponses) {
+              appendedEventMessageKeys.add(key);
+              if (payload.type === 'user_message') appendedUserPromptKeys.add(visibleMessageDigest('user-prompt', text));
+            }
           }
         }
       } else if (collectAppendedResponses && obj?.type === 'response_item'
@@ -932,7 +936,15 @@ export function* parse(
   // thread records prompts as events at all. Rows emitted before the first
   // such event were judged without it, so its arrival replays the thread.
   const firstUserMessageEvent = appendCandidate && sawUserMessageEvent && prior.userMessageEvents !== true;
-  const fast = appendCandidate && !possibleCrossBoundaryDuplicate && !firstUserMessageEvent;
+  // Multipart items use a separate digest domain in the bounded response bloom:
+  // an eventual prompt event changes their labels, not their stored identities.
+  const possiblePromptLabelChange = appendCandidate
+    && [...appendedUserPromptKeys].some(key => bloomMightContain(priorResponseBloom, key));
+  // A label-only replay updates existing rows in place. It has no obsolete
+  // identities to retract, and deleting the shared session here would erase
+  // unchanged child rollouts that discovery correctly did not schedule.
+  const labelsOnlyReplay = (firstUserMessageEvent || possiblePromptLabelChange) && !possibleCrossBoundaryDuplicate;
+  const fast = appendCandidate && !possibleCrossBoundaryDuplicate && !firstUserMessageEvent && !possiblePromptLabelChange;
   if (metrics) metrics.plan = fast
     ? (cooperativeAppend ? 'cooperative-append' : 'verified-append')
     : 'snapshot';
@@ -993,7 +1005,7 @@ export function* parse(
   // A child rollout contributes to its parent projection. Replaying only this
   // child cannot safely retract the whole parent session; leave destructive
   // replacement to orchestration that replays the complete contributing tree.
-  const canRetract = (sourceMeta?.replaceSnapshot || (_cursor !== null && !fast)) && !agentId;
+  const canRetract = (sourceMeta?.replaceSnapshot || (_cursor !== null && !fast && !labelsOnlyReplay)) && !agentId;
   if (canRetract) out.push({ kind: 'delete-session', sessionId });
   const msgByUuid = new Map<string, MessageRecord>();
   const emittedMessageUuids = new Set<string>();
@@ -1139,9 +1151,19 @@ export function* parse(
         // events, a user-role item without one was put there by Codex itself
         // (session preamble, the notice left by an aborted turn). A thread with
         // no such event at all keeps its prompts only as response items.
-        const injected = role === 'user' && userMessageEvents;
+        // UserMessageItem::message in Codex concatenates text inputs without
+        // separators. Keep our existing stored text/identity representation,
+        // but do not infer harness authorship from that formatting difference.
+        const promptText = role === 'user' ? codexMessagePayloadText(payload, '') : null;
+        const promptKey = promptText === null ? null : visibleMessageDigest('user', promptText);
+        const possibleHumanPrompt = promptKey !== null && (eventMessageKeys.has(promptKey)
+          || (fast && bloomMightContain(priorEventBloom, promptKey)));
+        const injected = role === 'user' && userMessageEvents && !possibleHumanPrompt;
         insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts, isMeta: injected ? 1 : 0 });
         bloomAdd(responseMessageBloom, key);
+        if (promptText !== null && promptText !== text) {
+          bloomAdd(responseMessageBloom, visibleMessageDigest('user-prompt', promptText));
+        }
       }
       return;
     }

@@ -9,7 +9,9 @@ import { createBuiltinProviderRegistry } from '../packages/core/src/providers/bu
 import { assertHarnessConformance, harnessContractProblems } from './harness-conformance.mjs';
 
 // The test file in which each built-in provider checks complete parses of its
-// real fixtures with assertHarnessConformance(). The fixtures and the layout a
+// fixtures with assertHarnessConformance(). Devin uses its real schema with
+// explicitly synthetic rows; other fixture provenance is documented locally.
+// The fixtures and the layout a
 // provider expects live with that provider's tests, so the check does too.
 const CHECKED_IN = {
   claude: 'claude-parse.test.mjs',
@@ -17,6 +19,7 @@ const CHECKED_IN = {
   'codexhost-antigravity': 'codexhost-antigravity-provider.test.mjs',
   copilot: 'copilot-provider.test.mjs',
   deepseek: 'deepseek-tree.test.mjs',
+  devin: 'app-devin-index.test.mjs',
   hermes: 'hermes-provider.test.mjs',
   kimi: 'kimi-parse.test.mjs',
   kiro: 'kiro-provider.test.mjs',

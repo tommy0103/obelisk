@@ -536,7 +536,7 @@ function codexEventText(payload: JsonRecord): string | null {
   return null;
 }
 
-function codexMessagePayloadText(payload: JsonRecord): string | null {
+function codexMessagePayloadText(payload: JsonRecord, separator = '\n'): string | null {
   if (!Array.isArray(payload?.content)) return null;
   const parts: string[] = [];
   for (let index = 0; index < payload.content.length; index++) {
@@ -557,7 +557,7 @@ function codexMessagePayloadText(payload: JsonRecord): string | null {
     }
     if (typeof block?.text === 'string') parts.push(block.text);
   }
-  return parts.length ? parts.join('\n') : null;
+  return parts.length ? parts.join(separator) : null;
 }
 
 function codexVisibleMessageKey(role: unknown, text: unknown): string {

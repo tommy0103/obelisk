@@ -403,6 +403,16 @@ test('a session a sub-agent started has tasks, not submissions, and is one turn'
   assert.deepEqual(validateUsf({ ...byPerson, started_by: 'human' }), ['session: "started_by" "human" is not "agent"']);
 });
 
+test('agent-started sessions reject human steps even when hidden or inactive', () => {
+  const { session: usf } = only([session(), message('ask', 'user', 'a human prompt', 1)]);
+  for (const state of ['hidden', 'inactive']) {
+    const changed = structuredClone(usf);
+    changed.started_by = 'agent';
+    changed.turns[0].steps[0].state = state;
+    assert.deepEqual(validateUsf(changed), ['turns[0]: a session started by an agent has a human step']);
+  }
+});
+
 test('steps keep the order the provider gave the messages, not the order of their timestamps', () => {
   const { session: usf } = only([
     session(),

@@ -230,7 +230,7 @@ harness 用助手的身份写的通知（切换模型的提示之类）也是 `h
 
 没有消息头的工具结果仍保留为 `harness/result`，时间为 `null`。只有子 agent 消息或主消息为空的子 session 仍保留其后代。脱离父级的子树按祖先先于后代装配，避免输入顺序导致重复导出；循环的 session 父子关系会被拒绝。无关联调用的 `run` 按实际时间（考虑时区偏移）插入，不重排已有步骤。
 
-每个内置 adapter 的测试都用 `tests/harness-conformance.mjs` 检查自己的真实样本：`is_meta` 的消息、角色不是用户和助手的消息都要有 `harness_kind`，装配出来的 USF 两种形态都要通过校验；`tests/provider-harness-conformance.test.mjs` 保证没有哪个 adapter 漏掉。这项检查看不出“harness 写的、但样子和模型输出一样”的消息，那要靠各 adapter 自己的测试。
+每个内置 adapter 的测试都用 `tests/harness-conformance.mjs` 检查自己的样本（Devin 使用真实数据库 schema 加合成记录，其他样本的来源见对应测试）：`is_meta` 的消息、角色不是用户和助手的消息都要有 `harness_kind`，装配出来的 USF 两种形态都要通过校验；`tests/provider-harness-conformance.test.mjs` 保证没有哪个 adapter 漏掉。这项检查看不出“harness 写的、但样子和模型输出一样”的消息，那要靠各 adapter 自己的测试。
 
 仓库内的 `tests/usf.test.mjs` 覆盖 Codex、DeepSeek、OMP、Pi 的 fixture 和格式回归，`tests/core-package-build.test.mjs` 覆盖构建后包的导出入口；它们由 `npm test` 和 CLI CI 的完整仓库测试执行。5.1 中的 12-adapter 端到端探针位于仓库外的 Cairn 原型，不是本仓库 CI 的覆盖承诺。
 

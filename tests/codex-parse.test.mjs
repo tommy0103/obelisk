@@ -725,3 +725,27 @@ test('codex records of the real rollouts say who wrote each message', () => {
     assertHarnessConformance(drain(parse({ key: path, sessionId: '' }, null)).values);
   }
 });
+
+for (const eventFirst of [false, true]) {
+  test(`Codex multipart human input stays human across checkpoints (event first: ${eventFirst})`, () => {
+    // Codex UserMessageItem::message concatenates Text items without a separator:
+    // openai/codex@daa59ebd298ed6d7ee7dc92af09e5b25c5d63029,
+    // codex-rs/protocol/src/items.rs. This is a synthetic regression case.
+    const item = userItem('02', 'unused');
+    item.payload.content = ['Please ', 'review this.'].map(text => ({ type: 'input_text', text }));
+    const event = userEvent('02', 'Please review this.');
+    const path = writeFixture([
+      { type: 'session_meta', timestamp: META.timestamp, payload: META },
+      eventFirst ? event : item,
+    ]);
+    const first = drain(parse({ key: path, sessionId: '' }, null));
+    appendFileSync(path, JSON.stringify(eventFirst ? item : event) + '\n');
+    const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+    for (const records of [second.values, drain(parse({ key: path, sessionId: '' }, null)).values]) {
+      const users = records.filter(record => record.kind === 'message' && record.role === 'user');
+      assert.ok(users.length > 0);
+      assert.ok(users.every(record => record.is_meta === 0 && record.harness_kind === null),
+        'different text segmentation is not evidence of harness authorship');
+    }
+  });
+}

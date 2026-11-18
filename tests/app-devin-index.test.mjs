@@ -19,6 +19,7 @@ import { createDevinProvider, defaultDevinRoot, devinAgentId, devinSessionId } f
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 
 const DEVIN_SCHEMA = readFileSync(new URL('./fixtures/devin/schema.sql', import.meta.url), 'utf8');
 const INDEX_SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -236,6 +237,17 @@ test('parse() projects the main chain once, attributes the subagent chain, and k
   const agentId = devinAgentId(sid, 'a1b2c3d4');
   const messages = records.filter(record => record.kind === 'message');
   const byUuid = new Map(messages.map(record => [record.uuid.slice(sid.length + 1), record]));
+
+  assertHarnessConformance(records);
+  for (const id of ['s1', 's2', 'sub-s', 'bg-done']) {
+    assert.equal(byUuid.get(id).harness_kind, 'other', id);
+  }
+  for (const id of ['footer-1', 'sub-task']) {
+    assert.equal(byUuid.get(id).harness_kind, 'reminder', id);
+  }
+  for (const id of ['u1', 'u-rewound', 'u2', 'a1', 'a1:thinking', 'sub-a2']) {
+    assert.equal(byUuid.get(id).harness_kind, null, id);
+  }
 
   assert.equal(messages.length, new Set(messages.map(record => record.uuid)).size, 'every message is emitted once');
   const visibleMain = messages.filter(record => record.visibility === 'visible' && record.agent_id === null).map(record => record.uuid.slice(sid.length + 1));
