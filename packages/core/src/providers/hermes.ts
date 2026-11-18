@@ -31,6 +31,7 @@ import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
+  HarnessKind,
   MessageVisibility,
   ProviderAdapter,
   RawLookup,
@@ -908,6 +909,10 @@ function hermesParse({ openStore }: HermesParseDeps) {
         }
         const visibility = messageVisibility(message);
         const isMeta = (visibility === 'hidden' ? 1 : 0) as 0 | 1;
+        // A delegation-complete row is Hermes bringing a sub-agent's result back, not something
+        // the person typed. It stays retrievable (see messageVisibility), so only its kind says so.
+        const harnessKind: HarnessKind | null = visibility === 'hidden' ? 'other'
+          : stringValue(message['display_kind']) === 'async_delegation_complete' ? 'notification' : null;
         const rawMessageId =
           scalarValue(message['id']) ?? `${meta.rawSessionId}:row-${String(messageIndex).padStart(6, '0')}`;
 
@@ -976,6 +981,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
             content_type: 'thinking',
             visibility,
             is_meta: isMeta,
+            harness_kind: harnessKind,
             ...base,
           };
           previousUuid = thinkingUuid;
@@ -996,6 +1002,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
           content_type: messageText !== null ? 'text' : calls.length > 0 ? 'tool_use' : 'unknown',
           visibility,
           is_meta: isMeta,
+          harness_kind: harnessKind,
           ...base,
         };
         if (visibility === 'visible') visibleMessages += 1;
@@ -1031,6 +1038,8 @@ function hermesParse({ openStore }: HermesParseDeps) {
         countMode: 'total',
         jsonl_path: sourcePathFor(meta.dbPath, meta.rawSessionId),
         source: name,
+        // Upstream's `subagent` class, whether or not its parent is in this store.
+        started_by: sessionSource === 'subagent' ? 'agent' : null,
       } satisfies SessionRecord;
       // Hermes gives a delegated session its own row (and its own transcript) with
       // parent_session_id pointing back at the parent, so unlike Claude Code's sidechain units the

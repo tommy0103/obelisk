@@ -447,14 +447,16 @@ function createQueryApi(
       LIMIT 6
     `);
     // Null or non-canonical hits have no safe lexical ordering; retain the
-    // original scan instead of forcing them through the indexed path.
+    // original scan instead of forcing them through the indexed path. A null
+    // hit makes every distance NULL, so rowid decides, as in the indexed path:
+    // without it the six rows kept depend on the plan SQLite happens to pick.
     const scanContext = db.prepare(`
       SELECT uuid,text,content_type,is_meta,role,timestamp,model,
              COALESCE(visibility,'visible') AS visibility,
              COALESCE(source, 'claude') AS source
       FROM messages
       WHERE ${contextWhere}
-      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp))
+      ORDER BY ABS(JULIANDAY(timestamp)-JULIANDAY($timestamp)), rowid
       LIMIT 6
     `);
     return rows.map((r: DbRow) => {

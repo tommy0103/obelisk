@@ -5,7 +5,8 @@
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, title TEXT, project TEXT, project_path TEXT,
   started_at TEXT, ended_at TEXT, git_branch TEXT, version TEXT,
-  message_count INTEGER DEFAULT 0, jsonl_path TEXT, source TEXT DEFAULT 'claude');
+  message_count INTEGER DEFAULT 0, jsonl_path TEXT, source TEXT DEFAULT 'claude',
+  started_by TEXT);
 CREATE TABLE IF NOT EXISTS messages (
   uuid TEXT PRIMARY KEY, session_id TEXT, type TEXT, parent_uuid TEXT,
   timestamp TEXT, role TEXT, text TEXT, content_type TEXT,
@@ -13,7 +14,7 @@ CREATE TABLE IF NOT EXISTS messages (
   is_sidechain INTEGER DEFAULT 0, agent_id TEXT,
   input_tokens INTEGER, output_tokens INTEGER,
   cwd TEXT, skill TEXT, turn_duration_ms INTEGER,
-  source TEXT DEFAULT 'claude');
+  source TEXT DEFAULT 'claude', harness_kind TEXT);
 CREATE TABLE IF NOT EXISTS tool_calls (
   id TEXT PRIMARY KEY, message_uuid TEXT, session_id TEXT,
   name TEXT, presentation TEXT DEFAULT 'default', input_json TEXT, file_path TEXT);

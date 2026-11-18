@@ -525,6 +525,8 @@ function* projectSession(snapshot: SessionSnapshot, sessionId: string, unitKeyVa
       session_id: sessionId,
       timestamp,
       is_meta: 0 as const,
+      harness_kind: role === 'assistant' || userInput ? null
+        : extensions['barista/prompt_cache_footer'] === true ? 'reminder' as const : 'other' as const,
       model,
       is_sidechain: agentId === null ? 0 as const : 1 as const,
       agent_id: agentId,

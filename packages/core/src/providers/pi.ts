@@ -24,6 +24,7 @@ import type {
   DiscoverContext,
   IndexUnit,
   InventoryIssue,
+  HarnessKind,
   MessageRecord,
   MessageVisibility,
   ProviderAdapter,
@@ -1051,6 +1052,7 @@ function projectSession(
     text,
     contentType,
     isMeta,
+    harnessKind,
     visibility,
     model,
     timestamp,
@@ -1064,6 +1066,7 @@ function projectSession(
     text: string | null;
     contentType: string;
     isMeta: 0 | 1;
+    harnessKind: HarnessKind | null;
     visibility: MessageVisibility;
     model: string | null;
     timestamp: string | null;
@@ -1079,6 +1082,7 @@ function projectSession(
       text,
       content_type: contentType,
       is_meta: isMeta,
+      harness_kind: harnessKind,
       visibility,
       model,
       is_sidechain: 0,
@@ -1129,6 +1133,8 @@ function projectSession(
       projectedRole = role,
       meta = isMeta,
       model: string | null = null,
+      // What the harness wrote, when this is not the person's or the model's.
+      harnessKind: HarnessKind | null = meta ? 'other' : null,
     ): string => {
       const record = emitMessage({
         entry,
@@ -1140,6 +1146,7 @@ function projectSession(
         text,
         contentType,
         isMeta: meta,
+        harnessKind,
         visibility,
         model,
         timestamp,
@@ -1189,7 +1196,7 @@ function projectSession(
         }
       }
       if (typeof message.errorMessage === 'string' && message.errorMessage.length > 0) {
-        emit(content.length, 'error', trunc(message.errorMessage), 'assistant', 'assistant', 0, model);
+        emit(content.length, 'error', trunc(message.errorMessage), 'assistant', 'assistant', 0, model, 'error');
       }
       if (emitted.length === 0) emit(0, 'unknown', null, 'assistant', 'assistant', 0, model);
       if (accountUsage) {
@@ -1224,14 +1231,15 @@ function projectSession(
         parent: currentToolScope,
       };
     } else if (role === 'bashExecution') {
-      emit(0, 'bash_execution', bashText(message), 'user', 'bashExecution', 0);
+      // A shell command run through the harness. It stays retrievable (not meta).
+      emit(0, 'bash_execution', bashText(message), 'user', 'bashExecution', 0, null, 'command');
     } else if (role === 'custom') {
       const display = message.display !== false;
       const customVisibility = display ? visibility : 'hidden';
       const originalVisibility = visibility;
       visibility = customVisibility;
       projectContent(message.content, (index, _contentType, text) => (
-        emit(index, 'custom', text, 'system', 'custom', 1)
+        emit(index, 'custom', text, 'system', 'custom', 1, null, 'reminder')
       ));
       visibility = originalVisibility;
     } else if (role === 'branchSummary' || role === 'compactionSummary') {

@@ -92,6 +92,7 @@ import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
+  HarnessKind,
   MessageRecord,
   ProviderAdapter,
   RawLookup,
@@ -1453,12 +1454,17 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           const content = record.data.content;
           const text = joinPartText(content, 'text');
           const sourceKind = isRecord(record.data.source) ? record.data.source.kind : undefined;
-          const isMeta = sourceKind !== 'user' ? 1 : 0;
+          // A user/message whose producer is not the person is context the
+          // harness or a plugin put in. Two producers write the summary that
+          // stands in for history: DSH's own compaction and Obelisk's handoff.
+          const harnessKind: HarnessKind | null = sourceKind === 'user' ? null
+            : sourceKind === 'compact-checkpoint' || sourceKind === 'obelisk-context-handoff' ? 'compaction'
+              : typeof sourceKind === 'string' ? 'reminder' : 'other';
           pushMessage({
             kind: 'message', uuid: userMessageUuid(dbId, record.data.id, record.seq),
             session_id: sessionId, type: 'user', parent_uuid: lastMessageUuid,
             timestamp, role: 'user', text: trunc(text),
-            content_type: text !== null ? 'text' : 'unknown', is_meta: isMeta,
+            content_type: text !== null ? 'text' : 'unknown', is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind,
             visibility: 'visible', model: null, is_sidechain: isSubagent ? 1 : 0, agent_id: agentId,
             input_tokens: null, output_tokens: null, cwd, skill: null, source: 'deepseek',
           });

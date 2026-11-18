@@ -53,6 +53,7 @@ import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
+  HarnessKind,
   MessageRecord,
   MessageVisibility,
   ProviderAdapter,
@@ -438,6 +439,8 @@ function discoverAt(rootDir: string, ctx: DiscoverContext, opener: ZcodeDatabase
 function mapVisibility(data: Record<string, unknown>): {
   visibility: MessageVisibility;
   isMeta: 0 | 1;
+  /** What ZCode wrote, when the message is not a prompt or a response. */
+  harnessKind: HarnessKind | null;
 } {
   const semantics = isRecord(data.semantics) ? data.semantics : {};
   const ui = str(semantics.uiVisibility);
@@ -446,15 +449,16 @@ function mapVisibility(data: Record<string, unknown>): {
   const kind = str(semantics.kind);
   if (ui === 'visible' && provider === 'visible' && transcript === 'visible'
     && (kind === 'user_prompt' || kind === 'assistant_response')) {
-    return { visibility: 'visible', isMeta: 0 };
+    return { visibility: 'visible', isMeta: 0, harnessKind: null };
   }
   if (ui === 'visible' && provider === 'hidden' && transcript === 'visible' && kind === 'timeline_event') {
-    return { visibility: 'visible', isMeta: 1 };
+    return { visibility: 'visible', isMeta: 1, harnessKind: 'other' };
   }
-  if (ui === 'hidden' && provider === 'visible' && transcript === 'hidden') {
-    return { visibility: 'hidden', isMeta: 0 };
-  }
-  return { visibility: 'hidden', isMeta: 0 };
+  // Everything else is hidden. Only a prompt or a response stays the
+  // person's or the model's own; a reminder, a fork notice or a notice copied
+  // into a fork was written by ZCode, whatever role it is stored under.
+  if (kind === 'user_prompt' || kind === 'assistant_response') return { visibility: 'hidden', isMeta: 0, harnessKind: null };
+  return { visibility: 'hidden', isMeta: 1, harnessKind: kind === 'system_reminder' ? 'reminder' : 'other' };
 }
 
 // ---- rewind / compaction active-set (design §4.5) ----
@@ -653,7 +657,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
       if (data === null) continue;
       const semantics = isRecord(data.semantics) ? data.semantics : {};
       const kind = str(semantics.kind);
-      const { visibility: triadVisibility, isMeta } = mapVisibility(data);
+      const { visibility: triadVisibility, isMeta, harnessKind: semanticKind } = mapVisibility(data);
       let visibility = triadVisibility;
       if (triadVisibility === 'visible' && !isActive(message.id)) visibility = 'inactive';
 
@@ -681,7 +685,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
           id: `${sessionId}:${message.id}`,
           session_id: sessionId,
           timestamp: messageTimestamp,
-          source: name,
+          // The summary kind, not the provider (skill-doc/references/schema.md).
+          source: 'compaction',
           content: body,
           // The transport message is hidden in ZCode's UI, but its body is
           // the canonical compaction summary Obelisk exposes as evidence.
@@ -715,6 +720,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
               text: partData.text,
               content_type: 'thinking',
               is_meta: isMeta,
+              harness_kind: semanticKind,
               visibility,
               model,
               is_sidechain: isSubagent ? 1 : 0,
@@ -790,6 +796,13 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
       const role = data.role === 'user' ? 'user' : 'assistant';
       const fullText = textParts.join('\n');
       const contentType = fullText.length > 0 ? 'text' : hasToolCall ? 'tool_use' : 'unknown';
+      // A response that carries an error and nothing else is ZCode's record of a
+      // model call that failed or was cancelled, not something the model said.
+      const failure = isRecord(data.error) && isRecord(data.error.data) ? data.error.data : isRecord(data.error) ? {} : null;
+      const harnessKind: HarnessKind | null = semanticKind
+        ?? (role === 'assistant' && contentType === 'unknown' && failure !== null
+          ? (failure.turnResult === 'cancelled' ? 'interruption' : 'error')
+          : null);
       if (role === 'user') {
         const env = isRecord(data.contextSnapshot) && isRecord((data.contextSnapshot as Record<string, unknown>).envInfo)
           ? (data.contextSnapshot as Record<string, unknown>).envInfo as Record<string, unknown>
@@ -812,6 +825,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
           text: fullText.length > 0 ? trunc(fullText) : null,
           content_type: contentType,
           is_meta: isMeta,
+          harness_kind: harnessKind,
           visibility: 'hidden',
           model,
           is_sidechain: isSubagent ? 1 : 0,
@@ -837,6 +851,7 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
         text: fullText.length > 0 ? trunc(fullText) : null,
         content_type: contentType,
         is_meta: isMeta,
+        harness_kind: harnessKind,
         visibility,
         model,
         is_sidechain: isSubagent ? 1 : 0,
@@ -889,6 +904,8 @@ function* parse(unit: IndexUnit, _cursor: Cursor, opener: ZcodeDatabaseOpener): 
       countMode: 'total',
       jsonl_path: unit.key,
       source: name,
+      // ZCode's own class for a session a sub-agent tool call created, also when the parent is gone.
+      started_by: session.task_type === 'subagent_child' ? 'agent' : null,
     });
 
     for (const record of records) yield record;

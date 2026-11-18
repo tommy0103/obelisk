@@ -23,7 +23,7 @@ import {
   codexIsGuardianThread, codexAgentNickname, codexAgentRole, codexUsage,
   codexEventText, codexMessagePayloadText, codexVisibleMessageKey,
   codexToolInput, codexToolOutput,
-  extractMessageIsMeta, isSkillInstructions,
+  extractHarnessKind, isSkillInstructions,
   readCodexGuardianThreadInfo, normalizeTranscriptTimestamp,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes,
   readCodexBufferLines, readCodexLines,
@@ -321,6 +321,8 @@ interface CodexCursorState {
   sourceInode?: string;
   verifiedPrefix?: boolean;
   stateComplete?: boolean;
+  /** The thread has a `user_message` event: what the person typed is recorded as such an event. */
+  userMessageEvents?: boolean;
   indexedTitle?: string;
   indexedUpdatedAt?: string | null;
   chunkHashes: string[];
@@ -499,6 +501,7 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
       || (value.sourceInode !== undefined && typeof value.sourceInode !== 'string')
       || (value.verifiedPrefix !== undefined && typeof value.verifiedPrefix !== 'boolean')
       || (value.stateComplete !== undefined && typeof value.stateComplete !== 'boolean')
+      || (value.userMessageEvents !== undefined && typeof value.userMessageEvents !== 'boolean')
       || (value.indexedTitle !== undefined && typeof value.indexedTitle !== 'string')
       || (value.indexedUpdatedAt !== undefined && !nullableString(value.indexedUpdatedAt))
       || !Array.isArray(value.chunkHashes)
@@ -791,11 +794,13 @@ export function* parse(
     && fingerprint.prefixMatches));
   const eventMessageKeys = new Set<string>();
   const appendedEventMessageKeys = new Set<string>();
+  const appendedUserPromptKeys = new Set<string>();
   const appendedResponseMessageKeys = new Set<string>();
   let metaRecord: { lineNum: number; obj: any } | null = !appendCandidate
     ? null
     : { lineNum: 1, obj: { timestamp: prior.startedAt, payload: prior.meta } };
   let sawAutoReviewModel = false;
+  let sawUserMessageEvent = false;
   const scan = (start: number, collectAppendedResponses: boolean): {
     lineCount: number; completeLineCount: number; completeLineOffset: number; terminated: boolean; malformed: boolean;
   } => {
@@ -828,12 +833,16 @@ export function* parse(
         || obj?.model === 'codex-auto-review';
       const payload = obj?.payload || {};
       if (obj?.type === 'event_msg') {
+        sawUserMessageEvent ||= payload.type === 'user_message';
         if (payload.type === 'user_message' || payload.type === 'agent_message') {
           const text = codexEventText(payload);
           if (text !== null) {
             const key = visibleMessageDigest(payload.type === 'user_message' ? 'user' : 'assistant', text);
             eventMessageKeys.add(key);
-            if (collectAppendedResponses) appendedEventMessageKeys.add(key);
+            if (collectAppendedResponses) {
+              appendedEventMessageKeys.add(key);
+              if (payload.type === 'user_message') appendedUserPromptKeys.add(visibleMessageDigest('user-prompt', text));
+            }
           }
         }
       } else if (collectAppendedResponses && obj?.type === 'response_item'
@@ -923,7 +932,19 @@ export function* parse(
     [...appendedEventMessageKeys].some(key => bloomMightContain(priorResponseBloom, key))
       || [...appendedResponseMessageKeys].some(key => bloomMightContain(priorEventBloom, key))
   );
-  const fast = appendCandidate && !possibleCrossBoundaryDuplicate;
+  // Whether a user-role response item is the person's depends on whether the
+  // thread records prompts as events at all. Rows emitted before the first
+  // such event were judged without it, so its arrival replays the thread.
+  const firstUserMessageEvent = appendCandidate && sawUserMessageEvent && prior.userMessageEvents !== true;
+  // Multipart items use a separate digest domain in the bounded response bloom:
+  // an eventual prompt event changes their labels, not their stored identities.
+  const possiblePromptLabelChange = appendCandidate
+    && [...appendedUserPromptKeys].some(key => bloomMightContain(priorResponseBloom, key));
+  // A label-only replay updates existing rows in place. It has no obsolete
+  // identities to retract, and deleting the shared session here would erase
+  // unchanged child rollouts that discovery correctly did not schedule.
+  const labelsOnlyReplay = (firstUserMessageEvent || possiblePromptLabelChange) && !possibleCrossBoundaryDuplicate;
+  const fast = appendCandidate && !possibleCrossBoundaryDuplicate && !firstUserMessageEvent && !possiblePromptLabelChange;
   if (metrics) metrics.plan = fast
     ? (cooperativeAppend ? 'cooperative-append' : 'verified-append')
     : 'snapshot';
@@ -931,6 +952,7 @@ export function* parse(
     eventMessageKeys.clear();
     metaRecord = null;
     sawAutoReviewModel = false;
+    sawUserMessageEvent = false;
     scanResult = scan(0, false);
     if (!sameStat(stat, statSync(unit.key))) return _cursor;
     if (scanResult.malformed) throw new Error(CODEX_MALFORMED_LINE_ERROR);
@@ -940,6 +962,7 @@ export function* parse(
   const responseMessageBloom = fast ? priorResponseBloom : emptyBloom();
   for (const key of eventMessageKeys) bloomAdd(eventMessageBloom, key);
   const previous = fast ? prior : null;
+  const userMessageEvents = sawUserMessageEvent || previous?.userMessageEvents === true;
   const basicCursor = compressed
     ? encodeCodexZstCursor(stat, completeLineCount)
     : `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}`;
@@ -982,7 +1005,7 @@ export function* parse(
   // A child rollout contributes to its parent projection. Replaying only this
   // child cannot safely retract the whole parent session; leave destructive
   // replacement to orchestration that replays the complete contributing tree.
-  const canRetract = (sourceMeta?.replaceSnapshot || (_cursor !== null && !fast)) && !agentId;
+  const canRetract = (sourceMeta?.replaceSnapshot || (_cursor !== null && !fast && !labelsOnlyReplay)) && !agentId;
   if (canRetract) out.push({ kind: 'delete-session', sessionId });
   const msgByUuid = new Map<string, MessageRecord>();
   const emittedMessageUuids = new Set<string>();
@@ -1020,11 +1043,16 @@ export function* parse(
   }) => {
     const visibility = messageVisibility(role, text);
     const skillInstructions = role === 'user' && isSkillInstructions(text);
+    // A hidden message is one of Codex's context envelopes. A user-role item
+    // that no prompt event stands for is Codex's too; nothing says what it is.
+    const harnessKind = skillInstructions ? 'skill'
+      : visibility === 'hidden' ? 'reminder'
+        : extractHarnessKind({}, text) ?? (isMeta ? 'other' : null);
     const rec: MessageRecord = {
       kind: 'message', uuid, session_id: sessionId, type, parent_uuid: sm.lastMessageUuid,
       timestamp: timestamp || null, role, text: trunc(text),
       content_type: skillInstructions ? 'skill_instructions' : contentType,
-      is_meta: visibility === 'hidden' || skillInstructions ? 1 : (isMeta || extractMessageIsMeta({}, text)), visibility,
+      is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind, visibility,
       model: currentModel, is_sidechain: isSidechain, agent_id: agentId,
       input_tokens: null, output_tokens: null, cwd: currentCwd, skill: null, source: 'codex',
     };
@@ -1118,8 +1146,24 @@ export function* parse(
       const role = payload.role || 'assistant';
       const key = text === null ? null : visibleMessageDigest(role, text);
       if (text !== null && key !== null && !eventMessageKeys.has(key)) {
-        insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts });
+        // Codex records each prompt the person typed as a `user_message` event
+        // with a user-role response item beside it. In a thread that has such
+        // events, a user-role item without one was put there by Codex itself
+        // (session preamble, the notice left by an aborted turn). A thread with
+        // no such event at all keeps its prompts only as response items.
+        // UserMessageItem::message in Codex concatenates text inputs without
+        // separators. Keep our existing stored text/identity representation,
+        // but do not infer harness authorship from that formatting difference.
+        const promptText = role === 'user' ? codexMessagePayloadText(payload, '') : null;
+        const promptKey = promptText === null ? null : visibleMessageDigest('user', promptText);
+        const possibleHumanPrompt = promptKey !== null && (eventMessageKeys.has(promptKey)
+          || (fast && bloomMightContain(priorEventBloom, promptKey)));
+        const injected = role === 'user' && userMessageEvents && !possibleHumanPrompt;
+        insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts, isMeta: injected ? 1 : 0 });
         bloomAdd(responseMessageBloom, key);
+        if (promptText !== null && promptText !== text) {
+          bloomAdd(responseMessageBloom, visibleMessageDigest('user-prompt', promptText));
+        }
       }
       return;
     }
@@ -1202,6 +1246,7 @@ export function* parse(
           && fingerprint.complete
           && (prior === null || fingerprint.prefixMatches),
         stateComplete,
+        userMessageEvents,
         indexedTitle: indexedMeta?.indexedTitle,
         indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
         chunkHashes: fingerprint.chunkHashes,

@@ -179,9 +179,20 @@ interactions, or the full Electron suites.
   aborted turns that carry usage must still emit a row (`text: null`,
   `content_type: 'unknown'`), or token accounting and the timeline develop holes.
 - **Bump `indexVersionMarker` whenever you change uuid format, role
-  normalization, or anything else affecting already-stored rows.** Otherwise the
-  mtime short-circuit in discovery leaves old-format rows in the database
-  forever.
+  normalization, or anything else that leaves already-stored rows wrong or in
+  conflict with new ones.** Otherwise the mtime short-circuit in discovery
+  leaves old-format rows in the database forever. A bump replays every session
+  of that provider on the user's machine, which can be tens of gigabytes, so do
+  not bump for a change that only labels records more precisely (a new nullable
+  field, a finer `is_meta` or `harness_kind`): stored rows stay valid, and a
+  session picks the change up the next time it is parsed.
+- **Say what the harness wrote with `harness_kind`.** `is_meta` only decides
+  whether a message is in default retrieval; a provider may keep a
+  harness-written message retrievable (`is_meta: 0`) and still name it. A whole
+  session a sub-agent created is said on the session record (`started_by`), not
+  by marking its messages. Check complete parses of your real fixtures with
+  `assertHarnessConformance()` (`tests/harness-conformance.mjs`) in your
+  provider's tests.
 - **Express "this should not be shown" with the existing `visibility` field**
   (`providers/types.ts`), which is defined as provider-normalized display
   eligibility and already has a consumer in the assembler. Do not add a third

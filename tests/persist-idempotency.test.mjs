@@ -201,7 +201,7 @@ const AUTHORITATIVE_FIELD_CASES = [
     session_id: 'session-2', type: 'user', parent_uuid: 'parent-1', timestamp: null,
     role: null, text: null, content_type: null, is_meta: 1, visibility: 'hidden',
     model: null, is_sidechain: 1, agent_id: 'agent-1', input_tokens: null,
-    output_tokens: null, cwd: null, skill: 'review', source: 'claude',
+    output_tokens: null, cwd: null, skill: 'review', source: 'claude', harness_kind: 'reminder',
   }],
   ['tool_calls', 'id', BASE_TOOL_CALL, {
     message_uuid: 'message-2', session_id: 'session-2', name: 'read_file',
@@ -288,5 +288,41 @@ test('changed tool-result replay preserves workflow healer candidate order', () 
 
   assert.equal(db.prepare('SELECT rowid FROM tool_results WHERE tool_use_id=?').get('call-1').rowid, firstRowid);
   assert.equal(db.prepare('SELECT parent_tool_use_id FROM workflows WHERE run_id=?').get('run-1').parent_tool_use_id, 'call-1');
+  db.close();
+});
+
+test('who wrote a message and who started a session are stored as the provider gives them', () => {
+  const db = openNodeSqlite();
+  db.exec(SCHEMA);
+  const unit = { key: 'unit-1', sessionId: 'session-1' };
+  const sessionRecord = (startedBy) => ({
+    kind: 'session', id: 'session-1', title: 'Delegated', project: null, started_at: null, ended_at: null,
+    git_branch: null, version: null, message_count: 2, countMode: 'total', jsonl_path: '/tmp/session-1.jsonl',
+    source: 'claude', ...(startedBy === undefined ? {} : { started_by: startedBy }),
+  });
+  const stream = (startedBy) => (function* records() {
+    yield messageRecord(1, { role: 'user', type: 'user', harness_kind: 'notification' });
+    yield messageRecord(2);
+    yield sessionRecord(startedBy);
+    return '1:1';
+  }());
+  const stored = () => ({
+    kinds: db.prepare('SELECT uuid, harness_kind, is_meta FROM messages ORDER BY uuid').all().map(row => ({ ...row })),
+    startedBy: db.prepare("SELECT started_by FROM sessions WHERE id='session-1'").get().started_by,
+  });
+
+  persist(db, unit, stream('agent'));
+  assert.deepEqual(stored(), {
+    kinds: [
+      // Kept retrievable by its provider (not meta), and still the harness's.
+      { uuid: 'message-1', harness_kind: 'notification', is_meta: 0 },
+      { uuid: 'message-2', harness_kind: null, is_meta: 0 },
+    ],
+    startedBy: 'agent',
+  });
+
+  // The latest parse decides: a stored value does not outlive a parse that no longer says it.
+  persist(db, unit, stream(undefined));
+  assert.equal(stored().startedBy, null);
   db.close();
 });
