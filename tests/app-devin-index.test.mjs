@@ -370,6 +370,45 @@ test('a store hint re-plans a rewrite the aggregates cannot see; without a hint 
   store.close();
 });
 
+test('a WAL hint reconciles an equal-length rewrite even when another session appended', () => {
+  const home = makeTempDir('obelisk-devin-mixed-');
+  const { root, dbPath } = seedRoot(home);
+  const store = new Store(dbPath);
+  try {
+    for (const id of ['a', 'b', 'untouched']) {
+      store.session(id, { head: 1 });
+      store.node(id, 1, null, assistant(`${id}1`, T0, 'old answer'));
+    }
+    assert.equal(build(home, root).complete, true);
+    store.db.exec('BEGIN');
+    store.node('a', 2, 1, assistant('a2', T0 + 1, 'appended A'));
+    store.head('a', 2, T0 + 1);
+    store.db.prepare("UPDATE message_nodes SET chat_message = ? WHERE session_id = 'b' AND node_id = 1")
+      .run(JSON.stringify(assistant('b1', T0, 'new answer')));
+    store.db.exec('COMMIT');
+
+    clearDebounce(home);
+    const hinted = build(home, root, { changedPaths: [`${dbPath}-wal`] });
+    assert.equal(hinted.complete, true);
+    assert.deepEqual(hinted.affectedSessionIds.sort(), ['a', 'b'].map(id => devinSessionId(dbPath, id)).sort(),
+      'both changed sessions replay; the untouched sibling does not');
+    const rows = dest => indexRows(dest, 'SELECT uuid, visibility, text FROM messages ORDER BY uuid');
+    const afterHint = rows(home);
+    assert.equal(afterHint.find(row => row.uuid.endsWith(':b1')).text, 'new answer');
+
+    clearDebounce(home);
+    const reconciled = build(home, root);
+    assert.equal(reconciled.complete, true);
+    assert.deepEqual(reconciled.affectedSessionIds, []);
+    assert.deepEqual(rows(home), afterHint);
+    const freshHome = makeTempDir('obelisk-devin-mixed-fresh-');
+    assert.equal(build(freshHome, root).complete, true);
+    assert.deepEqual(rows(freshHome), afterHint);
+  } finally {
+    store.close();
+  }
+});
+
 test('hiding or deleting a session retracts it; an unreadable store retracts nothing', () => {
   const home = makeTempDir('obelisk-devin-retract-');
   const { root, dbPath } = seedRoot(home);

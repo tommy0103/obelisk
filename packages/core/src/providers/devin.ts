@@ -24,10 +24,9 @@
 // byte sizes, max created_at), plus a digest of the session's node bytes.
 // octet_length reads record headers, not payloads, so an unhinted census
 // compares aggregates only and stays cheap on a large store. When a watcher
-// hint names the store and no aggregate moved, the write is unexplained: every
-// session's node bytes are digested and only a mismatch is replayed. A rewrite
-// that keeps every aggregate and lands in the same scan as an aggregate-visible
-// change waits for the next unexplained hint or a rebuild.
+// hint names the store, aggregate-unchanged sessions still need their bytes
+// verified: an append in one session cannot explain away a rewrite in another.
+// Only digest mismatches replay; ordinary appends do not replay siblings.
 
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -78,6 +77,7 @@ function defaultOpenDatabase(path: string): SqliteDb {
   return new DatabaseSync(path, { readOnly: true, timeout: BUSY_TIMEOUT_MS });
 }
 
+/** @internal Exported for tests. */
 export function defaultDevinRoot({
   homeDir = homedir(), platform = process.platform, env = process.env,
 }: { homeDir?: string; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {}): string {
@@ -86,6 +86,7 @@ export function defaultDevinRoot({
   return join(xdg ? xdg : join(homeDir, '.local', 'share'), 'devin', 'cli');
 }
 
+/** @internal Exported for tests. */
 export function devinSessionId(dbPath: string, rawSessionId: string): string {
   const dbi = createHash('sha256').update(dbPath).digest('hex').slice(0, 12);
   return `devin:${dbi}:${rawSessionId}`;
@@ -330,8 +331,9 @@ function discoverAt(dbPath: string, ctx: DiscoverContext, opener: DevinDatabaseO
         meta: { dbPath, rawSessionId: '', tombstone: true } satisfies DevinUnitMeta,
       });
     }
-    if (hinted && units.length === 0) {
-      // The watcher saw a write no aggregate explains: compare exact bytes.
+    if (hinted) {
+      // A store-level hint can cover writes to multiple sessions. Verify every
+      // aggregate-unchanged session even when another session already has work.
       db.exec('BEGIN');
       try {
         for (const { session, sessionId, key, digest } of unchanged) {
@@ -399,6 +401,7 @@ function chain(nodes: ReadonlyMap<number, NodeRow>, head: number | null): NodeRo
   return out.reverse();
 }
 
+/** @internal Exported for tests. */
 export function devinAgentId(sessionId: string, rawAgentId: string): string {
   return `${sessionId}:agent:${rawAgentId}`;
 }
