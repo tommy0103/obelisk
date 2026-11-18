@@ -112,6 +112,31 @@ test('additive migrations preserve old index state and summary rows while adding
   }
 });
 
+test('adding the harness kind and session starter leaves stored rows as they are, with no value', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, source TEXT DEFAULT 'claude');
+      CREATE TABLE messages (uuid TEXT PRIMARY KEY, session_id TEXT, role TEXT, text TEXT, is_meta INTEGER DEFAULT 0);
+      INSERT INTO sessions (id, title) VALUES ('old-session', 'Before the fields');
+      INSERT INTO messages VALUES ('old-meta', 'old-session', 'user', '<system-reminder>x</system-reminder>', 1);
+    `);
+
+    migrateCoreSchemaColumns(db);
+    assert.deepEqual(
+      { ...db.prepare("SELECT text, is_meta, harness_kind FROM messages WHERE uuid='old-meta'").get() },
+      { text: '<system-reminder>x</system-reminder>', is_meta: 1, harness_kind: null },
+    );
+    assert.deepEqual(
+      { ...db.prepare("SELECT title, started_by FROM sessions WHERE id='old-session'").get() },
+      { title: 'Before the fields', started_by: null },
+    );
+    migrateCoreSchemaColumns(db);
+  } finally {
+    db.close();
+  }
+});
+
 test('tool results schema indexes live session patch lookups', async () => {
   const db = new DatabaseSync(':memory:');
   try {

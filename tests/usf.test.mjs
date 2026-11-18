@@ -7,7 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, cpSync, mkdirSync } from 'node:fs';
+import { copyFileSync, cpSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -320,6 +320,9 @@ test('a session that is another session\'s sub-agent is a run inside its parent,
 
   const alone = assembleUsf([note, ...child]);
   assert.deepEqual(alone.sessions.map(({ session: usf, detached }) => [usf.id, detached]), [['child', true]]);
+  // Standing alone, it is still a session a sub-agent started: what it was given is a task.
+  assert.equal(alone.sessions[0].session.started_by, 'agent');
+  assert.deepEqual(stepsOf(alone.sessions[0].session).map(label), ['harness/task', 'agent/text']);
 });
 
 test('a tool result whose call is not among the records is kept as a result step', () => {
@@ -338,7 +341,7 @@ test('what the harness wrote in the agent\'s place is harness content, with its 
     session(),
     message('ask', 'user', 'go on', 1),
     message('notice', 'assistant', 'model a -> b', 2, { is_meta: 1, model: 'b', input_tokens: 0, output_tokens: 0 }),
-    message('failed', 'assistant', '404 not found', 3, { content_type: 'error' }),
+    message('failed', 'assistant', '404 not found', 3, { content_type: 'error', harness_kind: 'error' }),
     { kind: 'summary', id: 'compact-1', session_id: SESSION, timestamp: at(4), source: 'compaction', content: 'earlier work', input_tokens: 300, output_tokens: 20 },
   ]);
   assert.deepEqual(usf.turns[0].steps.slice(1), [
@@ -353,9 +356,51 @@ test('the kind of harness content comes from canonical fields, never from parsin
     session(),
     message('ask', 'user', 'go on', 1),
     message('reminder', 'user', '<system-reminder>looks like one</system-reminder>', 2, { is_meta: 1 }),
-    message('skill', 'user', '# Skill', 3, { is_meta: 1, content_type: 'skill_instructions', skill: 'review' }),
+    message('skill', 'user', '# Skill', 3, { is_meta: 1, content_type: 'skill_instructions', harness_kind: 'skill', skill: 'review' }),
+    message('untold', 'user', '# Skill', 4, { is_meta: 1, content_type: 'skill_instructions' }),
   ]);
-  assert.deepEqual(usf.turns[0].steps.slice(1).map((step) => [step.kind, step.skill]), [['other', undefined], ['skill', 'review']]);
+  assert.deepEqual(usf.turns[0].steps.slice(1).map((step) => [step.kind, step.skill]),
+    [['other', undefined], ['skill', 'review'], ['other', undefined]]);
+});
+
+test('a message the provider says the harness wrote is harness content of that kind, whatever its role and also when it is not meta', () => {
+  const { session: usf } = only([
+    session(),
+    message('ask', 'user', 'delegate and wait', 1),
+    message('stopped', 'user', '[Request interrupted by user]', 2, { is_meta: 1, harness_kind: 'interruption' }),
+    message('back', 'user', 'the sub-agent finished: all green', 3, { harness_kind: 'notification' }),
+    message('ran', 'bashExecution', 'Ran `ls`', 4, { type: 'user', harness_kind: 'command' }),
+    message('cancelled', 'assistant', null, 5, { content_type: 'unknown', harness_kind: 'interruption' }),
+    message('answer', 'assistant', 'done', 6),
+  ]);
+  assert.equal(usf.turns.length, 1, 'none of them is a submission');
+  assert.deepEqual(usf.turns[0].steps.map(label),
+    ['human', 'harness/interruption', 'harness/notification', 'harness/command', 'harness/interruption', 'agent/text']);
+  assert.deepEqual(validateUsf(usf), []);
+});
+
+test('a session a sub-agent started has tasks, not submissions, and is one turn', () => {
+  const records = [
+    message('task-1', 'user', 'look into the failing test', 1),
+    message('answer-1', 'assistant', 'found it', 2),
+    message('task-2', 'user', 'now fix it', 3),
+    message('note', 'user', 'context the harness put in', 4, { is_meta: 1 }),
+    message('answer-2', 'assistant', 'fixed', 5),
+  ];
+  const { session: byAgent } = only([session({ started_by: 'agent' }), ...records]);
+  assert.equal(byAgent.started_by, 'agent');
+  assert.deepEqual(byAgent.turns.map((turn) => turn.steps.map(label)),
+    [['harness/task', 'agent/text', 'harness/task', 'harness/other', 'agent/text']]);
+  assert.deepEqual(validateUsf(byAgent), []);
+
+  const { session: byPerson } = only([session({ started_by: null }), ...records]);
+  assert.equal('started_by' in byPerson, false);
+  assert.deepEqual(byPerson.turns.map((turn) => turn.steps.map(label)),
+    [['human', 'agent/text'], ['human', 'harness/other', 'agent/text']]);
+
+  assert.deepEqual(validateUsf({ ...byPerson, started_by: 'agent' }),
+    ['turns[0]: a session started by an agent has a human step', 'turns[1]: a session started by an agent has a human step']);
+  assert.deepEqual(validateUsf({ ...byPerson, started_by: 'human' }), ['session: "started_by" "human" is not "agent"']);
 });
 
 test('steps keep the order the provider gave the messages, not the order of their timestamps', () => {
@@ -601,4 +646,15 @@ test('cyclic subagent sessions are rejected instead of duplicating their records
     { kind: 'subagent', session_id: 'a', agent_id: 'b' },
     { kind: 'subagent', session_id: 'b', agent_id: 'a' },
   ]), /acyclic subagent session relationships/);
+});
+
+test('codex: a turn starts at each prompt the person typed and nowhere else', () => {
+  const typed = readFileSync(fixture('codex/real-rollout-structural-sanitized.jsonl'), 'utf8').split('\n')
+    .filter(line => line.length > 0).map(line => JSON.parse(line))
+    .filter(line => line.type === 'event_msg' && line.payload?.type === 'user_message').length;
+  const [{ session }] = assembleUsf(codexRecords()).sessions;
+  const human = session.turns.flatMap(turn => turn.steps).filter(step => step.by === 'human');
+  assert.ok(typed > 0, 'the fixture records prompts as events');
+  assert.equal(human.length, typed, 'the rollout also has user-role items Codex wrote itself');
+  assert.equal(session.turns.length, typed);
 });

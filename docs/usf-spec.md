@@ -81,6 +81,7 @@ USF（Universal Session Format，通用 session 格式）是一条 session 的�
 | `id` | 字符串 | session 的 ID |
 | `title` | 字符串或 null | |
 | `git_branch` | 字符串或 null | session 所在的 git 分支。adapter 现在每条 session 只给一个值 |
+| `started_by` | `agent`，或者没有 | 这条 session 是子 agent 开的。里面没有 `human` 步骤，上级 agent 交给它的内容是 `task`，整条 session 是一个回合。没有这个字段就是人开的，或者 harness 没有说 |
 | `turns` | 回合的数组 | 按顺序 |
 
 本机信息（`jsonl_path`、项目路径）不在 USF 里，由使用方另外保存。
@@ -126,7 +127,7 @@ USF（Universal Session Format，通用 session 格式）是一条 session 的�
 
 | 字段 | 说明 |
 | --- | --- |
-| `kind` | `compaction`（压缩后留下的摘要）、`recap`（人离开一阵后的回顾）、`interruption`（请求被打断）、`command`（斜杠命令的外壳）、`reminder`（系统提醒）、`skill`（skill 的说明文字）、`attachment`（附带的文件）、`task`（交给子 agent 的任务）、`error`（模型调用失败时 harness 写下的错误）、`result`（一条工具结果，发起它的调用不在记录里）、`other` |
+| `kind` | `compaction`（压缩后留下的摘要）、`recap`（人离开一阵后的回顾）、`interruption`（请求被打断）、`command`（斜杠命令的外壳）、`reminder`（系统提醒）、`skill`（skill 的说明文字）、`attachment`（附带的文件）、`task`（交给子 agent 的任务）、`error`（模型调用失败时 harness 写下的错误）、`result`（一条工具结果，发起它的调用不在记录里）、`notification`（后台的工作结束后 harness 送回来的通知，比如子 agent 或后台任务的结果）、`other` |
 | `content` | 见 3.5 |
 | `model`、`usage` | 可选，含义同 `agent` 步骤。harness 自己调用模型时才有，比如压缩 |
 
@@ -177,8 +178,9 @@ harness 用助手的身份写的通知（切换模型的提示之类）也是 `h
 | USF | 现有记录 | 缺什么 |
 | --- | --- | --- |
 | 回合的划分 | `human` 步骤的位置 | |
-| `human` 步骤 | `message`：`role` 是 `user`、不是注入、`content_type` 不是 `tool_result`、不在子 agent 里。紧挨着、时间相同、并且把前一条当作父消息的几条，是同一次提交的几个部分，合成一个步骤 | Claude 的 adapter 没有把压缩摘要和打断标记标成注入。“几个部分”没有明确的标记，只能靠这三个条件认 |
-| `harness` 步骤 | `is_meta` 的 `message`（不论角色）、角色不是 `user` 也不是 `assistant` 的 `message`、`content_type` 是 `error` 的 `message`，以及 `summary` | `kind` 只有几种能从记录得到：`skill` 和 `error` 看 `content_type`，`task` 看是不是子 agent 里的用户消息，`compaction` 和 `recap` 看 `summary` 的 `source`。其余一律是 `other`。按 ADR-0007，装配不读消息的文字去猜，所以 `interruption`、`command`、`reminder`、`attachment` 要等 adapter 给出来 |
+| `human` 步骤 | `message`：`role` 是 `user`、`harness_kind` 是空、不是 `is_meta`、`content_type` 不是 `tool_result`、不在子 agent 里，所在的 session 也不是子 agent 开的。紧挨着、时间相同、并且把前一条当作父消息的几条，是同一次提交的几个部分，合成一个步骤 | “几个部分”没有明确的标记，只能靠这三个条件认 |
+| `harness` 步骤 | `harness_kind` 有值的 `message`（不论角色，也不论是不是 `is_meta`）、`is_meta` 的 `message`、角色不是 `user` 也不是 `assistant` 的 `message`，以及 `summary` | `kind` 就是 `harness_kind`，装配不读消息的文字去猜（ADR-0007）。`harness_kind` 是空时装配只补两种从结构上看得出来的：`task`（子 agent 里的、或者子 agent 开的 session 里的用户消息）和 `result`；其余是 `other`。`summary` 的 `kind` 看它的 `source`。adapter 现在还没有给出 `attachment`：附件它们还不输出 |
+| session 的 `started_by` | `session` 的 `started_by`；另外，别的 session 的 `subagent` 记录指到这条 session、而上级不在记录里时，也算子 agent 开的 | |
 | `agent` 步骤，`text` 和 `reasoning` | `content_type` 是 `text`、`thinking` 的助手 `message`，包括 `text` 为空的 | |
 | `agent` 步骤，`tool` | `tool_call`，加上 `tool_use_id` 相同的 `tool_result`。`content_type` 是 `tool_result` 的 `message` 自己不成步骤，除非它的文字和结果不一样 | |
 | `harness` 步骤，`result` | 找不到 `tool_call` 的 `tool_result` | |
@@ -208,12 +210,14 @@ harness 用助手的身份写的通知（切换模型的提示之类）也是 `h
 | 不一致的地方 | 现状 |
 | --- | --- |
 | 子 agent 是哪次调用启动的 | Claude、Codex、Kimi、Kiro 给了；DeepSeek、Hermes、OpenCode、ZCode 没有给，这些子 agent 只能写成 `run` 步骤。其余 4 个的样本里没有子 agent |
-| 交给子 agent 的任务 | 多数是一条普通的用户消息；Kimi 把它标成注入；Kiro 用 `system` 角色 |
+| 交给子 agent 的任务 | 多数是一条普通的用户消息，靠它在子 agent 里来认；Kimi 把它标成注入，Kiro 用 `system` 角色，这两个由 adapter 标 `harness_kind: task` |
+| 子 agent 开的 session | Claude、Codex、DeepSeek、Kimi 把子 agent 并在上级的 session 里；Hermes 每个子 agent 是一条独立的 session；Kiro（cli）、OpenCode、ZCode 在上级不在时也是独立的 session。独立的这些由 adapter 在 session 上给 `started_by` |
+| harness 内容的种类 | 除 Copilot（源数据里没有这些内容）外的 adapter 都给 `harness_kind`。依据是源数据里的字段；Claude 和 Codex 的几种外壳只有固定的文字开头可认，由 adapter 自己认。源数据说不出是什么的给 `other` |
 | 带回工具结果的消息 | 角色有 `user`，也有 `toolResult`（OMP、Pi）；有的把结果的文字在消息上再写一遍；Hermes 里有结果挂在助手消息上、调用不在记录里 |
 | harness 写的通知 | ZCode、Hermes 用助手角色加 `is_meta`；Kiro、OpenCode 用 `system` 角色 |
 | 一条消息的几个部分 | Pi 每个内容块给一条记录，其余 adapter 一条消息一条记录 |
-| 记录的顺序 | 消息以外的记录没有约定在什么时候给：DeepSeek 把工具调用和结果放在全部消息之前，Kimi 把调用、结果、摘要放在全部消息之后，ZCode 把一条消息的调用放在这条消息自己的记录之前，其余的放在消息之后。工具调用由装配按所属的消息归位；摘要只能靠 adapter 在正确的位置给出，Kimi 现在做不到。消息之间也没有约定必须按时间，Kiro 有一处不按时间。Obelisk 的应用是按时间排的 |
-| `summary` 的 `source` | 没有统一的词表：`away_summary`、`compaction`、`kiro:compaction`、`pi:compaction`、`copilot`。Kiro 把分支对话（tangent）的回答也记成了压缩 |
+| 记录的顺序 | 消息以外的记录没有约定在什么时候给：DeepSeek 把工具调用和结果放在全部消息之前，Kimi 把调用、结果、摘要放在全部消息之后，ZCode 把一条消息的调用放在这条消息自己的记录之前，其余的放在消息之后。工具调用由装配按所属的消息归位；摘要没有所属的消息，只能靠 adapter 在它所在的位置给出（Kimi 原先排在最后，已改）。消息之间也没有约定必须按时间，Kiro 有一处不按时间。Obelisk 的应用是按时间排的 |
+| `summary` 的 `source` | 按 Obelisk 的文档它是摘要的种类，不是来源，但没有统一的词表：`away_summary`、`compaction`（Kimi、Hermes、OpenCode、ZCode）、`kiro:compaction`、`pi:compaction`、`copilot`。Kiro 把分支对话（tangent）的回答也记成了压缩 |
 | 图片 | 只有 Pi 给了一个占位的文字，其余不给 |
 
 ### 5.2 使用参考实现
@@ -225,6 +229,8 @@ harness 用助手的身份写的通知（切换模型的提示之类）也是 `h
 `publishedUsf` 只过滤非当前可见的步骤；它不遮盖秘密、不生成回合哈希，也不保证结果已经可以对外发布。`validateUsf` 检查结构、字段类型和格式约束，不检查内容是否已经脱敏，也不验证 blob 是否存在或回合哈希是否正确。
 
 没有消息头的工具结果仍保留为 `harness/result`，时间为 `null`。只有子 agent 消息或主消息为空的子 session 仍保留其后代。脱离父级的子树按祖先先于后代装配，避免输入顺序导致重复导出；循环的 session 父子关系会被拒绝。无关联调用的 `run` 按实际时间（考虑时区偏移）插入，不重排已有步骤。
+
+每个内置 adapter 的测试都用 `tests/harness-conformance.mjs` 检查自己的真实样本：`is_meta` 的消息、角色不是用户和助手的消息都要有 `harness_kind`，装配出来的 USF 两种形态都要通过校验；`tests/provider-harness-conformance.test.mjs` 保证没有哪个 adapter 漏掉。这项检查看不出“harness 写的、但样子和模型输出一样”的消息，那要靠各 adapter 自己的测试。
 
 仓库内的 `tests/usf.test.mjs` 覆盖 Codex、DeepSeek、OMP、Pi 的 fixture 和格式回归，`tests/core-package-build.test.mjs` 覆盖构建后包的导出入口；它们由 `npm test` 和 CLI CI 的完整仓库测试执行。5.1 中的 12-adapter 端到端探针位于仓库外的 Cairn 原型，不是本仓库 CI 的覆盖承诺。
 
@@ -267,6 +273,7 @@ harness 用助手的身份写的通知（切换模型的提示之类）也是 `h
 | 回合的边界和 ID | 每个 step 的 `extra.turn` |
 | `skill` | step 的 `extra.skill` |
 | `git_branch` | 根对象的 `extra.git_branch` |
+| `started_by` | 根对象的 `extra.started_by` |
 
 导出时丢掉的：`state` 不是当前可见的步骤；`kind` 里 ATIF 没有对应约定的那些（保留在 `extra.kind`）。
 

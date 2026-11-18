@@ -58,6 +58,7 @@ in production mode (`!` entries in [knip.jsonc](knip.jsonc), tests excluded).
 | Tests make temp directories with `makeTempDir()` (realpath, removed on exit), never `os.tmpdir()` | ESLint `no-restricted-imports`/`no-restricted-properties` on `tests/**`; `tests/temp-dirs.test.mjs` |
 | Every `app/tests/electron-*.mjs` suite runs in `test:electron:all` | `app/tests/run-electron-suites.mjs` discovers suites by name |
 | `schema.sql` changes are deliberate | sha256 pin in `tests/provider-schema-stability.test.mjs` |
+| Every built-in provider checks that its records say who wrote each message (`assertHarnessConformance()`) | `tests/provider-harness-conformance.test.mjs` |
 
 An exception goes on the offending line as an `eslint-disable-next-line` with
 the reason above it. When a review catches a mistake that a check could catch,

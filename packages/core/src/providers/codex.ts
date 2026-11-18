@@ -23,7 +23,7 @@ import {
   codexIsGuardianThread, codexAgentNickname, codexAgentRole, codexUsage,
   codexEventText, codexMessagePayloadText, codexVisibleMessageKey,
   codexToolInput, codexToolOutput,
-  extractMessageIsMeta, isSkillInstructions,
+  extractHarnessKind, isSkillInstructions,
   readCodexGuardianThreadInfo, normalizeTranscriptTimestamp,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes,
   readCodexBufferLines, readCodexLines,
@@ -321,6 +321,8 @@ interface CodexCursorState {
   sourceInode?: string;
   verifiedPrefix?: boolean;
   stateComplete?: boolean;
+  /** The thread has a `user_message` event: what the person typed is recorded as such an event. */
+  userMessageEvents?: boolean;
   indexedTitle?: string;
   indexedUpdatedAt?: string | null;
   chunkHashes: string[];
@@ -499,6 +501,7 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
       || (value.sourceInode !== undefined && typeof value.sourceInode !== 'string')
       || (value.verifiedPrefix !== undefined && typeof value.verifiedPrefix !== 'boolean')
       || (value.stateComplete !== undefined && typeof value.stateComplete !== 'boolean')
+      || (value.userMessageEvents !== undefined && typeof value.userMessageEvents !== 'boolean')
       || (value.indexedTitle !== undefined && typeof value.indexedTitle !== 'string')
       || (value.indexedUpdatedAt !== undefined && !nullableString(value.indexedUpdatedAt))
       || !Array.isArray(value.chunkHashes)
@@ -796,6 +799,7 @@ export function* parse(
     ? null
     : { lineNum: 1, obj: { timestamp: prior.startedAt, payload: prior.meta } };
   let sawAutoReviewModel = false;
+  let sawUserMessageEvent = false;
   const scan = (start: number, collectAppendedResponses: boolean): {
     lineCount: number; completeLineCount: number; completeLineOffset: number; terminated: boolean; malformed: boolean;
   } => {
@@ -828,6 +832,7 @@ export function* parse(
         || obj?.model === 'codex-auto-review';
       const payload = obj?.payload || {};
       if (obj?.type === 'event_msg') {
+        sawUserMessageEvent ||= payload.type === 'user_message';
         if (payload.type === 'user_message' || payload.type === 'agent_message') {
           const text = codexEventText(payload);
           if (text !== null) {
@@ -923,7 +928,11 @@ export function* parse(
     [...appendedEventMessageKeys].some(key => bloomMightContain(priorResponseBloom, key))
       || [...appendedResponseMessageKeys].some(key => bloomMightContain(priorEventBloom, key))
   );
-  const fast = appendCandidate && !possibleCrossBoundaryDuplicate;
+  // Whether a user-role response item is the person's depends on whether the
+  // thread records prompts as events at all. Rows emitted before the first
+  // such event were judged without it, so its arrival replays the thread.
+  const firstUserMessageEvent = appendCandidate && sawUserMessageEvent && prior.userMessageEvents !== true;
+  const fast = appendCandidate && !possibleCrossBoundaryDuplicate && !firstUserMessageEvent;
   if (metrics) metrics.plan = fast
     ? (cooperativeAppend ? 'cooperative-append' : 'verified-append')
     : 'snapshot';
@@ -931,6 +940,7 @@ export function* parse(
     eventMessageKeys.clear();
     metaRecord = null;
     sawAutoReviewModel = false;
+    sawUserMessageEvent = false;
     scanResult = scan(0, false);
     if (!sameStat(stat, statSync(unit.key))) return _cursor;
     if (scanResult.malformed) throw new Error(CODEX_MALFORMED_LINE_ERROR);
@@ -940,6 +950,7 @@ export function* parse(
   const responseMessageBloom = fast ? priorResponseBloom : emptyBloom();
   for (const key of eventMessageKeys) bloomAdd(eventMessageBloom, key);
   const previous = fast ? prior : null;
+  const userMessageEvents = sawUserMessageEvent || previous?.userMessageEvents === true;
   const basicCursor = compressed
     ? encodeCodexZstCursor(stat, completeLineCount)
     : `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}`;
@@ -1020,11 +1031,16 @@ export function* parse(
   }) => {
     const visibility = messageVisibility(role, text);
     const skillInstructions = role === 'user' && isSkillInstructions(text);
+    // A hidden message is one of Codex's context envelopes. A user-role item
+    // that no prompt event stands for is Codex's too; nothing says what it is.
+    const harnessKind = skillInstructions ? 'skill'
+      : visibility === 'hidden' ? 'reminder'
+        : extractHarnessKind({}, text) ?? (isMeta ? 'other' : null);
     const rec: MessageRecord = {
       kind: 'message', uuid, session_id: sessionId, type, parent_uuid: sm.lastMessageUuid,
       timestamp: timestamp || null, role, text: trunc(text),
       content_type: skillInstructions ? 'skill_instructions' : contentType,
-      is_meta: visibility === 'hidden' || skillInstructions ? 1 : (isMeta || extractMessageIsMeta({}, text)), visibility,
+      is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind, visibility,
       model: currentModel, is_sidechain: isSidechain, agent_id: agentId,
       input_tokens: null, output_tokens: null, cwd: currentCwd, skill: null, source: 'codex',
     };
@@ -1118,7 +1134,13 @@ export function* parse(
       const role = payload.role || 'assistant';
       const key = text === null ? null : visibleMessageDigest(role, text);
       if (text !== null && key !== null && !eventMessageKeys.has(key)) {
-        insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts });
+        // Codex records each prompt the person typed as a `user_message` event
+        // with a user-role response item beside it. In a thread that has such
+        // events, a user-role item without one was put there by Codex itself
+        // (session preamble, the notice left by an aborted turn). A thread with
+        // no such event at all keeps its prompts only as response items.
+        const injected = role === 'user' && userMessageEvents;
+        insertMessage({ uuid: lineUuid(currentLine), type: role === 'user' ? 'user' : 'assistant', role, text, contentType: 'text', timestamp: ts, isMeta: injected ? 1 : 0 });
         bloomAdd(responseMessageBloom, key);
       }
       return;
@@ -1202,6 +1224,7 @@ export function* parse(
           && fingerprint.complete
           && (prior === null || fingerprint.prefixMatches),
         stateComplete,
+        userMessageEvents,
         indexedTitle: indexedMeta?.indexedTitle,
         indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
         chunkHashes: fingerprint.chunkHashes,

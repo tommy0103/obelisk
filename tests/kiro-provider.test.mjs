@@ -11,9 +11,11 @@ import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/pro
 import { persist } from '../packages/core/src/persist.ts';
 import { runWriteTransaction } from '../packages/core/src/tx.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { assembleUsf } from '../packages/core/src/usf.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { createProviderIndexPlan, indexProviderPlan } from '../packages/core/src/provider-indexing.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const fixture = name => new URL(`./fixtures/kiro/${name}`, import.meta.url);
@@ -516,4 +518,77 @@ test('Kiro opens its real SQLite source read-only and leaves every source byte u
   const db = openDatabase(path);
   assert.throws(() => db.exec('DELETE FROM conversations_v2'), /readonly/);
   db.close();
+});
+
+test('Kiro does not present a tool result that lost its call id as something the person submitted', () => {
+  const cli = setup();
+  seedCli(cli.root, json('cli.json'), [
+    { version: 'v1', kind: 'Prompt', data: { content: [{ kind: 'text', data: 'run it' }] } },
+    { version: 'v1', kind: 'ToolResults', data: { content: [{ kind: 'toolResult', data: { content: [{ kind: 'text', data: 'output' }], status: 'success' } }] } },
+    { version: 'v1', kind: 'ToolResults', data: { content: [] } },
+  ].map(row => JSON.stringify(row)).join('\n') + '\n');
+  const fromCli = [...cli.provider.parse(discover(cli.provider)[0], null)].filter(row => row.kind === 'message' && row.role === 'user');
+  assert.deepEqual(fromCli.map(row => [row.text, row.is_meta, row.harness_kind]), [['run it', 0, null], [null, 1, 'result'], [null, 1, 'result']]);
+
+  const workspace = setup();
+  const directory = seedWorkspace(workspace.root);
+  const event = (payload) => JSON.stringify({ id: `id-${payload.type}`, timestamp: '2026-01-01T12:00:00.000Z', payload });
+  writeFileSync(join(directory, 'messages.jsonl'), [
+    event({ type: 'user', content: 'run it' }),
+    event({ type: 'tool_result', content: 'output', success: true }),
+  ].join('\n') + '\n');
+  const fromWorkspace = [...workspace.provider.parse(discover(workspace.provider)[0], null)].filter(row => row.kind === 'message' && row.role === 'user');
+  assert.deepEqual(fromWorkspace.map(row => [row.text, row.is_meta, row.harness_kind]), [['run it', 0, null], [null, 1, 'result']]);
+});
+
+test('Kiro says when a sub-agent created a session, so that its prompts are tasks and not submissions', () => {
+  const prompt = [{ version: 'v1', kind: 'Prompt', data: { content: [{ kind: 'text', data: 'look into it' }] } }]
+    .map(row => JSON.stringify(row)).join('\n') + '\n';
+  const parsed = (header) => {
+    const { root, provider } = setup();
+    seedCli(root, header, prompt);
+    return [...provider.parse(discover(provider)[0], null)];
+  };
+  const byAgent = parsed({ ...json('cli.json'), session_created_reason: 'subagent' });
+  assert.equal(byAgent.find(row => row.kind === 'session').started_by, 'agent');
+  const [{ session: usf }] = assembleUsf(byAgent).sessions;
+  assert.equal(usf.started_by, 'agent');
+  // (The header's turn metadata also gives a text-less model call, left out here.)
+  const notTheModel = (session) => session.turns.flatMap(turn => turn.steps).filter(step => step.by !== 'agent');
+  assert.deepEqual(notTheModel(usf).map(step => [step.by, step.kind, step.content]),
+    [['harness', 'other', 'Session created by a Kiro subagent'], ['harness', 'task', 'look into it']]);
+  assert.equal(byAgent.find(row => row.kind === 'message' && row.text === 'look into it').is_meta, 0, 'the session stays searchable');
+
+  const byPerson = parsed({ ...json('cli.json'), session_created_reason: 'user' });
+  assert.equal(byPerson.find(row => row.kind === 'session').started_by, null);
+  assert.deepEqual(notTheModel(assembleUsf(byPerson).sessions[0].session).map(step => step.by), ['human']);
+});
+
+test('Kiro names the task it hands to a sub-agent', () => {
+  const { root, provider } = setup();
+  const directory = seedWorkspace(root);
+  const event = (payload) => JSON.stringify({ id: `id-${payload.type}`, timestamp: '2026-01-01T12:00:00.000Z', payload });
+  writeFileSync(join(directory, 'messages.jsonl'), [
+    event({ type: 'user', content: 'split the work' }),
+    event({ type: 'agent_note', content: 'a note Kiro wrote' }),
+    event({ type: 'sub_agent_start', subSessionId: 'child-1', subAgentName: 'worker', prompt: 'do the first half' }),
+  ].join('\n') + '\n');
+  const messages = [...provider.parse(discover(provider)[0], null)].filter(row => row.kind === 'message');
+  assert.deepEqual(messages.map(row => [row.role, row.text, row.harness_kind]), [
+    ['user', 'split the work', null],
+    ['system', 'a note Kiro wrote', 'other'],
+    ['system', 'do the first half', 'task'],
+  ]);
+});
+
+test('Kiro records of every captured layout say who wrote each message', () => {
+  for (const seed of [seedCli, seedWorkspace, seedStore, seedV3]) {
+    const { root, provider } = setup();
+    seed(root);
+    const issues = [];
+    const units = discover(provider, { issues });
+    assert.deepEqual(issues, []);
+    assert.ok(units.length > 0, seed.name);
+    for (const unit of units) assertHarnessConformance([...provider.parse(unit, null)]);
+  }
 });

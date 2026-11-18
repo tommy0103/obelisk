@@ -9,7 +9,7 @@ import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, s
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
 
-import type { InventoryIssue } from './providers/types.ts';
+import type { HarnessKind, InventoryIssue } from './providers/types.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from './vendor/dsh-zstd.ts';
 
 const CLAUDE_DIR = join(homedir(), '.claude');
@@ -130,17 +130,37 @@ function extractContentType(content: JsonValue): string {
   return !sawUnknown && types.size === 1 ? [...types][0] : 'unknown';
 }
 
-const COMMAND_ENVELOPE_RE = /^\s*(<command-name>[^<]+<\/command-name>|<(?:task-notification|system-reminder)\b|<local-command(?:\b|-))/;
-const SKILL_INSTRUCTIONS_RE = /^\s*Base directory for this skill(?:\s*:|\s*\r?\n)/;
-
-function extractMessageIsMeta(record: JsonRecord, text: string | null = extractText(record?.message?.content, TEXT_LIMIT)): 0 | 1 {
-  const msg = record?.message || {};
-  if (record?.isMeta === true || msg.isMeta === true) return 1;
-  return typeof text === 'string' && COMMAND_ENVELOPE_RE.test(text) ? 1 : 0;
-}
+// The wrappers Claude Code puts around what it writes under the user role.
+const COMMAND_ENVELOPE_RE = /^\s*(?:<command-name>[^<]+<\/command-name>|<local-command(?:\b|-))/;
+const REMINDER_ENVELOPE_RE = /^\s*<system-reminder\b/;
+const NOTIFICATION_ENVELOPE_RE = /^\s*<task-notification\b/;
+// The whole text of the line Claude Code writes when the person stops a response. Current
+// versions also name the stopped response in `interruptedMessageId`; older ones have only the text.
+const INTERRUPTION_MARKER_RE = /^\s*\[Request interrupted by user(?: for tool use)?\]\s*$/;
+const SKILL_INSTRUCTIONS_RE =/^\s*Base directory for this skill(?:\s*:|\s*\r?\n)/;
 
 function isSkillInstructions(text: unknown): boolean {
   return typeof text === 'string' && SKILL_INSTRUCTIONS_RE.test(text);
+}
+
+/** What the harness wrote here, or null when nothing says the harness wrote it. */
+function extractHarnessKind(record: JsonRecord, text: string | null = extractText(record?.message?.content, TEXT_LIMIT)): HarnessKind | null {
+  // Written under the user role: the summary that replaces compacted history, and the marker
+  // left where a response was interrupted. Neither is something the person submitted.
+  if (record?.isCompactSummary === true) return 'compaction';
+  if (typeof record?.interruptedMessageId === 'string') return 'interruption';
+  if (typeof text === 'string') {
+    if (INTERRUPTION_MARKER_RE.test(text)) return 'interruption';
+    if (COMMAND_ENVELOPE_RE.test(text)) return 'command';
+    if (REMINDER_ENVELOPE_RE.test(text)) return 'reminder';
+    if (NOTIFICATION_ENVELOPE_RE.test(text)) return 'notification';
+  }
+  if (record?.isMeta === true || record?.message?.isMeta === true) return isSkillInstructions(text) ? 'skill' : 'other';
+  return null;
+}
+
+function extractMessageIsMeta(record: JsonRecord, text: string | null = extractText(record?.message?.content, TEXT_LIMIT)): 0 | 1 {
+  return extractHarnessKind(record, text) === null ? 0 : 1;
 }
 
 function filePath(name: string, input: JsonRecord | null | undefined): string | null {
@@ -561,7 +581,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 
 export {
   CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, getTextLimit, setTextLimit,
-  trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
+  trunc, truncJson, extractText, extractContentType, extractHarnessKind, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes, readCodexBufferLines, readCodexLines,
   normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue, normalizeTranscriptTimestamp,

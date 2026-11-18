@@ -115,6 +115,14 @@ export type TranscriptRecord =
 
 export type MessageVisibility = 'visible' | 'inactive' | 'hidden';
 
+/**
+ * What a message the harness wrote is. The values are the kinds of a USF
+ * harness step (docs/usf-spec.md, 3.3).
+ */
+export type HarnessKind =
+  | 'compaction' | 'recap' | 'interruption' | 'command' | 'reminder' | 'skill'
+  | 'attachment' | 'task' | 'error' | 'result' | 'notification' | 'other';
+
 export interface MessageRecord {
   kind: 'message';
   uuid: string;
@@ -125,7 +133,15 @@ export interface MessageRecord {
   role: string | null;
   text: string | null;
   content_type: string | null;
+  /** Excluded from default retrieval and title derivation. Says nothing more than that. */
   is_meta: 0 | 1;
+  /**
+   * Set when the harness wrote this message, whatever its role and whether or
+   * not it is `is_meta`: a provider may keep harness-written text retrievable.
+   * Null or absent: the provider does not say. Rows stored before the field
+   * existed are null as well, until their session is parsed again.
+   */
+  harness_kind?: HarnessKind | null;
   /**
    * Provider-attested evidence state. `inactive` requires an explicit source
    * supersession signal; assemblers never infer it from text or tree shape.
@@ -278,6 +294,13 @@ export interface SessionRecord {
   countMode: 'total' | 'delta';
   jsonl_path: string;
   source: string;
+  /**
+   * `agent` when the source attests that a sub-agent created this session and
+   * it is emitted as a session of its own. Its user messages are then tasks
+   * from the agent that started it, not a person's submissions. Null or absent:
+   * the source does not say.
+   */
+  started_by?: 'agent' | null;
 }
 
 // A transcript source. Pure: it never touches the Obelisk database. It owns its

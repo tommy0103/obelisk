@@ -16,6 +16,7 @@
 // cannot be cut from a delta.
 
 import type {
+  HarnessKind,
   MessageRecord,
   SessionRecord,
   SubagentRecord,
@@ -29,8 +30,8 @@ export const USF_VERSION = 1;
 
 export const USF_HARNESS_KINDS = [
   'compaction', 'recap', 'interruption', 'command', 'reminder', 'skill',
-  'attachment', 'task', 'error', 'result', 'other',
-] as const;
+  'attachment', 'task', 'error', 'result', 'notification', 'other',
+] as const satisfies readonly HarnessKind[];
 export type UsfHarnessKind = typeof USF_HARNESS_KINDS[number];
 
 /** `local` keeps every step and marks the ones that are not current; `published` has only current steps. */
@@ -114,6 +115,8 @@ export interface UsfSession {
   id: string;
   title: string | null;
   git_branch: string | null;
+  /** Present when a sub-agent started the session: it then has tasks, and no human step. */
+  started_by?: 'agent';
   turns: UsfTurn[];
 }
 
@@ -335,6 +338,10 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
     if (agent.note?.parent_tool_use_id) startedBy.set(agent.note.parent_tool_use_id, agent);
   }
   const placed = new Set<string>();
+  // A session a sub-agent started: its provider says so, or another session's
+  // records name it as their sub-agent. Nobody submits in it; like in a
+  // sub-agent's records inside a session, a user message is a task.
+  const agentStarted = input.record?.started_by === 'agent' || input.child;
 
   // The steps of one list of records. `top`: the session's own records, where a
   // person can submit; otherwise a sub-agent's, where a user message is its
@@ -423,6 +430,9 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
           ...(record.skill ? { skill: record.skill } : {}),
         };
         const text = record.text ?? '';
+        // What the provider says the harness wrote here. The assembly adds only
+        // what the structure of the records shows: a task, a result without a call.
+        const kind = record.harness_kind ?? null;
         const carried = brought.get(record.uuid) ?? [];
         if (record.content_type === 'tool_result') {
           // The message that brings tool results back has no step of its own:
@@ -430,10 +440,10 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
           // repeats them. Text that says something else is kept.
           if (text.trim() && !carried.some((result) => (result.content ?? '').trim() === text.trim())) {
             if (carried.length) stats.textOnResultMessage++;
-            steps.push({ by: 'harness', ...base, kind: carried.length ? 'other' : 'result', content: text });
+            steps.push({ by: 'harness', ...base, kind: kind ?? (carried.length ? 'other' : 'result'), content: text });
           }
         } else if (record.role === 'user') {
-          const person = top && !record.is_meta && !record.is_sidechain
+          const person = top && !agentStarted && kind === null && !record.is_meta && !record.is_sidechain
             && (!record.agent_id || record.agent_id === record.session_id);
           if (!text) stats.emptyContent++;
           // Some providers give one record per part of a message (a text, then
@@ -454,14 +464,14 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
           } else {
             steps.push({
               by: 'harness', ...base,
-              kind: record.content_type === 'skill_instructions' ? 'skill' : !top && !record.is_meta ? 'task' : 'other',
+              kind: kind ?? ((!top || agentStarted) && !record.is_meta ? 'task' : 'other'),
               content: text,
             });
           }
-        } else if (record.role === 'assistant' && (record.is_meta || record.content_type === 'error')) {
+        } else if (record.role === 'assistant' && (kind !== null || record.is_meta)) {
           // Written in the agent's place by the harness (a notice, a failed
           // model call): not something the model said.
-          steps.push({ by: 'harness', ...base, ...from(record), kind: record.content_type === 'error' ? 'error' : 'other', content: text });
+          steps.push({ by: 'harness', ...base, ...from(record), kind: kind ?? 'other', content: text });
         } else if (record.role === 'assistant') {
           // A message that only carries tool calls has no step of its own: the
           // calls are the steps. Any other message stays, also when no text
@@ -474,7 +484,7 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
             });
           }
         } else {
-          steps.push({ by: 'harness', ...base, kind: 'other', content: text });
+          steps.push({ by: 'harness', ...base, kind: kind ?? 'other', content: text });
         }
         for (const made of callsOf.get(record.uuid) ?? []) steps.push(toolStep(made));
         // A result whose call is not among the records is kept where its message is.
@@ -549,6 +559,7 @@ function assembleSession(input: SessionRecords): { assembled: AssembledUsfSessio
         id: input.sessionId,
         title: input.record?.title ?? null,
         git_branch: input.record?.git_branch ?? null,
+        ...(agentStarted ? { started_by: 'agent' as const } : {}),
         turns,
       },
       stats,
@@ -769,7 +780,8 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
   };
 
   const session = object(value);
-  only('session', value, ['usf', 'harness', 'id', 'title', 'git_branch', 'turns'], []);
+  only('session', value, ['usf', 'harness', 'id', 'title', 'git_branch', 'turns'], ['started_by']);
+  if ('started_by' in session && session.started_by !== 'agent') bad('session', `"started_by" ${JSON.stringify(session.started_by)} is not "agent"`);
   textFields('session', value, ['id']);
   for (const key of ['title', 'git_branch']) {
     if (session[key] !== null && typeof session[key] !== 'string') bad('session', `"${key}" is neither text nor null`);
@@ -792,6 +804,7 @@ export function validateUsf(value: unknown, { profile = 'local' }: { profile?: U
       .map((step, i) => (object(step).by === 'human' && !object(step).state ? i : -1))
       .filter((i) => i >= 0);
     if (starts.length > 1) bad(where, 'more than one submission in a turn');
+    if (starts.length > 0 && session.started_by === 'agent') bad(where, 'a session started by an agent has a human step');
     if (t > 0 && starts[0] !== 0) bad(where, 'a turn after the first does not start with a submission');
   });
   return problems;

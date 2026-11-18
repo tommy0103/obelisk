@@ -28,6 +28,8 @@ import { opencodeSessionId, opencodeStoreHash, opencodeUnitKey } from '../packag
 import { openOpencodeDatabaseWithNodeSqlite } from '../packages/core/src/providers/opencode-node.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { assembleUsf } from '../packages/core/src/usf.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
@@ -975,6 +977,7 @@ test('parses real captured OpenCode V1 and V2 store rows from fixtures', () => {
     const { values, cursor } = drain(provider.parse(unit, null));
     assert.ok(cursor, 'parse returned valid cursor');
     assert.ok(values.length > 0, 'emitted canonical records');
+    assertHarnessConformance(values);
 
     const sessionRecord = values.find(r => r.kind === 'session');
     assert.ok(sessionRecord, 'session record emitted');
@@ -1572,6 +1575,8 @@ test('P2-8: V2 skill and shell project to canonical records, and unknown types a
 
   const msgs = records.filter(r => r.kind === 'message');
   assert.equal(msgs.length, 3, 'all 3 non-standard messages emitted canonical records');
+  assert.deepEqual(msgs.map(m => [m.role, m.harness_kind ?? null]), [['system', 'skill'], ['assistant', null], ['system', 'other']],
+    'a row OpenCode wrote itself says what it is');
 
   // skill
   assert.equal(msgs[0].content_type, 'skill_instructions');
@@ -1648,8 +1653,13 @@ test('P2-10: parent classification consistency: rechecked within snapshot, and o
   const units = discover(provider);
   assert.equal(units[0].isSubagent, false, 'orphan session is not subagent because parent does not exist');
 
-  const { cursor } = drain(provider.parse(units[0], null));
+  const { cursor, values: orphanRecords } = drain(provider.parse(units[0], null));
   assert.ok(cursor);
+  // Its parent is gone, so it stands alone; the store still says a sub-agent created it.
+  assert.equal(orphanRecords.find(r => r.kind === 'session').started_by, 'agent');
+  assert.equal(orphanRecords.find(r => r.kind === 'message').is_meta, 0, 'and it stays searchable');
+  assert.deepEqual(assembleUsf(orphanRecords).sessions[0].session.turns.flatMap(turn => turn.steps).map(step => [step.by, step.kind, step.content]),
+    [['harness', 'task', 'orphan text']]);
 
   // Raw lookup with freshly parsed cursor must succeed and not fail fingerprint
   const sessionId = opencodeSessionId('ses_orphan', dbPath);
@@ -2028,6 +2038,7 @@ test('pre-split completed compaction is a summary in direct, SQLite and raw proj
     const unit = discover(source.provider)[0];
     const records = [...source.provider.parse(unit, null)];
     assert.equal(records.find(r => r.kind === 'summary')?.content, 'completed summary');
+    assert.equal(records.find(r => r.kind === 'summary')?.source, 'compaction', 'a summary record names its kind, not the provider');
     idx.run();
     const summary = idx.db.prepare('SELECT * FROM summaries').get();
     assert.equal(summary.content, 'completed summary');

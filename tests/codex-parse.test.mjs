@@ -10,8 +10,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 function writeFixture(lines) {
@@ -638,4 +640,88 @@ test('codex provider discovers, watches, and reads archived sessions', () => {
     agentId: 'codex:archive-agent',
   });
   assert.match(raw.text, /archived Codex sentinel/);
+});
+
+const userItem = (second, text) => ({
+  type: 'response_item', timestamp: `2026-06-10T10:00:${second}Z`,
+  payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+});
+const userEvent = (second, message) => ({
+  type: 'event_msg', timestamp: `2026-06-10T10:00:${second}Z`, payload: { type: 'user_message', message },
+});
+
+test('codex parse() takes a user-role item without a prompt event as written by Codex', () => {
+  // The shape of a real rollout: a preamble item before the first prompt, each
+  // prompt as an item with its event, and an item left where a turn was aborted.
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    userItem('01', 'instructions and workspace notes'),
+    userItem('01', '<environment_context>\n  <cwd>/tmp/work</cwd>\n</environment_context>'),
+    userItem('02', 'what the person typed'),
+    userEvent('02', 'what the person typed'),
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:03Z', payload: { type: 'agent_message', message: 'answer' } },
+    userItem('04', 'the previous turn was aborted'),
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:04Z', payload: { type: 'turn_aborted', reason: 'interrupted' } },
+  ]);
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  // A context envelope is named by its element; for the other items nothing says what they are.
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message' && record.role === 'user')
+      .map(message => [message.text.split('\n')[0], message.is_meta, message.harness_kind, message.visibility]),
+    [
+      ['instructions and workspace notes', 1, 'other', 'visible'],
+      ['<environment_context>', 1, 'reminder', 'hidden'],
+      ['what the person typed', 0, null, 'visible'],
+      ['the previous turn was aborted', 1, 'other', 'visible'],
+    ],
+  );
+  assert.equal(values.find(record => record.kind === 'message' && record.role === 'assistant').harness_kind, null);
+});
+
+test('codex parse() keeps user-role items as prompts in a thread that records no prompt events', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    userItem('01', 'a prompt kept only as an item'),
+    { type: 'response_item', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] } },
+  ]);
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message').map(message => [message.role, message.is_meta]),
+    [['user', 0], ['assistant', 0]],
+  );
+});
+
+test('codex parse() replays the thread when its first prompt event arrives after earlier rows were emitted', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    userItem('01', 'instructions and workspace notes'),
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  assert.deepEqual(first.values.filter(record => record.kind === 'message').map(message => message.is_meta), [0],
+    'nothing yet says this thread records prompts as events');
+  assert.equal(cursorState(first.ret).userMessageEvents, false);
+
+  appendFileSync(path, [JSON.stringify(userItem('02', 'what the person typed')), JSON.stringify(userEvent('02', 'what the person typed')), ''].join('\n'));
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.deepEqual(
+    second.values.filter(record => record.kind === 'message').map(message => [message.text, message.is_meta]),
+    [['instructions and workspace notes', 1], ['what the person typed', 0]],
+    'the row emitted earlier is given again, now as written by Codex',
+  );
+  assert.equal(cursorState(second.ret).userMessageEvents, true);
+
+  appendFileSync(path, [JSON.stringify(userItem('03', 'the previous turn was aborted')), ''].join('\n'));
+  const third = drain(parse({ key: path, sessionId: '' }, second.ret));
+  assert.deepEqual(
+    third.values.filter(record => record.kind === 'message').map(message => [message.text, message.is_meta]),
+    [['the previous turn was aborted', 1]],
+    'a later append resumes from the cursor and still knows the thread has prompt events',
+  );
+});
+
+test('codex records of the real rollouts say who wrote each message', () => {
+  for (const name of ['codex/real-rollout-structural-sanitized.jsonl', 'codex-apply-patch.jsonl']) {
+    const path = fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
+    assertHarnessConformance(drain(parse({ key: path, sessionId: '' }, null)).values);
+  }
 });

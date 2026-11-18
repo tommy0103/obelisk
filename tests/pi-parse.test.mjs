@@ -25,6 +25,7 @@ import { createProviderRegistry } from '../packages/core/src/providers/registry.
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -370,6 +371,9 @@ test('raw Pi lookup resolves the exact canonical block and rejects replacement p
   assert.equal(lookup(messages.find(message => message.content_type === 'text')).messageText, longText);
   assert.equal(messages.find(message => message.content_type === 'text').text.length, 10000);
   assert.equal(lookup(messages.find(message => message.content_type === 'tool_use')).messageText, null);
+  assert.deepEqual(messages.map(message => [message.content_type, message.harness_kind]),
+    [['thinking', null], ['text', null], ['tool_use', null], ['error', 'error']],
+    'only the record of the failed call is the harness\'s');
   assert.equal(lookup(messages.find(message => message.content_type === 'error')).messageText, 'exact synthetic error');
   assert.equal(provider.raw({
     source: 'pi',
@@ -1257,6 +1261,11 @@ test('full tree marks abandoned messages inactive while indexing every summary a
   assert.equal(bash.type, 'user');
   assert.equal(bash.content_type, 'bash_execution');
   assert.equal(bash.is_meta, 0);
+  assert.equal(bash.harness_kind, 'command', 'a command run through Pi stays retrievable and is not a submission');
+  assert.equal(messages.find(record => record.text === 'visible extension context').harness_kind, 'reminder');
+  assert.equal(messages.find(record => record.text === 'hidden extension context').harness_kind, 'reminder');
+  assert.equal(messages.find(record => record.text === 'abandoned branch').harness_kind, null);
+  assert.equal(messages.find(record => record.text === 'active request').harness_kind, null);
   assert.equal(bash.text.length, 10_000);
   assert.match(bash.text, /\[Output truncated\. Full output: \/tmp\/must-not-be-read\]$/);
   assert.equal(values.filter(record => record.kind === 'tool_call').length, 0);
@@ -2149,4 +2158,11 @@ test('long linear Pi trees validate without repeated prefix walks', () => {
   }
   const { values } = parseOnly(writeSession(jsonl(records)).root);
   assert.equal(values.filter(record => record.kind === 'message').length, 5000);
+});
+
+test('Pi records of every captured session say who wrote each message', () => {
+  for (const name of ['tool-session', 'real-model-session', 'harness-source', 'harness-checkpoint-fork', 'harness-null-leaf']) {
+    const { root } = writeSession(fixture(`${name}.jsonl`));
+    assertHarnessConformance(parseOnly(root).values);
+  }
 });

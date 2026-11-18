@@ -13,7 +13,7 @@ import { basename, dirname, join, normalize, win32 } from 'node:path';
 import { normalizeObservedCwd, projectSlugFromPath, readLines, trunc, truncJson } from '../parsing.ts';
 import type { SqliteDb, SqliteRow } from '../sqlite-types.ts';
 import type {
-  Cursor, DiscoverContext, IndexUnit, MessageRecord, ProviderAdapter,
+  Cursor, DiscoverContext, HarnessKind, IndexUnit, MessageRecord, ProviderAdapter,
   RawLookup, RawRecord, TranscriptRecord, WatchTarget,
 } from './types.ts';
 
@@ -50,6 +50,8 @@ interface ProjectedMessage {
   input?: number | null;
   output?: number | null;
   meta?: boolean;
+  /** What a harness-written message is, when the source names it. A `meta` message without one is `other`. */
+  harnessKind?: HarnessKind;
   agent?: string;
   execution?: string;
   summary?: boolean;
@@ -350,6 +352,9 @@ function cliMessages(source: KiroSource): ProjectedMessage[] {
     timestamp = time(data.meta?.timestamp) ?? timestamp;
     if (!['Prompt', 'AssistantMessage', 'ToolResults'].includes(event.kind)) continue;
     const role = event.kind === 'AssistantMessage' ? 'assistant' : 'user';
+    // A result that cannot be tied to its call still came from the harness, not
+    // from the person, although Kiro stores it under the user role.
+    const unmatched = event.kind === 'ToolResults' ? { meta: true, harnessKind: 'result' as const } : {};
     const start = out.length;
     for (const part of Array.isArray(data.content) ? data.content : []) {
       const block = object(part);
@@ -362,9 +367,9 @@ function cliMessages(source: KiroSource): ProjectedMessage[] {
       } else if (block.kind === 'toolResult' && str(value.toolUseId) !== null) {
         out.push({ ...base, text: resultText(value.content) || null,
           result: { id: value.toolUseId, content: resultText(value.content), error: value.status !== 'success' } });
-      } else out.push({ ...base, text: null });
+      } else out.push({ ...base, ...unmatched, text: null });
     }
-    if (out.length === start) out.push({ role, timestamp, model, text: null, raw: event });
+    if (out.length === start) out.push({ role, timestamp, model, text: null, raw: event, ...unmatched });
     if (typeof data.message_id === 'string') byRawId.set(data.message_id, out.at(-1)!);
   }
   // Usage is per user turn, not per assistant block. Attach it once, to the
@@ -418,7 +423,7 @@ function workspaceMessages(source: KiroSource): ProjectedMessage[] {
       out.push({ ...base, role: 'user', text: text || null,
         result: { id: payload.toolCallId, content: text, error: payload.success === false } });
     } else if (payload.type === 'sub_agent_start' && str(payload.subSessionId)) {
-      const message: ProjectedMessage = { ...base, role: 'system', text: str(payload.prompt) ?? str(payload.explanation), meta: true,
+      const message: ProjectedMessage = { ...base, role: 'system', text: str(payload.prompt) ?? str(payload.explanation), meta: true, harnessKind: 'task',
         execution: str(payload.parentExecutionId) ?? undefined,
         subagent: { id: payload.subSessionId, name: str(payload.subAgentName), description: str(payload.prompt) ?? str(payload.explanation), duration: null, parentCall: null } };
       out.push(message);
@@ -426,7 +431,9 @@ function workspaceMessages(source: KiroSource): ProjectedMessage[] {
     } else if (payload.type === 'sub_agent_complete') {
       completions.push(event);
     } else if (['tool_call', 'tool_result'].includes(payload.type)) {
-      out.push({ ...base, role: payload.type === 'tool_call' ? 'assistant' : 'user', text: null });
+      // No call id: see the note on unmatched results in cliMessages().
+      out.push({ ...base, role: payload.type === 'tool_call' ? 'assistant' : 'user', text: null,
+        ...(payload.type === 'tool_result' ? { meta: true, harnessKind: 'result' as const } : {}) });
     }
   };
   for (const event of events) append(event);
@@ -546,7 +553,7 @@ function recordsFor(source: KiroSource, sessionId: string, messages: ProjectedMe
     }
     records.push({ kind: 'message', uuid, session_id: sessionId, type: message.role, parent_uuid: previous.get(scope) ?? null,
       timestamp: message.timestamp, role: message.role, text: message.text === null ? null : trunc(message.text),
-      content_type: message.contentType ?? (message.call ? 'tool_use' : message.result ? 'tool_result' : message.text === null ? 'unknown' : 'text'), is_meta: message.meta ? 1 : 0, visibility: 'visible', model: message.model ?? null,
+      content_type: message.contentType ?? (message.call ? 'tool_use' : message.result ? 'tool_result' : message.text === null ? 'unknown' : 'text'), is_meta: message.meta ? 1 : 0, harness_kind: message.harnessKind ?? (message.meta ? 'other' : null), visibility: 'visible', model: message.model ?? null,
       is_sidechain: message.agent ? 1 : 0, agent_id: message.agent ? `${sessionId}:subagent:${message.agent}` : null, input_tokens: message.input ?? null, output_tokens: message.output ?? null,
       cwd: source.cwd, skill: null, source: name } satisfies MessageRecord);
     previous.set(scope, uuid);
@@ -572,7 +579,9 @@ function recordsFor(source: KiroSource, sessionId: string, messages: ProjectedMe
     project: projectSlugFromPath(source.cwd), started_at: time(header.created_at ?? header.createdAt),
     ended_at: time(header.updated_at ?? header.lastModifiedAt) ?? messages.at(-1)?.timestamp ?? null,
     git_branch: null, version: source.format === 'workspace' ? `workspace-${header.schemaVersion}` : source.format === 'cli' ? 'cli-v1' : 'conversations-v2',
-    message_count: messages.filter(message => message.agent === undefined && !(message.summary && message.text !== null)).length, countMode: 'total', jsonl_path: sourcePath(source), source: name });
+    message_count: messages.filter(message => message.agent === undefined && !(message.summary && message.text !== null)).length, countMode: 'total', jsonl_path: sourcePath(source), source: name,
+    // A CLI header can attest that a sub-agent created the session; it carries no parent id.
+    started_by: source.format === 'cli' && str(header.session_created_reason) === 'subagent' ? 'agent' : null });
   return records;
 }
 
