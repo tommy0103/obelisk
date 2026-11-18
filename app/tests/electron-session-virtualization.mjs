@@ -1105,7 +1105,9 @@ async function run() {
   await delay(250);
 
   await win.webContents.executeJavaScript(`(() => {
-    const original = window.marked.parse;
+    // Every Markdown render hands its HTML to DOMPurify, which parses it with
+    // DOMParser; counting those parses counts renders without a test hook.
+    const original = DOMParser.prototype.parseFromString;
     const originalJsonParse = JSON.parse;
     const codexExecOutput = ${JSON.stringify(codexExecOutput)};
     const trackedPrefixes = [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')]
@@ -1114,9 +1116,9 @@ async function run() {
       .map(uuid => 'Message ' + uuid.slice('message-'.length) + ' ');
     let calls = 0;
     let codexExecCalls = 0;
-    window.marked.parse = function timelineMarkdownProbe(...args) {
-      const text = String(args[0] || '');
-      if (trackedPrefixes.some(prefix => text.startsWith(prefix))) calls++;
+    DOMParser.prototype.parseFromString = function timelineMarkdownProbe(...args) {
+      const html = String(args[0] || '');
+      if (trackedPrefixes.some(prefix => html.includes('<p>' + prefix))) calls++;
       return original.apply(this, args);
     };
     JSON.parse = function timelineJsonProbe(value, ...args) {
@@ -1127,7 +1129,7 @@ async function run() {
       calls: () => calls,
       codexExecCalls: () => codexExecCalls,
       restore: () => {
-        window.marked.parse = original;
+        DOMParser.prototype.parseFromString = original;
         JSON.parse = originalJsonParse;
       },
     };
@@ -1457,7 +1459,7 @@ async function run() {
   await waitFor(win.webContents, `!document.querySelector('.flap-slot.flipping')`, 'tail append flap settlement');
   const updatedReaderText = `Updated ${scrollProbe.anchor.uuid} ${'content identity '.repeat(20)}`;
   await win.webContents.executeJavaScript(`(() => {
-    const original = window.marked.parse;
+    const original = DOMParser.prototype.parseFromString;
     const targetUuid = ${JSON.stringify(scrollProbe.anchor.uuid)};
     const targetText = ${JSON.stringify(updatedReaderText)};
     const unchangedPrefixes = [...document.querySelectorAll('.virtual-timeline-row [data-uuid]')]
@@ -1466,15 +1468,15 @@ async function run() {
       .map(uuid => 'Message ' + uuid.slice('message-'.length) + ' ');
     let targetCalls = 0;
     let unchangedCalls = 0;
-    window.marked.parse = function timelineContentIdentityProbe(value, ...args) {
-      const text = String(value || '');
-      if (text === targetText) targetCalls++;
-      if (unchangedPrefixes.some(prefix => text.startsWith(prefix))) unchangedCalls++;
+    DOMParser.prototype.parseFromString = function timelineContentIdentityProbe(value, ...args) {
+      const html = String(value || '');
+      if (html.includes('<p>' + targetText)) targetCalls++;
+      if (unchangedPrefixes.some(prefix => html.includes('<p>' + prefix))) unchangedCalls++;
       return original.call(this, value, ...args);
     };
     window.__timelineContentIdentityProbe = {
       calls: () => ({ target: targetCalls, unchanged: unchangedCalls }),
-      restore: () => { window.marked.parse = original; },
+      restore: () => { DOMParser.prototype.parseFromString = original; },
     };
   })()`, true);
   scrollingContentUuid = scrollProbe.anchor.uuid;

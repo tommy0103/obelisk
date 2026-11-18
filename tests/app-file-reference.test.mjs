@@ -17,7 +17,7 @@ function tempProject() {
   const root = makeTempDir('obelisk-file-ref-');
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });
   fs.writeFileSync(path.join(root, 'src', 'app.ts'), 'export const a = 1;\n');
-  return fs.realpathSync(root);
+  return root;
 }
 
 test('normalizeRoots keeps absolute paths and drops the rest', () => {

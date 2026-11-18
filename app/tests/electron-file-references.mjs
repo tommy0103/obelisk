@@ -67,6 +67,8 @@ const messages = [{
   cwd,
 }];
 
+const INDEX_ERROR = 'Index database could not be read: no such table: memories';
+
 const RECOVERY_NOTICE =
   'Previous settings could not be read. They were preserved at /tmp/settings.json.corrupt-1';
 
@@ -144,6 +146,7 @@ function registerHandlers() {
       // aside by a save. The notice therefore has to arrive on the save response, because the
       // editor path does not reload settings afterwards.
       settingsRecovery: null,
+      indexError: INDEX_ERROR,
       recapDir: '/fixture/persisted-recap',
       sources: [{
         id: 'copilot', name: 'GitHub Copilot', vendor: 'GitHub', color: '#8957e5',
@@ -297,6 +300,7 @@ async function run() {
       nativeSelects: document.querySelectorAll('select').length,
       version: document.querySelector('.version-text')?.textContent?.trim() || null,
       recovery: document.querySelector('.settings-recovery')?.textContent?.trim() || null,
+      indexError: document.querySelector('.settings-index-error')?.textContent?.trim() || null,
     };
   })()`, true);
 
@@ -314,6 +318,10 @@ async function run() {
   assert(
     settingsState.recovery === null,
     `no recovery notice before a save has preserved anything (${settingsState.recovery})`,
+  );
+  assert(
+    settingsState.indexError === INDEX_ERROR,
+    `Settings shows an unreadable index (${settingsState.indexError})`,
   );
 
   const copilotCheckboxes = await win.webContents.executeJavaScript(`(() =>

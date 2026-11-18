@@ -37,6 +37,7 @@ function handleNotesClick(event) {
       <div><h2 id="update-notes-title">What’s new</h2><p>Obelisk {{ updateState.version }}</p></div>
       <button class="update-button subtle" type="button" aria-label="Close release notes" @click="notesOpen = false">Close</button>
     </header>
+    <!-- eslint-disable-next-line vue/no-v-html -- renderUpdateNotes() -->
     <div v-if="html" class="update-notes-content" @click="handleNotesClick" v-html="html"></div>
     <p v-else class="update-empty">Release notes aren’t available for this update.</p>
     <footer><button class="update-button" type="button" @click="notesOpen = false">Done</button></footer>

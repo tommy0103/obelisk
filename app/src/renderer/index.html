@@ -3,8 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- Transcript content is attacker-controlled, so no inline or remote script.
+     Inline styles stay allowed: Vue custom elements and row markup use them.
+     Images load from wherever transcripts point. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: file: http: https:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'" />
 <title>Obelisk</title>
-<script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
 </head>
 <body>
 <div id="app"></div>

@@ -295,6 +295,7 @@ onUnmounted(() => {
     <div v-if="detailMemory" class="detail">
       <div class="detail-header">
         <div class="detail-eyebrow">
+          <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
           <span class="project-icon" v-html="FOLDER_SVG"></span>
           <span class="project-name">{{ formatProjectLabel(detailMemory.project) }}</span>
           <span v-if="detailMemory.archived" class="archived-tag">archived</span>
@@ -342,6 +343,7 @@ onUnmounted(() => {
           File not found or empty.
         </div>
         <pre v-else-if="showSource" class="markdown-source">{{ detailMarkdown }}</pre>
+        <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
         <div v-else class="markdown-body" v-html="renderedMarkdown"></div>
       </div>
 
@@ -415,19 +417,17 @@ onUnmounted(() => {
 
         <div class="row-body">
           <div class="row-path">
-            <span
-              v-if="dominantRowStatus(m)"
-              class="row-status"
-              :class="dominantRowStatus(m)"
-              :title="dominantRowStatus(m)"
-              v-html="statusGlyphs(dominantRowStatus(m))"
-            ></span>
+            <!-- eslint-disable-next-line vue/no-v-html -- static SVG -->
+            <span v-if="dominantRowStatus(m)" class="row-status" :class="dominantRowStatus(m)" :title="dominantRowStatus(m)" v-html="statusGlyphs(dominantRowStatus(m))"></span>
             <template v-if="showProjectPrefix">
+              <!-- eslint-disable-next-line vue/no-v-html -- escapeHTML() -->
               <span class="project-prefix" v-html="projectLabel(m)"></span>
               <span class="project-prefix-sep">/</span>
             </template>
+            <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
             <span class="path-text" v-html="pathHTML(m)"></span>
           </div>
+          <!-- eslint-disable-next-line vue/no-v-html -- highlightPlain() escapes -->
           <div class="row-summary" v-html="summaryHTML(m)"></div>
         </div>
 
@@ -637,21 +637,6 @@ onUnmounted(() => {
 
 .row.archived .row-path, .row.archived .row-summary { color: var(--muted); }
 .row.archived .row-path .project-prefix { color: var(--muted-2); }
-
-/* Empty state */
-.empty {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted-2);
-  font-size: var(--text-sm);
-  padding: 60px 20px;
-  text-align: center;
-  flex-direction: column;
-  gap: 8px;
-}
-.empty .hint { font-size: 11px; color: var(--muted-2); }
 
 /* Detail panel styles */
 .detail-header { margin-bottom: 24px; }

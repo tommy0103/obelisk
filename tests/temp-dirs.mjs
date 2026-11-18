@@ -5,7 +5,10 @@
 // leaking hundreds of MB into $TMPDIR over repeated runs (this caused ENOSPC).
 // makeTempDir records every directory it creates and removes them all when the
 // test-file process exits (node --test spawns one process per file).
-import { mkdtempSync, rmSync } from 'node:fs';
+// It returns the realpath: on macOS $TMPDIR sits under /var, a symlink to
+// /private/var, and code under test that resolves paths would otherwise not
+// match the path the test built. ESLint keeps other tests off tmpdir().
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -22,7 +25,7 @@ process.on('exit', () => {
 });
 
 export function makeTempDir(prefix) {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   created.add(dir);
   return dir;
 }

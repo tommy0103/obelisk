@@ -33,7 +33,6 @@ import type { SessionMessageRow, MessageRow, PartRow } from './opencode-source.t
 import { isRecord, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
 
 import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey, opencodeObservationKey, opencodeObservationProofKey } from './opencode-identity.ts';
-export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
 
 import { normalizeObservedCwd, projectSlugFromPath } from '../parsing.ts';
 import type { SqliteDb } from '../sqlite-types.ts';
@@ -55,6 +54,7 @@ const TOMBSTONE_CURSOR = '0:0:v1:tombstone';
 
 export type OpencodeDatabaseOpener = (dbPath: string) => SqliteDb;
 
+/** @internal Exported for tests. */
 export function defaultOpencodeDataRoot(homeDir = homedir()): string {
   const xdg = process.env.XDG_DATA_HOME;
   if (xdg !== undefined && xdg.trim().length > 0) {
@@ -92,6 +92,7 @@ function openSource(dbPath: string, opener: OpencodeDatabaseOpener): SqliteDb | 
   }
 }
 
+/** @internal Exported for tests. */
 export function isValidChannelDbName(filename: string): boolean {
   return /^opencode-[a-zA-Z0-9._-]+\.db$/.test(filename);
 }

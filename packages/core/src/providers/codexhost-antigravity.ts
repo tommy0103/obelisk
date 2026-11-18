@@ -465,4 +465,4 @@ export function createCodexHostAntigravityProvider({
   };
 }
 
-export { sessionId as codexhostAntigravitySessionId };
+export { /** @internal Exported for tests. */ sessionId as codexhostAntigravitySessionId };

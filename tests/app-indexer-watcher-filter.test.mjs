@@ -8,10 +8,10 @@
 // fix events dropped here.
 
 import { test, mock } from 'node:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const SERVICE_URL = new URL('../app/src/main/indexer-service.ts', import.meta.url);
 const WATCHER_URL = new URL('../../../packages/adaptive-watcher/src/index.ts', SERVICE_URL).href;
@@ -39,7 +39,7 @@ test('caller routes provider-declared exact files regardless of suffix', async (
     const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?watcher-filter=${Date.now()}`);
     const timers = manualTimers();
     const builds = [];
-    const dir = mkdtempSync(join(tmpdir(), 'obelisk-wf-'));
+    const dir = makeTempDir('obelisk-wf-');
     const sourceDb = join(dir, 'db.sqlite');
     const pinnedTranscript = join(dir, 'history.jsonl');
     writeFileSync(sourceDb, 'sqlite fixture');
@@ -122,7 +122,7 @@ test('Hermes profile stores reach the indexer through the declared tree file nam
   try {
     const { createHermesProvider } = await import('../packages/core/src/providers/hermes.ts');
     const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?watcher-hermes=${Date.now()}`);
-    const home = mkdtempSync(join(tmpdir(), 'obelisk-hermes-wf-'));
+    const home = makeTempDir('obelisk-hermes-wf-');
     const profileStore = join(home, 'profiles', 'coder', 'state.db');
     mkdirSync(join(home, 'profiles', 'coder'), { recursive: true });
     writeFileSync(profileStore, 'sqlite fixture');
@@ -201,7 +201,7 @@ test('caller routes OpenCode dynamic channel databases without synchronous direc
   try {
     const { createOpencodeProvider } = await import('../packages/core/src/providers/opencode.ts');
     const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?watcher-opencode=${Date.now()}`);
-    const home = mkdtempSync(join(tmpdir(), 'obelisk-opencode-wf-'));
+    const home = makeTempDir('obelisk-opencode-wf-');
     const opencodeDir = join(home, 'data');
     mkdirSync(opencodeDir, { recursive: true });
 
@@ -260,7 +260,7 @@ test('merged OpenCode predicate preserves Hermes profile database names', async 
   } } });
   try {
     const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?merged=${Date.now()}`);
-    const root = mkdtempSync(join(tmpdir(), 'obelisk-merged-watch-'));
+    const root = makeTempDir('obelisk-merged-watch-');
     const profiles = join(root, 'profiles');
     mkdirSync(join(profiles, 'coder'), { recursive: true });
     const wal = join(profiles, 'coder', 'state.db-wal'); writeFileSync(wal, '');

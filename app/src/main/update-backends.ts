@@ -40,7 +40,7 @@ export async function createMacUpdateBackend(receive: (event: UpdateEvent) => vo
       bridge.setEventHandler(() => {});
     }
   } catch (error) {
-    try { bridge?.setAutomaticChecks(false); bridge?.setEventHandler(() => {}); } catch {}
+    try { bridge?.setAutomaticChecks(false); bridge?.setEventHandler(() => {}); } catch { /* the init error below is the one to report */ }
     log(`Sparkle initialization failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   log('Using electron-updater because the Sparkle bridge could not initialize');

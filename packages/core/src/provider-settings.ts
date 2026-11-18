@@ -71,6 +71,7 @@ function configuredPath(value: unknown, homeDir: string): string | null {
   return isAbsolute(expanded) ? normalize(expanded) : null;
 }
 
+/** @internal Exported for tests. */
 export function resolveProviderRoots(
   registry: ProviderRegistry,
   persisted: PersistedProviderSettings = {},

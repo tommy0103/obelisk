@@ -20,7 +20,6 @@ export const state = reactive({
   sourceFilter: 'all',
   projectSearch: '',
   sortDesc: true,
-  includeMessageBodies: false,
   cursorId: null,
   selection: markRaw(new Set()),
   loaded: false
@@ -77,8 +76,4 @@ export function setQuery(q) {
 
 export function setProjectSearch(q) {
   state.projectSearch = q;
-}
-
-export function toggleIncludeMessageBodies() {
-  state.includeMessageBodies = !state.includeMessageBodies;
 }

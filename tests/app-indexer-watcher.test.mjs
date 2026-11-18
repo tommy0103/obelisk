@@ -91,10 +91,8 @@ test('default watcher reports deep new files in freshly created directories', as
     }
     assert.ok(sawIt, 'the deep new transcript reached buildIndex as a changed path');
     const hit = builds.find((b) => (b.changedPaths ?? []).some((p) => p.endsWith('agent-1.jsonl')));
-    // @parcel/watcher reports real paths — on macOS the temp dir's /var/...
-    // symlink resolves to /private/var/...
-    const realRoot = fs.realpathSync(root);
-    assert.ok(hit.changedPaths.every((p) => p.startsWith(root) || p.startsWith(realRoot)),
+    // @parcel/watcher reports real paths; makeTempDir already returns one.
+    assert.ok(hit.changedPaths.every((p) => p.startsWith(root)),
       'changed paths are absolute paths under the watched root');
   } finally {
     await service.stop();

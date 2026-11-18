@@ -144,28 +144,20 @@ const fontSizeIdx = ref(FONT_SIZES.indexOf(parseInt(localStorage.getItem(FONT_SI
 if (fontSizeIdx.value < 0) fontSizeIdx.value = 2;
 const fontSize = computed(() => FONT_SIZES[fontSizeIdx.value] + 'px');
 
-function adjustFont(delta) {
-  const next = fontSizeIdx.value + delta;
-  if (next >= 0 && next < FONT_SIZES.length) {
-    fontSizeIdx.value = next;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[next]);
-  }
-}
-
 function handleZoom(e) {
   if (!(e.metaKey || e.ctrlKey)) return;
   if (e.key === '=' || e.key === '+') {
     e.preventDefault();
     if (fontSizeIdx.value < FONT_SIZES.length - 1) fontSizeIdx.value++;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   } else if (e.key === '-') {
     e.preventDefault();
     if (fontSizeIdx.value > 0) fontSizeIdx.value--;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   } else if (e.key === '0') {
     e.preventDefault();
     fontSizeIdx.value = 2;
-    localStorage.setItem(FONT_SIZE_KEY, FONT_SIZES[fontSizeIdx.value]);
+    localStorage.setItem(FONT_SIZE_KEY, String(FONT_SIZES[fontSizeIdx.value]));
   }
 }
 
@@ -188,7 +180,7 @@ onMounted(async () => {
   active.value = true;
   userScroll.attach(wrapRef.value);
   attachKeydown();
-  removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId } = {}) => {
+  removeSessionUpdated = window.obelisk?.onSessionUpdated?.(({ sessionId }) => {
     if (!active.value || !props.id || sessionId !== props.id) return;
     void liveReloadCoordinator.request();
   }) || null;
@@ -408,7 +400,7 @@ const totalMsgs = computed(() => timelineItems.value.length);
 let navLock = false;
 let scrollFrame = null;
 
-function onScroll(event) {
+function onScroll() {
   if (navLock) return;
   if (scrollFrame !== null) return;
   scrollFrame = requestAnimationFrame(() => {
@@ -488,6 +480,7 @@ function navigateToSubagent(agentId) {
       <template v-if="session && !loading">
         <div class="session-header" :class="{ 'is-preparing': !timelineReady }" ref="headerRef">
           <div class="session-eyebrow">
+            <!-- eslint-disable-next-line vue/no-v-html -- static SVG from store.js -->
             <span class="project-icon" v-html="FOLDER_SVG"></span>
             <span class="project-name">{{ formatProjectLabel(session.project) }}</span>
             <span class="sep">&middot;</span>
