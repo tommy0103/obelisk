@@ -156,22 +156,13 @@ async function waitFor(webContents, expression, message, timeoutMs = 8000) {
 }
 
 async function probeOrdinaryScrollGeometry(win, { startIndex, direction }) {
-  await win.webContents.executeJavaScript(
-    `window.location.hash = '#/sessions/${sessionId}?focus=message-${startIndex}'`,
-    true,
-  );
-  await waitFor(
-    win.webContents,
-    `document.querySelector('[data-uuid="message-${startIndex}"].is-focused')`,
-    `ordinary-scroll geometry start ${startIndex}`,
-  );
-  await delay(100);
   return win.webContents.executeJavaScript(`new Promise((resolve, reject) => {
     const wrap = document.querySelector('.detail-wrap');
     const direction = ${direction};
     const originalScrollTo = wrap.scrollTo.bind(wrap);
     const blockAutomaticScrollEnd = event => event.stopImmediatePropagation();
     let programmaticScrolls = 0;
+    const scrollWrites = [];
     let maxVisibleOverlaps = 0;
     let overlapExample = null;
     let previousGeometry = null;
@@ -181,6 +172,7 @@ async function probeOrdinaryScrollGeometry(win, { startIndex, direction }) {
     const cleanup = () => {
       stopped = true;
       clearTimeout(deadline);
+      focusObserver.disconnect();
       wrap.scrollTo = originalScrollTo;
       wrap.removeEventListener('scrollend', blockAutomaticScrollEnd, true);
     };
@@ -188,13 +180,24 @@ async function probeOrdinaryScrollGeometry(win, { startIndex, direction }) {
       cleanup();
       reject(new Error('Ordinary-scroll geometry probe timed out'));
     }, 8000);
-    wrap.addEventListener('scrollend', blockAutomaticScrollEnd, true);
-    wrap.scrollTo = (...args) => {
-      programmaticScrolls++;
-      return originalScrollTo(...args);
-    };
-    wrap.dispatchEvent(new WheelEvent('wheel', { deltaY: direction * 70, bubbles: true }));
-    const startedAt = performance.now();
+    let startedAt = null;
+    // Start on the rendered focus target, before its deferred measurement retry.
+    // A fixed sleep races the retry on slower renderers and hides it on fast ones.
+    const focusObserver = new MutationObserver(beginGesture);
+    focusObserver.observe(wrap, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
+    function beginGesture() {
+      if (!document.querySelector('[data-uuid="message-${startIndex}"].is-focused')) return;
+      focusObserver.disconnect();
+      wrap.addEventListener('scrollend', blockAutomaticScrollEnd, true);
+      wrap.scrollTo = (...args) => {
+        programmaticScrolls++;
+        scrollWrites.push({ args, stack: new Error().stack });
+        return originalScrollTo(...args);
+      };
+      wrap.dispatchEvent(new WheelEvent('wheel', { deltaY: direction * 70, bubbles: true }));
+      startedAt = performance.now();
+      requestAnimationFrame(frame);
+    }
     function frame(now) {
       if (stopped) return;
       try { sampleFrame(now); }
@@ -251,14 +254,15 @@ async function probeOrdinaryScrollGeometry(win, { startIndex, direction }) {
       cleanup();
       wrap.dispatchEvent(new Event('scrollend'));
       resolve({
-        programmaticScrolls,
+        programmaticScrolls, scrollWrites,
         maxVisibleOverlaps,
         overlapExample,
         maxResidualMotion,
         residualExample,
       });
     }
-    requestAnimationFrame(frame);
+    window.location.hash = '#/sessions/${sessionId}?focus=message-${startIndex}';
+    beginGesture();
   })`, true);
 }
 
@@ -1061,7 +1065,7 @@ async function run() {
     );
     assert(
       geometry.programmaticScrolls === 0,
-      `ordinary ${label} scrolling performs no programmatic scrollTo writes`,
+      `ordinary ${label} scrolling performs no programmatic scrollTo writes (${JSON.stringify(geometry.scrollWrites)})`,
     );
     assert(
       Math.abs(geometry.maxResidualMotion) < 1.5,
@@ -1083,7 +1087,7 @@ async function run() {
     );
     assert(
       geometry.programmaticScrolls === 0,
-      `small-window ${label} scrolling performs no programmatic scrollTo writes`,
+      `small-window ${label} scrolling performs no programmatic scrollTo writes (${JSON.stringify(geometry.scrollWrites)})`,
     );
     assert(
       Math.abs(geometry.maxResidualMotion) < 1.5,

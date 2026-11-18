@@ -435,7 +435,9 @@ export function useSessionTimelineViewport({
     if (!targetWindow) return Promise.resolve();
     return new Promise(resolve => targetWindow.requestAnimationFrame(() => {
       targetWindow.requestAnimationFrame(() => {
-        scroll();
+        // The first write is explicit navigation. A delayed measurement retry
+        // must not reclaim the viewport after the reader starts scrolling.
+        if (!(userScroll?.isActive() ?? false)) scroll();
         resolve();
       });
     }));
