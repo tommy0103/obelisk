@@ -313,6 +313,10 @@ const indexedProvenance = db => readProviderSessionProvenance(db)
 const scheduledSessionIds = round => sessionUnits(round.plan.items.map(item => item.unit))
   .map(unit => unit.sessionId);
 
+// A clock past the store gate's settle window: the fixture's writes are old enough that its stat
+// signature can certify an idle store. Tests about the window itself use the real clock.
+const idleClock = () => Date.now() + 60_000;
+
 /** Run rounds until the store settles, bounded so a regression fails instead of hanging. */
 function settle(index, limit = 6) {
   for (let round = 0; round < limit; round += 1) {
@@ -897,7 +901,7 @@ test('persist() writes a Hermes session and a changed store replays it instead o
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
   try {
-    const provider = createHermesProvider({ rootDir: layout.base, openStore });
+    const provider = createHermesProvider({ rootDir: layout.base, openStore, now: idleClock });
     const all = discover(provider);
     const unit = all.find(candidate => candidate.meta.rawSessionId === SESSION_ALPHA);
     const firstParse = drain(provider.parse(unit, null));
@@ -1841,6 +1845,7 @@ test('a failed exact-digest read reports an incomplete inventory and does not ce
       if (failDigestRead && opens > 1) throw new Error('simulated EACCES on the digest read');
       return openStore(path);
     },
+    now: idleClock,
   });
   const index = indexFixture(provider);
   try {
@@ -2211,12 +2216,37 @@ test('a certified store is skipped without opening its database', () => {
       opens += 1;
       return openStore(path);
     },
+    now: idleClock,
   }));
   try {
     settle(index);
     opens = 0;
     assert.equal(index.run().plan.items.length, 0, 'an idle store produces no work');
     assert.equal(opens, 0, 'and is not opened at all');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('a store written within the settle window is read again instead of skipped', () => {
+  // File times tick coarsely, so a same-size rewrite in the same tick as the certified gate
+  // leaves mtime, ctime, size and inode unchanged. Until the window passes, the stat signature
+  // cannot vouch for the store and each scan reads it.
+  const layout = fixtureHome();
+  let opens = 0;
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      opens += 1;
+      return openStore(path);
+    },
+  }));
+  try {
+    settle(index);
+    opens = 0;
+    assert.equal(index.run().plan.items.length, 0, 'an unchanged store produces no work');
+    assert.ok(opens > 0, 'but its fresh gate is not trusted to skip the read');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });

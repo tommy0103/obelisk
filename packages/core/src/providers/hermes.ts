@@ -268,24 +268,44 @@ function sessionTotalTokens(row: SqliteRow): number | null {
 }
 
 /** mtime + ctime + size + inode of one store file, per the cursor rule in CONTRIBUTING. */
-function fileSignature(path: string): string {
+function fileSignature(path: string): { signature: string; ctimeMs: number } {
   try {
     const stat = statSync(path);
-    return [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':');
+    return { signature: [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':'), ctimeMs: stat.ctimeMs };
   } catch {
-    return 'absent';
+    return { signature: 'absent', ctimeMs: -Infinity };
   }
 }
 
 /**
- * The store-level gate: mtime + ctime + size + inode of the database and its WAL, so a
- * same-millisecond rewrite that leaves the content fingerprints untouched still moves it.
- * It is a property of the STORE, not of a session: putting it into every session cursor
- * made any write invalidate every session in the store, and one appended line replayed
- * the whole database.
+ * How long after a store's last change a later write can still leave its stat signature
+ * unchanged. File times come from a coarse clock (a kernel tick on Linux, the ~15.6 ms timer
+ * on Windows, whole seconds on HFS+), so a same-size rewrite in the same tick keeps mtime,
+ * ctime, size and inode identical.
  */
-function storeGate(dbPath: string): string {
-  return sha256(`${fileSignature(dbPath)}|${fileSignature(`${dbPath}-wal`)}`);
+const STORE_GATE_SETTLE_MS = 2000;
+
+interface StoreGate {
+  value: string;
+  /** False when the store changed too recently for its signature to rule out a later write. */
+  settled: boolean;
+}
+
+/**
+ * The store-level gate: mtime + ctime + size + inode of the database and its WAL, so a
+ * same-size rewrite that leaves the content fingerprints untouched still moves it, once the
+ * gate is settled. It is a property of the STORE, not of a session: putting it into every
+ * session cursor made any write invalidate every session in the store, and one appended line
+ * replayed the whole database.
+ *
+ * An unsettled gate is recorded under a distinct value and never certifies anything: a scan
+ * that sees one reads the store and compares exact digests instead of trusting the signature.
+ */
+function storeGate(dbPath: string, now: number): StoreGate {
+  const main = fileSignature(dbPath);
+  const wal = fileSignature(`${dbPath}-wal`);
+  const settled = now - Math.max(main.ctimeMs, wal.ctimeMs) >= STORE_GATE_SETTLE_MS;
+  return { value: sha256(`${main.signature}|${wal.signature}${settled ? '' : '|unsettled'}`), settled };
 }
 
 function storeGateKey(dbPath: string): string {
@@ -719,6 +739,8 @@ function toolInputJson(value: unknown): string {
 
 interface HermesParseDeps {
   openStore?: HermesStoreOpener;
+  /** Wall clock the store gate is settled against. */
+  now: () => number;
 }
 
 /** Upstream keeps the text of those parts only (codex_responses_adapter._OUTPUT_TEXT_TYPES). */
@@ -814,7 +836,7 @@ function classifyCompactionSummary(content: string | null): CompactionSummarySha
     : null;
 }
 
-function hermesParse({ openStore }: HermesParseDeps) {
+function hermesParse({ openStore, now }: HermesParseDeps) {
   return function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
     const meta = unit.meta as HermesUnitMeta;
     if (meta.tombstone === true) return null;
@@ -832,7 +854,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
       // the fresh gate, skip the session, and the stale text would stay indexed. Sampling it after
       // the open would let a rename-over of the path in that window hand the cursor a *newer*
       // file's gate while the rows came from the old inode.
-      const gate = storeGate(meta.dbPath);
+      const gate = storeGate(meta.dbPath, now()).value;
       db = openStore(meta.dbPath);
       // One read transaction for every statement of this parse. Under WAL a writer could
       // otherwise commit between the session row and the message list, and the adapter
@@ -1153,10 +1175,13 @@ export function createHermesProvider({
   rootDir,
   homeDir = homedir(),
   openStore,
+  now = Date.now,
 }: {
   rootDir?: string;
   homeDir?: string;
   openStore?: HermesStoreOpener;
+  /** Wall clock the store gate is settled against; tests advance it instead of sleeping. */
+  now?: () => number;
 } = {}): ProviderAdapter {
   const automaticRoot = defaultHermesHome(homeDir);
   const sourceRoots =
@@ -1230,7 +1255,7 @@ export function createHermesProvider({
 
           // The gate is one row per store. It answers "may I skip this store entirely?" in a
           // single cursor read, which is what keeps an idle store from being opened at all.
-          const gate = storeGate(dbPath);
+          const { value: gate, settled: gateSettled } = storeGate(dbPath, now());
           const gateKey = storeGateKey(dbPath);
           const stored = parseStoreCursor(ctx.lastCursor(gateKey));
           const indexedIds = new Set(dbIndexed.map(session => session.sessionId));
@@ -1254,6 +1279,7 @@ export function createHermesProvider({
             !hinted
             && forcedSessions.size === 0
             && stored !== null
+            && gateSettled
             && stored.gate === gate
             && stored.sessions === indexedSessions
           ) {
@@ -1311,7 +1337,7 @@ export function createHermesProvider({
               });
               continue;
             }
-            if (cursor.gate === gate) continue; // written at the current gate: certified unchanged
+            if (gateSettled && cursor.gate === gate) continue; // written at the current settled gate: certified unchanged
             candidates.push({ entry, stored: cursor });
           }
 
@@ -1374,11 +1400,12 @@ export function createHermesProvider({
             });
           }
 
-          if (scheduled.length === 0 && !digestUnavailable) {
+          if (scheduled.length === 0 && !digestUnavailable && gateSettled) {
             // Nothing needs (re)writing, so this read certified the whole store at this gate.
             // Recording that here is what lets the next scan skip the store; it is deliberately
             // withheld while any unit is scheduled, so a unit that fails to persist is retried
-            // instead of being swallowed by a gate that already claims the store is done.
+            // instead of being swallowed by a gate that already claims the store is done. An
+            // unsettled gate certifies nothing, so it is not recorded either.
             units.push({
               key: gateKey,
               // No session: this unit carries no records, only the store's gate row. An empty
@@ -1426,7 +1453,7 @@ export function createHermesProvider({
       }
       return units;
     },
-    parse: hermesParse({ openStore }),
+    parse: hermesParse({ openStore, now }),
     raw: (input: RawLookup): RawRecord | null => rawHermes(input, openStore),
   };
 }
