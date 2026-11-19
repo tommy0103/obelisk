@@ -5,6 +5,7 @@ set -euo pipefail
 desktop=$1
 cli=$2
 fixture=$3
+electron=${4:-$desktop}
 work=$(mktemp -d)
 desktop_pid=
 cleanup() {
@@ -18,32 +19,36 @@ cleanup() {
 trap cleanup EXIT
 project="$work/.claude/projects/nix-smoke"
 database="$work/.obelisk/obelisk.sqlite"
+session=e3d532d5-1980-4b10-92dc-34bd2af2ea8f
 mkdir -p "$project"
-cp "$fixture" "$project/e3d532d5-1980-4b10-92dc-34bd2af2ea8f.jsonl"
+cp "$fixture" "$project/$session.jsonl"
 
 # Both processes use default storage in the same disposable home.
 isolated=(env -i HOME="$work" PATH="$PATH")
 flags=(--user-data-dir="$work/user-data" --devtools --remote-debugging-port=0)
+arch=$(uname -m)
 if [[ $(uname -s) == Darwin ]]; then
-  # Exercise the bundle directly, including Finder's entry point and the native
-  # Electron runtime. A translated Intel app could otherwise pass on arm64.
-  arch=$(uname -m)
+  # A translated Intel app could otherwise pass on arm64.
   lipo "$desktop" -verify_arch "$arch"
-  runtime_arch=$("${isolated[@]}" ELECTRON_RUN_AS_NODE=1 timeout 10 "$desktop" -p process.arch)
-  if [[ $runtime_arch != "${arch/x86_64/x64}" ]]; then
-    echo "Packaged Electron runs as $runtime_arch on the $arch runner" >&2
-    exit 1
-  fi
 else
   isolated+=(DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY")
   if [[ -n ${FONTCONFIG_FILE:-} ]]; then isolated+=(FONTCONFIG_FILE="$FONTCONFIG_FILE"); fi
   flags+=(--no-sandbox --ozone-platform=x11 --disable-gpu --disable-dev-shm-usage)
 fi
+
+# Linux passes the Electron executable used by its app.asar launcher.
+"${isolated[@]}" ELECTRON_RUN_AS_NODE=1 timeout 30 "$electron" -e '
+  const assert = require("node:assert/strict");
+  const { arch, versions: { electron, node, modules: abi } } = process;
+  assert.equal(arch, process.argv[1]);
+  assert.ok(electron && node && abi, "Missing packaged Electron runtime versions");
+  console.log(JSON.stringify({ electron, node, abi, arch }));
+' "${arch/x86_64/x64}"
 "${isolated[@]}" timeout -k 5 180 "$desktop" "${flags[@]}" >"$work/desktop.log" 2>&1 &
 desktop_pid=$!
 
-# The CLI can build an index itself. Wait for the desktop's own completed build
-# before invoking the CLI, then require the app-only marker in the CLI's query.
+# The CLI can build an index itself. Verify the desktop wrote the fixture before
+# allowing the CLI to open the database.
 marker="SELECT count(*) FROM index_state WHERE jsonl_path = '__app_last_successful_build__'"
 until [[ $(sqlite3 -readonly "$database" "$marker" 2>/dev/null) == 1 ]]; do
   if ! kill -0 "$desktop_pid" 2>/dev/null; then
@@ -53,16 +58,22 @@ until [[ $(sqlite3 -readonly "$database" "$marker" 2>/dev/null) == 1 ]]; do
   sleep 0.2
 done
 
-cat >"$work/query.mjs" <<'JS'
-return sql("SELECT text FROM messages WHERE EXISTS (SELECT 1 FROM index_state WHERE jsonl_path = '__app_last_successful_build__')")[0]?.text;
-JS
+# A CLI pointed at its own database could index the same fixture. Require the
+# desktop-only marker in the query run by both readers.
+query="SELECT text FROM messages WHERE session_id = '$session' AND uuid = 'e895cf23-a540-4481-b1d3-9d13799d33e6' AND ($marker) = 1"
+expected='Reply with exactly: ok'
+if [[ $(sqlite3 -readonly "$database" "$query") != "$expected" ]]; then
+  echo "Desktop completed its index without the expected Claude message" >&2
+  exit 1
+fi
+printf 'return sql("%s")[0]?.text;\n' "$query" >"$work/query.mjs"
 result=$("${isolated[@]}" timeout 30 "$cli" --query "$work/query.mjs")
-if [[ $result != '"Reply with exactly: ok"' ]]; then
+if [[ $result != "\"$expected\"" ]]; then
   echo "Expected the installed CLI to retrieve the desktop-indexed Claude message, received: $result" >&2
   exit 1
 fi
 
-# Read the updater state from the running renderer through the shipped preload.
+# Verify Vue mounted the shipped UI, then query its updater through the preload.
 timeout 100 node --input-type=module - "$work/user-data/DevToolsActivePort" <<'JS'
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -86,7 +97,7 @@ async function rendererPage() {
   }
 }
 
-async function verifyUpdatesDisabled(page) {
+async function verifyRenderer(page) {
   const socket = new WebSocket(page.webSocketDebuggerUrl);
   let timer;
   try {
@@ -95,7 +106,11 @@ async function verifyUpdatesDisabled(page) {
       timer = setTimeout(() => resolve(null), 10_000);
       socket.onclose = socket.onerror = () => resolve(null);
       socket.onopen = () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate',
-        params: { expression: 'window.obelisk.getUpdateState()', awaitPromise: true, returnByValue: true } }));
+        params: {
+          expression: `document.querySelector('#app main') && document.querySelector('#app aside')
+            ? window.obelisk.getUpdateState() : null`,
+          awaitPromise: true, returnByValue: true,
+        } }));
       socket.onmessage = event => {
         const message = JSON.parse(event.data);
         if (message.id === 1) resolve(message);
@@ -104,6 +119,7 @@ async function verifyUpdatesDisabled(page) {
     if (!response) return false;
     const { error, result } = response;
     if (error || result.exceptionDetails) throw new Error(JSON.stringify(error || result.exceptionDetails));
+    if (result.result.value === null) return false;
     assert.equal(result.result.value.phase, 'disabled');
     assert.equal(result.result.value.backend, null);
     return true;
@@ -119,10 +135,10 @@ while (true) {
   const page = await rendererPage();
   if (page) {
     foundPage = true;
-    if (await verifyUpdatesDisabled(page)) break;
+    if (await verifyRenderer(page)) break;
   }
   if (Date.now() >= deadline) {
-    throw new Error(foundPage ? 'Installed renderer did not return its updater state'
+    throw new Error(foundPage ? 'Installed renderer did not mount its UI and return its updater state'
       : 'Installed renderer did not appear in DevTools targets');
   }
   await delay(200);

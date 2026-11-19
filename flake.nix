@@ -27,7 +27,7 @@
           default = cli;
         }
         // nixpkgs.lib.optionalAttrs (builtins.elem system desktopSystems) {
-          app = pkgs.callPackage ./nix/app.nix { };
+          app = pkgs.callPackage ./nix/app.nix { inherit desktopSystems; };
         }
       );
 
@@ -51,9 +51,6 @@
                 ];
               }
               ''
-                skill=${packages.cli}/share/skills/obelisk/obelisk
-                cmp ${./skill-doc/SKILL.md} "$skill/SKILL.md"
-                diff -r ${./skill-doc/references} "$skill/references"
                 ${
                   if pkgs.stdenv.hostPlatform.isDarwin then
                     ''
@@ -63,7 +60,8 @@
                     ''
                       export FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}
                       xvfb-run -a bash ${./nix/check-desktop.sh} \
-                        ${packages.app}/bin/obelisk-app ${packages.cli}/bin/obelisk ${./tests/fixtures/claude/custom-title-session.jsonl}
+                        ${packages.app}/bin/obelisk-app ${packages.cli}/bin/obelisk ${./tests/fixtures/claude/custom-title-session.jsonl} \
+                        ${nixpkgs.lib.getExe packages.app.electron}
                     ''
                 }
                 touch "$out"

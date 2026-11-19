@@ -1,20 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import type { UpdateBackend, UpdateEvent, UpdateState } from '../shared/update-types.ts';
-
-export async function hasPackageUpdateChannel(platform: NodeJS.Platform, arch: string, resourcesPath: string): Promise<boolean> {
-  if (platform !== 'darwin' && !(platform === 'linux' && arch === 'x64')) return false;
-  try {
-    const type = (await readFile(join(resourcesPath, 'package-type'), 'utf8')).trim();
-    return platform === 'darwin' ? type !== 'nix' : type === 'deb';
-  } catch (error) {
-    // Upstream macOS bundles have no package-type marker.
-    return platform === 'darwin' && (error as NodeJS.ErrnoException).code === 'ENOENT';
-  }
-}
 
 function stableParts(version: unknown): number[] | null {
   if (typeof version !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) return null;

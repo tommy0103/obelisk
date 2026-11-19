@@ -4,26 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { makeTempDir } from './temp-dirs.mjs';
-import { createUpdateService, hasPackageUpdateChannel, isNewerStable } from '../app/src/main/update-service.ts';
+import { createUpdateService, isNewerStable } from '../app/src/main/update-service.ts';
 import { createUpdateLifecycle } from '../app/src/main/update-lifecycle.ts';
-
-test('Nix manages updates on both Mac architectures while release bundles keep their update channel', async () => {
-  const resources = makeTempDir('obelisk-update-channel-');
-  const marker = join(resources, 'package-type');
-  for (const arch of ['arm64', 'x64']) assert.equal(await hasPackageUpdateChannel('darwin', arch, resources), true);
-  assert.equal(await hasPackageUpdateChannel('linux', 'x64', resources), false);
-
-  await writeFile(marker, 'nix\n');
-  for (const arch of ['arm64', 'x64']) assert.equal(await hasPackageUpdateChannel('darwin', arch, resources), false);
-  assert.equal(await hasPackageUpdateChannel('linux', 'x64', resources), false);
-
-  await writeFile(marker, 'deb\n');
-  assert.equal(await hasPackageUpdateChannel('linux', 'x64', resources), true);
-  assert.equal(await hasPackageUpdateChannel('linux', 'arm64', resources), false);
-});
 
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 function harness(options = {}) {

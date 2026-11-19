@@ -3,8 +3,10 @@
   buildNpmPackage,
   copyDesktopItems,
   darwin,
+  desktopSystems,
   electron_43-bin,
   importNpmLock,
+  jq,
   makeDesktopItem,
   makeWrapper,
   nodejs_22,
@@ -16,13 +18,26 @@ let
   inherit (stdenv.hostPlatform) isDarwin;
   lockedElectron = (lib.importJSON ../app/package-lock.json).packages."node_modules/electron".version;
 in
+# Use the pinned Nixpkgs runtime, allowing newer minor and patch releases
+# within Obelisk's locked Electron major.
 assert lib.assertMsg (
   lib.versions.major electron.version == lib.versions.major lockedElectron
-) "Update the Nix Electron package to match the major version in app/package-lock.json";
+  && lib.versionAtLeast electron.version lockedElectron
+) "Update the Nix Electron package to satisfy the locked Electron version within the same major";
 buildNpmPackage {
   pname = "obelisk-app";
   version = (lib.importJSON ../app/package.json).version;
-  src = ../.;
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../LICENSE
+      ../app
+      ../package.json
+      ../packages/adaptive-watcher
+      ../packages/core
+      ../tsconfig.json
+    ];
+  };
 
   nodejs = nodejs_22;
   npmRoot = "app";
@@ -30,19 +45,29 @@ buildNpmPackage {
   npmConfigHook = importNpmLock.npmConfigHook;
   # The locked better-sqlite3 and @parcel/watcher packages ship platform-specific Node-API bindings.
   npmRebuildFlags = [ "--ignore-scripts" ];
-  env.ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
+  env.OBELISK_DISABLE_UPDATER = "1";
+  disallowedReferences = [ nodejs_22 ];
 
   nativeBuildInputs = [
     makeWrapper
   ]
   ++ (if isDarwin then [ darwin.autoSignDarwinBinariesHook ] else [ copyDesktopItems ]);
 
-  preBuild =
-    "cd app\n"
-    + lib.optionalString isDarwin ''
-      # Nix owns updates. Omit the release-only Sparkle rebuild and framework copy.
-      npm pkg delete build.beforePack build.mac.extraFiles
-    '';
+  preBuild = ''
+    cd app
+    # Only Electron runs at runtime. Exclude build and CLI tools whose patched
+    # shebangs would otherwise retain the build host's Node inside app.asar.
+    ${jq}/bin/jq '
+      .build.files += [
+        "!**/node_modules/node-gyp/**",
+        "!**/node_modules/node-addon-api/tools/**",
+        "!**/node_modules/{electron-sparkle-updater,js-yaml,nopt,semver,which}/bin/**"
+      ]
+      | del(.build.beforePack | select(. == "scripts/sparkle-packaging.mjs"))
+      | del(.build.mac.extraFiles[]? | select(.from? == "node_modules/electron-sparkle-updater/native/vendor/Sparkle.framework"))
+    ' package.json > nix-package.json
+    mv nix-package.json package.json
+  '';
   npmBuildScript = "pack";
   npmBuildFlags = [
     "--"
@@ -62,7 +87,6 @@ buildNpmPackage {
       ''
         mkdir -p "$out/Applications"
         mv release/mac*/Obelisk.app "$out/Applications/"
-        echo nix > "$out/Applications/Obelisk.app/Contents/Resources/package-type"
         makeWrapper "$out/Applications/Obelisk.app/Contents/MacOS/Obelisk" "$out/bin/obelisk-app"
       ''
     else
@@ -89,15 +113,12 @@ buildNpmPackage {
     })
   ];
 
+  passthru = { inherit electron; };
   meta = {
     description = "Desktop app for browsing and indexing local coding-agent history";
     homepage = "https://github.com/tommy0103/obelisk";
     license = lib.licenses.agpl3Only;
     mainProgram = "obelisk-app";
-    platforms = [
-      "x86_64-linux"
-      "aarch64-darwin"
-      "x86_64-darwin"
-    ];
+    platforms = desktopSystems;
   };
 }

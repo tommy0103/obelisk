@@ -10,7 +10,16 @@
 buildNpmPackage {
   pname = "obelisk-cli";
   version = (lib.importJSON ../packages/cli/package.json).version;
-  src = ../.;
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../LICENSE
+      ../package.json
+      ../package-lock.json
+      ../packages
+      ../tsconfig.json
+    ];
+  };
 
   nodejs = nodejs_22;
   npmDeps = importNpmLock { npmRoot = ../.; };
@@ -39,6 +48,10 @@ buildNpmPackage {
     test "$("$out/bin/obelisk" --version)" = "$version"
     echo "return sql('SELECT COUNT(*) AS count FROM sessions')[0].count" > "$TMPDIR/query.mjs"
     test "$("$out/bin/obelisk" --query "$TMPDIR/query.mjs")" = 0
+    skillDir="$out/share/skills/obelisk/obelisk"
+    cmp ${../packaging/skill-package.json} "$skillDir/package.json"
+    cmp ${../skill-doc/SKILL.md} "$skillDir/SKILL.md"
+    diff -r ${../skill-doc/references} "$skillDir/references"
     runHook postInstallCheck
   '';
 
