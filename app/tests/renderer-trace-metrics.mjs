@@ -57,3 +57,10 @@ export function rendererTaskMetrics(traceEvents, startMark, endMark) {
   };
 }
 
+
+// Host noise only adds time, and on shared CI hosts it lands on single runs, so
+// a budget holds for the median of an odd number of samples.
+export function median(values) {
+  if (values.length % 2 === 0) throw new Error(`median needs an odd sample count, got ${values.length}`);
+  return [...values].sort((a, b) => a - b)[(values.length - 1) / 2];
+}
