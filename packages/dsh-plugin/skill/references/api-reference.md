@@ -98,6 +98,7 @@ Full-text search across all indexed message text using FTS5.
 | `text` | `string` | FTS5 query string |
 | `opts.limit` | `number` | Max results, default 20 |
 | `opts.sessionId` | `string` | Restrict to one session |
+| `opts.excludeSession` | `string` or `string[]` | Exclude session IDs in SQL before ranking and LIMIT; an empty array excludes nothing |
 | `opts.project` | `string` | SQL `LIKE` pattern over `sessions.project` |
 | `opts.projectPath` | `string` | Exact match on `sessions.project_path` |
 | `opts.contextLimit` | `number` | Temporal neighbors per hit, integer 0–6; default 6. Zero skips neighbor lookup |
