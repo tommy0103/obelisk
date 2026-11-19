@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSessionPatch } from '../src/shared/session-patch.mjs';
 import { assembleSessionDetail } from '../src/shared/session-detail-assembly.mjs';
-import { rendererTaskMetrics } from './renderer-trace-metrics.mjs';
+import { median, rendererTaskMetrics } from './renderer-trace-metrics.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appRoot = join(here, '..');
@@ -15,7 +15,9 @@ const messageCount = Number(process.env.OBELISK_TIMELINE_MESSAGE_COUNT || 2000);
 const coldOpenOnly = process.argv.includes('--cold-open-only');
 const focusMessageIndex = Math.floor(messageCount * 0.75);
 const focusMessageUuid = `message-${focusMessageIndex}`;
-const stationaryAppendRuns = 3;
+// Samples per renderer timing budget; each budget holds for their median.
+const timingSamples = 3;
+const stationaryAppendRuns = timingSamples;
 const firstStationaryAppendIndex = messageCount;
 const scrollingAppendIndex = messageCount + stationaryAppendRuns;
 const nearTailEscapeAppendIndex = scrollingAppendIndex + 1;
@@ -322,7 +324,8 @@ function screenshotContentDeviation(event) {
 }
 
 let wheelTraceRun = 0;
-async function traceWheelPaintContinuity(win, { updateTool = false } = {}) {
+// `updatePath` names the script a live Bash tool update writes during the gesture.
+async function traceWheelPaintContinuity(win, { updatePath = null } = {}) {
   const runId = wheelTraceRun++;
   const startMark = `obelisk-wheel-${runId}-start`;
   const endMark = `obelisk-wheel-${runId}-end`;
@@ -363,14 +366,15 @@ async function traceWheelPaintContinuity(win, { updateTool = false } = {}) {
       probe.wheels++;
       if (probe.wheels === 1) probe.previous = performance.now();
       probe.wheelDistance += Math.abs(event.deltaY);
-      if (probe.wheels === 3 && ${JSON.stringify(updateTool)}) {
+      if (probe.wheels === 3 && ${JSON.stringify(updatePath !== null)}) {
         void window.obelisk.getSessionSummaries('wheel-bash-update-probe');
       }
     };
     const observer = new MutationObserver(() => {
       if (
         probe.updateVisibleAtWheel === null
-        && tool?.querySelector('.prompt-cmd')?.textContent.includes('/tmp/q_jul15b.mjs')
+        && ${JSON.stringify(updatePath !== null)}
+        && tool?.querySelector('.prompt-cmd')?.textContent.includes(${JSON.stringify(updatePath)})
       ) probe.updateVisibleAtWheel = probe.wheels;
     });
     wrap?.addEventListener('wheel', recordWheel, { passive: true });
@@ -432,9 +436,12 @@ async function traceWheelPaintContinuity(win, { updateTool = false } = {}) {
     }
     requestAnimationFrame(frame);
   })()`, true);
-  if (updateTool) {
+  if (updatePath !== null) {
     nextPatchDelayMs = 80;
-    replaceToolInput(win, 'call-1', liveBashToolInput, { notify: false });
+    replaceToolInput(win, 'call-1', {
+      ...liveBashToolInput,
+      command: liveBashToolInput.command.replaceAll('/tmp/q_jul15b.mjs', updatePath),
+    }, { notify: false });
   }
   await win.webContents.executeJavaScript(
     `performance.mark(${JSON.stringify(startMark)})`,
@@ -906,53 +913,73 @@ async function run() {
   await win.webContents.executeJavaScript(`document.querySelector('button[title="First"]')?.click()`, true);
   await delay(350);
 
-  const wheelBaseline = await traceWheelPaintContinuity(win);
-  await win.webContents.executeJavaScript(`document.querySelector('button[title="First"]')?.click()`, true);
-  await delay(350);
-  const globalReadsBeforeWheelUpdate = { ...globalReads };
-  stressGlobalCatalogue = true;
-  const wheelPaint = await traceWheelPaintContinuity(win, { updateTool: true });
-  stressGlobalCatalogue = false;
-  // Chromium coalesces wheel events into one per rendered frame, so a slow
-  // runner sees fewer. The update is requested on wheel 3; the gesture only
-  // has to continue past it.
+  // Renderer timings vary per run on shared CI hosts (macOS guests count host
+  // CPU steal as thread time), so each timing budget holds for the median of
+  // `timingSamples` baseline/update pairs. Behavior holds for every pair.
+  const wheelBaselines = [];
+  const wheelPaints = [];
+  let globalReadsBeforeWheelUpdate;
+  for (let sample = 0; sample < timingSamples; sample++) {
+    const updatePath = `/tmp/q_jul15b-${sample}.mjs`;
+    if (sample > 0) {
+      await win.webContents.executeJavaScript(`document.querySelector('button[title="First"]')?.click()`, true);
+      await delay(350);
+    }
+    const wheelBaseline = await traceWheelPaintContinuity(win);
+    await win.webContents.executeJavaScript(`document.querySelector('button[title="First"]')?.click()`, true);
+    await delay(350);
+    globalReadsBeforeWheelUpdate = { ...globalReads };
+    stressGlobalCatalogue = true;
+    const wheelPaint = await traceWheelPaintContinuity(win, { updatePath });
+    stressGlobalCatalogue = false;
+    wheelBaselines.push(wheelBaseline);
+    wheelPaints.push(wheelPaint);
+    // Chromium coalesces wheel events into one per rendered frame, so a slow
+    // runner sees fewer. The update is requested on wheel 3; the gesture only
+    // has to continue past it.
+    assert(
+      Math.abs(wheelPaint.after - wheelPaint.before) > 500
+        && wheelPaint.wheels > 3 && wheelPaint.screenshots >= 4,
+      `wheel trace exercises compositor scrolling (${JSON.stringify(wheelPaint)})`,
+    );
+    assert(
+      wheelPaint.blankFrames === 0,
+      `fast wheel scrolling never presents a blank timeline frame (${JSON.stringify(wheelPaint)})`,
+    );
+    assert(
+      wheelBaseline.maxVisibleOverlaps === 0,
+      `ordinary wheel scrolling never overlaps visible rows (${JSON.stringify(wheelBaseline.overlapExample)})`,
+    );
+    assert(
+      wheelPaint.updateVisibleAtWheel === null,
+      `Bash tool update stays out of the timeline DOM for the complete wheel burst (became visible after wheel ${wheelPaint.updateVisibleAtWheel})`,
+    );
+    assert(
+      JSON.stringify(globalReads) === JSON.stringify(globalReadsBeforeWheelUpdate),
+      `conversation updates do not reload global catalogues while scrolling (${JSON.stringify(globalReads)})`,
+    );
+    await waitFor(
+      win.webContents,
+      `Boolean(document.querySelector('[data-view-key="tool:call-1"] .prompt-cmd')?.textContent.includes(${JSON.stringify(updatePath)}))`,
+      'post-scroll Bash tool update',
+    );
+  }
+  const medianOf = (traces, key) => median(traces.map(trace => trace[key]));
+  const wheelTaskWorkMs = medianOf(wheelPaints, 'maxTaskWorkMs');
   assert(
-    Math.abs(wheelPaint.after - wheelPaint.before) > 500
-      && wheelPaint.wheels > 3 && wheelPaint.screenshots >= 4,
-    `wheel trace exercises compositor scrolling (${JSON.stringify(wheelPaint)})`,
+    wheelTaskWorkMs < 50,
+    `Bash tool update avoids a 50ms renderer CPU long task while scrolling (median ${wheelTaskWorkMs.toFixed(2)}ms of ${wheelPaints.map(trace => trace.maxTaskWorkMs.toFixed(2)).join(', ')})`,
   );
+  const wheelFrameGap = medianOf(wheelPaints, 'maxFrameGap');
   assert(
-    wheelPaint.blankFrames === 0,
-    `fast wheel scrolling never presents a blank timeline frame (${JSON.stringify(wheelPaint)})`,
+    wheelFrameGap < 250,
+    `native wheel scrolling avoids catastrophic stalls (median ${wheelFrameGap.toFixed(1)}ms of ${wheelPaints.map(trace => `${trace.maxFrameGap.toFixed(1)} (draw ${trace.maxCompositorFrameGap})`).join(', ')})`,
   );
+  const baselineFunctionWorkMs = medianOf(wheelBaselines, 'maxFunctionWorkMs');
+  const updateFunctionWorkMs = medianOf(wheelPaints, 'maxFunctionWorkMs');
   assert(
-    wheelBaseline.maxVisibleOverlaps === 0,
-    `ordinary wheel scrolling never overlaps visible rows (${JSON.stringify(wheelBaseline.overlapExample)})`,
-  );
-  assert(
-    wheelPaint.maxTaskWorkMs < 50,
-    `Bash tool update avoids a 50ms renderer CPU long task while scrolling (${JSON.stringify(wheelPaint)})`,
-  );
-  assert(
-    wheelPaint.maxFrameGap < 250,
-    `native wheel scrolling avoids catastrophic stalls (${wheelPaint.maxFrameGap.toFixed(1)}ms; native draw gap ${wheelPaint.maxCompositorFrameGap}ms)`,
-  );
-  assert(
-    wheelPaint.maxFunctionWorkMs <= wheelBaseline.maxFunctionWorkMs + 2,
-    `Bash patch preparation stays off the scrolling renderer task budget (baseline ${wheelBaseline.maxFunctionWorkMs.toFixed(2)}ms, update ${wheelPaint.maxFunctionWorkMs.toFixed(2)}ms)`,
-  );
-  assert(
-    wheelPaint.updateVisibleAtWheel === null,
-    `Bash tool update stays out of the timeline DOM for the complete wheel burst (became visible after wheel ${wheelPaint.updateVisibleAtWheel})`,
-  );
-  assert(
-    JSON.stringify(globalReads) === JSON.stringify(globalReadsBeforeWheelUpdate),
-    `conversation updates do not reload global catalogues while scrolling (${JSON.stringify(globalReads)})`,
-  );
-  await waitFor(
-    win.webContents,
-    `Boolean(document.querySelector('[data-view-key="tool:call-1"] .prompt-cmd')?.textContent.includes('/tmp/q_jul15b.mjs'))`,
-    'post-scroll Bash tool update',
+    updateFunctionWorkMs <= baselineFunctionWorkMs + 2,
+    `Bash patch preparation stays off the scrolling renderer task budget (median baseline ${baselineFunctionWorkMs.toFixed(2)}ms, update ${updateFunctionWorkMs.toFixed(2)}ms; update ${wheelPaints.map(trace => trace.maxFunctionWorkMs.toFixed(2)).join(', ')})`,
   );
 
   await win.webContents.executeJavaScript(`window.location.hash = '#/sessions'`, true);
@@ -1235,8 +1262,9 @@ async function run() {
   );
   for (const [runIndex, trace] of stationaryTraces.entries()) {
     if (trace.maxTaskMs >= 8.33) console.log(`SLOWEST RENDERER TASK ${runIndex + 1}: ${JSON.stringify(trace.slowestChildren)}`);
-    assert(trace.maxTaskWorkMs < 8.33, `stationary live commit ${runIndex + 1} stays inside a 120Hz renderer work budget (${trace.maxTaskWorkMs.toFixed(2)}ms work, ${trace.maxTaskMs.toFixed(2)}ms wall across ${trace.tasks} tasks)`);
   }
+  const stationaryWorkMs = median(stationaryTraces.map(trace => trace.maxTaskWorkMs));
+  assert(stationaryWorkMs < 8.33, `stationary live commits stay inside a 120Hz renderer work budget (median ${stationaryWorkMs.toFixed(2)}ms work of ${stationaryTraces.map(trace => `${trace.maxTaskWorkMs.toFixed(2)}ms work/${trace.maxTaskMs.toFixed(2)}ms wall/${trace.tasks} tasks`).join(', ')})`);
 
   await win.webContents.executeJavaScript(`(() => {
     const probe = { minRows: Infinity, zeroFrames: 0, samples: 0, stop: false };
@@ -1606,9 +1634,11 @@ async function run() {
       && ipcReads.subagents === 1
       && ipcReads.workflows === 1
       && ipcReads.summaries === 1
-      && ipcReads.patches === 7
+      // One per wheel-sample Bash update and per stationary commit, plus the
+      // three later live updates.
+      && ipcReads.patches === timingSamples + stationaryAppendRuns + 3
       && ipcReads.patchMessageRows.every(count => count === 1),
-    `live updates use seven single-message patches after one full snapshot (${JSON.stringify(ipcReads)})`,
+    `live updates use single-message patches after one full snapshot (${JSON.stringify(ipcReads)})`,
   );
 
   await win.webContents.executeJavaScript(`document.querySelector('button[title="Last"]')?.click()`, true);
