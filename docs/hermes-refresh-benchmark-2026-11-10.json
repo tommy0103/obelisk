@@ -1,0 +1,257 @@
+{
+  "node": "v22.23.3",
+  "sqlite": "3.51.3",
+  "machine": {
+    "platform": "darwin",
+    "release": "24.4.0",
+    "cpu": "Apple M3 Max",
+    "cores": 16,
+    "totalMemory": 137438953472,
+    "freeMemory": 30411997184
+  },
+  "workload": {
+    "sessions": 2500,
+    "messages": 160000,
+    "contentBytes": 9000,
+    "sourceBytes": 1484644352,
+    "runs": 3,
+    "schema": "checked-in Hermes store shape, version32; generated content"
+  },
+  "method": "Real built CLI process wall time, known indexed invocation nonce. A private __last_build__ row is removed before due-refresh samples to exercise refresh rather than the baseline30s debounce. Immediate-repeat samples leave it intact. No production store/index is used. Normal-worker results are separate compiled Core API calls, not CLI timing claims.",
+  "variants": [
+    {
+      "name": "baseline",
+      "samples": [
+        {
+          "phase": "unchanged_due_query",
+          "run": 0,
+          "ms": 4503.068082999998,
+          "count": 160000
+        },
+        {
+          "phase": "immediate_repeat_query",
+          "run": 0,
+          "ms": 118.06795799999963,
+          "count": 160000
+        },
+        {
+          "phase": "mixed_append_edit_query",
+          "run": 0,
+          "ms": 2873.52895800001,
+          "count": 160001
+        },
+        {
+          "phase": "real_search",
+          "run": 0,
+          "ms": 2545.6575830000074,
+          "count": null
+        },
+        {
+          "phase": "checkpoint_only_query",
+          "run": 0,
+          "ms": 2614.8095420000027,
+          "count": 160001
+        },
+        {
+          "phase": "unchanged_due_query",
+          "run": 1,
+          "ms": 136.53516699999454,
+          "count": 160001
+        },
+        {
+          "phase": "immediate_repeat_query",
+          "run": 1,
+          "ms": 107.97474999999395,
+          "count": 160001
+        },
+        {
+          "phase": "mixed_append_edit_query",
+          "run": 1,
+          "ms": 2856.3126249999914,
+          "count": 160002
+        },
+        {
+          "phase": "real_search",
+          "run": 1,
+          "ms": 2826.8443750000006,
+          "count": null
+        },
+        {
+          "phase": "checkpoint_only_query",
+          "run": 1,
+          "ms": 4437.906749999995,
+          "count": 160002
+        },
+        {
+          "phase": "unchanged_due_query",
+          "run": 2,
+          "ms": 130.81116700000712,
+          "count": 160002
+        },
+        {
+          "phase": "immediate_repeat_query",
+          "run": 2,
+          "ms": 106.67208299999766,
+          "count": 160002
+        },
+        {
+          "phase": "mixed_append_edit_query",
+          "run": 2,
+          "ms": 2670.9885829999985,
+          "count": 160003
+        },
+        {
+          "phase": "real_search",
+          "run": 2,
+          "ms": 2637.061540999988,
+          "count": null
+        },
+        {
+          "phase": "checkpoint_only_query",
+          "run": 2,
+          "ms": 2627.0127090000024,
+          "count": 160003
+        }
+      ],
+      "coldBuildMs": 25469.315959,
+      "normal": [
+        {
+          "run": 0,
+          "ms": 2727.063458,
+          "payloadReads": 2500,
+          "complete": true
+        },
+        {
+          "run": 1,
+          "ms": 2609.208042,
+          "payloadReads": 2500,
+          "complete": true
+        },
+        {
+          "run": 2,
+          "ms": 2646.4257500000003,
+          "payloadReads": 2500,
+          "complete": true
+        }
+      ]
+    },
+    {
+      "name": "repair",
+      "samples": [
+        {
+          "phase": "unchanged_due_query",
+          "run": 0,
+          "ms": 2779.7244590000046,
+          "count": 160000
+        },
+        {
+          "phase": "immediate_repeat_query",
+          "run": 0,
+          "ms": 132.79108400001132,
+          "count": 160000
+        },
+        {
+          "phase": "mixed_append_edit_query",
+          "run": 0,
+          "ms": 2591.393665999989,
+          "count": 160001
+        },
+        {
+          "phase": "real_search",
+          "run": 0,
+          "ms": 189.8394999999873,
+          "count": null
+        },
+        {
+          "phase": "checkpoint_only_query",
+          "run": 0,
+          "ms": 2536.651417000001,
+          "count": 160001
+        },
+        {
+          "phase": "unchanged_due_query",
+          "run": 1,
+          "ms": 141.1322499999951,
+          "count": 160001
+        },
+        {
+          "phase": "immediate_repeat_query",
+          "run": 1,
+          "ms": 137.44458300000406,
+          "count": 160001
+        },
+        {
+          "phase": "mixed_append_edit_query",
+          "run": 1,
+          "ms": 2638.7397499999934,
+          "count": 160002
+        },
+        {
+          "phase": "real_search",
+          "run": 1,
+          "ms": 189.84604200000467,
+          "count": null
+        },
+        {
+          "phase": "checkpoint_only_query",
+          "run": 1,
+          "ms": 2520.5780830000003,
+          "count": 160002
+        },
+        {
+          "phase": "unchanged_due_query",
+          "run": 2,
+          "ms": 1874.5961249999964,
+          "count": 160002
+        },
+        {
+          "phase": "immediate_repeat_query",
+          "run": 2,
+          "ms": 133.5633749999979,
+          "count": 160002
+        },
+        {
+          "phase": "mixed_append_edit_query",
+          "run": 2,
+          "ms": 2562.3384159999987,
+          "count": 160003
+        },
+        {
+          "phase": "real_search",
+          "run": 2,
+          "ms": 192.28329099999974,
+          "count": null
+        },
+        {
+          "phase": "checkpoint_only_query",
+          "run": 2,
+          "ms": 2465.075457999992,
+          "count": 160003
+        }
+      ],
+      "coldBuildMs": 24449.062334,
+      "normal": [
+        {
+          "run": 0,
+          "ms": 323.039792,
+          "payloadReads": 64,
+          "complete": true
+        },
+        {
+          "run": 1,
+          "ms": 235.606625,
+          "payloadReads": 65,
+          "complete": true
+        },
+        {
+          "run": 2,
+          "ms": 244.74974999999998,
+          "payloadReads": 65,
+          "complete": true
+        }
+      ]
+    }
+  ],
+  "baselineCommit": "cc75c2dd1aead4f4374758a7536385307934e177",
+  "repairCodeCommit": "4d26a2244da56880d388e62f13717e121a58dc24"
+}
