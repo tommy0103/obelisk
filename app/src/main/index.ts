@@ -18,7 +18,7 @@ import { isSameDocumentNavigation, isSameOrigin, safeProtocol } from './window-n
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, resolveFileReference } from './file-reference.ts';
 import { createDeferredQuit } from './quit-teardown.ts';
 import { createUpdateLifecycle } from './update-lifecycle.ts';
-import { createUpdateService } from './update-service.ts';
+import { createUpdateService, hasPackageUpdateChannel } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
@@ -481,13 +481,8 @@ const updateLifecycle = createUpdateLifecycle({
   stop: () => stopBackgroundResources({ stopWorker: true }),
   resume: () => { if (!appQuitRequested) startBackgroundResources({ watchSources: loadPersistedSettings().autoRefresh !== false }); },
 });
-// Only the shipped amd64 Debian target has a verified Linux update channel.
-// AppImage/source builds and other architectures must not consume its feed.
-const isDebInstall = app.isPackaged && process.platform === 'linux' && process.arch === 'x64' &&
-  await fs.promises.readFile(path.join(process.resourcesPath, 'package-type'), 'utf8')
-    .then(value => value.trim() === 'deb', () => false);
 const updater = createUpdateService({
-  enabled: app.isPackaged === true && (process.platform === 'darwin' || isDebInstall),
+  enabled: app.isPackaged === true && await hasPackageUpdateChannel(process.platform, process.arch, process.resourcesPath),
   version: app.getVersion(),
   createBackend: async receive => {
     const { createMacUpdateBackend, createDebUpdateBackend } = await import('./update-backends.ts');

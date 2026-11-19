@@ -6,11 +6,13 @@
   outputs =
     { self, nixpkgs }:
     let
-      systems = [
+      # Desktop targets shipped by .github/workflows/release-app.yml.
+      desktopSystems = [
         "x86_64-linux"
-        "aarch64-linux"
         "aarch64-darwin"
+        "x86_64-darwin"
       ];
+      systems = desktopSystems ++ [ "aarch64-linux" ];
     in
     {
       packages = nixpkgs.lib.genAttrs systems (
@@ -24,7 +26,7 @@
           inherit cli skill;
           default = cli;
         }
-        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        // nixpkgs.lib.optionalAttrs (builtins.elem system desktopSystems) {
           app = pkgs.callPackage ./nix/app.nix { };
         }
       );
@@ -42,7 +44,8 @@
           packaging =
             pkgs.runCommand "obelisk-packaging-check"
               {
-                nativeBuildInputs = [
+                nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                  pkgs.nodejs_22
                   pkgs.sqlite
                   pkgs.xvfb-run
                 ];
@@ -51,8 +54,17 @@
                 skill=${packages.cli}/share/skills/obelisk/obelisk
                 cmp ${./skill-doc/SKILL.md} "$skill/SKILL.md"
                 diff -r ${./skill-doc/references} "$skill/references"
-                xvfb-run -a bash ${./nix/check-desktop.sh} \
-                  ${packages.app}/bin/obelisk-app ${packages.cli}/bin/obelisk ${./tests/fixtures/claude/custom-title-session.jsonl}
+                ${
+                  if pkgs.stdenv.hostPlatform.isDarwin then
+                    ''
+                      test -x ${packages.app}/Applications/Obelisk.app/Contents/MacOS/Obelisk
+                    ''
+                  else
+                    ''
+                      xvfb-run -a bash ${./nix/check-desktop.sh} \
+                        ${packages.app}/bin/obelisk-app ${packages.cli}/bin/obelisk ${./tests/fixtures/claude/custom-title-session.jsonl}
+                    ''
+                }
                 touch "$out"
               '';
         }

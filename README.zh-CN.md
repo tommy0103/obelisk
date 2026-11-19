@@ -83,18 +83,24 @@ obelisk install
 #### 用 Nix 安装
 
 在你的 flake 中加入 `inputs.obelisk.url = "github:tommy0103/obelisk";`。
-`cli`（也是 `default`）提供 `obelisk` 命令，`skill` 提供检索文档。
-`x86_64-linux` 上还可以安装 `app`，用 `obelisk-app` 启动桌面应用。
-这三个包都来自 `flake.lock` 锁定的同一个 Git 提交。
+`cli`（也是 `default`）提供 `obelisk` 命令，`skill` 提供检索文档，
+`app` 提供桌面启动命令 `obelisk-app`。三个包都来自 `flake.lock` 锁定的同一个 Git 提交。
 
-下面的 Home Manager 模块假设已传入 `inputs` 和 `pkgs`。它会安装桌面应用和
-CLI，并把检索 skill 链接到 Pi 的技能目录。
+| Nix 系统 | 可用包 |
+| --- | --- |
+| `x86_64-linux`、`aarch64-darwin`、`x86_64-darwin` | `app`、`cli`、`skill` |
+| `aarch64-linux` | `cli`、`skill` |
+
+在 Windows 上可以用上面的 npm 命令安装原生 CLI。在 WSL 中使用 Nix 时，按对应的 Linux 架构选择包。
+
+下面的 Home Manager 模块假设已传入 `inputs` 和 `pkgs`。它会安装 CLI，把检索 skill
+链接到 Pi 的技能目录，并在有 `app` 包的平台上安装桌面应用。
 
 ```nix
 let
   obelisk = inputs.obelisk.packages.${pkgs.stdenv.hostPlatform.system};
 in {
-  home.packages = [ obelisk.app obelisk.cli ];
+  home.packages = [ obelisk.cli ] ++ pkgs.lib.optional (obelisk ? app) obelisk.app;
   home.file.".pi/agent/skills/obelisk".source =
     "${obelisk.cli}/share/skills/obelisk/obelisk";
 }

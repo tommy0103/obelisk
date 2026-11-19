@@ -94,20 +94,27 @@ rebuilds incrementally.
 #### Install with Nix
 
 Add `inputs.obelisk.url = "github:tommy0103/obelisk";` to your flake.
-Its `cli` (also `default`) package provides the `obelisk` command, and
-`skill` contains the retrieval docs. On `x86_64-linux`, `app` provides
-the `obelisk-app` desktop launcher. All three use the revision in your
-`flake.lock`.
+The `cli` package (also `default`) provides `obelisk`, `skill` contains the
+retrieval docs, and `app` provides the `obelisk-app` desktop launcher. All
+three use the revision in your `flake.lock`.
 
-This Home Manager example installs the desktop app and CLI and links the
-retrieval skill into Pi's skill directory. It assumes `inputs` and `pkgs`
-are in scope.
+| Nix system | Packages |
+| --- | --- |
+| `x86_64-linux`, `aarch64-darwin`, `x86_64-darwin` | `app`, `cli`, `skill` |
+| `aarch64-linux` | `cli`, `skill` |
+
+On Windows, install the native CLI with npm as shown above. Nix inside WSL
+uses the corresponding Linux packages.
+
+This Home Manager example installs the CLI, links the retrieval skill into
+Pi's skill directory, and adds the desktop app where available. It assumes
+`inputs` and `pkgs` are in scope.
 
 ```nix
 let
   obelisk = inputs.obelisk.packages.${pkgs.stdenv.hostPlatform.system};
 in {
-  home.packages = [ obelisk.app obelisk.cli ];
+  home.packages = [ obelisk.cli ] ++ pkgs.lib.optional (obelisk ? app) obelisk.app;
   home.file.".pi/agent/skills/obelisk".source =
     "${obelisk.cli}/share/skills/obelisk/obelisk";
 }
