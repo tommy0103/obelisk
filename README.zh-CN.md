@@ -80,6 +80,29 @@ obelisk install
 装完后在任意 agent 会话里直接 `/obelisk <你的问题>`。第一次运行会建索引
 （100 个会话大约 5 秒），之后都是增量更新。
 
+#### 用 Nix 安装
+
+在你的 flake 中加入 `inputs.obelisk.url = "github:tommy0103/obelisk";`。
+`cli`（也是 `default`）提供 `obelisk` 命令，`skill` 提供检索文档。
+`x86_64-linux` 上还可以安装 `app`，用 `obelisk-app` 启动桌面应用。
+这三个包都来自 `flake.lock` 锁定的同一个 Git 提交。
+
+下面的 Home Manager 模块假设已传入 `inputs` 和 `pkgs`。它会安装桌面应用和
+CLI，并把检索 skill 链接到 Pi 的技能目录。
+
+```nix
+let
+  obelisk = inputs.obelisk.packages.${pkgs.stdenv.hostPlatform.system};
+in {
+  home.packages = [ obelisk.app obelisk.cli ];
+  home.file.".pi/agent/skills/obelisk".source =
+    "${obelisk.cli}/share/skills/obelisk/obelisk";
+}
+```
+
+如果使用其他 agent，把链接的目标位置换成它的技能目录即可。需要升级时，在配置
+目录运行 `nix flake update obelisk` 并重新应用配置，三者会一起更新。
+
 ### 工作原理
 
 ```text
