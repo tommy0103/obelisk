@@ -1,0 +1,5 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-03T10:00:00Z","content":"<USER_REQUEST>\nExample request b1.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nExample request b2.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nExample request b3.\n</USER_SETTINGS_CHANGE>"}
+{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-03T10:00:07Z","input_tokens":18763,"cache_read_tokens":19865,"output_tokens":150,"tool_calls":[{"name":"read_url_content","args":{"Url":"Example value b4.","toolAction":"Example value b5.","toolSummary":"Example value b6."}},{"name":"read_url_content","args":{"Url":"Example value b7.","toolAction":"Example value b8.","toolSummary":"Example value b9."}}]}
+{"step_index":8,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-01-03T10:00:14Z","content":"Example output b10."}
+{"step_index":9,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-01-03T10:00:21Z","content":"Example output b11."}
+{"step_index":11,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-01-03T10:00:28Z","content":"Example output b12.\n"}

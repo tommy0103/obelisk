@@ -1,6 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { createAntigravityProvider, type AntigravityDatabaseOpener } from './antigravity.ts';
 import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
 import { createCodexHostAntigravityProvider } from './codexhost-antigravity.ts';
@@ -30,6 +31,7 @@ export function createBuiltinProviderRegistry(
     openKiroDatabase,
     openOpencodeDatabase,
     openDevinDatabase,
+    openAntigravityDatabase,
   }: {
     homeDir?: string;
     cwd?: string;
@@ -40,9 +42,11 @@ export function createBuiltinProviderRegistry(
     openKiroDatabase?: KiroDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
     openDevinDatabase?: DevinDatabaseOpener;
+    openAntigravityDatabase?: AntigravityDatabaseOpener;
   } = {},
 ): ProviderRegistry {
   return createProviderRegistry([
+    createAntigravityProvider({ rootDir: roots['antigravity'], homeDir, openDatabase: openAntigravityDatabase }),
     createClaudeProvider({ rootDir: roots['claude'] }),
     createCodexProvider({ rootDir: roots['codex'] }),
     createCodexHostAntigravityProvider({ rootDir: roots['codexhost-antigravity'] }),

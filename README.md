@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Devin, Hermes Agent, Kiro, Kimi Code, OMP, OpenCode, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
+Past Antigravity, Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Devin, Hermes Agent, Kiro, Kimi Code, OMP, OpenCode, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
 
 **English** · [中文](README.zh-CN.md)
 
@@ -180,6 +180,7 @@ non-Claude IDs are provider-prefixed so they cannot collide.
 
 | Provider | Default source |
 | --- | --- |
+| Antigravity | `~/.gemini/antigravity/brain/*/.system_generated/logs`; titles, workspaces and sub-agent origin from `conversation_summaries.db` |
 | Claude Code | `~/.claude/projects` |
 | Codex | `~/.codex/sessions`, `~/.codex/archived_sessions` |
 | GitHub Copilot | VS Code `User` data roots (Chronicle store + workspace transcripts) |
@@ -206,6 +207,7 @@ rows that normal queries omit; supported query helpers can opt in with
 | Hermes Agent | Superseded history is not split: compaction-archived and rewound rows are both stored as `inactive` |
 | OpenCode | Session revert state attests inactive history |
 | Devin | Messages no live chain reaches (rewound turns, compacted history) are inactive |
+| Antigravity | The step log does not attest rewind; compaction checkpoints are kept as `compaction` rows and earlier steps stay active |
 | Claude Code | The source does not attest rewind or current-leaf state |
 | Codex | Sessions have no branching semantics |
 
