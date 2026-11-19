@@ -14,6 +14,7 @@ import { assertHarnessConformance, harnessContractProblems } from './harness-con
 // The fixtures and the layout a
 // provider expects live with that provider's tests, so the check does too.
 const CHECKED_IN = {
+  antigravity: 'antigravity-provider.test.mjs',
   claude: 'claude-parse.test.mjs',
   codex: 'codex-parse.test.mjs',
   'codexhost-antigravity': 'codexhost-antigravity-provider.test.mjs',
