@@ -28,7 +28,7 @@ if [[ $(uname -s) == Darwin ]]; then
   # Exercise the bundle directly, including Finder's entry point and the native
   # Electron runtime. A translated Intel app could otherwise pass on arm64.
   arch=$(uname -m)
-  lipo -verify_arch "$arch" "$desktop"
+  lipo "$desktop" -verify_arch "$arch"
   runtime_arch=$("${isolated[@]}" ELECTRON_RUN_AS_NODE=1 timeout 10 "$desktop" -p process.arch)
   if [[ $runtime_arch != "${arch/x86_64/x64}" ]]; then
     echo "Packaged Electron runs as $runtime_arch on the $arch runner" >&2
@@ -36,9 +36,10 @@ if [[ $(uname -s) == Darwin ]]; then
   fi
 else
   isolated+=(DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY")
-  flags+=(--no-sandbox --ozone-platform=x11 --disable-dev-shm-usage)
+  if [[ -n ${FONTCONFIG_FILE:-} ]]; then isolated+=(FONTCONFIG_FILE="$FONTCONFIG_FILE"); fi
+  flags+=(--no-sandbox --ozone-platform=x11 --disable-gpu --disable-dev-shm-usage)
 fi
-"${isolated[@]}" timeout -k 5 60 "$desktop" "${flags[@]}" >"$work/desktop.log" 2>&1 &
+"${isolated[@]}" timeout -k 5 180 "$desktop" "${flags[@]}" >"$work/desktop.log" 2>&1 &
 desktop_pid=$!
 
 # The CLI can build an index itself. Wait for the desktop's own completed build
@@ -62,41 +63,68 @@ if [[ $result != '"Reply with exactly: ok"' ]]; then
 fi
 
 # Read the updater state from the running renderer through the shipped preload.
-timeout 20 node --input-type=module - "$work/user-data/DevToolsActivePort" <<'JS'
+timeout 100 node --input-type=module - "$work/user-data/DevToolsActivePort" <<'JS'
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 
-let page;
-while (!page) {
+async function rendererPage() {
   const portFile = await readFile(process.argv[2], 'utf8').catch(error => {
     if (error.code !== 'ENOENT') throw error;
     return '';
   });
   const port = portFile.split('\n')[0];
-  if (port) {
-    const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) });
-    page = (await response.json()).find(tab => tab.type === 'page' && tab.url.includes('/out/renderer/index.html'));
+  if (!port) return;
+  const signal = AbortSignal.timeout(10_000);
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal });
+    if (!response.ok) throw new Error(`DevTools target discovery returned HTTP ${response.status}`);
+    return (await response.json()).find(tab => tab.type === 'page' && tab.url.includes('/out/renderer/index.html'));
+  } catch (error) {
+    // Electron may publish the port before it accepts connections or responds.
+    if (!signal.aborted && !['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(error.cause?.code)) throw error;
   }
-  if (!page) await delay(100);
 }
-const socket = new WebSocket(page.webSocketDebuggerUrl);
-try {
-  const state = await new Promise((resolve, reject) => {
-    socket.onerror = () => reject(new Error('Failed to connect to the installed renderer'));
-    socket.onclose = () => reject(new Error('The installed renderer disconnected'));
-    socket.onopen = () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate',
-      params: { expression: 'window.obelisk.getUpdateState()', awaitPromise: true, returnByValue: true } }));
-    socket.onmessage = event => {
-      const { id, error, result } = JSON.parse(event.data);
-      if (id !== 1) return;
-      if (error || result.exceptionDetails) reject(new Error(JSON.stringify(error || result.exceptionDetails)));
-      else resolve(result.result.value);
-    };
-  });
-  assert.equal(state.phase, 'disabled');
-  assert.equal(state.backend, null);
-} finally {
-  socket.close();
+
+async function verifyUpdatesDisabled(page) {
+  const socket = new WebSocket(page.webSocketDebuggerUrl);
+  let timer;
+  try {
+    const response = await new Promise(resolve => {
+      // A renderer target may be replaced between discovery and attachment.
+      timer = setTimeout(() => resolve(null), 10_000);
+      socket.onclose = socket.onerror = () => resolve(null);
+      socket.onopen = () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate',
+        params: { expression: 'window.obelisk.getUpdateState()', awaitPromise: true, returnByValue: true } }));
+      socket.onmessage = event => {
+        const message = JSON.parse(event.data);
+        if (message.id === 1) resolve(message);
+      };
+    });
+    if (!response) return false;
+    const { error, result } = response;
+    if (error || result.exceptionDetails) throw new Error(JSON.stringify(error || result.exceptionDetails));
+    assert.equal(result.result.value.phase, 'disabled');
+    assert.equal(result.result.value.backend, null);
+    return true;
+  } finally {
+    clearTimeout(timer);
+    socket.close();
+  }
+}
+
+const deadline = Date.now() + 60_000;
+let foundPage = false;
+while (true) {
+  const page = await rendererPage();
+  if (page) {
+    foundPage = true;
+    if (await verifyUpdatesDisabled(page)) break;
+  }
+  if (Date.now() >= deadline) {
+    throw new Error(foundPage ? 'Installed renderer did not return its updater state'
+      : 'Installed renderer did not appear in DevTools targets');
+  }
+  await delay(200);
 }
 JS

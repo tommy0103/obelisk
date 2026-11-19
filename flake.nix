@@ -61,6 +61,7 @@
                     ''
                   else
                     ''
+                      export FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}
                       xvfb-run -a bash ${./nix/check-desktop.sh} \
                         ${packages.app}/bin/obelisk-app ${packages.cli}/bin/obelisk ${./tests/fixtures/claude/custom-title-session.jsonl}
                     ''
