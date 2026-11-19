@@ -534,6 +534,64 @@ test('wait helper returns null within the cap when the nonce never appears', () 
   assert.ok(Date.now() - startedAt < 2000, 'shrunk poll timings keep the test fast');
 });
 
+test('wait helper returns null without polling after a complete recovery build', () => {
+  const dir = makeTempDir('obelisk-invoking-complete-');
+  const dbPath = join(dir, 'obelisk.sqlite');
+  const seed = new DatabaseSync(dbPath);
+  seed.exec(SCHEMA);
+  seed.close();
+
+  // Reads: immediate lookup, schema gate, lookup after the build. Any more
+  // are poll ticks waiting for a writer that does not exist.
+  let reads = 0;
+  const result = resolveInvokingSessionIdWithWait('obq-never-indexed', null, {
+    openRead: () => { reads += 1; return new DatabaseSync(dbPath, { readOnly: true }); },
+    build: () => ({ skip: false, complete: true }),
+    pollIntervalMs: 5,
+    pollCapMs: 200,
+  });
+
+  assert.equal(result, null);
+  assert.equal(reads, 3);
+});
+
+for (const build of [
+  { skip: true, reason: 'writer_busy' },
+  { skip: true, complete: false, reason: 'database_busy' },
+  { skip: false, complete: false },
+]) {
+  test(`wait helper polls for another writer after the recovery build ends ${build.reason ?? 'incomplete'}`, () => {
+    const dir = makeTempDir('obelisk-invoking-contended-');
+    const dbPath = join(dir, 'obelisk.sqlite');
+    const seed = new DatabaseSync(dbPath);
+    seed.exec(SCHEMA);
+    seed.close();
+
+    let reads = 0;
+    const result = resolveInvokingSessionIdWithWait(NONCE, null, {
+      openRead: () => {
+        reads += 1;
+        if (reads === 5) {
+          // The other writer publishes the nonce during the second poll tick.
+          const db = new DatabaseSync(dbPath);
+          db.prepare('INSERT INTO messages (uuid, session_id, type, role, text, timestamp) VALUES (?,?,?,?,?,?)')
+            .run('msg-other', 'sid-self', 'assistant', 'assistant', null, new Date().toISOString());
+          db.prepare('INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json) VALUES (?,?,?,?,?)')
+            .run('call-other', 'msg-other', 'sid-self', 'Bash', JSON.stringify({ command: `obelisk --search "needle" --nonce ${NONCE}` }));
+          db.close();
+        }
+        return new DatabaseSync(dbPath, { readOnly: true });
+      },
+      build: () => build,
+      pollIntervalMs: 5,
+      pollCapMs: 2000,
+    });
+
+    assert.equal(result, 'sid-self');
+    assert.equal(reads, 5);
+  });
+}
+
 test('cli runs one incremental recovery build when the recent-build debounce skips the refresh', () => {
   const home = tempHome('obelisk-invoking-fresh-');
   const projectDir = join(home, '.claude', 'projects', '-tmp-fresh');
