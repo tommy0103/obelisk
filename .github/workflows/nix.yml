@@ -31,6 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
+      - name: Evaluate Home Manager component selection
+        run: nix eval --impure --file nix/check-home-manager.nix
       - run: nix flake check --no-update-lock-file --print-build-logs
       - name: Launch the installed macOS app and query its index
         if: runner.os == 'macOS'

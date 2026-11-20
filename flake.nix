@@ -15,6 +15,8 @@
       systems = desktopSystems ++ [ "aarch64-linux" ];
     in
     {
+      homeManagerModules.default = import ./nix/home-manager.nix self.packages;
+
       packages = nixpkgs.lib.genAttrs systems (
         system:
         let

@@ -106,6 +106,8 @@ three use the revision in your `flake.lock`.
 On Windows, install the native CLI with npm as shown above. Nix inside WSL
 uses the corresponding Linux packages.
 
+For a one-option installation, see the [Obelisk Home Manager module](nix/README.md).
+
 This Home Manager example installs the CLI, links the retrieval skill into
 Pi's skill directory, and adds the desktop app where available. It assumes
 `inputs` and `pkgs` are in scope.
