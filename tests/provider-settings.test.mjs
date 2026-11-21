@@ -289,7 +289,7 @@ test('providerRoots.codex accepts validated non-empty root arrays and rejects in
   // Saving unrelated settings preserves the configured codex array.
   assert.equal(setPersistedSetting(valid, 'editorScheme', 'cursor'), false);
   assert.equal(setPersistedSetting(valid, 'providerRoots.claude', '/custom/claude'), true);
-    assert.deepEqual(valid.providerRoots.codex, ['~/.codex', '~/profiles/codex-work', join(probeHomeDir, '.codex')]);
+  assert.deepEqual(valid.providerRoots.codex, ['~/.codex', '~/profiles/codex-work', join(probeHomeDir, '.codex')]);
 
   for (const invalidCodex of [[], [''], ['/valid', './relative'], [123]]) {
     const invalidRuntime = createConfiguredBuiltinProviderRuntime({
