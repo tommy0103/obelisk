@@ -8,11 +8,87 @@ fixture=$3
 electron=${4:-$desktop}
 work=$(mktemp -d)
 desktop_pid=
+desktop_status=
+crash_marker=$work/.crash-marker
+: >"$crash_marker"
+
+# Bash reduces a signalled background job to "Bus error: 10". Name the status so
+# a CI log states the reason instead of leaving it inside a job notification.
+report_exit() {
+  [[ -n $desktop_status ]] || return 0
+  if ((desktop_status > 128)); then
+    echo "The installed app died from SIG$(kill -l $((desktop_status - 128)) 2>/dev/null || echo $((desktop_status - 128))) (status $desktop_status)" >&2
+  else
+    echo "The installed app exited with status $desktop_status" >&2
+  fi
+}
+
+# The crash reporter writes to the passwd home, not to the disposable $HOME, and
+# its reports are the only record of which binary faulted.
+report_crashes() {
+  local dir report
+  for dir in "$work/Library/Logs/DiagnosticReports" "/Users/$(id -un)/Library/Logs/DiagnosticReports"; do
+    [[ -d $dir ]] || continue
+    while IFS= read -r report; do
+      printf -- '--- %s ---\n' "${report##*/}" >&2
+      head -c 20000 "$report" >&2
+      echo >&2
+    done < <(find "$dir" -maxdepth 1 -name '*.ips' -newer "$crash_marker" 2>/dev/null)
+  done
+}
+
+# electron-builder rewrites the main executable and the nested helper bundles after
+# the Electron distribution signed them, and mac.identity=null leaves the result
+# unsigned, so a store bundle carries a mix of stale and valid signatures. Report
+# what the platform sees instead of deciding here: Apple silicon refuses to run code
+# whose signature no longer matches, and that refusal surfaces as the app dying.
+report_bundle_state() {
+  local bundle=$1 item bundles=0 bundles_ok=0 files=0 files_ok=0
+  echo "Signatures in $bundle" >&2
+  while IFS= read -r item; do
+    bundles=$((bundles + 1))
+    if codesign --verify --deep --strict "$item" 2>/dev/null; then
+      bundles_ok=$((bundles_ok + 1))
+    else
+      printf 'codesign: %s: seal not verified\n' "${item#"$bundle"/}" >&2
+    fi
+  done < <(find "$bundle" -type d \( -name '*.app' -o -name '*.framework' \) 2>/dev/null)
+  while IFS= read -r item; do
+    [[ $item == */Contents/MacOS/* || $item == */Versions/* ]] && continue
+    lipo -archs "$item" >/dev/null 2>&1 || continue
+    files=$((files + 1))
+    if codesign --verify "$item" 2>/dev/null; then
+      files_ok=$((files_ok + 1))
+    else
+      printf 'codesign: %s: not signed\n' "${item#"$bundle"/}" >&2
+    fi
+  done < <(find "$bundle" -type f \( -perm -111 -o -name '*.node' -o -name '*.dylib' -o -name '*.so' \) 2>/dev/null)
+  printf 'codesign: %s of %s bundles and %s of %s standalone Mach-O verify\n' \
+    "$bundles_ok" "$bundles" "$files_ok" "$files" >&2
+}
+
 cleanup() {
-  if [[ $? != 0 && -f $work/desktop.log ]]; then cat "$work/desktop.log" >&2; fi
+  local status=$?
   if [[ -n $desktop_pid ]]; then
+    # Only a job that already ended reports its own status; a killed one would
+    # otherwise report this script's own SIGTERM as the app's cause of death.
+    if ! kill -0 "$desktop_pid" 2>/dev/null; then
+      wait "$desktop_pid" 2>/dev/null || desktop_status=$?
+    fi
     kill "$desktop_pid" 2>/dev/null || true
     wait "$desktop_pid" 2>/dev/null || true
+  fi
+  if [[ $status != 0 ]]; then
+    if [[ -f $work/desktop.log ]]; then
+      printf -- '--- packaged app output ---\n' >&2
+      cat "$work/desktop.log" >&2
+    fi
+    report_exit
+    report_crashes
+    if [[ $(uname -s) == Darwin ]]; then
+      local app=${desktop%/Contents/MacOS/*}
+      [[ -d $app ]] && report_bundle_state "$app"
+    fi
   fi
   rm -rf "$work"
 }
@@ -25,7 +101,9 @@ cp "$fixture" "$project/$session.jsonl"
 
 # Both processes use default storage in the same disposable home.
 isolated=(env -i HOME="$work" PATH="$PATH")
-flags=(--user-data-dir="$work/user-data" --devtools --remote-debugging-port=0)
+# Electron logs nothing to stderr without this, so a runtime failure leaves no
+# trace beyond the signal that ends the process.
+flags=(--user-data-dir="$work/user-data" --devtools --remote-debugging-port=0 --enable-logging=stderr)
 arch=$(uname -m)
 if [[ $(uname -s) == Darwin ]]; then
   # A translated Intel app could otherwise pass on arm64.
