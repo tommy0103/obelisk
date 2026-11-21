@@ -27,6 +27,7 @@ import { persist } from '../packages/core/src/persist.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { createZstdFrameDecoder, scanZstdFrames } from '../packages/core/src/vendor/dsh-zstd.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 import { runCli } from './cli-test-helpers.mjs';
 
@@ -350,11 +351,11 @@ test('projects a whole tree into canonical records with correct linkage', () => 
   const byKind = (kind) => values.filter((record) => record.kind === kind);
 
   const messages = byKind('message');
-  const texts = messages.filter((m) => m.role === 'user').map((m) => [m.text, m.is_meta, m.is_sidechain]);
+  const texts = messages.filter((m) => m.role === 'user').map((m) => [m.text, m.is_meta, m.is_sidechain, m.harness_kind]);
   assert.deepEqual(texts, [
-    ['inspect the project', 0, 0],
-    ['<system-reminder>injected</system-reminder>', 1, 0],
-    ['review the code', 0, 1],
+    ['inspect the project', 0, 0, null],
+    ['<system-reminder>injected</system-reminder>', 1, 0, 'reminder'],
+    ['review the code', 0, 1, null],
   ]);
   // child messages fold into the root session
   assert.ok(messages.filter((m) => m.is_sidechain === 1).every((m) => m.session_id === ROOT_ID && m.agent_id === CHILD_ID));
@@ -2135,4 +2136,42 @@ test('a version-5 artifact no longer blocks the whole force build: healthy proje
   db.close();
   assert.ok(ids.some((id) => id.includes('healthy-session')), 'the healthy project is indexed');
   assert.ok(!ids.some((id) => id.includes('v5-session')), 'the unsupported artifact is never parsed as a known format');
+});
+
+test('a user/message the person did not produce says what it is', () => {
+  const dir = makeTempDir('obelisk-dsh-kinds-');
+  const sessionDir = join(dir, 'sessions', '--tmp-dsh-project--', 'kinds-session-1');
+  mkdirSync(sessionDir, { recursive: true });
+  const user = (seq, text, source) => ({
+    type: 'user/message', seq, time: 1753005601000 + seq,
+    data: { content: [{ type: 'text', text }], ...(source === undefined ? {} : { source }), role: 'user', id: `msg-${seq}` },
+  });
+  writeFileSync(join(sessionDir, 'session.jsonl'), [
+    { ...HEADER, id: 'kinds-session-1' },
+    user(1, 'typed by the person', { kind: 'user' }),
+    user(2, 'context from the host', { kind: 'runtime-context' }),
+    user(3, 'summary that stands in for compacted history', { kind: 'compact-checkpoint' }),
+    user(4, 'handoff written at a context-window rollover', { kind: 'obelisk-context-handoff', trigger: { kind: 'model' } }),
+    user(5, 'no producer recorded'),
+  ].map((event) => JSON.stringify(event)).join('\n') + '\n');
+  const provider = createDeepseekProvider({ rootDir: join(dir, 'sessions') });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const { values } = drain(provider.parse(unit, null));
+  assert.deepEqual(
+    values.filter((record) => record.kind === 'message').map((m) => [m.text, m.is_meta, m.harness_kind]),
+    [
+      ['typed by the person', 0, null],
+      ['context from the host', 1, 'reminder'],
+      ['summary that stands in for compacted history', 1, 'compaction'],
+      ['handoff written at a context-window rollover', 1, 'compaction'],
+      ['no producer recorded', 1, 'other'],
+    ],
+  );
+});
+
+test('DeepSeek records of the captured session trees say who wrote each message', () => {
+  const provider = createDeepseekProvider({ rootDir: fileURLToPath(new URL('./fixtures/deepseek/sessions', import.meta.url)) });
+  const units = provider.discover({ lastCursor: () => null });
+  assert.ok(units.length > 0);
+  for (const unit of units) assertHarnessConformance(drain(provider.parse(unit, null)).values);
 });

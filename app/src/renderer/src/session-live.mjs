@@ -1,6 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+/** @internal Exported for tests. */
 export function createSessionLiveState() {
   return {
     dirtySessions: new Set(),
@@ -27,6 +28,7 @@ export function clearSessionDirty(sessionId, live = sessionLiveState) {
   if (sessionId) live.dirtySessions.delete(sessionId);
 }
 
+/** @internal Exported for tests. */
 export function consumeSessionDirty(live, sessionId) {
   if (!sessionId || !live.dirtySessions.has(sessionId)) return false;
   live.dirtySessions.delete(sessionId);

@@ -7,6 +7,7 @@ const CONTEXT_WINDOW_EVIDENCE_STATUS = [
   'Use handoff sections `SPEC-CONFIRMED REQUIREMENTS` (goal, progress, next steps; cite user, spec, or source), `AGENT INFERENCES` (never `LOCKED DESIGN` or confirmed by repetition), `UNRESOLVED CONFLICTS`, and `UNVERIFIED ACCEPTANCE CRITERIA`.',
 ].join(' ')
 
+/** @internal Exported for tests. */
 export const CONTEXT_WINDOW_OBELISK_SCOPE = 'Scope Obelisk recovery to the supplied `session_id` and use `context(message_uuid)` at the previous-window boundary; do not search global history or other sessions.'
 
 /** Stable model guidance for prose handoff and scoped Obelisk recovery. */

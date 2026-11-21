@@ -14,7 +14,7 @@ import type {
   InventoryIssue,
   ProviderAdapter,
 } from './providers/types.ts';
-import type { SqliteDb } from './sqlite-types.ts';
+import type { SqliteDb, SqliteStatement } from './sqlite-types.ts';
 
 export interface ProviderSessionProvenance extends IndexedSession {
   readonly source: string;
@@ -199,8 +199,16 @@ function checkpointCursor(state: StoredProviderState | undefined): Cursor {
   return state.cursor ?? `${state.mtime}:${state.linesProcessed}`;
 }
 
+// Read for every discovered unit on every refresh, so prepare it once per connection.
+const checkpointStatements = new WeakMap<SqliteDb, SqliteStatement>();
+
 function storedCheckpoint(db: SqliteDb, key: string): StoredProviderState | undefined {
-  const row = db.prepare('SELECT * FROM index_state WHERE jsonl_path = ?').get(key);
+  let statement = checkpointStatements.get(db);
+  if (statement === undefined) {
+    statement = db.prepare('SELECT * FROM index_state WHERE jsonl_path = ?');
+    checkpointStatements.set(db, statement);
+  }
+  const row = statement.get(key);
   return row === undefined ? undefined : storedState(row);
 }
 
@@ -209,7 +217,7 @@ export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
   return state?.replayRequired ? null : checkpointCursor(state);
 }
 
-export function providerSessionUnitKey(
+function providerSessionUnitKey(
   provider: ProviderAdapter | undefined,
   session: IndexedSession,
 ): string {

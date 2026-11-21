@@ -16,7 +16,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path';
 
 import {
-  extractText, extractContentType, extractMessageIsMeta, isSkillInstructions,
+  TEXT_LIMIT, extractText, extractContentType, extractHarnessKind,
   filePath, trunc, truncJson, readLines, discoverJsonlFiles, isDir, sourceInventoryIssue,
   normalizeTranscriptTimestamp,
 } from '../parsing.ts';
@@ -55,7 +55,7 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
     || Number(parts[4]) !== stat.ino;
 }
 
-export const name = 'claude';
+const name = 'claude';
 // v6 composes v5 canonical timestamp repair with orphan-family session rows.
 // Existing installs must replay once even when their family cursors are current.
 export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v6__';
@@ -229,10 +229,6 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     !orphanMembers.has(join(projectsDir, unit.project!, unit.sessionId, 'subagents')))];
 }
 
-export function discover(ctx: DiscoverContext): IndexUnit[] {
-  return discoverAt(join(homedir(), '.claude'), ctx);
-}
-
 function toolResultText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -398,17 +394,20 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (obj.version) sm.version = obj.version;
     sm.n++;
 
-    const text = extractText(msg.content);
+    const fullText = extractText(msg.content, Infinity);
+    const text = trunc(fullText);
+    // Preserve canonical classification independently of the caller's output budget.
+    const classificationText = trunc(fullText, TEXT_LIMIT);
     const rawContentType = extractContentType(msg.content);
-    const isMeta = extractMessageIsMeta(obj, text);
-    const contentType = isMeta && isSkillInstructions(text) ? 'skill_instructions' : rawContentType;
+    const harnessKind = extractHarnessKind(obj, classificationText);
+    const contentType = harnessKind === 'skill' ? 'skill_instructions' : rawContentType;
     const aid = isSubagent ? (unit.agentId ?? null) : (obj.agentId || null);
 
     if (obj.uuid) {
       records.push({
         kind: 'message', uuid: obj.uuid, session_id: sid, type: obj.type,
         parent_uuid: obj.parentUuid || null, timestamp: ts, role: msg.role || obj.type,
-        text, content_type: contentType, is_meta: (isMeta ? 1 : 0), visibility: 'visible',
+        text, content_type: contentType, is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind, visibility: 'visible',
         model: msg.model || null,
         is_sidechain: obj.isSidechain ? 1 : 0, agent_id: aid,
         input_tokens: totalInputTokens(usage), output_tokens: usage.output_tokens || null,
@@ -675,5 +674,3 @@ export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: {
     raw: rawClaude,
   };
 }
-
-export const claudeProvider = createClaudeProvider();

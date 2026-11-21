@@ -4,11 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createKimiProvider } from '../packages/core/src/providers/kimi.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { assembleUsf } from '../packages/core/src/usf.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 function drain(gen) {
@@ -97,9 +99,10 @@ test('kimi provider folds main and subagent wire logs into the canonical transcr
     : record);
   assert.equal(
     createHash('sha256').update(JSON.stringify(goldenRecords)).digest('hex'),
-    '09d76616919435a46a3395194349e696e0d8f6717a24b018515e1f3867ec347a',
+    '737c67cca9cc536be5f46e6de033d55f4358bba9e3620ba19f4af7685c06fac0',
     'complete yielded record sequence changed',
   );
+  assertHarnessConformance(values);
 
   assert.deepEqual(values[0], { kind: 'delete-session', sessionId: 'kimi:session-native-1' });
   assert.equal(ret, unit.meta.currentCursor);
@@ -323,10 +326,11 @@ test('kimi provider presents user-slash activations as real user prompts', () =>
   assert.deepEqual(messages.map(record => ({
     text: record.text,
     is_meta: record.is_meta,
+    harness_kind: record.harness_kind,
   })), [
-    { text: '/obelisk synthesize my history', is_meta: 0 },
-    { text: '/demo:ship --fast', is_meta: 0 },
-    { text: 'Model-triggered skill instructions.', is_meta: 1 },
+    { text: '/obelisk synthesize my history', is_meta: 0, harness_kind: null },
+    { text: '/demo:ship --fast', is_meta: 0, harness_kind: null },
+    { text: 'Model-triggered skill instructions.', is_meta: 1, harness_kind: 'skill' },
   ]);
   assert.equal(provider.raw({
     source: 'kimi',
@@ -367,4 +371,95 @@ test('kimi provider maps protocol-1.0 embedded tool calls and results', () => {
   })), [{
     tool_use_id: 'kimi:session-tools-1:main:legacy-call', content: 'legacy result',
   }]);
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message').map(record => [record.role, record.content_type]),
+    [['assistant', 'unknown'], ['tool', 'tool_result']],
+    'the message that only brings a result back says so',
+  );
+  const steps = assembleUsf(values).sessions[0].session.turns.flatMap(turn => turn.steps);
+  assert.deepEqual(steps.map(step => [step.kind, step.result?.content ?? null]), [['tool', 'legacy result']],
+    'the result is on its call and not a step of its own as well');
+});
+
+test('kimi provider gives a compaction summary where it stands among the messages', () => {
+  const root = makeTempDir('obelisk-kimi-summary-place-');
+  const sessionDir = join(root, 'sessions', 'workspace-1', 'session-summary-1');
+  const mainDir = join(sessionDir, 'agents', 'main');
+  mkdirSync(mainDir, { recursive: true });
+  writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({ workDir: '/tmp/summary', lastPrompt: 'first' }));
+  const say = (time, role, text) => ({ type: 'context.append_message', time, message: {
+    role, content: [{ type: 'text', text }], toolCalls: [], ...(role === 'user' ? { origin: { kind: 'user' } } : {}),
+  } });
+  const records = [
+    { type: 'metadata', protocol_version: '1.0', created_at: 1753005600000 },
+    say(1753005601000, 'user', 'first'),
+    say(1753005602000, 'assistant', 'first answer'),
+    { type: 'context.apply_compaction', time: 1753005603000, summary: 'what happened so far', compactedCount: 2 },
+    say(1753005604000, 'user', 'second'),
+    say(1753005605000, 'assistant', 'second answer'),
+    { type: 'context.apply_compaction', time: 1753005606000, summary: 'what happened after that', compactedCount: 2 },
+  ];
+  writeFileSync(join(mainDir, 'wire.jsonl'), records.map(record => JSON.stringify(record)).join('\n') + '\n');
+  const provider = createKimiProvider({ rootDir: root });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+
+  const { values } = drain(provider.parse(unit, null));
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message' || record.kind === 'summary').map(record => record.text ?? record.content),
+    ['first', 'first answer', 'what happened so far', 'second', 'second answer', 'what happened after that'],
+  );
+  const { turns } = assembleUsf(values).sessions[0].session;
+  assert.deepEqual(turns.map(turn => turn.steps.map(step => step.kind ?? step.by)), [
+    ['human', 'text', 'compaction'],
+    ['human', 'text', 'compaction'],
+  ], 'each compaction is in the turn it happened in');
+});
+
+test('kimi provider says what each message Kimi wrote itself is', () => {
+  const root = makeTempDir('obelisk-kimi-kinds-');
+  const sessionDir = join(root, 'sessions', 'workspace-1', 'session-kinds-1');
+  const mainDir = join(sessionDir, 'agents', 'main');
+  const childDir = join(sessionDir, 'agents', 'agent-7');
+  mkdirSync(mainDir, { recursive: true });
+  mkdirSync(childDir, { recursive: true });
+  writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({
+    workDir: '/tmp/kimi-kinds',
+    agents: { main: { type: 'main' }, 'agent-7': { type: 'sub', parentAgentId: 'main' } },
+  }));
+  const said = (time, content, origin) => ({ type: 'context.append_message', time, message: { role: 'user', content, toolCalls: [], origin } });
+  writeFileSync(join(mainDir, 'wire.jsonl'), [
+    { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+    said(2, 'typed by the person', { kind: 'user' }),
+    said(3, 'compressed image context', { kind: 'injection', variant: 'image_compression' }),
+    said(4, 'a trigger Kimi fired', { kind: 'system_trigger' }),
+  ].map(record => JSON.stringify(record)).join('\n') + '\n');
+  writeFileSync(join(childDir, 'wire.jsonl'), [
+    { type: 'metadata', protocol_version: '1.5', created_at: 1 },
+    said(5, 'child prompt', { kind: 'system_trigger', name: 'subagent' }),
+  ].map(record => JSON.stringify(record)).join('\n') + '\n');
+
+  const provider = createKimiProvider({ rootDir: root });
+  const { values } = drain(provider.parse(provider.discover({ lastCursor: () => null })[0], null));
+  assert.deepEqual(
+    values.filter(record => record.kind === 'message').map(record => [record.text, record.is_meta, record.harness_kind]),
+    [
+      ['typed by the person', 0, null],
+      ['compressed image context', 1, 'reminder'],
+      ['a trigger Kimi fired', 1, 'other'],
+      ['child prompt', 1, 'task'],
+    ],
+  );
+  const run = assembleUsf(values).sessions[0].session.turns.flatMap(turn => turn.steps).find(step => step.kind === 'run');
+  assert.deepEqual(run.run.steps.map(step => [step.by, step.kind]), [['harness', 'task']],
+    'the prompt a sub-agent starts from is its task');
+});
+
+test('Kimi records of the captured manifest session say who wrote each message', () => {
+  const root = makeTempDir('obelisk-kimi-conformance-');
+  mkdirSync(join(root, 'sessions', 'workspace-1'), { recursive: true });
+  cpSync(new URL('./fixtures/kimi/manifest-session', import.meta.url), join(root, 'sessions', 'workspace-1', 'session-1'), { recursive: true });
+  const provider = createKimiProvider({ rootDir: root });
+  const units = provider.discover({ lastCursor: () => null });
+  assert.equal(units.length, 1);
+  assertHarnessConformance(drain(provider.parse(units[0], null)).values);
 });

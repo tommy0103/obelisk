@@ -145,7 +145,7 @@ async function applyRollover(
 }
 
 /** Replace the complete active surface with the model-authored prose handoff. */
-export async function applyExplicitRollover(
+async function applyExplicitRollover(
   ctx: Context,
   agent: Agent,
   pending: PendingRollover,

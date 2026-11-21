@@ -4,8 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
 
@@ -24,9 +24,10 @@ import {
   sessionMetrics,
   taskPrompt,
 } from '../scripts/context-window-ab-eval.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
 test('agent runs wait for natural completion unless an explicit timeout is configured', () => {
-  const output = join(tmpdir(), 'context-window-timeout-plan');
+  const output = join(makeTempDir('obelisk-context-window-timeout-'), 'plan');
   assert.equal(parseArgs(['--output', output]).timeoutMinutes, undefined);
   assert.equal(parseArgs(['--output', output, '--timeout-minutes', '90']).timeoutMinutes, 90);
 });
@@ -110,7 +111,7 @@ test('session metrics distinguish compaction, model rollover, forced rollover, a
 });
 
 test('shared DSH session storage reports only the current eval workspace', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-shared-dsh-sessions-'));
+  const root = makeTempDir('obelisk-shared-dsh-sessions-');
   const currentWorkspace = '/eval/current-workspace';
   const otherWorkspace = '/eval/other-workspace';
   const writeSession = (name, cwd, outputTokens, compressed = false) => {
@@ -156,7 +157,7 @@ test('200K runs using at least 450K and crossing two boundaries qualify without 
 });
 
 test('CLI dry-run materializes an auditable plan without invoking a model', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-context-window-eval-'));
+  const root = makeTempDir('obelisk-context-window-eval-');
   const dshRoot = join(root, 'deepseek-harness');
   const output = join(root, 'plan');
   mkdirSync(dshRoot);
@@ -204,7 +205,7 @@ test('CLI dry-run materializes an auditable plan without invoking a model', () =
 });
 
 test('an interrupted run directory is cleared while an atomic result is reused', () => {
-  const output = mkdtempSync(join(tmpdir(), 'obelisk-context-window-resume-'));
+  const output = makeTempDir('obelisk-context-window-resume-');
   const run = join(output, 'compact-01');
   try {
     mkdirSync(run);
@@ -222,7 +223,7 @@ test('an interrupted run directory is cleared while an atomic result is reused',
 });
 
 test('real execution uses the built DSH CLI instead of candidate-scoped tsx resolution', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-dsh-bin-'));
+  const root = makeTempDir('obelisk-dsh-bin-');
   const built = join(root, 'apps', 'cli', 'lib', 'bin.js');
   try {
     mkdirSync(join(root, 'apps', 'cli', 'lib'), { recursive: true });

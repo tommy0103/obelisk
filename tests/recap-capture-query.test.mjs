@@ -3,9 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
 import { buildRecapExportQuery, cleanRecapFilename } from '../app/src/main/recap-capture-query.ts';
 
 test('recap export query includes the selected recap filename', () => {

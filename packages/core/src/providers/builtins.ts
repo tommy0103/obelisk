@@ -6,6 +6,7 @@ import { createCodexProvider } from './codex.ts';
 import { createCodexHostAntigravityProvider } from './codexhost-antigravity.ts';
 import { createCopilotProvider, type CopilotChronicleOpener } from './copilot.ts';
 import { createDeepseekProvider } from './deepseek.ts';
+import { createDevinProvider, type DevinDatabaseOpener } from './devin.ts';
 import { createHermesProvider, type HermesStoreOpener } from './hermes.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createKiroProvider, type KiroDatabaseOpener } from './kiro.ts';
@@ -30,6 +31,7 @@ export function createBuiltinProviderRegistry(
     openZcodeDatabase,
     openKiroDatabase,
     openOpencodeDatabase,
+    openDevinDatabase,
   }: {
     homeDir?: string;
     codexHomeDir?: string;
@@ -41,6 +43,7 @@ export function createBuiltinProviderRegistry(
     openZcodeDatabase?: ZcodeDatabaseOpener;
     openKiroDatabase?: KiroDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
+    openDevinDatabase?: DevinDatabaseOpener;
   } = {},
 ): ProviderRegistry {
   return createProviderRegistry([
@@ -49,6 +52,7 @@ export function createBuiltinProviderRegistry(
     createCodexHostAntigravityProvider({ rootDir: roots['codexhost-antigravity'] }),
     createCopilotProvider({ rootDir: roots['copilot'], userDataRoots: copilotUserDataRoots, openChronicle: openCopilotChronicle }),
     createDeepseekProvider({ rootDir: roots['deepseek'] }),
+    createDevinProvider({ rootDir: roots['devin'], homeDir, openDatabase: openDevinDatabase }),
     createHermesProvider({ rootDir: roots['hermes'], openStore: openHermesStore }),
     createKimiProvider({ rootDir: roots['kimi'] }),
     createKiroProvider({ rootDir: roots['kiro'], openDatabase: openKiroDatabase }),

@@ -6,7 +6,7 @@
     "lib": ["ES2023"],
     "types": ["node"],
     "strict": true,
-    "noImplicitAny": false,
+    "noImplicitAny": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "allowJs": true,

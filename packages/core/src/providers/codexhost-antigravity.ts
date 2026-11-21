@@ -15,6 +15,7 @@ import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
+  HarnessKind,
   MessageRecord,
   ProviderAdapter,
   RawLookup,
@@ -22,8 +23,8 @@ import type {
   TranscriptRecord,
 } from './types.ts';
 
-export const name = 'codexhost-antigravity';
-export const CODEXHOST_ANTIGRAVITY_CANONICAL_TRANSCRIPT_MARKER = '__codexhost_antigravity_canonical_transcript_v2__';
+const name = 'codexhost-antigravity';
+const CODEXHOST_ANTIGRAVITY_CANONICAL_TRANSCRIPT_MARKER = '__codexhost_antigravity_canonical_transcript_v2__';
 const CURSOR_TAG = 'codexhost-antigravity-snapshot-v1';
 const HISTORY_DIR = 'antigravity-history';
 const MAPPING_DIR = join('mapping-store', 'threads');
@@ -214,11 +215,11 @@ function projectedRecords(snapshot: SourceSnapshot, id: string): TranscriptRecor
   const turns = (snapshot.history?.turns as unknown[] | undefined) ?? [];
   let parent: string | null = null;
   let messageCount = 0;
-  const addMessage = (uuid: string, role: string, content: string | null, contentType: string, model: string | null, isMeta: 0 | 1 = 0): void => {
+  const addMessage = (uuid: string, role: string, content: string | null, contentType: string, model: string | null, harnessKind: HarnessKind | null = null, isMeta: 0 | 1 = 0): void => {
     const row: MessageRecord = {
       kind: 'message', uuid, session_id: id, type: role, parent_uuid: parent,
       timestamp: null, role, text: content === null ? null : trunc(content), content_type: contentType,
-      is_meta: isMeta, visibility: 'visible', model, is_sidechain: 0, agent_id: null,
+      is_meta: isMeta, harness_kind: harnessKind, visibility: 'visible', model, is_sidechain: 0, agent_id: null,
       input_tokens: null, output_tokens: null, cwd: snapshot.cwd, skill: null, source: name,
     };
     out.push(row);
@@ -252,7 +253,7 @@ function projectedRecords(snapshot: SourceSnapshot, id: string): TranscriptRecor
         continue;
       }
       if (item.type === 'contextCompaction') {
-        addMessage(uuid, 'system', null, 'unknown', model, 1);
+        addMessage(uuid, 'system', null, 'unknown', model, 'compaction', 1);
         continue;
       }
       // Item IDs are local to the CodexHost thread. Ordinals also distinguish
@@ -286,7 +287,7 @@ function projectedRecords(snapshot: SourceSnapshot, id: string): TranscriptRecor
     }
     const outcome = object(turn.outcome);
     if (outcome?.status === 'failed') {
-      addMessage(`${prefix}:outcome`, 'system', text(object(outcome.error)?.message), 'text', null);
+      addMessage(`${prefix}:outcome`, 'system', text(object(outcome.error)?.message), 'text', null, 'error');
     }
   }
   if (messageCount === 0) {
@@ -295,7 +296,7 @@ function projectedRecords(snapshot: SourceSnapshot, id: string): TranscriptRecor
     out.push({
       kind: 'message', uuid: `${id}:mapping`, session_id: id, type: 'system', parent_uuid: null,
       timestamp: null, role: 'system', text: null, content_type: 'unknown', is_meta: 1,
-      visibility: 'hidden', model: null, is_sidechain: 0, agent_id: null,
+      harness_kind: 'other', visibility: 'hidden', model: null, is_sidechain: 0, agent_id: null,
       input_tokens: null, output_tokens: null, cwd: snapshot.cwd, skill: null, source: name,
     });
   }
@@ -465,6 +466,4 @@ export function createCodexHostAntigravityProvider({
   };
 }
 
-export const codexHostAntigravityProvider = createCodexHostAntigravityProvider();
-
-export { sessionId as codexhostAntigravitySessionId };
+export { /** @internal Exported for tests. */ sessionId as codexhostAntigravitySessionId };

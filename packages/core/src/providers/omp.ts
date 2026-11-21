@@ -12,7 +12,7 @@ import {
 
 const SOURCE = 'omp';
 
-export const OMP_CANONICAL_TRANSCRIPT_MARKER = '__omp_canonical_transcript_v1__';
+const OMP_CANONICAL_TRANSCRIPT_MARKER = '__omp_canonical_transcript_v2__';
 
 function resolveOmpRoot(rootDir: string | undefined, homeDir: string): PiRootResolution {
   const fallbackRoot = join(homeDir, '.omp', 'agent', 'sessions');
@@ -54,5 +54,3 @@ export function createOmpProvider({
     },
   });
 }
-
-export const ompProvider = createOmpProvider();

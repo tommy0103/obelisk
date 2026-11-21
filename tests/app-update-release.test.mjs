@@ -3,14 +3,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { generateKeyPairSync, sign, createHash } from 'node:crypto';
 import { assembleRelease, assembleDebianRelease, verifyArchive, validateKeyPair } from '../app/scripts/update-release.mjs';
+import { makeTempDir } from './temp-dirs.mjs';
 
-async function artifacts(t) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'obelisk-update-feed-')); t.after(() => rm(directory, { recursive: true, force: true }));
+async function artifacts() {
+  const directory = makeTempDir('obelisk-update-feed-');
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const trustedPublicKey = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
   const version = '0.2.4';
@@ -24,8 +24,8 @@ async function artifacts(t) {
   }
   return { directory, version, tag: `v${version}`, trustedPublicKey, notes: '# Fixed & improved\n\n<unsafe>' };
 }
-test('a release exposes separate signed Sparkle feeds and one fallback manifest containing both architectures', async t => {
-  const options = await artifacts(t); await assembleRelease(options);
+test('a release exposes separate signed Sparkle feeds and one fallback manifest containing both architectures', async () => {
+  const options = await artifacts(); await assembleRelease(options);
   const fallback = JSON.parse(await readFile(path.join(options.directory, 'latest-mac.yml'), 'utf8'));
   assert.equal(fallback.version, '0.2.4'); assert.equal(fallback.files.length, 2);
   assert.deepEqual(fallback.files.map(file => file.url), ['Obelisk-0.2.4-mac-arm64.zip', 'Obelisk-0.2.4-mac-x64.zip']);
@@ -39,19 +39,19 @@ test('a release exposes separate signed Sparkle feeds and one fallback manifest 
     verifyArchive(await readFile(path.join(options.directory, fallback.files.find(file => file.url.endsWith(`-${arch}.zip`)).url)), signature, options.trustedPublicKey);
   }
 });
-test('an archive changed after signing prevents release assembly', async t => {
-  const options = await artifacts(t); await writeFile(path.join(options.directory, 'Obelisk-0.2.4-mac-arm64.zip'), 'tampered');
+test('an archive changed after signing prevents release assembly', async () => {
+  const options = await artifacts(); await writeFile(path.join(options.directory, 'Obelisk-0.2.4-mac-arm64.zip'), 'tampered');
   await assert.rejects(assembleRelease(options), /signature does not match/);
 });
-test('release assembly rejects missing architectures and another trusted public key', async t => {
-  const options = await artifacts(t);
+test('release assembly rejects missing architectures and another trusted public key', async () => {
+  const options = await artifacts();
   await rm(path.join(options.directory, 'Obelisk-0.2.4-mac-x64.dmg'));
   await assert.rejects(assembleRelease(options), /Missing x64 DMG/);
   const { publicKey } = generateKeyPairSync('ed25519');
   await assert.rejects(assembleRelease({ ...options, trustedPublicKey: publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64') }), /signature does not match/);
 });
-test('update metadata cannot advertise an archive under the wrong version, architecture or repository', async t => {
-  const options = await artifacts(t);
+test('update metadata cannot advertise an archive under the wrong version, architecture or repository', async () => {
+  const options = await artifacts();
   await assert.rejects(assembleRelease({ ...options, repository: 'somewhere/else' }), /configured repository/);
   const file = path.join(options.directory, 'sparkle-arm64.json');
   const info = JSON.parse(await readFile(file, 'utf8')); await writeFile(file, JSON.stringify({ ...info, arch: 'x64' }));
@@ -67,8 +67,8 @@ test('Sparkle keys use the official 32-byte seed format and must match the baked
   assert.throws(() => validateKeyPair(pub, Buffer.alloc(32).toString('base64')), /do not match/);
 });
 
-test('Debian update metadata carries the verified amd64 installer and the same release notes', async t => {
-  const options = await artifacts(t);
+test('Debian update metadata carries the verified amd64 installer and the same release notes', async () => {
+  const options = await artifacts();
   const file = 'Obelisk-0.2.4-linux-amd64.deb';
   const bytes = Buffer.from('immutable Debian archive fixture');
   const metadata = { file, version: options.version, arch: 'x64', size: bytes.length,

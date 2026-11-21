@@ -10,13 +10,13 @@ import VibeCard from '../components/recap/VibeCard.vue';
 import WorkflowCard from '../components/recap/WorkflowCard.vue';
 import ClosingCard from '../components/recap/ClosingCard.vue';
 import { PALETTES, ARCH_KEYS } from '../components/recap/archetypes.js';
-import mockJson from '../mock/recap-2026-W24.json';
+import { sampleRecap } from '../mock/sample-recap.js';
 
 defineOptions({ name: 'RecapDetail' });
 
 const route = useRoute();
-const recapData = ref(mockJson);
-const currentArch = ref(mockJson.persona.archetype);
+const recapData = ref(sampleRecap);
+const currentArch = ref(sampleRecap.persona.archetype);
 const currentIdx = ref(0);
 const recapFilename = computed(() => String(route.params.id || ''));
 
@@ -55,7 +55,7 @@ onMounted(async () => {
   if (filename) await loadRecap(filename);
   if (window.obelisk?.onRecapUpdated) {
     unsubRecap = window.obelisk.onRecapUpdated((fp) => {
-      if (fp.endsWith(route.params.id)) loadRecap(route.params.id);
+      if (fp.endsWith(recapFilename.value)) loadRecap(recapFilename.value);
     });
   }
 });
@@ -95,7 +95,6 @@ function onKeydown(e) {
 <template>
   <div class="recap-app" :style="cssVars" @keydown="onKeydown" tabindex="0">
 
-    <!-- Stage -->
     <div class="stage">
       <div class="deck">
         <div class="card-slot" :class="{ active: currentIdx === 0, prev: currentIdx > 0 }">
@@ -151,7 +150,6 @@ function onKeydown(e) {
       </div>
     </div>
 
-    <!-- Nav -->
     <div class="nav">
       <button class="nav-arrow" :disabled="currentIdx === 0" @click="goTo(currentIdx - 1)">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">

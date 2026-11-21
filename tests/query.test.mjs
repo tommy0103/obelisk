@@ -18,6 +18,7 @@ import { kiroSessionId } from '../packages/core/src/providers/kiro.ts';
 import { copilotSessionId } from '../packages/core/src/providers/copilot.ts';
 import { canonicalSessionId as zcodeSessionId } from '../packages/core/src/providers/zcode.ts';
 import { opencodeSessionId } from '../packages/core/src/providers/opencode-identity.ts';
+import { devinSessionId } from '../packages/core/src/providers/devin.ts';
 import { createQueryApi, createAttuneApi } from '../packages/core/src/query.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -772,6 +773,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawOpencode = '77777777-7777-4777-8777-777777777777';
   const rawHermes = '20260101_120000_aaaaaa';
   const rawAntigravity = '88888888-8888-4888-8888-888888888888';
+  const rawDevin = 'brave-otter';
   const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
   const rawKiro = kiroHeader.id;
   // Canonical ids in each provider's own shape: pi/omp/deepseek/kiro namespace by
@@ -790,6 +792,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalAntigravityA = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-a');
   const canonicalAntigravityB = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-b');
   const canonicalOpencode = opencodeSessionId(rawOpencode, '/Users/me/opencode/db.sqlite');
+  const canonicalDevin = devinSessionId('/Users/me/.local/share/devin/cli/sessions.db', rawDevin);
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -805,6 +808,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalZcode, 'Zcode session', '-Users-me-zcode', '/Users/me/zcode', '2026-09-18T02:00:00Z', '2026-09-18T03:00:00Z', null, 1, 'zcode');
   insertSession.run(canonicalHermes, 'Hermes session', '-Users-me-hermes', '/Users/me/hermes', '2026-09-18T01:00:00Z', '2026-09-18T02:00:00Z', null, 1, 'hermes');
   insertSession.run(canonicalKiro, kiroHeader.title, '-workspace-demo', kiroHeader.workspacePaths[0], kiroHeader.createdAt, kiroHeader.lastModifiedAt, null, 1, 'kiro');
+  insertSession.run(canonicalDevin, 'Devin session', '-Users-me-devin', '/Users/me/devin', '2026-09-18T00:35:00Z', '2026-09-18T00:40:00Z', null, 1, 'devin');
   insertSession.run(canonicalOpencode, 'Opencode session', '-Users-me-opencode', '/Users/me/opencode', '2026-09-18T00:30:00Z', '2026-09-18T00:45:00Z', null, 1, 'opencode');
   insertSession.run(canonicalAntigravityA, 'Antigravity A', '-Users-me-antigravity-a', '/Users/me/antigravity-a', '2026-09-18T00:10:00Z', '2026-09-18T00:20:00Z', null, 1, 'codexhost-antigravity');
   insertSession.run(canonicalAntigravityB, 'Antigravity B', '-Users-me-antigravity-b', '/Users/me/antigravity-b', '2026-09-18T00:10:00Z', '2026-09-18T00:21:00Z', null, 1, 'codexhost-antigravity');
@@ -826,6 +830,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
     'codexhost-antigravity': [rawAntigravity, [canonicalAntigravityB, canonicalAntigravityA]],
     copilot: [rawCopilot, [canonicalCopilot]],
     deepseek: [rawDeepseek, [canonicalDeepseek]],
+    devin: [rawDevin, [canonicalDevin]],
     hermes: [rawHermes, [canonicalHermes]],
     kimi: [rawKimi, [canonicalKimi]],
     kiro: [rawKiro, [canonicalKiro]],
@@ -900,6 +905,7 @@ test('every provider embeds the native session id verbatim in its canonical id',
     opencode: opencodeSessionId(native, '/Users/me/obelisk/db.sqlite'),
     deepseek: canonicalDeepseekTreeSessionId(native, deepseekProjectScope('/Users/me/obelisk')),
     copilot: copilotSessionId(native, '/Users/me/obelisk'),
+    devin: devinSessionId('/Users/me/.local/share/devin/cli/sessions.db', native),
     zcode: zcodeSessionId('/Users/me/obelisk/db/db.sqlite', native),
   };
   assert.deepEqual(Object.keys(canonical).sort(), createBuiltinProviderRegistry().catalog().map(provider => provider.id).sort());

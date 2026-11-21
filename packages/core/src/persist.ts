@@ -34,7 +34,7 @@ const SQLITE_SAFE_KEY_COUNT = 900;
 const MESSAGE_FIELDS = [
   'session_id', 'type', 'parent_uuid', 'timestamp', 'role', 'text',
   'content_type', 'is_meta', 'visibility', 'model', 'is_sidechain',
-  'agent_id', 'input_tokens', 'output_tokens', 'cwd', 'skill', 'source',
+  'agent_id', 'input_tokens', 'output_tokens', 'cwd', 'skill', 'source', 'harness_kind',
 ] as const satisfies readonly (keyof MessageRecord)[];
 const TOOL_CALL_FIELDS = [
   'message_uuid', 'session_id', 'name', 'presentation', 'input_json', 'file_path',
@@ -50,7 +50,8 @@ interface ReplayState {
 }
 
 function sameFields<T extends object>(row: SqliteRow, record: T, fields: readonly (keyof T)[]): boolean {
-  return fields.every(field => row[String(field)] === record[field]);
+  // An optional field a record leaves out is stored as NULL.
+  return fields.every(field => row[String(field)] === (record[field] ?? null));
 }
 
 function uniqueKeys(records: readonly TranscriptRecord[], kinds: readonly TranscriptRecord['kind'][]): string[] {
@@ -120,8 +121,8 @@ const priorTimestampForMerge = (prior: string | null | undefined, incoming: stri
 function statements(db: SqliteDb) {
   return {
     msg: db.prepare(`
-      INSERT INTO messages (uuid,session_id,type,parent_uuid,timestamp,role,text,content_type,is_meta,visibility,model,is_sidechain,agent_id,input_tokens,output_tokens,cwd,skill,source)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO messages (uuid,session_id,type,parent_uuid,timestamp,role,text,content_type,is_meta,visibility,model,is_sidechain,agent_id,input_tokens,output_tokens,cwd,skill,source,harness_kind)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(uuid) DO UPDATE SET
         session_id=excluded.session_id, type=excluded.type, parent_uuid=excluded.parent_uuid,
         timestamp=excluded.timestamp, role=excluded.role, text=excluded.text,
@@ -129,7 +130,8 @@ function statements(db: SqliteDb) {
         visibility=excluded.visibility, model=excluded.model,
         is_sidechain=excluded.is_sidechain, agent_id=excluded.agent_id,
         input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
-        cwd=excluded.cwd, skill=excluded.skill, source=excluded.source
+        cwd=excluded.cwd, skill=excluded.skill, source=excluded.source,
+        harness_kind=excluded.harness_kind
       WHERE messages.session_id IS NOT excluded.session_id
         OR messages.type IS NOT excluded.type
         OR messages.parent_uuid IS NOT excluded.parent_uuid
@@ -146,7 +148,8 @@ function statements(db: SqliteDb) {
         OR messages.output_tokens IS NOT excluded.output_tokens
         OR messages.cwd IS NOT excluded.cwd
         OR messages.skill IS NOT excluded.skill
-        OR messages.source IS NOT excluded.source`),
+        OR messages.source IS NOT excluded.source
+        OR messages.harness_kind IS NOT excluded.harness_kind`),
     tc: db.prepare(`
       INSERT INTO tool_calls (id,message_uuid,session_id,name,presentation,input_json,file_path)
       VALUES (?,?,?,?,?,?,?)
@@ -178,7 +181,7 @@ function statements(db: SqliteDb) {
         OR tool_results.file_path IS NOT excluded.file_path
         OR tool_results.is_error IS NOT excluded.is_error`),
     sum: db.prepare('INSERT OR REPLACE INTO summaries (id,session_id,timestamp,source,content,visibility,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?)'),
-    ses: db.prepare('INSERT OR REPLACE INTO sessions (id,title,project,project_path,started_at,ended_at,git_branch,version,message_count,jsonl_path,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)'),
+    ses: db.prepare('INSERT OR REPLACE INTO sessions (id,title,project,project_path,started_at,ended_at,git_branch,version,message_count,jsonl_path,source,started_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'),
     sub: db.prepare(`
       INSERT INTO subagents (agent_id,session_id,parent_tool_use_id,agent_type,description,duration_ms,total_tokens)
       VALUES (?,?,?,?,?,?,?)
@@ -237,8 +240,8 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
       case 'message': {
         const previous = replay?.messages.get(r.uuid);
         if (replay != null && previous != null && sameFields(previous, r, MESSAGE_FIELDS)) break;
-        st.msg.run(r.uuid, r.session_id, r.type, r.parent_uuid, r.timestamp, r.role, r.text, r.content_type, r.is_meta, r.visibility, r.model, r.is_sidechain, r.agent_id, r.input_tokens, r.output_tokens, r.cwd, r.skill, r.source);
-        replay?.messages.set(r.uuid, { ...r, turn_duration_ms: previous?.turn_duration_ms ?? null });
+        st.msg.run(r.uuid, r.session_id, r.type, r.parent_uuid, r.timestamp, r.role, r.text, r.content_type, r.is_meta, r.visibility, r.model, r.is_sidechain, r.agent_id, r.input_tokens, r.output_tokens, r.cwd, r.skill, r.source, r.harness_kind ?? null);
+        replay?.messages.set(r.uuid, { ...r, harness_kind: r.harness_kind ?? null, turn_duration_ms: previous?.turn_duration_ms ?? null });
         break;
       }
       case 'tool_call': {
@@ -305,6 +308,8 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
           message_count,
           r.jsonl_path,
           r.source,
+          // Not merged with the stored row: the latest parse says who started the session.
+          r.started_by ?? null,
         );
         break;
       }

@@ -4,7 +4,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createClaudeProvider } from '../packages/core/src/providers/claude.ts';
@@ -61,7 +60,7 @@ for (const [name, createProvider, inventoryDir] of providers) {
 }
 
 test('Kimi recovers its session unit key from canonical wire provenance', () => {
-  const root = join(tmpdir(), 'obelisk-kimi-unit-key');
+  const root = makeTempDir('obelisk-kimi-unit-key-');
   const sessionDir = join(root, 'sessions', 'workspace', 'session');
   const provider = createKimiProvider({ rootDir: root });
 

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { Arch } from 'builder-util';
 
-export async function beforePack(context) {
+async function beforePack(context) {
   if (context.electronPlatformName !== 'darwin') return;
   const arch = Arch[context.arch];
   if (!['arm64', 'x64'].includes(arch)) throw new Error('macOS updates require separate arm64 and x64 packages');

@@ -4,6 +4,7 @@
 <script setup>
 defineProps({
   title: String,
+  /** @type {import('vue').PropType<import('../../recap').PathItem[]>} */
   items: Array,
   idx: { type: Number, default: 2 },
   total: { type: Number, default: 5 },

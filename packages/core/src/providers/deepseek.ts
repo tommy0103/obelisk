@@ -56,9 +56,7 @@
 //
 // Packed chunk rows (`text-chunks`/`reasoning-chunks`/`tool-call-chunks`) are
 // NOT expanded during projection: their members duplicate the step-final
-// assistant/message, which always carries the assembled content. The vendored
-// codec (../vendor/dsh-chunk-rows.ts) remains available for raw
-// reconstruction but is not on the indexing path.
+// assistant/message, which always carries the assembled content.
 //
 // Format v2/v3 notes (ADR-0014): the v2+ embedded assistant/message `stream`
 // is ignored exactly like packed rows. `system/message` (v3) is not indexed —
@@ -94,6 +92,7 @@ import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
+  HarnessKind,
   MessageRecord,
   ProviderAdapter,
   RawLookup,
@@ -101,7 +100,7 @@ import type {
   TranscriptRecord,
 } from './types.ts';
 
-export const name = 'deepseek';
+const name = 'deepseek';
 // Replay readable trees once to repair snapshots published without a child.
 const DEEPSEEK_CANONICAL_TRANSCRIPT_MARKER = '__deepseek_canonical_transcript_v5__';
 
@@ -178,8 +177,6 @@ function stepKeyOf(uuid: string | null): string | null {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
-
-// ---- log reading ----
 
 /** Decode complete frames [fromFrame, frames.length) into plaintext. */
 function decodeFrames(buffer: Buffer, frames: Array<{ start: number; end: number }>, fromFrame: number): string {
@@ -258,8 +255,6 @@ function readLogRecords(plaintext: string): LogRecord[] {
   }
   return records;
 }
-
-// ---- content helpers ----
 
 function joinPartText(content: unknown, partType: string): string | null {
   if (!Array.isArray(content)) return null;
@@ -991,8 +986,6 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   return units;
 }
 
-// ---- cursor checkpoint ----
-
 /** Everything the incremental parse carries about ONE member file, as a single
  * record (ADR-0014, revised): the fast-path preconditions, the parent-chain
  * seed, and the emitted-anchor bookkeeping always appear and travel together.
@@ -1461,12 +1454,17 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
           const content = record.data.content;
           const text = joinPartText(content, 'text');
           const sourceKind = isRecord(record.data.source) ? record.data.source.kind : undefined;
-          const isMeta = sourceKind !== 'user' ? 1 : 0;
+          // A user/message whose producer is not the person is context the
+          // harness or a plugin put in. Two producers write the summary that
+          // stands in for history: DSH's own compaction and Obelisk's handoff.
+          const harnessKind: HarnessKind | null = sourceKind === 'user' ? null
+            : sourceKind === 'compact-checkpoint' || sourceKind === 'obelisk-context-handoff' ? 'compaction'
+              : typeof sourceKind === 'string' ? 'reminder' : 'other';
           pushMessage({
             kind: 'message', uuid: userMessageUuid(dbId, record.data.id, record.seq),
             session_id: sessionId, type: 'user', parent_uuid: lastMessageUuid,
             timestamp, role: 'user', text: trunc(text),
-            content_type: text !== null ? 'text' : 'unknown', is_meta: isMeta,
+            content_type: text !== null ? 'text' : 'unknown', is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind,
             visibility: 'visible', model: null, is_sidechain: isSubagent ? 1 : 0, agent_id: agentId,
             input_tokens: null, output_tokens: null, cwd, skill: null, source: 'deepseek',
           });
@@ -1704,8 +1702,6 @@ function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cu
   return encodeCursor(maxMtime, totalCount, nextState);
 }
 
-// ---- raw ----
-
 function rawDeepseek(rootDir: string, input: RawLookup): RawRecord | null {
   const uuid = input.messageUuid;
   let rawSessionId: string | null = null;
@@ -1819,5 +1815,3 @@ export function createDeepseekProvider({ rootDir = deepseekSessionsRoot() }: { r
     raw: (input) => rawDeepseek(rootDir, input),
   };
 }
-
-export const deepseekProvider = createDeepseekProvider();

@@ -105,6 +105,80 @@ function assertNormalAppendReads(metrics, sourceStat, suffixBytes) {
 const REAL_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url);
 const REAL_PREFIX_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized-prefix.jsonl', import.meta.url);
 
+for (const refresh of ['first prompt', 'legacy checkpoint', 'multipart prompt']) {
+  test(`Codex prompt-label refresh preserves unchanged child contributions (${refresh})`, t => {
+    const legacyCheckpoint = refresh === 'legacy checkpoint';
+    const multipartPrompt = refresh === 'multipart prompt';
+    const root = makeTempDir('obelisk-codex-label-refresh-');
+    const sessions = join(root, 'sessions');
+    mkdirSync(sessions);
+    const parent = join(sessions, 'parent.jsonl');
+    const child = join(sessions, 'child.jsonl');
+    const childId = `${ID}-child`;
+    // Synthetic rollout records using Codex's thread_spawn source shape.
+    writeJsonl(parent, [
+      { type: 'session_meta', timestamp: META.timestamp, payload: META },
+      { type: 'response_item', timestamp: META.timestamp, payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'workspace preamble' }],
+      } },
+      ...(legacyCheckpoint || multipartPrompt ? [prefixLines()[1]] : []),
+      ...(multipartPrompt ? [{ type: 'response_item', timestamp: META.timestamp, payload: {
+        type: 'message', role: 'user', content: ['follow', ' up'].map(text => ({ type: 'input_text', text })),
+      } }] : []),
+    ]);
+    writeJsonl(child, [
+      { type: 'session_meta', timestamp: META.timestamp, payload: {
+        ...META, id: childId, source: { subagent: { thread_spawn: { parent_thread_id: ID } } },
+      } },
+      ...prefixLines().slice(1),
+      ...suffixLines().slice(0, 3),
+    ]);
+    const db = freshDb();
+    t.after(() => db.close());
+    const provider = createCodexProvider({ rootDir: root });
+    const cursors = new Map();
+    for (const key of [parent, child]) cursors.set(key, persist(db, { key, sessionId: SESSION_ID }, parse({ key, sessionId: SESSION_ID }, null)));
+    if (legacyCheckpoint) {
+      // Pre-label v4 cursors carry no userMessageEvents, even when prompts exist.
+      const parts = cursors.get(parent).split(':');
+      const state = JSON.parse(Buffer.from(parts[5], 'base64url').toString('utf8'));
+      delete state.userMessageEvents;
+      parts[5] = Buffer.from(JSON.stringify(state)).toString('base64url');
+      cursors.set(parent, parts.join(':'));
+      db.prepare('UPDATE messages SET is_meta=0, harness_kind=NULL WHERE agent_id IS NULL').run();
+    }
+    const childRows = () => ({
+      messages: db.prepare('SELECT * FROM messages WHERE agent_id=? ORDER BY uuid').all(`codex:${childId}`),
+      tools: db.prepare('SELECT * FROM tool_calls WHERE id LIKE ? ORDER BY id').all(`codex:${childId}:%`),
+      results: db.prepare('SELECT * FROM tool_results WHERE tool_use_id LIKE ? ORDER BY tool_use_id').all(`codex:${childId}:%`),
+      agents: db.prepare('SELECT * FROM subagents ORDER BY agent_id').all(),
+    });
+    const before = childRows();
+    assert.ok(before.messages.length >= 2 && before.tools.length > 0 && before.results.length > 0);
+    appendFileSync(parent, JSON.stringify(suffixLines().at(-1)) + '\n');
+    const context = {
+      lastCursor: key => cursors.get(key) ?? null,
+      indexedSessions: () => [{ sessionId: SESSION_ID, jsonlPath: parent }],
+      changedPaths: [parent],
+    };
+    const units = provider.discover(context);
+    assert.deepEqual(units.map(unit => unit.key), [parent], 'unchanged children need no replay for a label refresh');
+    for (const next of units) cursors.set(next.key, persist(db, next, provider.parse(next, cursors.get(next.key))));
+    assert.deepEqual(childRows(), before, 'child messages, tool evidence and subagent links survive the parent refresh');
+    assert.deepEqual({ ...db.prepare("SELECT is_meta, harness_kind FROM messages WHERE text='workspace preamble'").get() },
+      { is_meta: 1, harness_kind: 'other' });
+    if (multipartPrompt) {
+      assert.deepEqual({ ...db.prepare('SELECT is_meta, harness_kind FROM messages WHERE text=?').get('follow\n up') },
+        { is_meta: 0, harness_kind: null }, 'a later event repairs an earlier multipart prompt label');
+    }
+    assert.equal(provider.discover({ ...context, changedPaths: undefined }).length, 0, 'the checkpoint converges');
+    const fresh = freshDb();
+    t.after(() => fresh.close());
+    for (const key of [parent, child]) persist(fresh, { key, sessionId: SESSION_ID }, parse({ key, sessionId: SESSION_ID }, null));
+    assert.deepEqual(dumpDb(db), dumpDb(fresh), 'incremental label refresh equals a fresh family parse');
+  });
+}
+
 test('Codex marker upgrade backfills stale session-index metadata from an unchanged real rollout once', t => {
   const root = makeTempDir('obelisk-codex-metadata-backfill-');
   const sessionsDir = join(root, 'sessions');

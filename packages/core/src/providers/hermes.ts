@@ -31,6 +31,7 @@ import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
+  HarnessKind,
   MessageVisibility,
   ProviderAdapter,
   RawLookup,
@@ -46,11 +47,11 @@ import { homedir } from 'node:os';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { normalizeObservedCwd, projectSlugFromPath, trunc } from '../parsing.ts';
 
-export const name = 'hermes';
+const name = 'hermes';
 // v7: the exact message digest now frames every projected field unambiguously. An older digest
 // could mistake a control character in reasoning text for a field boundary, certify the store,
 // and leave changed thinking text stale. Replay those sessions before trusting the new digest.
-export const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v7__';
+const HERMES_CANONICAL_TRANSCRIPT_MARKER = '__hermes_canonical_transcript_v7__';
 
 const CURSOR_TAG = 'hermes-snapshot-v2';
 const STORE_FILE = 'state.db';
@@ -154,7 +155,10 @@ function samePathWithin(ops: ContainmentPathOps, left: string, right: string): b
   return ops.caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-/** True when `candidate` (a store path, or a `<store>#session:<id>` source path) sits under `root`. */
+/**
+ * True when `candidate` (a store path, or a `<store>#session:<id>` source path) sits under `root`.
+ * @internal Exported for tests.
+ */
 export function pathInside(
   root: string,
   candidate: string,
@@ -183,7 +187,7 @@ function expandRoot(rootDir: string, homeDir: string): string {
   return normalize(trimmed);
 }
 
-export function defaultHermesHome(homeDir: string = homedir()): string {
+function defaultHermesHome(homeDir: string = homedir()): string {
   const fromEnv = process.env['HERMES_HOME'];
   if (typeof fromEnv === 'string' && fromEnv.trim().length > 0 && isAbsolute(fromEnv.trim())) {
     return normalize(fromEnv.trim());
@@ -203,6 +207,7 @@ function profileKey(row: SqliteRow, profileDir: string | null): string {
   return profileDir ?? 'default';
 }
 
+/** @internal Exported for tests. */
 export function hermesSessionId(rawSessionId: string, profile: string, dbPath: string): string {
   // Scope by the store as well as the profile, the way copilot.ts scopes chronicle sessions by
   // their root: two stores can share a profile name, and then a copied session would collide.
@@ -904,6 +909,10 @@ function hermesParse({ openStore }: HermesParseDeps) {
         }
         const visibility = messageVisibility(message);
         const isMeta = (visibility === 'hidden' ? 1 : 0) as 0 | 1;
+        // A delegation-complete row is Hermes bringing a sub-agent's result back, not something
+        // the person typed. It stays retrievable (see messageVisibility), so only its kind says so.
+        const harnessKind: HarnessKind | null = visibility === 'hidden' ? 'other'
+          : stringValue(message['display_kind']) === 'async_delegation_complete' ? 'notification' : null;
         const rawMessageId =
           scalarValue(message['id']) ?? `${meta.rawSessionId}:row-${String(messageIndex).padStart(6, '0')}`;
 
@@ -972,6 +981,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
             content_type: 'thinking',
             visibility,
             is_meta: isMeta,
+            harness_kind: harnessKind,
             ...base,
           };
           previousUuid = thinkingUuid;
@@ -992,6 +1002,7 @@ function hermesParse({ openStore }: HermesParseDeps) {
           content_type: messageText !== null ? 'text' : calls.length > 0 ? 'tool_use' : 'unknown',
           visibility,
           is_meta: isMeta,
+          harness_kind: harnessKind,
           ...base,
         };
         if (visibility === 'visible') visibleMessages += 1;
@@ -1027,6 +1038,8 @@ function hermesParse({ openStore }: HermesParseDeps) {
         countMode: 'total',
         jsonl_path: sourcePathFor(meta.dbPath, meta.rawSessionId),
         source: name,
+        // Upstream's `subagent` class, whether or not its parent is in this store.
+        started_by: sessionSource === 'subagent' ? 'agent' : null,
       } satisfies SessionRecord;
       // Hermes gives a delegated session its own row (and its own transcript) with
       // parent_session_id pointing back at the parent, so unlike Claude Code's sidechain units the
@@ -1417,5 +1430,3 @@ export function createHermesProvider({
     raw: (input: RawLookup): RawRecord | null => rawHermes(input, openStore),
   };
 }
-
-export const hermesProvider = createHermesProvider();

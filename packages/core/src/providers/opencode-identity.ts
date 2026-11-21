@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { normalize } from 'node:path';
 
 // Existing composite identities are persistent data: do not change their bytes.
+/** @internal Exported for tests. */
 export function opencodeStoreHash(storePath: string): string {
   return createHash('sha256').update(`opencode-store-v1\0${normalize(storePath)}`).digest('hex');
 }

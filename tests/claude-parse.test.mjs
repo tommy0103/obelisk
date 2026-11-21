@@ -7,16 +7,19 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
+import { discoverJsonlFiles } from '../packages/core/src/parsing.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { assembleUsf } from '../packages/core/src/usf.ts';
 import { persist } from '../packages/core/src/persist.ts';
 import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -182,6 +185,7 @@ test('claude parse() reads the title from a real Claude Code custom-title transc
     project: 'fixture',
   };
   const full = drain(parse(unit, null));
+  assertHarnessConformance(full.values);
   const session = full.values.find(record => record.kind === 'session');
   // The real `custom-title` record wins; the `agent-name` alias line is ignored.
   assert.equal(session.title, 'obelisk fixture capture');
@@ -471,4 +475,98 @@ test('a legacy two-part cursor keeps the mtime-only gate until it upgrades', () 
     1,
     'a legacy cursor behind the current mtime is reselected',
   );
+});
+
+test('discovery finds subagent and workflow transcripts under session directories and directory symlinks', () => {
+  const root = makeTempDir('obelisk-claude-discover-');
+  const project = join(root, 'projects', 'proj');
+  const outside = join(root, 'elsewhere');
+  mkdirSync(join(project, 's1', 'subagents', 'workflows', 'run1'), { recursive: true });
+  mkdirSync(join(outside, 'subagents'), { recursive: true });
+  writeFileSync(join(project, 's1.jsonl'), '');
+  writeFileSync(join(project, 'notes.txt'), '');
+  writeFileSync(join(project, 's1', 'subagents', 'a1.jsonl'), '');
+  writeFileSync(join(project, 's1', 'subagents', 'workflows', 'run1', 'w1.jsonl'), '');
+  writeFileSync(join(outside, 'subagents', 'a2.jsonl'), '');
+  symlinkSync(outside, join(project, 's2'), 'dir');
+
+  const found = discoverJsonlFiles(join(root, 'projects'))
+    .map(({ path, ...rest }) => ({ path: path.slice(project.length + 1), ...rest }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  assert.deepEqual(found, [
+    { path: 's1.jsonl', sessionId: 's1', project: 'proj', isSubagent: false },
+    { path: join('s1', 'subagents', 'a1.jsonl'), sessionId: 's1', project: 'proj', isSubagent: true, agentId: 'a1' },
+    { path: join('s1', 'subagents', 'workflows', 'run1', 'w1.jsonl'), sessionId: 's1', project: 'proj', isSubagent: true, agentId: 'w1', workflowRunId: 'run1' },
+    { path: join('s2', 'subagents', 'a2.jsonl'), sessionId: 's2', project: 'proj', isSubagent: true, agentId: 'a2' },
+  ]);
+});
+
+// The shapes below follow real Claude Code transcripts (keys as written by the
+// harness, text replaced): a compaction summary carries `isCompactSummary`, an
+// interruption marker carries `interruptedMessageId`. Both are user-role lines.
+test('claude parse() does not present what the harness wrote under the user role as the person\'s', () => {
+  const dir = makeTempDir('obelisk-claude-harness-written-');
+  const path = join(dir, 'sid-h.jsonl');
+  const user = (uuid, second, content, extra = {}) => ({
+    uuid, type: 'user', timestamp: `2026-06-10T10:00:${second}Z`, isSidechain: false, userType: 'external',
+    message: { role: 'user', content }, ...extra,
+  });
+  const lines = [
+    user('summary', '00', 'Summary of the earlier conversation.', { isCompactSummary: true, isVisibleInTranscriptOnly: true }),
+    user('typed-1', '01', 'first thing the person typed'),
+    { uuid: 'a1', type: 'assistant', timestamp: '2026-06-10T10:00:02Z', message: { role: 'assistant', model: 'claude-opus', content: [{ type: 'text', text: 'working' }] } },
+    user('marker', '03', [{ type: 'text', text: '[Request interrupted by user]' }], { interruptedMessageId: 'msg_01' }),
+    user('typed-2', '04', 'second thing the person typed'),
+    // Versions that do not write interruptedMessageId leave only the fixed text.
+    user('marker-old', '05', [{ type: 'text', text: '[Request interrupted by user for tool use]' }]),
+    // The person quoting the marker inside a message of their own is still the person.
+    user('typed-3', '06', '[Request interrupted by user] is what I saw, why?'),
+  ];
+  writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  const { values } = drain(parse({ key: path, sessionId: 'sid-h', project: 'quiet-zero' }, null));
+  const meta = Object.fromEntries(values.filter(r => r.kind === 'message').map(m => [m.uuid, m.is_meta]));
+  assert.deepEqual(meta, { summary: 1, 'typed-1': 0, a1: 0, marker: 1, 'typed-2': 0, 'marker-old': 1, 'typed-3': 0 });
+
+  const [{ session }] = assembleUsf(values).sessions;
+  assert.deepEqual(
+    session.turns.map(turn => turn.steps.filter(step => step.by === 'human').map(step => step.id)),
+    [['typed-1'], ['typed-2'], ['typed-3']],
+    'a turn starts only where the person submitted something',
+  );
+});
+
+test('claude parse() says what each message the harness wrote is', () => {
+  const dir = makeTempDir('obelisk-claude-harness-kinds-');
+  const path = join(dir, 'sid-k.jsonl');
+  const user = (uuid, second, content, extra = {}) => ({
+    uuid, type: 'user', timestamp: `2026-06-10T10:00:${second}Z`, isSidechain: false, userType: 'external',
+    message: { role: 'user', content }, ...extra,
+  });
+  const lines = [
+    user('summary', '00', 'Summary of the earlier conversation.', { isCompactSummary: true }),
+    user('typed', '01', 'what the person typed'),
+    user('command', '02', '<command-name>/review</command-name>\n<command-args></command-args>'),
+    user('output', '03', '<local-command-stdout>done</local-command-stdout>'),
+    user('reminder', '04', '<system-reminder>\nThe date has changed.\n</system-reminder>'),
+    user('notice', '05', '<task-notification>\n<status>completed</status>\n</task-notification>'),
+    user('skill', '06', 'Base directory for this skill: /skills/review\n\n# Review', { isMeta: true }),
+    user('caveat', '07', 'Caveat: the messages below were generated by the user while running local commands.', { isMeta: true }),
+    user('marker', '08', [{ type: 'text', text: '[Request interrupted by user]' }], { interruptedMessageId: 'msg_01' }),
+    { uuid: 'answer', type: 'assistant', timestamp: '2026-06-10T10:00:09Z', message: { role: 'assistant', model: 'claude-opus', content: [{ type: 'text', text: 'working' }] } },
+  ];
+  writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  const { values } = drain(parse({ key: path, sessionId: 'sid-k', project: 'quiet-zero' }, null));
+  const messages = values.filter(r => r.kind === 'message');
+  assert.deepEqual(Object.fromEntries(messages.map(m => [m.uuid, m.harness_kind])), {
+    summary: 'compaction', typed: null, command: 'command', output: 'command', reminder: 'reminder',
+    notice: 'notification', skill: 'skill', caveat: 'other', marker: 'interruption', answer: null,
+  });
+  assertHarnessConformance(values);
+  assert.equal(messages.find(m => m.uuid === 'skill').content_type, 'skill_instructions');
+  assert.deepEqual(messages.filter(m => m.is_meta === 0).map(m => m.uuid), ['typed', 'answer'],
+    'what stays in default retrieval does not change');
+
+  const [{ session }] = assembleUsf(values).sessions;
+  assert.deepEqual(session.turns.flatMap(turn => turn.steps).map(step => step.by === 'harness' ? step.kind : step.by),
+    ['compaction', 'human', 'command', 'command', 'reminder', 'notification', 'skill', 'other', 'interruption', 'agent']);
 });

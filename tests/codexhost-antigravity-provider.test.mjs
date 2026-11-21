@@ -13,6 +13,7 @@ import { persist } from '../packages/core/src/persist.ts';
 import { createProviderIndexPlan, indexProviderPlan } from '../packages/core/src/provider-indexing.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { refreshSessionProjectPaths } from '../packages/core/src/index-finalize.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const fixtureRoot = new URL('./fixtures/codexhost-antigravity/', import.meta.url);
@@ -404,6 +405,8 @@ test('failed Antigravity turn without item results emits a visible, expandable f
   assert.equal(failure.role, 'system');
   assert.equal(failure.visibility, 'visible');
   assert.match(failure.text, /quota exhausted/);
+  assert.equal(failure.harness_kind, 'error', 'it says what it is: the record of a failed turn');
+  assert.equal(failure.is_meta, 0, 'and stays retrievable');
   assert.equal(records.find((record) => record.kind === 'session').message_count, 2);
   assert.equal(source.provider.indexVersionMarker.endsWith('v2__'), true, 'new canonical records require a replay marker bump');
   const raw = source.provider.raw({ source: source.provider.name, messageUuid: failureUuid,
@@ -419,4 +422,21 @@ test('failed Antigravity turn without item results emits a visible, expandable f
   assert.equal(storedFailure.visibility, 'visible');
   assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(unit.sessionId).message_count, 2);
   db.close();
+});
+
+test('an Antigravity context compaction item is the harness\'s, and says so', () => {
+  const source = setup();
+  source.history.turns[0].items.push({ item: { type: 'contextCompaction', id: 'compaction-1' }, outcome: { status: 'succeeded' } });
+  source.write();
+  const unit = discover(source.provider).units[0];
+  const messages = [...source.provider.parse(unit, null)].filter((record) => record.kind === 'message');
+  const compaction = messages.at(-1);
+  assert.deepEqual([compaction.role, compaction.is_meta, compaction.harness_kind], ['system', 1, 'compaction']);
+  assert.equal(messages.filter((record) => record.harness_kind != null).length, 1, 'nothing else in the turn is the harness\'s');
+});
+
+test('Antigravity records of the captured thread say who wrote each message', () => {
+  const source = setup();
+  const unit = discover(source.provider).units[0];
+  assertHarnessConformance([...source.provider.parse(unit, null)]);
 });

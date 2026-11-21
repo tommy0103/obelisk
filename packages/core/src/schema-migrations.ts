@@ -9,6 +9,8 @@ const COLUMN_MIGRATIONS = [
   ['messages', 'is_meta', 'INTEGER DEFAULT 0'],
   ['messages', 'visibility', "TEXT DEFAULT 'visible'"],
   ['messages', 'source', "TEXT DEFAULT 'claude'"],
+  ['messages', 'harness_kind', 'TEXT'],
+  ['sessions', 'started_by', 'TEXT'],
   ['tool_calls', 'presentation', "TEXT DEFAULT 'default'"],
   ['workflows', 'parent_tool_use_id', 'TEXT'],
   ['index_state', 'cursor', 'TEXT'],

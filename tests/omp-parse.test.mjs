@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createOmpProvider } from '../packages/core/src/providers/omp.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -58,6 +59,7 @@ test('OMP provider projects title-prefixed sessions with independent provenance'
   assert.equal(units[0].meta.kind, 'omp-session');
 
   const { values, cursor } = drain(provider.parse(units[0], null));
+  assertHarnessConformance(values);
   const session = values.find(record => record.kind === 'session');
   const messages = values.filter(record => record.kind === 'message');
   const toolCall = values.find(record => record.kind === 'tool_call');
@@ -108,7 +110,8 @@ test('OMP title prelude updates the title without changing session identity', ()
   const updated = FIXTURE.replace('OMP indexed title', 'Updated OMP title');
   writeFileSync(path, updated);
 
-  const secondUnit = provider.discover({ lastCursor: () => first.cursor })[0];
+  // Same-length rewrite in the same clock tick: only the watcher hint can see it (ADR-0001).
+  const secondUnit = provider.discover({ lastCursor: () => first.cursor, changedPaths: [path] })[0];
   const second = drain(provider.parse(secondUnit, first.cursor));
   const session = second.values.find(record => record.kind === 'session');
   assert.equal(secondUnit.sessionId, firstUnit.sessionId);

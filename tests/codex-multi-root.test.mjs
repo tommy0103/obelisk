@@ -127,7 +127,9 @@ test('CODEX_HOME resolution supports absolute, tilde, relative, blank, and unset
   assert.equal(defaultCodexHome({ env: { CODEX_HOME: '~/custom-codex' }, homeDir: home, cwd }), join(home, 'custom-codex'));
   assert.equal(defaultCodexHome({ env: { CODEX_HOME: '~\\win-codex' }, homeDir: home, cwd }), join(home, 'win-codex'));
   assert.equal(defaultCodexHome({ env: { CODEX_HOME: './rel-codex' }, homeDir: home, cwd }), resolve(cwd, './rel-codex'));
-  assert.equal(defaultCodexHome({ env: { CODEX_HOME: '/abs/codex' }, homeDir: home, cwd }), resolve('/abs/codex'));
+  const absoluteCodex = join(home, 'absolute-codex');
+  assert.equal(defaultCodexHome({ env: { CODEX_HOME: absoluteCodex }, homeDir: home, cwd }), absoluteCodex);
+  assert.equal(defaultCodexHome({ env: { CODEX_HOME: '/abs/codex' }, homeDir: home, cwd }), resolve(cwd, '/abs/codex'));
 });
 
 test('CLI honors CODEX_HOME (including symlinked paths) and explicit providerRoots.codex takes precedence', () => {

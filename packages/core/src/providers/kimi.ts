@@ -17,6 +17,7 @@ import type {
   DiscoverContext,
   TranscriptRecord,
   IndexUnit,
+  HarnessKind,
   MessageRecord,
   ProviderAdapter,
   RawLookup,
@@ -51,6 +52,8 @@ interface ProjectedSession {
   readonly toolCalls: ToolCallRecord[];
   readonly toolResults: ToolResultRecord[];
   readonly summaries: SummaryRecord[];
+  /** For each summary, the index in `messages` of the message it stands before. */
+  readonly summaryPositions: number[];
   readonly subagents: SubagentRecord[];
   readonly durations: TranscriptRecord[];
   readonly mainMessageCount: number;
@@ -212,10 +215,15 @@ function projectedMessageText(message: JsonRecord): string | null {
   return slashCommand === null ? messageText(message.content) : trunc(slashCommand);
 }
 
-function isMetaMessage(message: JsonRecord): boolean {
+/** What a message Kimi wrote itself is. Null for the person's own messages and the model's. */
+function harnessKindOf(message: JsonRecord): HarnessKind | null {
   const origin = message.origin as JsonRecord | undefined;
-  if (origin === undefined || origin.kind === 'user') return false;
-  return !isRealUserMessage(message);
+  if (origin === undefined || origin.kind === 'user' || isRealUserMessage(message)) return null;
+  if (origin.kind === 'skill_activation') return 'skill';
+  if (origin.kind === 'injection') return 'reminder';
+  // The prompt a sub-agent starts from is a system trigger named for it.
+  if (origin.kind === 'system_trigger' && origin.name === 'subagent') return 'task';
+  return 'other';
 }
 
 function canonicalMessageContentType(message: JsonRecord): string {
@@ -235,6 +243,7 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
   const toolCalls: ToolCallRecord[] = [];
   const toolResults: ToolResultRecord[] = [];
   const summaries: SummaryRecord[] = [];
+  const summaryPositions: number[] = [];
   const durations: TranscriptRecord[] = [];
   const childParentCalls = new Map<string, string>();
   let mainMessageCount = 0;
@@ -335,6 +344,7 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
         const uuid = namespacedEventId(sessionId, wire.agentId, source.id, line);
         const origin = source.origin as JsonRecord | undefined;
         const messageUuid = uuid;
+        const harnessKind = harnessKindOf(source);
         pushMessage({
           kind: 'message',
           uuid,
@@ -344,8 +354,13 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
           timestamp,
           role: source.role,
           text: projectedMessageText(source),
-          content_type: canonicalMessageContentType(source),
-          is_meta: isMetaMessage(source) ? 1 : 0,
+          // A protocol 1.0 result arrives as a message of its own. Its text is the
+          // result, which the tool_result record below carries as well.
+          content_type: source.role === 'tool' && typeof source.toolCallId === 'string'
+            ? 'tool_result'
+            : canonicalMessageContentType(source),
+          is_meta: harnessKind === null ? 0 : 1,
+          harness_kind: harnessKind,
           visibility: 'visible',
           model,
           is_sidechain: wire.main ? 0 : 1,
@@ -410,6 +425,9 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
             source: 'compaction',
             content,
           });
+          // Undo cannot reach below this point (the floor set just below), so
+          // the index stays the summary's place among the messages.
+          summaryPositions.push(messages.length);
         }
         undoFloor = messages.length;
         resetOpenState();
@@ -539,6 +557,7 @@ function projectSession(meta: KimiSessionUnitMeta, sessionId: string, state: Jso
     toolCalls,
     toolResults,
     summaries,
+    summaryPositions,
     subagents,
     durations,
     mainMessageCount,
@@ -979,10 +998,16 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
         jsonl_path: projected.mainWirePath,
         source: SOURCE,
       };
-      yield* projected.messages;
+      // Only messages have an order of their own; a summary has none and no
+      // record to hang on, so it is given where it stands among them.
+      let nextSummary = 0;
+      for (const [index, message] of projected.messages.entries()) {
+        while (projected.summaryPositions[nextSummary] === index) yield projected.summaries[nextSummary++]!;
+        yield message;
+      }
+      yield* projected.summaries.slice(nextSummary);
       yield* projected.toolCalls;
       yield* projected.toolResults;
-      yield* projected.summaries;
       yield* projected.subagents;
       yield* projected.durations;
       return after.currentCursor;
@@ -998,5 +1023,3 @@ export function createKimiProvider({ rootDir = defaultKimiRoot() }: { rootDir?: 
     },
   };
 }
-
-export const kimiProvider = createKimiProvider();

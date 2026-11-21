@@ -13,12 +13,12 @@ import { basename, dirname, join, normalize, win32 } from 'node:path';
 import { normalizeObservedCwd, projectSlugFromPath, readLines, trunc, truncJson } from '../parsing.ts';
 import type { SqliteDb, SqliteRow } from '../sqlite-types.ts';
 import type {
-  Cursor, DiscoverContext, IndexUnit, MessageRecord, ProviderAdapter,
+  Cursor, DiscoverContext, HarnessKind, IndexUnit, MessageRecord, ProviderAdapter,
   RawLookup, RawRecord, TranscriptRecord, WatchTarget,
 } from './types.ts';
 
-export const name = 'kiro';
-export const KIRO_CANONICAL_TRANSCRIPT_MARKER = '__kiro_canonical_transcript_v3__';
+const name = 'kiro';
+const KIRO_CANONICAL_TRANSCRIPT_MARKER = '__kiro_canonical_transcript_v3__';
 export type KiroDatabaseOpener = (path: string) => SqliteDb;
 type JsonRecord = Record<string, any>;
 type Format = 'cli' | 'workspace' | 'sqlite';
@@ -50,6 +50,8 @@ interface ProjectedMessage {
   input?: number | null;
   output?: number | null;
   meta?: boolean;
+  /** What a harness-written message is, when the source names it. A `meta` message without one is `other`. */
+  harnessKind?: HarnessKind;
   agent?: string;
   execution?: string;
   summary?: boolean;
@@ -128,10 +130,14 @@ function signature(paths: readonly string[]): { signature: string; mtime: number
   return { signature: hash(JSON.stringify(members)), mtime };
 }
 
-function sourceSignature(source: KiroSource) {
-  return signature(source.format === 'sqlite'
+function memberPaths(source: KiroSource): string[] {
+  return source.format === 'sqlite'
     ? [source.path, `${source.path}-wal`]
-    : filePaths(source.path, source.metadataPath!, source.format));
+    : filePaths(source.path, source.metadataPath!, source.format);
+}
+
+function sourceSignature(source: KiroSource) {
+  return signature(memberPaths(source));
 }
 
 function childPaths(path: string): string[] {
@@ -198,30 +204,42 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
       return [];
     }
   };
+  // A file in a format this adapter cannot read yet: keep the indexed sessions
+  // it backs, found by source path because its header is not trusted for
+  // identity. A file that backs none may still be another copy of an indexed
+  // session, so it withholds every deletion.
+  const retained = new Set<string>();
+  let unattributed = false;
+  const skip = (path: string, error: string, reported = path) => {
+    const owners = indexed.filter(session => session.jsonlPath === path);
+    for (const { sessionId } of owners) {
+      retained.add(sessionId);
+      ctx.retainSession?.(sessionId);
+    }
+    if (owners.length === 0) unattributed = true;
+    ctx.reportSkippedArtifact?.({ path: reported, error });
+  };
   const sessionsRoot = join(root, 'sessions');
   const workspaces = entries(sessionsRoot, indexed.some(session => !session.jsonlPath.includes('#kiro:')));
   const addFile = (path: string, metadataPath: string, format: 'cli' | 'workspace') => {
     try {
       const before = signature(filePaths(path, metadataPath, format));
       const header = object(JSON.parse(readFileSync(metadataPath, 'utf8')));
-      const rawId = str(format === 'cli' ? header.session_id : header.id);
-      if (rawId === null) throw new Error('Kiro session id is missing');
       if (format === 'cli' && header.session_state?.version !== 'v1') {
-        throw new Error(`Unsupported Kiro CLI schema ${String(header.session_state?.version)}`);
+        return skip(path, `Unsupported Kiro CLI schema ${String(header.session_state?.version)}`, metadataPath);
       }
       if (format === 'cli') {
         const first = readJsonl(path, true)[0];
-        if (first !== undefined && first.version !== 'v1') throw new Error(`Unsupported Kiro CLI event version ${String(first.version)}`);
+        if (first !== undefined && first.version !== 'v1') return skip(path, `Unsupported Kiro CLI event version ${String(first.version)}`);
       }
       if (format === 'workspace' && header.schemaVersion !== '1.0.0') {
-        throw new Error(`Unsupported Kiro workspace schema ${String(header.schemaVersion)}`);
+        return skip(path, `Unsupported Kiro workspace schema ${String(header.schemaVersion)}`, metadataPath);
       }
+      const rawId = str(format === 'cli' ? header.session_id : header.id);
+      if (rawId === null) throw new Error('Kiro session id is missing');
+      const cwd = observedCwd(format === 'cli' ? header.cwd : header.workspacePaths?.[0] ?? header.rootPaths?.[0]);
       if (signature(filePaths(path, metadataPath, format)).signature !== before.signature) throw new Error('Kiro metadata changed during discovery');
-      sources.push({
-        format, path, metadataPath, header, rawId,
-        cwd: observedCwd(format === 'cli' ? header.cwd : header.workspacePaths?.[0] ?? header.rootPaths?.[0]),
-        ...before,
-      });
+      sources.push({ format, path, metadataPath, header, rawId, cwd, ...before });
     } catch (error) { issue(metadataPath, error); }
   };
   for (const workspace of workspaces) {
@@ -262,8 +280,10 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
     const id = kiroSessionId(source.rawId, source.cwd);
     groups.set(id, [...(groups.get(id) ?? []), source]);
   }
+  const changed = ctx.changedPaths === undefined ? undefined : new Set(ctx.changedPaths);
   const units: IndexUnit[] = [];
   for (const [sessionId, group] of groups) {
+    if (retained.has(sessionId)) continue;
     // Prefer the newest saved snapshot. On equal timestamps, file formats
     // outrank the classic database. Do not deduplicate by prompt text.
     const updated = (source: KiroSource) => Date.parse(time(source.header.updated_at ?? source.header.lastModifiedAt) ?? '') || 0;
@@ -272,7 +292,8 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
     const currentCursor = cursor(group);
     const key = `kiro-unit:${sessionId}`;
     const prior = indexed.find(session => session.sessionId === sessionId);
-    const hinted = ctx.changedPaths?.some(path => group.some(source => [source.path, source.metadataPath, `${source.path}-wal`, sourcePath(source)].includes(path))) ?? false;
+    const hinted = changed !== undefined
+      && group.some(source => [...memberPaths(source), sourcePath(source)].some(path => changed.has(path)));
     if (!hinted && ctx.lastCursor(key) === currentCursor && (ctx.indexedSessions === undefined || prior !== undefined)) continue;
     // Incomplete inventory cannot certify switching from an old source copy.
     if (!complete && prior !== undefined && prior.jsonlPath !== sourcePath(group[0]!)) continue;
@@ -281,7 +302,8 @@ function discoverAt(root: string, dbPath: string, ctx: DiscoverContext, openData
   }
   if (complete) {
     for (const session of indexed) {
-      if (groups.has(session.sessionId)) continue;
+      if (groups.has(session.sessionId) || retained.has(session.sessionId)) continue;
+      if (unattributed) { ctx.retainSession?.(session.sessionId); continue; }
       units.push({ key: `kiro-unit:${session.sessionId}`, sessionId: session.sessionId,
         retractSessionIds: [session.sessionId], meta: { sources: [], cursor: '0:0:kiro-tombstone', tombstone: true, indexed } satisfies KiroUnitMeta });
     }
@@ -330,6 +352,9 @@ function cliMessages(source: KiroSource): ProjectedMessage[] {
     timestamp = time(data.meta?.timestamp) ?? timestamp;
     if (!['Prompt', 'AssistantMessage', 'ToolResults'].includes(event.kind)) continue;
     const role = event.kind === 'AssistantMessage' ? 'assistant' : 'user';
+    // A result that cannot be tied to its call still came from the harness, not
+    // from the person, although Kiro stores it under the user role.
+    const unmatched = event.kind === 'ToolResults' ? { meta: true, harnessKind: 'result' as const } : {};
     const start = out.length;
     for (const part of Array.isArray(data.content) ? data.content : []) {
       const block = object(part);
@@ -342,9 +367,9 @@ function cliMessages(source: KiroSource): ProjectedMessage[] {
       } else if (block.kind === 'toolResult' && str(value.toolUseId) !== null) {
         out.push({ ...base, text: resultText(value.content) || null,
           result: { id: value.toolUseId, content: resultText(value.content), error: value.status !== 'success' } });
-      } else out.push({ ...base, text: null });
+      } else out.push({ ...base, ...unmatched, text: null });
     }
-    if (out.length === start) out.push({ role, timestamp, model, text: null, raw: event });
+    if (out.length === start) out.push({ role, timestamp, model, text: null, raw: event, ...unmatched });
     if (typeof data.message_id === 'string') byRawId.set(data.message_id, out.at(-1)!);
   }
   // Usage is per user turn, not per assistant block. Attach it once, to the
@@ -398,7 +423,7 @@ function workspaceMessages(source: KiroSource): ProjectedMessage[] {
       out.push({ ...base, role: 'user', text: text || null,
         result: { id: payload.toolCallId, content: text, error: payload.success === false } });
     } else if (payload.type === 'sub_agent_start' && str(payload.subSessionId)) {
-      const message: ProjectedMessage = { ...base, role: 'system', text: str(payload.prompt) ?? str(payload.explanation), meta: true,
+      const message: ProjectedMessage = { ...base, role: 'system', text: str(payload.prompt) ?? str(payload.explanation), meta: true, harnessKind: 'task',
         execution: str(payload.parentExecutionId) ?? undefined,
         subagent: { id: payload.subSessionId, name: str(payload.subAgentName), description: str(payload.prompt) ?? str(payload.explanation), duration: null, parentCall: null } };
       out.push(message);
@@ -406,7 +431,9 @@ function workspaceMessages(source: KiroSource): ProjectedMessage[] {
     } else if (payload.type === 'sub_agent_complete') {
       completions.push(event);
     } else if (['tool_call', 'tool_result'].includes(payload.type)) {
-      out.push({ ...base, role: payload.type === 'tool_call' ? 'assistant' : 'user', text: null });
+      // No call id: see the note on unmatched results in cliMessages().
+      out.push({ ...base, role: payload.type === 'tool_call' ? 'assistant' : 'user', text: null,
+        ...(payload.type === 'tool_result' ? { meta: true, harnessKind: 'result' as const } : {}) });
     }
   };
   for (const event of events) append(event);
@@ -526,7 +553,7 @@ function recordsFor(source: KiroSource, sessionId: string, messages: ProjectedMe
     }
     records.push({ kind: 'message', uuid, session_id: sessionId, type: message.role, parent_uuid: previous.get(scope) ?? null,
       timestamp: message.timestamp, role: message.role, text: message.text === null ? null : trunc(message.text),
-      content_type: message.contentType ?? (message.call ? 'tool_use' : message.result ? 'tool_result' : message.text === null ? 'unknown' : 'text'), is_meta: message.meta ? 1 : 0, visibility: 'visible', model: message.model ?? null,
+      content_type: message.contentType ?? (message.call ? 'tool_use' : message.result ? 'tool_result' : message.text === null ? 'unknown' : 'text'), is_meta: message.meta ? 1 : 0, harness_kind: message.harnessKind ?? (message.meta ? 'other' : null), visibility: 'visible', model: message.model ?? null,
       is_sidechain: message.agent ? 1 : 0, agent_id: message.agent ? `${sessionId}:subagent:${message.agent}` : null, input_tokens: message.input ?? null, output_tokens: message.output ?? null,
       cwd: source.cwd, skill: null, source: name } satisfies MessageRecord);
     previous.set(scope, uuid);
@@ -552,7 +579,9 @@ function recordsFor(source: KiroSource, sessionId: string, messages: ProjectedMe
     project: projectSlugFromPath(source.cwd), started_at: time(header.created_at ?? header.createdAt),
     ended_at: time(header.updated_at ?? header.lastModifiedAt) ?? messages.at(-1)?.timestamp ?? null,
     git_branch: null, version: source.format === 'workspace' ? `workspace-${header.schemaVersion}` : source.format === 'cli' ? 'cli-v1' : 'conversations-v2',
-    message_count: messages.filter(message => message.agent === undefined && !(message.summary && message.text !== null)).length, countMode: 'total', jsonl_path: sourcePath(source), source: name });
+    message_count: messages.filter(message => message.agent === undefined && !(message.summary && message.text !== null)).length, countMode: 'total', jsonl_path: sourcePath(source), source: name,
+    // A CLI header can attest that a sub-agent created the session; it carries no parent id.
+    started_by: source.format === 'cli' && str(header.session_created_reason) === 'subagent' ? 'agent' : null });
   return records;
 }
 
@@ -609,5 +638,3 @@ export function createKiroProvider({
     },
   };
 }
-
-export const kiroProvider = createKiroProvider();
