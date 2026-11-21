@@ -10,16 +10,19 @@ const REFERENCE_SUFFIX = /:(\d+)(?::(\d+)|-(\d+))?$/;
 const INLINE_CODE_REFERENCE = /^[\w@.\-/]+\.[A-Za-z0-9]+:\d+(?::\d+|-\d+)?$/;
 const LOCAL_HREF = /^(?:file:|\/|[A-Za-z]:[\\/])/;
 
+/** @internal Exported for tests. */
 export function isLocalHref(href) {
   return typeof href === 'string' && LOCAL_HREF.test(href.trim());
 }
 
 // Deliberately strict: an extension *and* a line number are both required. Plain inline code
 // such as `package.json` or `useState` must never become a link.
+/** @internal Exported for tests. */
 export function isInlineCodeReference(text) {
   return typeof text === 'string' && INLINE_CODE_REFERENCE.test(text.trim());
 }
 
+/** @internal Exported for tests. */
 export function parseFileReference(raw) {
   if (typeof raw !== 'string' || !raw.trim()) return null;
   const text = raw.trim();
@@ -35,6 +38,7 @@ export function parseFileReference(raw) {
 
 // Only `file:` URLs are percent-encoded. Decoding a plain path would corrupt any filename
 // that legitimately contains `%`.
+/** @internal Exported for tests. */
 export function hrefToPath(href) {
   if (!href.startsWith('file:')) return href;
   try {

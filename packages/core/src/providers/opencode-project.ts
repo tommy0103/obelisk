@@ -175,7 +175,8 @@ export function* parseV2(
           id: `${sessionId}:summary:${encodeURIComponent(m.id)}`,
           session_id: sessionId,
           timestamp: messageTimestamp,
-          source: name,
+          // The summary kind, not the provider (skill-doc/references/schema.md).
+          source: 'compaction',
           content: trunc(summaryText),
           visibility: baseVisibility,
           input_tokens: usage.input,
@@ -196,6 +197,7 @@ export function* parseV2(
             text: null,
             content_type: 'unknown',
             is_meta: 1,
+            harness_kind: 'compaction',
             visibility: 'hidden',
             model: parseModelRef(session.model) ?? null,
             is_sidechain: isSubagent ? 1 : 0,
@@ -227,6 +229,7 @@ export function* parseV2(
         text: text !== null ? trunc(text) : null,
         content_type: text !== null ? 'text' : 'unknown',
         is_meta: 1,
+        harness_kind: 'reminder',
         visibility: baseVisibility,
         model: parseModelRef(session.model) ?? null,
         is_sidechain: isSubagent ? 1 : 0,
@@ -260,6 +263,7 @@ export function* parseV2(
         text: cardText,
         content_type: 'text',
         is_meta: 1,
+        harness_kind: 'other',
         visibility: baseVisibility,
         model: toModel ?? parseModelRef(session.model) ?? null,
         is_sidechain: isSubagent ? 1 : 0,
@@ -293,6 +297,7 @@ export function* parseV2(
         text: cardText,
         content_type: 'text',
         is_meta: 1,
+        harness_kind: 'other',
         visibility: baseVisibility,
         model: parseModelRef(session.model) ?? null,
         is_sidechain: isSubagent ? 1 : 0,
@@ -321,6 +326,7 @@ export function* parseV2(
         text: 'location switched',
         content_type: 'text',
         is_meta: 1,
+        harness_kind: 'other',
         visibility: baseVisibility,
         model: parseModelRef(session.model) ?? null,
         is_sidechain: isSubagent ? 1 : 0,
@@ -348,6 +354,7 @@ export function* parseV2(
         text: null,
         content_type: 'unknown',
         is_meta: 1,
+        harness_kind: 'other',
         visibility: 'hidden',
         model: parseModelRef(session.model) ?? null,
         is_sidechain: isSubagent ? 1 : 0,
@@ -598,6 +605,7 @@ export function* parseV2(
         text: instructions !== null ? trunc(instructions) : null,
         content_type: instructions !== null ? 'skill_instructions' : 'text',
         is_meta: 1,
+        harness_kind: 'skill',
         visibility: baseVisibility,
         model: parseModelRef(session.model) ?? null,
         is_sidechain: isSubagent ? 1 : 0,
@@ -687,6 +695,7 @@ export function* parseV2(
       text: text !== null ? trunc(text) : null,
       content_type: text !== null ? 'text' : 'unknown',
       is_meta: 1,
+      harness_kind: 'other',
       visibility: baseVisibility,
       model: parseModelRef(session.model) ?? null,
       is_sidechain: isSubagent ? 1 : 0,
@@ -726,6 +735,8 @@ export function* parseV2(
     countMode: 'total',
     jsonl_path: unit.key,
     source: name,
+    // A session with a parent is one a sub-agent tool call created, also when the parent is gone.
+    started_by: session.parent_id ? 'agent' : null,
   } satisfies SessionRecord);
 
   for (const record of records) yield record;
@@ -1142,6 +1153,8 @@ export function* parseV1(
     countMode: 'total',
     jsonl_path: unit.key,
     source: name,
+    // A session with a parent is one a sub-agent tool call created, also when the parent is gone.
+    started_by: session.parent_id ? 'agent' : null,
   } satisfies SessionRecord);
 
   for (const record of records) yield record;

@@ -72,9 +72,11 @@ const cleanup = () => {
   if (writer) clearInterval(writer);
   if (cursorProbe) clearInterval(cursorProbe);
   if (writerStopTimeout) clearTimeout(writerStopTimeout);
-  try { cursorDb?.close(); } catch {}
-  try { ws?.close(); } catch {}
-  try { child.kill('SIGTERM'); } catch {}
+  // Runs twice (explicitly, then on exit); node:sqlite throws on a second close.
+  cursorDb?.close();
+  cursorDb = undefined;
+  ws?.close();
+  child.kill('SIGTERM');
   fs.rmSync(tmp, { recursive: true, force: true });
 };
 process.on('exit', cleanup);
@@ -95,7 +97,7 @@ async function cdpConnect() {
   if (!page) throw new Error(`no matching CDP page target (got ${targets.map((t) => t.url).join(', ')})`);
   // Never leak a socket: close any previous connection before replacing it,
   // and close the new one if the open handshake fails.
-  try { ws?.close(); } catch {}
+  ws?.close();
   const next = new WebSocket(page.webSocketDebuggerUrl);
   next.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -108,13 +110,13 @@ async function cdpConnect() {
   };
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      try { next.close(); } catch {}
+      next.close();
       reject(new Error('cdp websocket open timeout'));
     }, 5000);
     next.onopen = () => { clearTimeout(timeout); resolve(); };
     next.onerror = (error) => {
       clearTimeout(timeout);
-      try { next.close(); } catch {}
+      next.close();
       reject(error);
     };
   });
@@ -171,11 +173,9 @@ try {
     const text = `gui append ${i}`;
     const start = performance.now();
     fs.appendFileSync(liveFile, `${line(i)}\n`);
-    // eslint-disable-next-line no-await-in-loop
     await waitFor(async () => visibleNow(text), `${text} visible`, 20000);
     isolated.push(performance.now() - start);
     console.log(`A append ${i} -> visible: ${isolated[isolated.length - 1].toFixed(0)} ms`);
-    // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 200));
   }
   console.log(`A isolated-burst latency ms: p50=${percentile(isolated, 50).toFixed(0)} p95=${percentile(isolated, 95).toFixed(0)}`);
@@ -227,10 +227,8 @@ try {
         indexedAt.set(a.i, performance.now());
       }
     }
-    // eslint-disable-next-line no-await-in-loop
     const hits = await Promise.all(missing.map(async (a) => ((await visibleNow(a.text)) ? a.i : null)));
     for (const hit of hits) if (hit !== null) visibleAt.set(hit, performance.now());
-    // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 100));
   }
   clearInterval(cursorProbe);

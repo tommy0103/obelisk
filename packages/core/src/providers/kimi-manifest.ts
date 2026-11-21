@@ -7,7 +7,7 @@ import { join, relative, sep } from 'node:path';
 
 import type { Cursor } from './types.ts';
 
-export const KIMI_MANIFEST_CURSOR_FORMAT = 'kimi-manifest-v1';
+const KIMI_MANIFEST_CURSOR_FORMAT = 'kimi-manifest-v1';
 export type KimiCursorDisposition = 'current' | 'replay';
 
 export interface KimiWireFile {

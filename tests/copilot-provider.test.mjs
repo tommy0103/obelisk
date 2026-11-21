@@ -24,6 +24,7 @@ import {
   createCopilotProvider,
   defaultCopilotUserDataRoots,
 } from '../packages/core/src/providers/copilot.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -641,6 +642,18 @@ test('direct canonical assembly equals SQLite round-trip assembly', () => {
     });
     db.close();
     assert.deepEqual(persisted, direct);
+  } finally {
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('Copilot records of the captured transcripts and Chronicle rows say who wrote each message', () => {
+  const layout = fixtureLayout();
+  try {
+    const provider = createCopilotProvider({ userDataRoots: [layout.root], openChronicle });
+    const units = discover(provider);
+    assert.ok(units.length > 0);
+    for (const unit of units) assertHarnessConformance(drain(provider.parse(unit, null)).values);
   } finally {
     rmSync(layout.base, { recursive: true, force: true });
   }

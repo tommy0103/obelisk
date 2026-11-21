@@ -21,11 +21,6 @@ export interface SessionCatalogueOptions extends SourceQueryOptions {
   limit?: number;
 }
 
-export interface SessionCataloguePage {
-  rows: SessionMetadata[];
-  total: number;
-}
-
 export interface ActivitySessionsOptions {
   from: string;
   to: string;
@@ -74,3 +69,11 @@ export interface AppliedSessionPatch {
 }
 
 export type WindowControlAction = 'minimize' | 'toggle-maximize' | 'close';
+
+export interface WindowState {
+  maximized: boolean;
+}
+
+export interface SessionUpdatedEvent {
+  sessionId: string;
+}

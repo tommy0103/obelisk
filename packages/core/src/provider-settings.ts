@@ -21,6 +21,7 @@ import type { HermesStoreOpener } from './providers/hermes.ts';
 import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 import type { KiroDatabaseOpener } from './providers/kiro.ts';
 import type { OpencodeDatabaseOpener } from './providers/opencode.ts';
+import type { DevinDatabaseOpener } from './providers/devin.ts';
 
 export type PersistedProviderSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -132,6 +133,7 @@ function configuredPaths(value: unknown, homeDir: string): string[] | undefined 
   return single !== null ? [single] : undefined;
 }
 
+/** @internal Exported for tests. */
 export function resolveProviderRoots(
   registry: ProviderRegistry,
   persisted: PersistedProviderSettings = {},
@@ -207,6 +209,7 @@ export function createConfiguredBuiltinProviderRuntime(
     openZcodeDatabase,
     openKiroDatabase,
     openOpencodeDatabase,
+    openDevinDatabase,
   }: {
     homeDir?: string;
     cwd?: string;
@@ -216,9 +219,10 @@ export function createConfiguredBuiltinProviderRuntime(
     openZcodeDatabase?: ZcodeDatabaseOpener;
     openKiroDatabase?: KiroDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
+    openDevinDatabase?: DevinDatabaseOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir });
   const copilotUsesAutomaticRoots = baseRoots.copilot === undefined
     && !hasExplicitProviderRoot(persisted, 'copilot');
@@ -240,7 +244,7 @@ export function createConfiguredBuiltinProviderRuntime(
       ...(opencodeUsesAutomaticRoots ? { opencode: undefined } : {}),
     },
     {
-      cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
+      cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase,
       copilotUserDataRoots,
       claudeSourceRoots,
       claudeDefaultRoot,

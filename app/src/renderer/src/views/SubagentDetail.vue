@@ -2,20 +2,15 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { ref, onMounted, watch, computed } from 'vue';
-import { useRouter } from 'vue-router';
-import { state } from '../store.js';
+import { ref, reactive, onMounted, watch } from 'vue';
 import { loadSubagentDetail, isTextTruncated, loadFullText } from '../data.js';
-import { escapeHTML, fmtClockTime, renderMarkdown } from '../utils.js';
+import { fmtClockTime, renderMarkdown } from '../utils.js';
 
 defineOptions({ name: 'SubagentDetail' });
 const props = defineProps({ id: String, agentId: String });
-const router = useRouter();
 
 const messages = ref([]);
 const loading = ref(false);
-
-const parentSession = computed(() => state.sessions.find(s => s.id === props.id));
 
 onMounted(async () => { await load(); });
 watch(() => props.agentId, async (n, o) => { if (n && n !== o) { messages.value = []; await load(); } });
@@ -28,17 +23,15 @@ async function load() {
   } finally { loading.value = false; }
 }
 
-function goBack() {
-  router.push(`/sessions/${props.id}`);
+const fullText = reactive(new Map());
+
+function toggleOpen(event, selector) {
+  /** @type {HTMLElement} */ (event.currentTarget).closest(selector).classList.toggle('open');
 }
 
-async function handleLoadFull(uuid, el) {
+async function handleLoadFull(uuid) {
   const full = await loadFullText(uuid);
-  if (full && el) {
-    const body = el.closest('.msg')?.querySelector('.markdown-msg, .markdown-compact');
-    if (body) body.outerHTML = renderMarkdown(full, { variant: 'msg' });
-    el.remove();
-  }
+  if (full) fullText.set(uuid, full);
 }
 
 function renderMsgMarkdown(msg, text, variant) {
@@ -63,60 +56,60 @@ function renderMsgMarkdown(msg, text, variant) {
 
       <div v-else class="timeline">
         <div
-          v-for="(msg, idx) in messages"
+          v-for="msg in messages"
           :key="msg.uuid"
           class="msg"
           :class="[msg.type === 'user' ? 'user' : 'assistant']"
           :data-uuid="msg.uuid"
         >
-          <!-- Thinking -->
           <template v-if="msg.content_type === 'thinking'">
             <div class="msg-thinking">
-              <button class="thinking-toggle" @click="$event.currentTarget.closest('.msg-thinking').classList.toggle('open')">
+              <button class="thinking-toggle" @click="toggleOpen($event, '.msg-thinking')">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
+              <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
               <div class="thinking-body" v-html="renderMsgMarkdown(msg, msg.text, 'msg')"></div>
             </div>
           </template>
 
-          <!-- Meta -->
           <template v-else-if="msg.is_meta">
             <div class="msg-meta-collapsed">
-              <button class="meta-toggle" @click="$event.currentTarget.closest('.msg-meta-collapsed').classList.toggle('open')">
+              <button class="meta-toggle" @click="toggleOpen($event, '.msg-meta-collapsed')">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="meta-label">System</span>
                 <span class="meta-preview">{{ (msg.text || '').replace(/<[^>]+>/g, '').slice(0, 80) }}</span>
               </button>
+              <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
               <div class="meta-body" v-html="renderMsgMarkdown(msg, msg.text, 'compact')"></div>
             </div>
           </template>
 
-          <!-- Normal message -->
           <template v-else>
             <div class="msg-head">
               <span class="role">{{ msg.type === 'user' ? 'Prompt' : 'Assistant' }}</span>
               <span class="when">{{ msg.timestamp ? fmtClockTime(msg.timestamp) : '' }}</span>
             </div>
             <div v-if="msg._thinking" class="msg-thinking">
-              <button class="thinking-toggle" @click="$event.currentTarget.closest('.msg-thinking').classList.toggle('open')">
+              <button class="thinking-toggle" @click="toggleOpen($event, '.msg-thinking')">
                 <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                 <span class="thinking-label">Thinking</span>
               </button>
+              <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
               <div class="thinking-body" v-html="renderMsgMarkdown(msg, msg._thinking, 'msg')"></div>
             </div>
-            <div v-if="msg.text" v-html="renderMsgMarkdown(msg, msg.text, 'msg')"></div>
+            <!-- eslint-disable-next-line vue/no-v-html -- renderMarkdown() -->
+            <div v-if="msg.text" v-html="renderMsgMarkdown(msg, fullText.get(msg.uuid) ?? msg.text, 'msg')"></div>
             <div v-else-if="!msg.tool_calls?.length" class="msg-text empty-text">(no text content)</div>
             <button
-              v-if="isTextTruncated(msg.text)"
+              v-if="isTextTruncated(msg.text) && !fullText.has(msg.uuid)"
               class="truncated-btn"
-              @click="handleLoadFull(msg.uuid, $event.currentTarget)"
+              @click="handleLoadFull(msg.uuid)"
             >Message truncated — click to load full text</button>
 
-            <!-- Tool calls -->
             <div v-if="msg.tool_calls?.length" class="msg-tools">
               <div v-for="tc in msg.tool_calls" :key="tc.id" class="msg-tool" :class="{ 'is-error': tc.result?.is_error }">
-                <button class="toolcall-toggle" @click="$event.currentTarget.closest('.msg-tool').classList.toggle('open')">
+                <button class="toolcall-toggle" @click="toggleOpen($event, '.msg-tool')">
                   <svg class="chevron" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 1.5l3 2.5-3 2.5"/></svg>
                   <span class="tool-name">{{ tc.name }}</span>
                   <span class="tool-arg">{{ getToolArgPreview(tc) }}</span>

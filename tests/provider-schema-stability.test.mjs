@@ -12,8 +12,9 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    // 2026-10-20: preserve checkpoints while marking retained units for replay.
-    '71c4ecef93d72808f8c56bb3ab7f7296a53fd1fad34e0adbcd3e300262f629bb',
+    // 2026-11-18: messages.harness_kind and sessions.started_by. Both are
+    // nullable additions; stored rows stay valid, so no provider replays for them.
+    '73f18a42aa43cd3504b95516f0773f8a706ed5c7c0143b2e2ec8a98a3f55c791',
   );
 });
 

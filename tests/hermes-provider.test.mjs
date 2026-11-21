@@ -30,6 +30,8 @@ import { createHermesProvider, hermesSessionId, pathInside } from '../packages/c
 import { createQueryApi } from '../packages/core/src/query.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { assembleUsf } from '../packages/core/src/usf.ts';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -1591,6 +1593,16 @@ test('parse() records a delegated session as a subagent link without suppressing
       true,
       'the child stays a first-class session rather than a suppressed sidechain',
     );
+    // Who started a session is said on the session, so that a first-class child's prompt is not
+    // read as something a person submitted.
+    const startedBy = id => records(id).find(record => record.kind === 'session').started_by;
+    assert.equal(startedBy(childId), 'agent');
+    assert.equal(startedBy('20260201_120000_orphan'), 'agent', 'also when the parent is not in this store');
+    assert.equal(startedBy(splitId), null, 'a compression-triggered split is still the person\'s session');
+    assert.equal(startedBy(parentId), null);
+    const [{ session: childUsf }] = assembleUsf(childRecords).sessions;
+    assert.deepEqual(childUsf.turns.flatMap(turn => turn.steps).map(step => [step.by, step.kind, step.content]),
+      [['harness', 'task', 'audit this'], ['agent', 'text', 'audited']]);
     assert.equal(records(splitId).some(record => record.kind === 'subagent'), false,
       'a compression-triggered split is not a subagent');
     assert.equal(records(parentId).some(record => record.kind === 'subagent'), false);
@@ -2572,6 +2584,11 @@ test('a display-suppressed row is meta and a timeline marker is not', () => {
     assert.equal(byId(layout.ids.hidden).visibility, 'hidden');
     assert.equal(byId(markerId).is_meta, 0, 'a timeline marker is not bookkeeping to suppress');
     assert.equal(byId(markerId).visibility, 'visible', 'and it stays in the conversation');
+    assert.equal(byId(markerId).harness_kind, 'notification',
+      'retrievable, and still Hermes bringing a result back rather than a prompt');
+    assert.equal(byId(layout.ids.hidden).harness_kind, 'other');
+    assert.equal(byId(layout.ids.final).harness_kind, null);
+    assert.equal(byId(layout.ids.rewound).harness_kind, null);
     assert.equal(byId(layout.ids.final).is_meta, 0);
     assert.equal(byId(layout.ids.rewound).is_meta, 0, 'a rewound turn was still a turn');
     assert.equal(
@@ -2601,6 +2618,7 @@ test('parses the rows captured from a real Hermes store', () => {
     assert.deepEqual(issues, [], 'a home without a profiles directory reports nothing');
     const records = [];
     for (const unit of units) records.push(...drain(provider.parse(unit, null)).values);
+    assertHarnessConformance(records);
 
     const store = new DatabaseSync(path, { readOnly: true });
     try {

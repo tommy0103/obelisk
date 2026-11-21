@@ -244,7 +244,7 @@ test('fresh orphan discover and parse preserve direct canonical detail through S
   const root = makeTempDir('obelisk-orphan-canonical-');
   const projects = join(root, 'projects');
   const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8').trim().split('\n').at(-1);
-  const path = writeSubagentTranscript(projects, 'agent-a', [JSON.parse(captured)]);
+  writeSubagentTranscript(projects, 'agent-a', [JSON.parse(captured)]);
   const provider = createClaudeProvider({ rootDir: root });
   const units = provider.discover({ lastCursor: () => null });
   assert.equal(units.length, 1);

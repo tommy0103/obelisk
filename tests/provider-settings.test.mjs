@@ -10,11 +10,11 @@ import {
   createConfiguredBuiltinProviderRuntime,
   getCopilotEditions,
   readPersistedProviderSettings,
+  resolveProviderRoots,
 } from '../packages/core/src/provider-settings.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import {
   buildSourceCatalog,
-  resolveProviderRoots,
   setPersistedSetting,
 } from '../app/src/main/provider-settings.ts';
 import { makeTempDir } from './temp-dirs.mjs';

@@ -28,6 +28,7 @@ const rebuilding = ref(false);
 const rebuildError = ref('');
 const settingsRecovery = ref('');
 const saveError = ref('');
+const indexError = ref('');
 const version = ref('');
 let stopIndexUpdates = null;
 let settingsRequestVersion = 0;
@@ -65,6 +66,7 @@ async function loadSettings({ preserveRecapPath = false } = {}) {
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
   settingsRecovery.value = s.settingsRecovery || '';
+  indexError.value = s.indexError || '';
   version.value = s.version || '';
   settingsLoaded = true;
 }
@@ -100,7 +102,8 @@ async function browseSourcePath(source) {
   }
 }
 
-async function toggleCopilotEdition(edition, enabled) {
+async function toggleCopilotEdition(edition, event) {
+  const enabled = /** @type {HTMLInputElement} */ (event.target).checked;
   edition.enabled = enabled;
   await saveSetting(`copilotEditions.${edition.id}`, enabled);
   await loadSettings();
@@ -184,7 +187,6 @@ function fmtRelative(iso) {
   <div class="settings-wrap">
     <div class="settings-content">
 
-      <!-- Data Sources -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Data Sources</h2>
@@ -194,6 +196,11 @@ function fmtRelative(iso) {
         <div v-if="saveError" class="status-row error settings-save-error">
           <span class="status-dot error"></span>
           <span>{{ saveError }}</span>
+        </div>
+
+        <div v-if="indexError" class="status-row error settings-index-error">
+          <span class="status-dot error"></span>
+          <span>{{ indexError }}</span>
         </div>
 
         <div v-if="settingsRecovery" class="status-row warn settings-recovery">
@@ -232,7 +239,7 @@ function fmtRelative(iso) {
           <div class="source-card-body">
             <div v-if="src.id === 'copilot' && !copilotCustomRoot" class="copilot-editions">
               <label v-for="edition in copilotEditions" :key="edition.id" class="copilot-edition">
-                <input type="checkbox" :checked="edition.enabled" @change="toggleCopilotEdition(edition, $event.target.checked)" />
+                <input type="checkbox" :checked="edition.enabled" @change="toggleCopilotEdition(edition, $event)" />
                 <span class="copilot-edition-details">
                   <span>{{ edition.name }}</span>
                   <span class="copilot-edition-path">{{ edition.path }}</span>
@@ -262,7 +269,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- Index -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Index location</h2>
@@ -274,7 +280,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- Auto-refresh -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Auto-refresh</h2>
@@ -288,7 +293,6 @@ function fmtRelative(iso) {
         </label>
       </section>
 
-      <!-- Editor -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Editor</h2>
@@ -306,7 +310,7 @@ function fmtRelative(iso) {
                 class="editor-picker-trigger"
                 :class="{ open: editorMenuOpen }"
                 aria-haspopup="listbox"
-                :aria-expanded="String(editorMenuOpen)"
+                :aria-expanded="editorMenuOpen"
                 aria-controls="editor-picker-menu"
                 @click="editorMenuOpen = !editorMenuOpen"
               >
@@ -329,7 +333,7 @@ function fmtRelative(iso) {
                   class="editor-picker-option"
                   :class="{ selected: editor.id === editorScheme }"
                   role="option"
-                  :aria-selected="String(editor.id === editorScheme)"
+                  :aria-selected="editor.id === editorScheme"
                   @click="chooseEditor(editor.id)"
                 >
                   <span>{{ editor.label }}</span>
@@ -343,7 +347,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- Recap -->
       <section class="settings-section">
         <div class="settings-section-head">
           <h2>Recap</h2>
@@ -370,7 +373,6 @@ function fmtRelative(iso) {
         </div>
       </section>
 
-      <!-- About -->
       <section class="settings-section last">
         <div class="settings-section-head">
           <h2>About</h2>

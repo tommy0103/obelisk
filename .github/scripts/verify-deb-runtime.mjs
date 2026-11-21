@@ -106,7 +106,9 @@ try {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json`, { signal: AbortSignal.timeout(1000) });
       target = (await response.json()).find(item => item.type === 'page' && item.url.includes('/out/renderer/index.html'));
-    } catch {}
+    } catch {
+      // DevTools is not listening yet; the deadline bounds the retries.
+    }
     if (!target) await delay(100);
   }
   assert.ok(target, `Installed renderer did not start: ${output}`);

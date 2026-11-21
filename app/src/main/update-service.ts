@@ -8,6 +8,7 @@ function stableParts(version: unknown): number[] | null {
   const parts = version.split('.').map(Number);
   return parts.every(Number.isSafeInteger) ? parts : null;
 }
+/** @internal Exported for tests. */
 export function isNewerStable(version: unknown, current: string): boolean {
   const next = stableParts(version), previous = stableParts(current);
   if (!next || !previous) return false;

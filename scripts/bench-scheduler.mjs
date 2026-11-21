@@ -17,10 +17,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 
-const require = createRequire(import.meta.url);
 const { createWorkerBuildIndex } = await import('../app/src/main/indexer-worker-client.ts');
 const { createIndexerService } = await import('../app/src/main/indexer-service.ts');
 

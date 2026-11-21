@@ -30,6 +30,7 @@
     "./schema-migrations": "./dist/schema-migrations.js",
     "./sqlite-types": "./dist/sqlite-types.js",
     "./tx": "./dist/tx.js",
+    "./usf": "./dist/usf.js",
     "./write-coordinator": "./dist/write-coordinator.js",
     "./writer-lease": "./dist/writer-lease.js"
   },

@@ -23,6 +23,7 @@ import { persist } from '../packages/core/src/persist.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { runCli } from './cli-test-helpers.mjs';
+import { assertHarnessConformance } from './harness-conformance.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
@@ -109,7 +110,7 @@ test('real-model aggregate indexes end to end: sessions, messages, tools, subage
   const toolErrors = db.prepare("SELECT COUNT(*) c FROM tool_results WHERE session_id LIKE 'zcode:%' AND is_error=1").get().c;
   assert.ok(toolErrors >= 1, 'error tool results indexed');
 
-  const summaries = db.prepare("SELECT COUNT(*) c FROM summaries WHERE source='zcode'").get().c;
+  const summaries = db.prepare("SELECT COUNT(*) c FROM summaries WHERE source='compaction' AND session_id LIKE 'zcode:%'").get().c;
   assert.equal(summaries, 1, 'compact summary indexed');
 
   const source = new DatabaseSync(sourcePath);
@@ -119,8 +120,31 @@ test('real-model aggregate indexes end to end: sessions, messages, tools, subage
   assert.ok(priced.cache_read > 0);
   assert.ok(db.prepare("SELECT 1 FROM messages WHERE source='zcode' AND content_type='tool_use' AND text IS NULL LIMIT 1").get(), 'tool-only assistant messages keep tool_use classification');
   assert.ok(db.prepare("SELECT 1 FROM messages WHERE source='zcode' AND content_type='unknown' AND text IS NULL LIMIT 1").get(), 'textless non-tool messages keep unknown classification');
-  const summary = db.prepare("SELECT visibility FROM summaries WHERE source='zcode' LIMIT 1").get();
+  const summary = db.prepare("SELECT visibility FROM summaries WHERE source='compaction' AND session_id LIKE 'zcode:%' LIMIT 1").get();
   assert.equal(summary.visibility, 'visible', 'compaction summary is available to standard readers');
+  // ZCode stores its own reminders and fork notices under the user role. The
+  // source names them (semantics.kind); only a prompt stays the person's.
+  const hiddenUserRows = db.prepare("SELECT is_meta, COUNT(*) c FROM messages WHERE source='zcode' AND role='user' AND visibility='hidden' GROUP BY is_meta ORDER BY is_meta").all();
+  const writtenByZcode = source.prepare("SELECT COUNT(*) c FROM message WHERE json_extract(data, '$.role')='user' AND json_extract(data, '$.semantics.kind') IN ('system_reminder', 'fork_notice')").get().c;
+  assert.ok(writtenByZcode > 0, 'the aggregate has reminders and fork notices');
+  assert.equal(hiddenUserRows.find(row => row.is_meta === 1)?.c, writtenByZcode, 'reminders and fork notices are not the person\'s');
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM messages WHERE source='zcode' AND role='user' AND is_meta=0 AND visibility='hidden'").get().c,
+    source.prepare("SELECT COUNT(*) c FROM message WHERE json_extract(data, '$.semantics.kind')='user_prompt' AND json_extract(data, '$.semantics.uiVisibility')='hidden'").get().c,
+    'a prompt copied into a fork stays the person\'s');
+  // What each of them is comes from the same field. A model call that was
+  // cancelled is in data.error; it left nothing the model said.
+  const kinds = Object.fromEntries(db.prepare("SELECT harness_kind, COUNT(*) c FROM messages WHERE source='zcode' AND harness_kind IS NOT NULL GROUP BY harness_kind").all().map(row => [row.harness_kind, row.c]));
+  assert.equal(kinds.reminder, source.prepare("SELECT COUNT(*) c FROM message WHERE json_extract(data, '$.semantics.kind')='system_reminder'").get().c);
+  const cancelled = source.prepare("SELECT COUNT(*) c FROM message WHERE json_extract(data, '$.error.data.turnResult')='cancelled'").get().c;
+  assert.ok(cancelled > 0, 'the aggregate has a cancelled model call');
+  assert.equal(kinds.interruption, cancelled);
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM messages WHERE source='zcode' AND harness_kind IS NULL AND is_meta=1").get().c, 0,
+    'every row ZCode wrote itself says what it is');
+  // A session a sub-agent tool call created says so, also where it is a session of its own.
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) c FROM sessions WHERE source='zcode' AND started_by='agent'").get().c,
+    source.prepare("SELECT COUNT(*) c FROM session WHERE task_type='subagent_child'").get().c,
+  );
   const reasoningParts = source.prepare(`
     SELECT p.message_id, p.data FROM part p
     JOIN message m ON m.id = p.message_id
@@ -359,7 +383,7 @@ test('compaction summary is indexed as a summary record, tail ancestors inactive
   seedSource(home);
   build(home);
   const db = openIndex(home);
-  const summary = db.prepare("SELECT * FROM summaries WHERE source='zcode'").get();
+  const summary = db.prepare("SELECT * FROM summaries WHERE source='compaction' AND session_id LIKE 'zcode:%'").get();
   assert.ok(summary, 'one compact summary row');
   assert.ok(summary.content.includes('Primary Request'), 'summary body carries the real model summary');
   // tail_start_id is the INCLUSIVE last-summarized message: every message up
@@ -902,4 +926,14 @@ test('parse output assembles and survives a SQLite round-trip (ADR-0007 hard gat
   }
   assert.ok(compared >= 15, `every fixture session compared (${compared})`);
   db.close();
+});
+
+test('ZCode records of the real aggregate say who wrote each message', () => {
+  const home = makeTempDir('obelisk-zcode-conformance-');
+  seedSource(home);
+  const provider = createZcodeProvider({ rootDir: join(home, '.zcode', 'cli') });
+  const units = provider.discover({ lastCursor: () => null });
+  assert.ok(units.length > 0);
+  // Together, so that a child session is checked inside its parent as well.
+  assertHarnessConformance(units.flatMap(unit => drain(provider.parse(unit, null))));
 });

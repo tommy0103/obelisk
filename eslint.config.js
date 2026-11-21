@@ -1,52 +1,111 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Flat ESLint config for the Obelisk root (Core + CLI + packaging + tests).
-// Scope: the root ESM/TS sources, including packages/core/src/ and
-// packages/cli/src/. The Electron app has its own package and toolchain and is
-// intentionally excluded (see docs/adr/0003).
+// One flat config for every tracked JS/TS source and Vue component, including
+// the Electron app. Every rule is an error: a warning that CI tolerates is a
+// rule nobody follows.
 
 import js from '@eslint/js';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
+import pluginVue from 'eslint-plugin-vue';
+
+const unusedVars = ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }];
+
+const htmlSinkMessage = 'Transcript text is attacker-controlled. Build markup with renderMarkdown()/escapeHTML() in utils.js or DOM APIs.';
+
+// el.innerHTML, el['innerHTML'] and el[`innerHTML`] name the same sink.
+function htmlSinkSelectors(node, member, names) {
+  return [
+    `${node}[${member}.property.name=${names}]`,
+    `${node}[${member}.property.value=${names}]`,
+    `${node}[${member}.property.expressions.length=0][${member}.property.quasis.0.value.cooked=${names}]`,
+  ].map(selector => ({ selector, message: htmlSinkMessage }));
+}
+
+// Raw tmpdir() paths leak (ENOSPC) and differ from realpath on macOS, where
+// /var/folders is a symlink to /private/var/folders.
+const tmpdirMessage = 'Use makeTempDir() from tests/temp-dirs.mjs: it returns a realpath and removes the directory when the test process exits.';
 
 export default tseslint.config(
   {
     ignores: [
-      'node_modules/**',
-      'app/**',
+      '**/node_modules/**',
       '**/dist/**',
+      'app/out/**',
+      'app/release/**',
       'release/**',
       '.dev.docs/**',
       '.obelisk/**',
       '.claude/**',
     ],
   },
-  js.configs.recommended,
   {
-    files: ['**/*.{js,mjs}'],
+    linterOptions: { reportUnusedDisableDirectives: 'error' },
+  },
+  js.configs.recommended,
+  ...pluginVue.configs['flat/essential'],
+  {
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'module',
       globals: { ...globals.node },
     },
     rules: {
-      // Empty catch is an intentional pattern here (best-effort JSON.parse etc.).
-      'no-empty': ['error', { allowEmptyCatch: true }],
-      'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+      // A catch may swallow an error only with a comment saying why it is safe to.
+      'no-empty': ['error', { allowEmptyCatch: false }],
     },
+  },
+  {
+    files: ['**/*.{js,mjs}'],
+    rules: { 'no-unused-vars': unusedVars },
   },
   {
     files: ['**/*.ts'],
     extends: [...tseslint.configs.recommended],
-    languageOptions: {
-      globals: { ...globals.node },
-    },
     rules: {
-      '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+      '@typescript-eslint/no-unused-vars': unusedVars,
       // Provider adapters parse untyped external transcript JSON; `any` at those
-      // boundaries is deliberate, not a smell.
+      // boundaries is deliberate.
       '@typescript-eslint/no-explicit-any': 'off',
+    },
+  },
+  {
+    files: ['app/src/renderer/**/*.{js,mjs,ts,vue}'],
+    languageOptions: { globals: { ...globals.browser } },
+    rules: {
+      // Each v-html carries a disable comment naming what made it safe.
+      'vue/no-v-html': 'error',
+      // CONTRIBUTING: transcript content is attacker-controlled.
+      'no-restricted-syntax': ['error',
+        ...htmlSinkSelectors('AssignmentExpression', 'left', '/^(innerHTML|outerHTML)$/'),
+        ...htmlSinkSelectors('CallExpression', 'callee', "/^insertAdjacentHTML$/"),
+      ],
+    },
+  },
+  {
+    // Route views are never written as tags, so they cannot collide with HTML elements.
+    files: ['app/src/renderer/src/views/*.vue'],
+    rules: { 'vue/multi-word-component-names': 'off' },
+  },
+  {
+    files: ['app/src/main/**/*.ts'],
+    rules: {
+      'no-restricted-properties': ['error', {
+        object: 'shell',
+        property: 'openPath',
+        message: 'macOS executes .app/.command/.sh files passed to shell.openPath. Resolve transcript paths with resolveFileReference() in file-reference.ts and open them in the editor.',
+      }],
+    },
+  },
+  {
+    files: ['tests/**/*.{js,mjs,ts}'],
+    ignores: ['tests/temp-dirs.mjs'],
+    rules: {
+      'no-restricted-imports': ['error', ...['os', 'node:os'].map(name => ({
+        name, importNames: ['tmpdir'], message: tmpdirMessage,
+      }))],
+      'no-restricted-properties': ['error', { object: 'os', property: 'tmpdir', message: tmpdirMessage }],
     },
   },
 );

@@ -21,6 +21,7 @@ import {
 } from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
+import type { Cursor } from '../../../packages/core/src/providers/types.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
   hasExplicitProviderRoot,
@@ -35,6 +36,8 @@ import {
   readProviderIndexState,
   readProviderSessionProvenance,
   writeProviderIndexMarkers,
+  type ProviderIndexItem,
+  type ProviderIndexResult,
   type ProviderInventoryIssue,
   type ProviderSessionProvenance,
   type StoredProviderState,
@@ -43,10 +46,12 @@ import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapte
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
-import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 import { resolveObeliskPaths } from '../../../packages/core/src/paths.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Injectable for tests; production passes better-sqlite3.
+type DatabaseConstructor = new (dbPath: string, options?: Database.Options) => Database.Database;
 
 const DEFAULT_CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const DEFAULT_DB_PATH = resolveObeliskPaths().dbPath;
@@ -62,12 +67,12 @@ function resolveSchemaPath() {
   return found;
 }
 
-function installSchema(db, schemaPath = resolveSchemaPath()) {
+function installSchema(db: Database.Database, schemaPath = resolveSchemaPath()) {
   db.exec(fs.readFileSync(schemaPath, 'utf8'));
   migrateCoreSchemaColumns(db);
 }
 
-function openIndexDb({ dbPath = DEFAULT_DB_PATH, schemaPath = resolveSchemaPath(), DatabaseImpl = Database }: { dbPath?: string; schemaPath?: string; DatabaseImpl?: new (dbPath: string) => any } = {}) {
+function openIndexDb({ dbPath = DEFAULT_DB_PATH, schemaPath = resolveSchemaPath(), DatabaseImpl = Database }: { dbPath?: string; schemaPath?: string; DatabaseImpl?: DatabaseConstructor } = {}) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseImpl(dbPath);
   configureConnection(db, { busyTimeoutMs: 250 });
@@ -75,7 +80,7 @@ function openIndexDb({ dbPath = DEFAULT_DB_PATH, schemaPath = resolveSchemaPath(
   return db;
 }
 
-function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionProvenance[]; indexState: ReadonlyMap<string, StoredProviderState> } {
+function copyPreservedDataFromDb(db: Database.Database, sourceDbPath: string): { sessions: ProviderSessionProvenance[]; indexState: ReadonlyMap<string, StoredProviderState> } {
   if (!sourceDbPath || !fs.existsSync(sourceDbPath)) {
     throw new Error(`Preserved Obelisk database is unavailable: ${sourceDbPath}`);
   }
@@ -87,7 +92,7 @@ function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionP
     `).get();
     if (hasMemories) {
       const sourceColumns = new Set(
-        db.prepare('PRAGMA previous_obelisk.table_info(memories)').all().map(column => column.name),
+        db.prepare<[], { name: string }>('PRAGMA previous_obelisk.table_info(memories)').all().map(column => column.name),
       );
       const targetColumns = [
         'id',
@@ -119,7 +124,7 @@ function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionP
       throw new Error(`Preserved Obelisk database has no sessions table: ${sourceDbPath}`);
     }
     const sessionColumns = new Set(
-      db.prepare('PRAGMA previous_obelisk.table_info(sessions)').all().map(column => column.name),
+      db.prepare<[], { name: string }>('PRAGMA previous_obelisk.table_info(sessions)').all().map(column => column.name),
     );
     if (!sessionColumns.has('id') || !sessionColumns.has('jsonl_path')) {
       throw new Error(`Preserved Obelisk sessions schema is incomplete: ${sourceDbPath}`);
@@ -131,13 +136,13 @@ function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionP
   }
 }
 
-function normalizeChangedPath(projectsDir, changedPath) {
+function normalizeChangedPath(projectsDir: string, changedPath: string) {
   if (!changedPath) return null;
   const raw = String(changedPath);
   return path.isAbsolute(raw) ? path.normalize(raw) : path.normalize(path.join(projectsDir, raw));
 }
 
-function sessionIdFromChangedPath(projectsDir, changedPath) {
+function sessionIdFromChangedPath(projectsDir: string, changedPath: string) {
   const fp = normalizeChangedPath(projectsDir, changedPath);
   if (!fp) return null;
   const rel = path.relative(projectsDir, fp);
@@ -154,13 +159,15 @@ function sessionIdFromChangedPath(projectsDir, changedPath) {
 // readers/writers, so it is safe to run after every build. A blocking TRUNCATE
 // (which reclaims the -wal file but needs exclusive access and can contend with
 // the daemon + queries) is reserved for maintenance/exit — pass mode explicitly.
-function checkpointDb(db, mode = 'PASSIVE') {
+function checkpointDb(db: Database.Database, mode = 'PASSIVE') {
   try {
     db.pragma(`wal_checkpoint(${mode})`);
-  } catch {}
+  } catch {
+    // The build already committed; a failed checkpoint only leaves the WAL larger.
+  }
 }
 
-function writeIndexMarker(db, key, value = Date.now()) {
+function writeIndexMarker(db: Database.Database, key: string, value = Date.now()) {
   db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)').run(key, value);
 }
 
@@ -169,6 +176,11 @@ function writeHeartbeat({
   writerLeasePath = writerLockPathFor(dbPath),
   DatabaseImpl = Database,
   LockDatabaseImpl = DatabaseImpl,
+}: {
+  dbPath?: string;
+  writerLeasePath?: string;
+  DatabaseImpl?: DatabaseConstructor;
+  LockDatabaseImpl?: DatabaseConstructor;
 } = {}) {
   if (!fs.existsSync(dbPath)) return;
   const lease = acquireWriterLease({
@@ -201,8 +213,8 @@ interface BuildIndexOptions {
   projectsDir?: string;
   dbPath?: string;
   schemaPath?: string;
-  DatabaseImpl?: new (dbPath: string) => any;
-  LockDatabaseImpl?: new (dbPath: string) => any;
+  DatabaseImpl?: DatabaseConstructor;
+  LockDatabaseImpl?: DatabaseConstructor;
   force?: boolean;
   reason?: string;
   readMode?: 'normal' | 'strict';
@@ -327,27 +339,19 @@ function buildIndex({
         codex: codexDir,
         ...providerRoots,
       };
-      const openCopilotChronicle = (sourcePath: string) => new (
-        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
-      )(sourcePath, { readonly: true, fileMustExist: true });
-      const openHermesStore = (sourcePath: string) => new (
-        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
-      )(sourcePath, { readonly: true, fileMustExist: true });
-      const openZcodeDatabase = (sourcePath: string) => new (
-        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
-      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
-      const openKiroDatabase = (sourcePath: string) => new (
-        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
-      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
-      const openOpencodeDatabase = (sourcePath: string) => new (
-        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
-      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openCopilotChronicle = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true });
+      const openHermesStore = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true });
+      const openZcodeDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openKiroDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openOpencodeDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openDevinDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
         ?? (providerSettings === undefined
           ? createBuiltinProviderRegistry(roots, {
             homeDir: compatibilityHome,
             claudeDefaultRoot: effectiveDefaultClaudeDir,
             openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
+            openDevinDatabase,
           })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             homeDir: compatibilityHome,
@@ -362,6 +366,7 @@ function buildIndex({
             openZcodeDatabase,
             openKiroDatabase,
             openOpencodeDatabase,
+            openDevinDatabase,
           }).registry);
       const claudeProvider = registry.get('claude');
       const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER;
@@ -446,7 +451,7 @@ function buildIndex({
         }
       }
       let ftsRebuilt = false;
-      const noteCommitted = ({ unit }, nextCursor) => {
+      const noteCommitted = ({ unit }: ProviderIndexItem, nextCursor: Cursor) => {
         if (nextCursor) {
           latestSourceMtime = Math.max(
             latestSourceMtime,
@@ -456,7 +461,7 @@ function buildIndex({
         if (unit.sessionId) affectedSessionIds.add(unit.sessionId);
         for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
       };
-      const finalize = (providerResult) => {
+      const finalize = (providerResult: ProviderIndexResult) => {
         if (force) {
           refreshSessionProjectPaths(db, null);
         } else {
@@ -480,7 +485,7 @@ function buildIndex({
 
       if (force) {
         const previousDb = providerPlan.retainedSessions.length > 0 && preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)
-          ? new (DatabaseImpl as new (file: string, options: { readonly: boolean; fileMustExist: boolean }) => any)(preserveDbPath, { readonly: true, fileMustExist: true })
+          ? new DatabaseImpl(preserveDbPath, { readonly: true, fileMustExist: true })
           : undefined;
         let snapshot: ReturnType<typeof prepareRetainedSnapshot> | undefined;
         try {
@@ -652,6 +657,4 @@ function buildIndex({
 export {
   buildIndex,
   writeHeartbeat,
-  openIndexDb,
-  inferProjectPath,
 };

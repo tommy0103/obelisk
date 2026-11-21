@@ -45,6 +45,15 @@ The persist layer only serializes transcript records and cursor state. SQLite is
 not the source of transcript semantics, and a persistence round-trip must not
 change the assembled result.
 
+Who wrote a message is a canonical field of its own. `harness_kind` names what
+a harness-written message is, with the vocabulary of USF harness steps
+(docs/usf-spec.md); `is_meta` only says that a message is left out of default
+retrieval. The two are independent: a provider may keep a harness-written
+message retrievable and still name it. A session that a sub-agent created and
+that is emitted as a session of its own carries `started_by: 'agent'`. Both
+fields are nullable additions: rows stored before them stay valid and are not
+replayed for them.
+
 **Consequences.** A new provider is complete only when its canonical transcript
 can pass directly through `assembleSessionDetail`. Provider conformance tests
 cover that seam, while persistence tests verify that canonical classification

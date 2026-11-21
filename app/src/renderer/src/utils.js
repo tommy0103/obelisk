@@ -1,17 +1,15 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Utility functions ported from the vanilla JS utils.js.
-// Pure helpers with no side-effects on global state (except formatProjectLabel which reads store).
-
+import DOMPurify from 'dompurify';
 import { state } from './store.js';
 import { markFileReferences, mayContainFileReference } from './file-references.mjs';
+import { isSafeImageSource, sessionMarked } from './markdown-image-renderer.js';
+import { SESSION_IMAGE_TAG } from './session-image-contract.js';
 
-// --- Time / formatting ---
+function pad2(n) { return String(n).padStart(2, '0'); }
 
-export function pad2(n) { return String(n).padStart(2, '0'); }
-
-export function isSameDay(a, b) {
+function isSameDay(a, b) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
@@ -42,15 +40,6 @@ export function fmtClockTime(iso) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-export function fmtSize(bytes) {
-  if (!bytes) return '-';
-  if (bytes < 1024) return bytes + 'B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'K';
-  return (bytes / 1024 / 1024).toFixed(1) + 'M';
-}
-
-// --- HTML / Markdown ---
-
 export function escapeHTML(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -62,15 +51,30 @@ export function highlightPlain(text, query) {
   return safe.replace(new RegExp(q, 'gi'), m => `<mark>${m}</mark>`);
 }
 
-export function sanitizeMarkdown(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/\son\w+="[^"]*"/gi, '');
+// Transcript Markdown is attacker-controlled, and marked passes raw HTML
+// through. DOMPurify's default allowlist strips scripts, handlers and
+// javascript: URLs; the session image element keeps the sources the Markdown
+// image renderer accepts, which DOMPurify's URI check would drop (file:, blob:).
+// A separate instance keeps this hook off the update-notes sanitizer. Built on
+// first use: Node tests import this module without a DOM.
+let purify = null;
+function sanitizeMarkdown(html) {
+  if (!purify) {
+    purify = DOMPurify(window);
+    purify.addHook('uponSanitizeAttribute', (node, data) => {
+      if (node.nodeName.toLowerCase() === SESSION_IMAGE_TAG && data.attrName === 'src') {
+        data.forceKeepAttr = isSafeImageSource(data.attrValue);
+      }
+    });
+  }
+  return purify.sanitize(html, {
+    ADD_TAGS: [SESSION_IMAGE_TAG],
+    FORBID_TAGS: ['style'],
+    RETURN_DOM_FRAGMENT: true,
+  });
 }
 
-export function highlightTextNodes(rootEl, query) {
+function highlightTextNodes(rootEl, query) {
   if (!query) return;
   const q = query.toLowerCase();
   const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null);
@@ -98,14 +102,13 @@ export function highlightTextNodes(rootEl, query) {
 
 export function renderMarkdown(text, opts = {}) {
   if (text == null) return '';
-  // marked is loaded globally via CDN in index.html and configured at startup.
-  const html = sanitizeMarkdown(window.marked.parse(text));
+  const html = sessionMarked.parse(text, { async: false });
   const cls = opts.variant === 'msg' ? 'markdown-msg'
             : opts.variant === 'compact' ? 'markdown-compact'
             : 'markdown-body';
   const container = document.createElement('div');
   container.className = cls;
-  container.innerHTML = html;
+  container.append(sanitizeMarkdown(html));
   // Without a cwd or session to resolve against, a reference could never be opened — leaving it
   // unmarked keeps it from looking actionable.
   if ((opts.cwd || opts.sessionId) && mayContainFileReference(html)) {
@@ -114,8 +117,6 @@ export function renderMarkdown(text, opts = {}) {
   if (opts.query) highlightTextNodes(container, opts.query.trim());
   return container.outerHTML;
 }
-
-// --- Duration / tokens / tooltip ---
 
 export function fmtDuration(ms) {
   if (!ms) return '—';
@@ -149,17 +150,6 @@ export function fmtTooltipDate(isoDay) {
   if (d.getFullYear() === thisYear) return `${months[d.getMonth()]} ${day}${suffix}`;
   return `${months[d.getMonth()]} ${day}${suffix}, ${d.getFullYear()}`;
 }
-
-export function positionTooltip(el, x, y) {
-  const pad = 12;
-  const rect = el.getBoundingClientRect();
-  let left = x + pad;
-  if (left + rect.width > window.innerWidth - pad) left = x - rect.width - pad;
-  el.style.left = left + 'px';
-  el.style.top = (y - 28) + 'px';
-}
-
-// --- Project label ---
 
 export function formatProjectLabel(slug) {
   if (!slug) return '(no project)';

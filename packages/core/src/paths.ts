@@ -25,7 +25,7 @@ export interface ResolveObeliskPathsOptions {
   pathExists?: (path: string) => boolean;
 }
 
-export const LEGACY_STORAGE_DOC_URL = 'https://github.com/tommy0103/obelisk#advanced-configuration';
+const LEGACY_STORAGE_DOC_URL = 'https://github.com/tommy0103/obelisk#advanced-configuration';
 
 function expandTilde(value: string, homeDir: string): string {
   if (value === '~') return homeDir;
