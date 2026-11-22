@@ -44,8 +44,8 @@ test('provider roots and source settings are derived from the registry without s
   };
 
   assert.deepEqual(resolveProviderRoots(registry, persisted), {
-    alpha: '/legacy/alpha',
-    beta: '/custom/beta',
+    alpha: normalize('/legacy/alpha'),
+    beta: normalize('/custom/beta'),
   });
 
   const rootsChanged = setPersistedSetting(persisted, 'providerRoots.alpha', '/custom/alpha');
@@ -62,19 +62,19 @@ test('provider roots and source settings are derived from the registry without s
       ['alpha', { sessionCount: 2, lastIndexed: '2026-07-20T10:00:00.000Z' }],
       ['beta', { sessionCount: 0, lastIndexed: '' }],
     ]),
-    pathExists: path => path === '/custom/alpha' || path === '/custom/beta',
+    pathExists: path => path === normalize('/custom/alpha') || path === normalize('/custom/beta'),
   });
 
   assert.deepEqual(sources, [
     {
       id: 'alpha', name: 'alpha name', vendor: 'alpha vendor', color: '#112233',
-      path: '/custom/alpha', settingKey: 'providerRoots.alpha', exists: true,
+      path: normalize('/custom/alpha'), settingKey: 'providerRoots.alpha', exists: true,
       sessionCount: 2, lastIndexed: '2026-07-20T10:00:00.000Z',
       status: 'ok', statusText: 'Connected',
     },
     {
       id: 'beta', name: 'beta name', vendor: 'beta vendor', color: '#445566',
-      path: '/custom/beta', settingKey: 'providerRoots.beta', exists: true,
+      path: normalize('/custom/beta'), settingKey: 'providerRoots.beta', exists: true,
       sessionCount: 0, lastIndexed: '', status: 'warn', statusText: 'No sessions found',
     },
   ]);
@@ -146,7 +146,7 @@ test('an ambiguous provider default stays omitted until the user selects a root'
   assert.deepEqual(resolveProviderRoots(registry, {
     providerRoots: { relative: '/fallback/relative' },
   }), {
-    relative: '/fallback/relative',
+    relative: normalize('/fallback/relative'),
   });
   assert.deepEqual(buildSourceCatalog({
     registry,
