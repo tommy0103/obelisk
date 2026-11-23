@@ -64,6 +64,11 @@ const SESSION_PATH_PREFIX = 'session:';
 // mistaken for a transcript path, and a force rebuild recreates it with everything else.
 const STORE_GATE_PREFIX = '__hermes_store_v1__:';
 const STORE_CURSOR_TAG = 'hermes-store-v1';
+// v2 tags the gate hash so a store certified before the settle window is not treated
+// as already verified: the first scan after upgrade compares exact digests, then
+// recertifies under this domain. The index_state key stays v1 so that scan can find
+// the old row.
+const STORE_GATE_DOMAIN = 'hermes-store-gate-v2';
 
 // CLI-side read-only opener
 export type HermesStoreOpener = (path: string) => SqliteDb;
@@ -300,12 +305,19 @@ interface StoreGate {
  *
  * An unsettled gate is recorded under a distinct value and never certifies anything: a scan
  * that sees one reads the store and compares exact digests instead of trusting the signature.
+ *
+ * The domain tag is part of the hash, so a certification written without it cannot equal a
+ * current settled gate. That is what forces the first scan after upgrade through the digest
+ * pass instead of skipping a store whose indexed text may still be stale.
  */
 function storeGate(dbPath: string, now: number): StoreGate {
   const main = fileSignature(dbPath);
   const wal = fileSignature(`${dbPath}-wal`);
   const settled = now - Math.max(main.ctimeMs, wal.ctimeMs) >= STORE_GATE_SETTLE_MS;
-  return { value: sha256(`${main.signature}|${wal.signature}${settled ? '' : '|unsettled'}`), settled };
+  return {
+    value: sha256(`${STORE_GATE_DOMAIN}|${main.signature}|${wal.signature}${settled ? '' : '|unsettled'}`),
+    settled,
+  };
 }
 
 function storeGateKey(dbPath: string): string {
