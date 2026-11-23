@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSessionPatch } from '../src/shared/session-patch.mjs';
 import { assembleSessionDetail } from '../src/shared/session-detail-assembly.mjs';
-import { median, rendererTaskMetrics } from './renderer-trace-metrics.mjs';
+import { rendererTaskMetrics, stationaryTimingVerdict, wheelTimingVerdict } from './renderer-trace-metrics.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appRoot = join(here, '..');
@@ -914,8 +914,9 @@ async function run() {
   await delay(350);
 
   // Renderer timings vary per run on shared CI hosts (macOS guests count host
-  // CPU steal as thread time), so each timing budget holds for the median of
-  // `timingSamples` baseline/update pairs. Behavior holds for every pair.
+  // CPU steal as thread time). `wheelTimingVerdict` holds the fine budget to the
+  // median of `timingSamples` baseline/update pairs; behavior and the severe
+  // stall caps hold for every pair.
   const wheelBaselines = [];
   const wheelPaints = [];
   let globalReadsBeforeWheelUpdate;
@@ -964,22 +965,18 @@ async function run() {
       'post-scroll Bash tool update',
     );
   }
-  const medianOf = (traces, key) => median(traces.map(trace => trace[key]));
-  const wheelTaskWorkMs = medianOf(wheelPaints, 'maxTaskWorkMs');
+  const wheelTiming = wheelTimingVerdict(wheelBaselines, wheelPaints);
   assert(
-    wheelTaskWorkMs < 50,
-    `Bash tool update avoids a 50ms renderer CPU long task while scrolling (median ${wheelTaskWorkMs.toFixed(2)}ms of ${wheelPaints.map(trace => trace.maxTaskWorkMs.toFixed(2)).join(', ')})`,
+    wheelTiming.longTask,
+    `Bash tool update avoids a 50ms renderer CPU long task in every gesture (${wheelPaints.map(trace => trace.maxTaskWorkMs.toFixed(2)).join(', ')}ms)`,
   );
-  const wheelFrameGap = medianOf(wheelPaints, 'maxFrameGap');
   assert(
-    wheelFrameGap < 250,
-    `native wheel scrolling avoids catastrophic stalls (median ${wheelFrameGap.toFixed(1)}ms of ${wheelPaints.map(trace => `${trace.maxFrameGap.toFixed(1)} (draw ${trace.maxCompositorFrameGap})`).join(', ')})`,
+    wheelTiming.stall,
+    `native wheel scrolling avoids catastrophic stalls in every gesture (${wheelPaints.map(trace => `${trace.maxFrameGap.toFixed(1)} (draw ${trace.maxCompositorFrameGap})`).join(', ')}ms)`,
   );
-  const baselineFunctionWorkMs = medianOf(wheelBaselines, 'maxFunctionWorkMs');
-  const updateFunctionWorkMs = medianOf(wheelPaints, 'maxFunctionWorkMs');
   assert(
-    updateFunctionWorkMs <= baselineFunctionWorkMs + 2,
-    `Bash patch preparation stays off the scrolling renderer task budget (median baseline ${baselineFunctionWorkMs.toFixed(2)}ms, update ${updateFunctionWorkMs.toFixed(2)}ms; update ${wheelPaints.map(trace => trace.maxFunctionWorkMs.toFixed(2)).join(', ')})`,
+    wheelTiming.patchPreparation,
+    `Bash patch preparation stays off the scrolling renderer task budget (median baseline ${wheelTiming.baselineFunctionWorkMs.toFixed(2)}ms, update ${wheelTiming.updateFunctionWorkMs.toFixed(2)}ms; update ${wheelPaints.map(trace => trace.maxFunctionWorkMs.toFixed(2)).join(', ')})`,
   );
 
   await win.webContents.executeJavaScript(`window.location.hash = '#/sessions'`, true);
@@ -1263,8 +1260,10 @@ async function run() {
   for (const [runIndex, trace] of stationaryTraces.entries()) {
     if (trace.maxTaskMs >= 8.33) console.log(`SLOWEST RENDERER TASK ${runIndex + 1}: ${JSON.stringify(trace.slowestChildren)}`);
   }
-  const stationaryWorkMs = median(stationaryTraces.map(trace => trace.maxTaskWorkMs));
-  assert(stationaryWorkMs < 8.33, `stationary live commits stay inside a 120Hz renderer work budget (median ${stationaryWorkMs.toFixed(2)}ms work of ${stationaryTraces.map(trace => `${trace.maxTaskWorkMs.toFixed(2)}ms work/${trace.maxTaskMs.toFixed(2)}ms wall/${trace.tasks} tasks`).join(', ')})`);
+  const stationaryTiming = stationaryTimingVerdict(stationaryTraces);
+  const stationarySamples = stationaryTraces.map(trace => `${trace.maxTaskWorkMs.toFixed(2)}ms work/${trace.maxTaskMs.toFixed(2)}ms wall/${trace.tasks} tasks`).join(', ');
+  assert(stationaryTiming.longTask, `stationary live commits avoid a 50ms renderer CPU long task in every commit (${stationarySamples})`);
+  assert(stationaryTiming.budget, `stationary live commits stay inside a 120Hz renderer work budget (median ${stationaryTiming.workMs.toFixed(2)}ms work of ${stationarySamples})`);
 
   await win.webContents.executeJavaScript(`(() => {
     const probe = { minRows: Infinity, zeroFrames: 0, samples: 0, stop: false };
