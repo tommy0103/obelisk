@@ -143,6 +143,37 @@ function groupPhysicalRoots(roots: readonly string[]): string[] {
   return [...groups.values()];
 }
 
+function rootFromTranscriptPath(path: string): string | null {
+  const projectDir = dirname(path);
+  const projectsDir = dirname(projectDir);
+  if (basename(projectsDir) !== 'projects') return null;
+  return dirname(projectsDir);
+}
+
+function priorRootTag(
+  root: string,
+  defaultRoot: string,
+  indexed: readonly { sessionId: string; jsonlPath: string }[],
+): string {
+  const canonical = rootTagFor(root, defaultRoot);
+  if (!canonical) return '';
+  const rootKey = physicalPathKey(root);
+  const priorRootKeys = new Map<string, string>();
+  const tags = new Set<string>();
+  for (const session of indexed) {
+    const priorRoot = rootFromTranscriptPath(session.jsonlPath);
+    if (priorRoot === null) continue;
+    const priorKey = priorRootKeys.get(priorRoot) ?? physicalPathKey(priorRoot);
+    priorRootKeys.set(priorRoot, priorKey);
+    if (priorKey !== rootKey) continue;
+    const separator = session.sessionId.indexOf(':');
+    if (separator > 0) tags.add(session.sessionId.slice(0, separator));
+  }
+  // A canonical scoped tag wins whenever already present. Otherwise preserve
+  // one proven prior alias scope for the entire physical root group.
+  return tags.has(canonical) ? canonical : tags.size === 1 ? [...tags][0]! : canonical;
+}
+
 export function pathInside(root: string, candidate: unknown): boolean {
   if (typeof candidate !== 'string' || candidate.length === 0) return false;
   if (lexicalPathInside(root, candidate)) return true;
@@ -353,10 +384,7 @@ function discoverAt(
     const prior = !file.isSubagent
       ? priorForPath(file.path, canonicalId)
       : undefined;
-    const effectiveId = prior?.sessionId.includes(':') && canonicalId.includes(':')
-      ? prior.sessionId
-      : canonicalId;
-    const idChanged = prior !== undefined && prior.sessionId !== effectiveId;
+    const idChanged = prior !== undefined && prior.sessionId !== canonicalId;
     const normalizedPath = normalize(file.path);
     if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath) && !idChanged) return false;
     const cursor = ctx.lastCursor(file.path);
@@ -368,15 +396,12 @@ function discoverAt(
   }).map((f: any) => {
     const canonicalId = canonicalSessionId(f.sessionId, rootTag);
     const prior = !f.isSubagent ? priorForPath(f.path, canonicalId) : undefined;
-    const effectiveId = prior?.sessionId.includes(':') && canonicalId.includes(':')
-      ? prior.sessionId
-      : canonicalId;
-    const retractSessionIds = prior !== undefined && prior.sessionId !== effectiveId
+    const retractSessionIds = prior !== undefined && prior.sessionId !== canonicalId
       ? [prior.sessionId]
       : undefined;
     return {
       key: f.path,
-      sessionId: effectiveId,
+      sessionId: canonicalId,
       project: f.project,
       isSubagent: f.isSubagent,
       agentId: f.agentId,
@@ -936,7 +961,7 @@ export function createClaudeProvider({
     discover: (ctx) => {
       const indexed = ctx.indexedSessions?.() ?? [];
       return groupPhysicalRoots(configuredRoots).flatMap((root) => {
-        const tag = id !== name ? id : rootTagFor(root, defaultRoot);
+        const tag = id !== name ? id : priorRootTag(root, defaultRoot, indexed);
         return discoverAt(root, ctx, tag, indexed, usesRootSet);
       });
     },

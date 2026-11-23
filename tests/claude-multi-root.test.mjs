@@ -127,7 +127,7 @@ test('claude explicit roots: physical aliases are scanned once and preserve one 
   const realRoot = join(home, 'profiles', 'real');
   const aliasRoot = join(home, 'profiles', 'alias');
   mkdirSync(join(realRoot, 'projects'), { recursive: true });
-  symlinkSync(realRoot, aliasRoot, 'dir');
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
   const transcript = copyRealFixture(realRoot);
 
   writeSettings(home, { providerRoots: { claude: [aliasRoot, realRoot] } });
@@ -141,6 +141,32 @@ test('claude explicit roots: physical aliases are scanned once and preserve one 
   assert.equal(sessions[0].jsonl_path, realpathSync(transcript), 'canonical physical path is stored');
   assert.equal(sessions[0].message_count, 1);
   db.close();
+});
+
+test('claude explicit roots: one prior alias scope covers main and subagent units after canonicalization', () => {
+  const home = makeTempDir('obelisk-claude-alias-scope-');
+  const realRoot = join(home, 'profiles', 'real');
+  const aliasRoot = join(home, 'profiles', 'alias');
+  mkdirSync(join(realRoot, 'projects'), { recursive: true });
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const transcript = copyRealFixture(realRoot);
+  const sessionDir = join(realRoot, 'projects', REAL_SLUG, REAL_SID);
+  const subagentsDir = join(sessionDir, 'subagents');
+  mkdirSync(subagentsDir, { recursive: true });
+  writeFileSync(join(subagentsDir, 'agent-a.jsonl'), `${JSON.stringify({
+    ...REAL_FIXTURE_USER, uuid: 'sub-u1', agentId: 'agent-a', isSidechain: true,
+    message: { role: 'user', content: 'subagent' },
+  })}\n`);
+  writeFileSync(join(subagentsDir, 'agent-a.meta.json'), JSON.stringify({ agentType: 'Explore' }));
+
+  const provider = createClaudeProvider({ rootDir: join(home, '.claude'), sourceRoots: [aliasRoot] });
+  const priorTag = 'legacy-alias-deadbe';
+  const units = provider.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [{ sessionId: `${priorTag}:${REAL_SID}`, jsonlPath: transcript.replace(realRoot, aliasRoot) }],
+  });
+  assert.ok(units.length >= 2);
+  assert.deepEqual(new Set(units.map(unit => unit.sessionId)), new Set([`${priorTag}:${REAL_SID}`]));
 });
 
 test('claude explicit roots: persisted identities stay unchanged when adding, removing, or reordering roots (even with identical basenames)', () => {
