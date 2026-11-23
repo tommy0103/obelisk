@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import {
   appendFileSync,
@@ -15,7 +16,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, relative, resolve } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
 
 import {
@@ -130,6 +131,96 @@ test('CODEX_HOME resolution supports absolute, tilde, relative, blank, and unset
   const absoluteCodex = join(home, 'absolute-codex');
   assert.equal(defaultCodexHome({ env: { CODEX_HOME: absoluteCodex }, homeDir: home, cwd }), absoluteCodex);
   assert.equal(defaultCodexHome({ env: { CODEX_HOME: '/abs/codex' }, homeDir: home, cwd }), resolve(cwd, '/abs/codex'));
+});
+
+test('explicit real and symlink roots discover one physical Codex store with a stable scope', () => {
+  const home = makeTempDir('obelisk-codex-alias-');
+  const realRoot = join(home, 'real-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const file = writeRollout(realRoot, { id: '019ed000-0000-7000-8000-000000000111' });
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const provider = createCodexProvider({ roots: [aliasRoot, realRoot], homeDir: home });
+  const units = provider.discover({ lastCursor: () => null });
+  assert.deepEqual(units.map(unit => unit.key), [file]);
+  assert.equal(units[0].sessionId, `codex:${codexRootScope(realRoot, home)}:019ed000-0000-7000-8000-000000000111`);
+  assert.deepEqual(provider.discover({ lastCursor: () => null, changedPaths: [join(aliasRoot, 'sessions', '2026', '06', '15', basename(file))] }).map(unit => unit.key), [file]);
+});
+
+test('legacy alias parent and child IDs enter one atomic family transition', () => {
+  const home = makeTempDir('obelisk-codex-alias-rekey-');
+  const realRoot = join(home, 'real-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const parentId = '019ed000-0000-7000-8000-000000000121';
+  const childId = '019ed000-0000-7000-8000-000000000122';
+  const parentPath = writeRollout(realRoot, { id: parentId, userText: 'parent' });
+  const childPath = writeRollout(realRoot, { id: childId, parentThreadId: parentId, userText: 'child' });
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const lexicalAlias = resolve(aliasRoot);
+  const scope = `${basename(aliasRoot)}-${createHash('sha256').update(`codex-root-v1\0${lexicalAlias}`).digest('hex').slice(0, 8)}`;
+  const oldParent = `codex:${scope}:${parentId}`;
+  const oldChild = `codex:${scope}:${childId}`;
+  const provider = createCodexProvider({ roots: [aliasRoot, realRoot], homeDir: home });
+  const units = provider.discover({
+    lastCursor: () => null,
+    indexedSessions: () => [
+      { sessionId: oldParent, jsonlPath: join(aliasRoot, relative(realRoot, parentPath)) },
+      { sessionId: oldChild, jsonlPath: join(aliasRoot, relative(realRoot, childPath)) },
+    ],
+  });
+  const parent = units.find(unit => unit.key === parentPath);
+  const child = units.find(unit => unit.key === childPath);
+  assert.ok(parent && child);
+  assert.equal(parent.atomicGroup, child.atomicGroup);
+  assert.deepEqual(new Set(parent.retractSessionIds), new Set([oldParent]));
+});
+
+test('built CLI keeps real-fixture identity stable across alias lifecycle and isolates an independent copy', () => {
+  const home = makeTempDir('obelisk-codex-real-alias-cli-');
+  const realRoot = join(home, 'real-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const independentRoot = join(home, 'independent-codex');
+  const rawId = realRolloutId();
+  const realFile = join(realRoot, 'sessions', '2026', '06', '15', `rollout-${rawId}.jsonl`);
+  mkdirSync(join(realRoot, 'sessions', '2026', '06', '15'), { recursive: true });
+  copyFileSync(REAL_PREFIX_FIXTURE, realFile);
+  mkdirSync(join(independentRoot, 'sessions', '2026', '06', '15'), { recursive: true });
+  copyFileSync(REAL_FIXTURE, join(independentRoot, 'sessions', '2026', '06', '15', `rollout-${rawId}.jsonl`));
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const settingsPath = join(home, '.obelisk', 'settings.json');
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  const save = roots => writeFileSync(settingsPath, JSON.stringify({ providerRoots: { codex: roots } }));
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const ids = () => {
+    const db = new DatabaseSync(dbPath);
+    const rows = db.prepare("SELECT id, jsonl_path FROM sessions WHERE source='codex' ORDER BY id").all();
+    db.close();
+    return rows;
+  };
+
+  save([aliasRoot, realRoot, independentRoot]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  const initial = ids();
+  assert.equal(initial.length, 2);
+  assert.equal(new Set(initial.map(row => row.id)).size, 2);
+  assert.equal(initial.filter(row => row.jsonl_path === realFile).length, 1);
+
+  save([independentRoot, realRoot, aliasRoot]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  assert.deepEqual(ids(), initial);
+
+  save([aliasRoot]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  assert.deepEqual(ids().map(row => row.id), [initial.find(row => row.jsonl_path === realFile).id]);
+
+  save([realRoot]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  assert.deepEqual(ids().map(row => row.id), [initial.find(row => row.jsonl_path === realFile).id]);
+
+  const restLines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
+  appendFileSync(join(aliasRoot, 'sessions', '2026', '06', '15', basename(realFile)), `${restLines.join('\n')}\n`);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  const afterAppend = ids();
+  assert.deepEqual(afterAppend.map(row => row.id), [initial.find(row => row.jsonl_path === realFile).id]);
 });
 
 test('CLI honors CODEX_HOME (including symlinked paths) and explicit providerRoots.codex takes precedence', () => {
