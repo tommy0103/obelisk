@@ -12,6 +12,9 @@ import { coreSchemaAssetPlugin } from './electron-vite.schema-plugin.mjs';
 // resolve to the built .js at runtime.
 export default defineConfig({
   main: {
+    define: {
+      'process.env.OBELISK_DISABLE_UPDATER': JSON.stringify(process.env.OBELISK_DISABLE_UPDATER ?? '0'),
+    },
     plugins: [externalizeDepsPlugin(), coreSchemaAssetPlugin()],
     build: {
       rollupOptions: {
