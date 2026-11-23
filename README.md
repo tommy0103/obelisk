@@ -91,6 +91,41 @@ obelisk install
 First run builds the index (~5 seconds for 100 sessions); after that it
 rebuilds incrementally.
 
+#### Install with Nix
+
+Add `inputs.obelisk.url = "github:tommy0103/obelisk";` to your flake.
+The `cli` package (also `default`) provides `obelisk`, `skill` contains the
+retrieval docs, and `app` provides the `obelisk-app` desktop launcher. All
+three use the revision in your `flake.lock`.
+
+| Nix system | Packages |
+| --- | --- |
+| `x86_64-linux`, `aarch64-darwin`, `x86_64-darwin` | `app`, `cli`, `skill` |
+| `aarch64-linux` | `cli`, `skill` |
+
+On Windows, install the native CLI with npm as shown above. Nix inside WSL
+uses the corresponding Linux packages.
+
+For a one-option installation, see the [Obelisk Home Manager module](nix/README.md).
+
+This Home Manager example installs the CLI, links the retrieval skill into
+Pi's skill directory, and adds the desktop app where available. It assumes
+`inputs` and `pkgs` are in scope.
+
+```nix
+let
+  obelisk = inputs.obelisk.packages.${pkgs.stdenv.hostPlatform.system};
+in {
+  home.packages = [ obelisk.cli ] ++ pkgs.lib.optional (obelisk ? app) obelisk.app;
+  home.file.".pi/agent/skills/obelisk".source =
+    "${obelisk.cli}/share/skills/obelisk/obelisk";
+}
+```
+
+For another agent, change the link destination to its skill directory.
+To update all three together, run `nix flake update obelisk` in your
+configuration and apply it again.
+
 ### How it works
 
 ```text

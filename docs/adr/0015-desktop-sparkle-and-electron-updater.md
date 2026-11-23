@@ -20,6 +20,10 @@ other Linux architectures, Windows, and development builds remain disabled
 until their feeds and packaged installation paths pass acceptance. Keep one updater service in the main process and one
 typed state/command interface through the existing sandboxed preload.
 
+Nix owns upgrades of its desktop packages. The flake sets
+`OBELISK_DISABLE_UPDATER=1` at build time so their main process never starts
+an updater, including when the macOS bundle is launched from Finder.
+
 Backend selection happens before a check or download. An invalid feed, failed
 download, or rejected signature is an error in the selected backend; it never
 triggers another backend to retry the same update. This preserves the update

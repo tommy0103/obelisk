@@ -49,9 +49,10 @@ agent cooperation and no provider changes.
 - Freshness recovery (`resolveInvokingSessionIdWithWait`): on a first miss,
   run one incremental build (`ignoreRecentBuild`, never the force
   full-republish path) — allowed under a fresh daemon heartbeat via the narrow
-  ADR-0006 carve-out (`ignoreDaemonOwnership`) — then poll freshly opened
-  read snapshots (~300 ms, ~4 s cap) as the lease-contention fallback. Still
-  unresolved is honest null. Queries without a nonce or with an immediate hit
+  ADR-0006 carve-out (`ignoreDaemonOwnership`). A complete build that still
+  misses is honest null at once. Otherwise (lease contention, an incomplete
+  build, an uninitialized index) poll freshly opened read snapshots (~300 ms,
+  ~4 s cap) for the other writer. Still unresolved is honest null. Queries without a nonce or with an immediate hit
   pay zero added latency.
 
 Rejected alternatives: agent-supplied session id (the agent does not know it);
