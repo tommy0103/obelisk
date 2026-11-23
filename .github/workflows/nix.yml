@@ -1,0 +1,44 @@
+name: Nix packages
+
+on:
+  workflow_dispatch:
+  push:
+    paths: &package-paths
+      - '.github/workflows/nix.yml'
+      - 'flake.*'
+      - 'nix/**'
+      - 'app/**'
+      - 'packages/**'
+      - 'packaging/**'
+      - 'skill-doc/**'
+      - 'package*.json'
+      - 'tsconfig*.json'
+      - 'tests/fixtures/claude/custom-title-session.jsonl'
+  pull_request:
+    paths: *package-paths
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
+      - name: Evaluate Home Manager component selection
+        run: nix eval --impure --file nix/check-home-manager.nix
+      - run: nix flake check --no-update-lock-file --print-build-logs
+      - name: Launch the installed macOS app and query its index
+        if: runner.os == 'macOS'
+        run: |
+          app=$(nix build --no-link --print-out-paths .#app)
+          cli=$(nix build --no-link --print-out-paths .#cli)
+          nix shell --inputs-from . nixpkgs#nodejs_22 nixpkgs#coreutils nixpkgs#sqlite -c \
+            bash nix/check-desktop.sh "$app/Applications/Obelisk.app/Contents/MacOS/Obelisk" \
+              "$cli/bin/obelisk" tests/fixtures/claude/custom-title-session.jsonl
