@@ -303,7 +303,9 @@ function recentCliInvokerSessions(
 }
 
 // Poll bounds for the nonce freshness fallback. The poll runs only when the
-// incremental recovery build loses the writer lease (writer_busy); the cap
+// incremental recovery build did not complete: another writer holds the
+// lease (writer_busy, database_busy), a source was mid-write, or the index is
+// not initialized. The cap
 // gives a concurrent build — the daemon's watcher-driven build (bounded
 // batching: ~250 ms trailing debounce, 0.5 s stability, 1.5 s max wait) —
 // time to publish the nonce. Cold-build cost on large corpora is a separate
@@ -313,7 +315,7 @@ const INVOCATION_POLL_CAP_MS = 4000;
 
 interface InvocationWaitOptions {
   openRead?: () => SqliteDb;
-  build?: () => unknown;
+  build?: () => { skip: boolean; complete?: boolean } | undefined;
   pollIntervalMs?: number;
   pollCapMs?: number;
   resolveOpts?: InvocationResolveOptions;
@@ -339,9 +341,9 @@ function sleepSync(ms: number): void {
 // read-only under a fresh daemon heartbeat. The writer lease remains the sole
 // arbitrator: if another writer holds it, the build skips with writer_busy and
 // the poll loop below waits for that writer (the daemon or a concurrent
-// agent's build) to publish the nonce. Still unresolved after the cap is
-// honest null. Queries without a nonce or with an immediate hit pay zero
-// added latency.
+// agent's build) to publish the nonce. A complete build that still misses is
+// honest null at once, as is a miss after the cap. Queries without a nonce or
+// with an immediate hit pay zero added latency.
 export function resolveInvokingSessionIdWithWait(
   nonce: string | readonly (string | { value: string; strict?: boolean })[] | null | undefined,
   providerRegistry: ProviderRegistry,
@@ -396,9 +398,14 @@ export function resolveInvokingSessionIdWithWait(
   const immediate = tryResolve();
   if (immediate) return immediate;
   if (schemaReady()) {
-    reportIndexIssues(build());
+    const result = build();
+    reportIndexIssues(result);
     const afterBuild = tryResolve();
     if (afterBuild) return afterBuild;
+    // A complete build indexed every source under the writer lease, after the
+    // provider flushed the tool-call record (ADR 0008). No other writer can
+    // publish the nonce later, so polling would only wait out the cap.
+    if (result?.complete === true) return null;
   }
   const deadline = Date.now() + pollCapMs;
   while (Date.now() < deadline) {
