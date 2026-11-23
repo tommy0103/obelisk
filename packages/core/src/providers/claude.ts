@@ -80,8 +80,8 @@ function sanitizeRootTag(dir: string): string {
 }
 
 export function rootTagFor(rootDir: string, defaultRoot: string): string {
-  const normalizedRoot = canonicalRootPath(rootDir);
-  const normalizedDefault = canonicalRootPath(defaultRoot);
+  const normalizedRoot = physicalPath(rootDir);
+  const normalizedDefault = physicalPath(defaultRoot);
   if (sameNormalizedPath(normalizedRoot, normalizedDefault)) return '';
   const base = sanitizeRootTag(normalizedRoot);
   const hashInput = (process.platform === 'win32' || isWindowsStylePath(normalizedRoot))
@@ -118,6 +118,29 @@ function tryRealpath(target: string): string | null {
   } catch {
     return null;
   }
+}
+
+function physicalPath(target: string): string {
+  return canonicalRootPath(tryRealpath(target) ?? target);
+}
+
+function physicalPathKey(target: string): string {
+  const path = physicalPath(target);
+  return process.platform === 'win32' ? path.toLowerCase() : path;
+}
+
+function groupPhysicalRoots(roots: readonly string[]): string[] {
+  const groups = new Map<string, string>();
+  for (const root of roots) {
+    // Existing roots are represented by their real path so discovery and all
+    // derived paths have one spelling. Missing roots remain lexical: their
+    // inventory failure must stay attributable to the configured path.
+    const resolved = tryRealpath(root);
+    const representative = resolved === null ? canonicalRootPath(root) : canonicalRootPath(resolved);
+    const key = process.platform === 'win32' ? representative.toLowerCase() : representative;
+    if (!groups.has(key)) groups.set(key, representative);
+  }
+  return [...groups.values()];
 }
 
 export function pathInside(root: string, candidate: unknown): boolean {
@@ -244,12 +267,15 @@ function discoverAt(
   const forcedPaths = new Set<string>();
   let historyChanged = false;
   for (const changedPath of ctx.changedPaths ?? []) {
-    const rootRelative = isAbsolute(changedPath)
-      ? normalize(changedPath)
+    const observedPath = isAbsolute(changedPath)
+      ? normalize(tryRealpath(changedPath) ?? changedPath)
+      : changedPath;
+    const rootRelative = isAbsolute(observedPath)
+      ? normalize(observedPath)
       : normalize(join(rootDir, changedPath));
     if (rootRelative === historyPath) historyChanged = true;
-    const absolute = isAbsolute(changedPath)
-      ? normalize(changedPath)
+    const absolute = isAbsolute(observedPath)
+      ? normalize(observedPath)
       : normalize(join(projectsDir, changedPath));
     const inside = relative(projectsDir, absolute);
     if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
@@ -310,13 +336,27 @@ function discoverAt(
     orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, preserveSessionHistory: true,
       meta: { kind: 'orphan-family', members, signature, mainPath, mainCursor } satisfies ClaudeOrphanFamilyMeta });
   }
+  const indexedByPhysicalPath = new Map<string, Array<(typeof indexed)[number]>>();
+  for (const session of indexed) {
+    const sessions = indexedByPhysicalPath.get(physicalPathKey(session.jsonlPath)) ?? [];
+    sessions.push(session);
+    indexedByPhysicalPath.set(physicalPathKey(session.jsonlPath), sessions);
+  }
+  const priorForPath = (path: string, canonicalId: string) => {
+    const candidates = indexedByPhysicalPath.get(physicalPathKey(path)) ?? [];
+    return candidates.find(session => session.sessionId === canonicalId)
+      ?? (candidates.length === 1 ? candidates[0] : undefined);
+  };
   const transcriptUnits = files.filter((file) => {
     if (orphanPaths.has(file.path)) return false;
     const canonicalId = canonicalSessionId(file.sessionId, rootTag);
     const prior = !file.isSubagent
-      ? indexed.find((session) => sameNormalizedPath(session.jsonlPath, file.path))
+      ? priorForPath(file.path, canonicalId)
       : undefined;
-    const idChanged = prior !== undefined && prior.sessionId !== canonicalId;
+    const effectiveId = prior?.sessionId.includes(':') && canonicalId.includes(':')
+      ? prior.sessionId
+      : canonicalId;
+    const idChanged = prior !== undefined && prior.sessionId !== effectiveId;
     const normalizedPath = normalize(file.path);
     if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath) && !idChanged) return false;
     const cursor = ctx.lastCursor(file.path);
@@ -327,15 +367,16 @@ function discoverAt(
       || cursorSignatureDiffers(cursor, file.path);
   }).map((f: any) => {
     const canonicalId = canonicalSessionId(f.sessionId, rootTag);
-    const prior = !f.isSubagent
-      ? indexed.find((session) => sameNormalizedPath(session.jsonlPath, f.path))
-      : undefined;
-    const retractSessionIds = prior !== undefined && prior.sessionId !== canonicalId
+    const prior = !f.isSubagent ? priorForPath(f.path, canonicalId) : undefined;
+    const effectiveId = prior?.sessionId.includes(':') && canonicalId.includes(':')
+      ? prior.sessionId
+      : canonicalId;
+    const retractSessionIds = prior !== undefined && prior.sessionId !== effectiveId
       ? [prior.sessionId]
       : undefined;
     return {
       key: f.path,
-      sessionId: canonicalId,
+      sessionId: effectiveId,
       project: f.project,
       isSubagent: f.isSubagent,
       agentId: f.agentId,
@@ -872,7 +913,7 @@ export function createClaudeProvider({
 } = {}): ProviderAdapter & { rootTagFor?: (root: string) => string } {
   const defaultRoot = rootDir;
   const usesRootSet = sourceRoots !== undefined;
-  const activeRoots = usesRootSet ? [...sourceRoots] : [rootDir];
+  const configuredRoots = usesRootSet ? [...sourceRoots] : [rootDir];
 
   return {
     name: id,
@@ -884,8 +925,9 @@ export function createClaudeProvider({
     watchTargets: (configuredRoot) => {
       const targets = (
         usesRootSet
-        && (sameNormalizedPath(configuredRoot, defaultRoot) || activeRoots.some((r) => sameNormalizedPath(r, configuredRoot)))
-      ) ? activeRoots : [configuredRoot];
+        && (sameNormalizedPath(configuredRoot, defaultRoot)
+          || configuredRoots.some((r) => sameNormalizedPath(r, configuredRoot)))
+      ) ? configuredRoots : [configuredRoot];
       return targets.flatMap((root) => [
         { kind: 'tree' as const, path: join(root, 'projects') },
         { kind: 'file' as const, path: join(root, 'history.jsonl') },
@@ -893,7 +935,7 @@ export function createClaudeProvider({
     },
     discover: (ctx) => {
       const indexed = ctx.indexedSessions?.() ?? [];
-      return activeRoots.flatMap((root) => {
+      return groupPhysicalRoots(configuredRoots).flatMap((root) => {
         const tag = id !== name ? id : rootTagFor(root, defaultRoot);
         return discoverAt(root, ctx, tag, indexed, usesRootSet);
       });

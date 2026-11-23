@@ -14,7 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -120,6 +120,27 @@ test('claude explicit roots: invalid providerRoots.claude disables provider inst
   assert.equal(empty.roots.claude, undefined);
   assert.equal(empty.registry.get('claude').descriptor.requiresExplicitRoot, true);
   assert.match(empty.registry.get('claude').descriptor.rootResolutionReason, /must not be empty/);
+});
+
+test('claude explicit roots: physical aliases are scanned once and preserve one session identity', () => {
+  const home = makeTempDir('obelisk-claude-alias-dedupe-');
+  const realRoot = join(home, 'profiles', 'real');
+  const aliasRoot = join(home, 'profiles', 'alias');
+  mkdirSync(join(realRoot, 'projects'), { recursive: true });
+  symlinkSync(realRoot, aliasRoot, 'dir');
+  const transcript = copyRealFixture(realRoot);
+
+  writeSettings(home, { providerRoots: { claude: [aliasRoot, realRoot] } });
+  const result = runCli(['--build'], { home });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const sessions = db.prepare("SELECT id, jsonl_path, message_count FROM sessions WHERE source = 'claude'").all();
+  assert.equal(sessions.length, 1, 'one physical transcript must not create duplicate sessions');
+  assert.equal(sessions[0].jsonl_path, realpathSync(transcript), 'canonical physical path is stored');
+  assert.equal(sessions[0].message_count, 1);
+  db.close();
 });
 
 test('claude explicit roots: persisted identities stay unchanged when adding, removing, or reordering roots (even with identical basenames)', () => {
