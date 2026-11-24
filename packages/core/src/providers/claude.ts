@@ -41,7 +41,8 @@ function cursorToSkip(cursor: Cursor): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-// Cursor format: mtime:lines:size:ctime:inode:device:birthtime. The
+// Cursor format: mtime:lines:size:ctime:inode:device:birthtime, optionally
+// followed by the physical root's device, inode and creation time. The
 // mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
 // same-millisecond rewrites) lets a same-mtime tail completion or a
 // same-mtime replacement back into discovery. Legacy `${mtime}:${lines}`
@@ -153,14 +154,22 @@ function hasUnresolvedLink(path: string): boolean {
   }
 }
 
-function rootObservationCursor(physical: string): string {
-  return `0:0:${physical}`;
-}
+const CLAUDE_ROOT_OBSERVATION_KEY = '__claude_configured_roots__';
 
 interface ClaudeRootObservation {
   readonly kind: 'root-observation';
-  readonly configured: string;
-  readonly physical: string;
+  readonly roots: ReadonlyMap<string, string | null>;
+  readonly cursor: string;
+}
+
+function readRootObservations(cursor: Cursor): Map<string, string> | null {
+  if (!cursor?.startsWith('0:0:')) return null;
+  try {
+    const entries: unknown = JSON.parse(cursor.slice(4));
+    if (!Array.isArray(entries)) return null;
+    return new Map(entries.filter((entry): entry is [string, string] =>
+      Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && typeof entry[1] === 'string'));
+  } catch { return null; }
 }
 
 function rootObservationUnits(
@@ -169,31 +178,35 @@ function rootObservationUnits(
   indexed: readonly IndexedSession[],
   ctx: DiscoverContext,
 ): IndexUnit[] {
-  if (ctx.previousCursor === undefined) return [];
-  const unselected = indexed.flatMap(session => {
+  if (ctx.previousCursor === undefined || ctx.indexedSessions === undefined) return [];
+  const previous = readRootObservations(ctx.previousCursor(CLAUDE_ROOT_OBSERVATION_KEY));
+  const unselected = new Set(indexed.flatMap(session => {
     const location = transcriptLocation(session.jsonlPath);
-    return location !== null && !physicalRoots.has(lexicalPathKey(location.root)) ? [location.root] : [];
-  });
-  const units: IndexUnit[] = [];
+    if (location === null) return [];
+    const key = lexicalPathKey(location.root);
+    return physicalRoots.has(key) ? [] : [key];
+  }));
+  const recorded = new Map<string, string>();
   for (const [configured, physical] of observedRoots) {
-    const key = `__claude_configured_alias__${lexicalPathKey(configured)}`;
-    const previous = ctx.previousCursor(key)?.match(/^0:0:(.+)$/s)?.[1] ?? null;
-    const displacedHistory = previous === null
-      ? physical === null && unselected.length > 0
-      : unselected.some(root => sameNormalizedPath(root, previous));
+    const key = lexicalPathKey(configured);
+    const priorRoot = previous?.get(key);
+    const displacedHistory = priorRoot === undefined
+      ? previous === null && physical === null && unselected.size > 0
+      : unselected.has(lexicalPathKey(priorRoot));
     if (displacedHistory) {
       ctx.reportIncompleteInventory?.({ path: configured, error: 'Configured Claude root no longer resolves to its indexed store' });
-      continue;
-    }
-    if (physical !== null && (previous !== null || !sameNormalizedPath(configured, physical))
-      && ctx.lastCursor(key) !== rootObservationCursor(physical)) {
-      units.push({
-        key, sessionId: '',
-        meta: { kind: 'root-observation', configured, physical } satisfies ClaudeRootObservation,
-      });
+      if (priorRoot === undefined) return [];
+      recorded.set(key, priorRoot);
+    } else if (physical !== null) {
+      recorded.set(key, physical);
     }
   }
-  return units;
+  const cursor = `0:0:${JSON.stringify([...recorded].sort(([left], [right]) => left.localeCompare(right)))}`;
+  if (ctx.lastCursor(CLAUDE_ROOT_OBSERVATION_KEY) === cursor) return [];
+  return [{
+    key: CLAUDE_ROOT_OBSERVATION_KEY, sessionId: '',
+    meta: { kind: 'root-observation', roots: observedRoots, cursor } satisfies ClaudeRootObservation,
+  }];
 }
 
 function transcriptLocation(path: string) {
@@ -244,12 +257,31 @@ function mayUseStoredPath(cursor: Cursor, path: string): boolean {
   }
 }
 
+function physicalDirectoryIdentity(root: string): string | null {
+  try {
+    const stat = statSync(root);
+    return stat.isDirectory() && stat.ino !== 0 ? `${stat.dev}:${stat.ino}:${stat.birthtimeMs}` : null;
+  } catch { return null; }
+}
+
+function checkpointRootIdentity(cursor: Cursor): string | null {
+  const fields = cursor?.split(':') ?? [];
+  return fields.length === 10 ? fields.slice(7).join(':') : null;
+}
+
+function checkpointOwnsStoredPath(cursor: Cursor, root: string, path: string): boolean {
+  const identity = checkpointRootIdentity(cursor);
+  return identity === null ? mayUseStoredPath(cursor, path) : identity === physicalDirectoryIdentity(root);
+}
+
 function rootMatchingCheckpoint(
   location: NonNullable<ReturnType<typeof transcriptLocation>>,
   roots: readonly string[],
   cursor: Cursor,
 ): string | undefined {
+  const rootIdentity = checkpointRootIdentity(cursor);
   const matching = roots.filter(root => {
+    if (rootIdentity !== null && rootIdentity !== physicalDirectoryIdentity(root)) return false;
     const path = join(root, 'projects', location.project, location.file);
     if (checkpointMatchesFile(cursor, path) === null) return false;
     const resolved = tryRealpath(path);
@@ -265,7 +297,7 @@ export function verifiedLegacyClaudeRoot(
   if (location === null || sameNormalizedPath(location.root, defaultRoot)) return undefined;
   const observedRoot = tryRealpath(location.root);
   if (observedRoot !== null && sameNormalizedPath(location.root, observedRoot)
-    && mayUseStoredPath(cursor, jsonlPath)) return observedRoot;
+    && checkpointOwnsStoredPath(cursor, observedRoot, jsonlPath)) return observedRoot;
   // Discovery publishes only selected roots. A legacy alias is safe to move
   // only when its stored checkpoint identifies exactly one of those roots.
   const physicalRoots = [...new Set(configuredRoots.map(physicalPath))];
@@ -297,7 +329,7 @@ function resolveIndexedRoots(
     if (location === null) continue;
     const cursor = ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath);
     let root = rootByKey.get(lexicalPathKey(location.root));
-    if (root !== undefined && !mayUseStoredPath(cursor, session.jsonlPath)) root = undefined;
+    if (root !== undefined && !checkpointOwnsStoredPath(cursor, root, session.jsonlPath)) root = undefined;
     if (root === undefined) {
       // A currently resolving symlink says nothing about where it pointed at
       // indexing time. Match the prior checkpoint against the selected stores.
@@ -815,12 +847,13 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
 function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
   const rootObservation = unit.meta as ClaudeRootObservation | undefined;
   if (rootObservation?.kind === 'root-observation') {
-    const { configured, physical } = rootObservation;
-    const resolved = tryRealpath(configured);
-    if (resolved === null || !sameNormalizedPath(resolved, physical)) {
-      throw new RetryableSourceReadError(configured, 'Configured Claude root changed during discovery');
+    for (const [configured, physical] of rootObservation.roots) {
+      const resolved = tryRealpath(configured);
+      if (resolved === null ? physical !== null : physical === null || !sameNormalizedPath(resolved, physical)) {
+        throw new RetryableSourceReadError(configured, 'Configured Claude root changed during discovery');
+      }
     }
-    return rootObservationCursor(physical);
+    return rootObservation.cursor;
   }
   if ((unit.meta as ClaudeOrphanFamilyMeta | undefined)?.kind === 'orphan-family') {
     return yield* parseOrphanFamily(unit, cursor);
@@ -828,10 +861,16 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
   if ((unit.meta as ClaudeWorkflowUnitMeta | undefined)?.kind === 'workflow') {
     return yield* parseWorkflow(unit);
   }
-  const skip = cursorToSkip(cursor);
   const stat = statSync(unit.key);
+  const fields = cursor?.split(':') ?? [];
+  const resume = fields.length < 5 || (checkpointIdentifiesFile(fields, stat) && stat.size >= Number(fields[2]));
+  const skip = resume ? cursorToSkip(cursor) : 0;
   const mtime = stat.mtimeMs;
   const isSubagent = unit.isSubagent === true;
+  const location = isSubagent ? null : transcriptLocation(unit.key);
+  const physical = location === null ? null : tryRealpath(location.root);
+  const rootIdentity = physical !== null && location !== null && sameNormalizedPath(location.root, physical)
+    ? physicalDirectoryIdentity(physical) : null;
   const records: TranscriptRecord[] = [];
   const historyTitle = ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null;
   let aiTitle: string | null = null;
@@ -1006,7 +1045,8 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
   }
 
   yield* records;
-  return `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}:${stat.dev}:${stat.birthtimeMs}`;
+  const fileCursor = `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}:${stat.dev}:${stat.birthtimeMs}`;
+  return rootIdentity === null ? fileCursor : `${fileCursor}:${rootIdentity}`;
 }
 
 /**
@@ -1140,6 +1180,8 @@ function rawClaude(input: RawLookup): RawRecord | null {
   const location = transcriptLocation(mainPath);
   if (location !== null) {
     const realRoot = tryRealpath(location.root);
+    const rootIdentity = checkpointRootIdentity(input.cursor ?? null);
+    if (rootIdentity !== null && rootIdentity !== physicalDirectoryIdentity(location.root)) return null;
     if (realRoot !== null && !sameNormalizedPath(location.root, realRoot)) {
       if (checkpointMatchesFile(input.cursor ?? null, mainPath) === null) return null;
     } else if (input.cursor != null && !mayUseStoredPath(input.cursor, mainPath)) {

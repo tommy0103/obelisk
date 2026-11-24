@@ -235,7 +235,11 @@ export function storedSessionCursor(
     sessionId: typeof session.id === 'string' ? session.id : '',
     jsonlPath: session.jsonl_path,
   });
-  return storedProviderCursor(db, unitKey);
+  // Claude verifies the backing file of retained rows even when their
+  // checkpoint has been invalidated for resuming an indexing pass.
+  return source === 'claude'
+    ? checkpointCursor(storedCheckpoint(db, unitKey))
+    : storedProviderCursor(db, unitKey);
 }
 
 export function readProviderSessionProvenance(db: SqliteDb, schema: 'main' | 'previous_obelisk' = 'main'): ProviderSessionProvenance[] {

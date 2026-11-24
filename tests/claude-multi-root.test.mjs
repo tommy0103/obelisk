@@ -27,6 +27,7 @@ import {
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 import { runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -244,6 +245,36 @@ test('claude explicit roots: unlinking or replacing a configured alias cannot dr
   db.close();
 });
 
+test('claude explicit roots: replacing a transcript file within its indexed store preserves the session identity', () => {
+  const home = makeTempDir('obelisk-claude-replace-file-');
+  const store = join(home, 'store');
+  const transcript = copyRealFixture(store);
+  const id = canonicalSessionId(REAL_SID, rootTagFor(store, join(home, '.claude')));
+  assert.equal(runClaudeRefresh(home, [store], true).status, 0);
+  const replacement = `${transcript}.tmp`;
+  const replacementText = 'Replacement file in the same Claude store';
+  writeFileSync(replacement, REAL_FIXTURE_TEXT.replace(REAL_FIXTURE_USER.message.content, replacementText));
+  renameSync(replacement, transcript);
+  for (const force of [false, true]) {
+    assert.equal(runClaudeRefresh(home, [store], force).status, 0);
+    const db = openClaudeIndex(home);
+    assert.deepEqual(db.prepare("SELECT id FROM sessions WHERE source = 'claude'").all().map(row => row.id), [id]);
+    assert.equal(db.prepare('SELECT text FROM messages WHERE uuid = ?').get(`${id}:${REAL_FIXTURE_USER.uuid}`)?.text, replacementText);
+    db.close();
+  }
+});
+
+test('claude explicit roots: an unavailable new setting does not keep a deliberately excluded store', () => {
+  const home = makeTempDir('obelisk-claude-new-missing-root-');
+  const previous = join(home, 'previous');
+  copyRealFixture(previous);
+  assert.equal(runClaudeRefresh(home, [previous], true).status, 0);
+  assert.equal(runClaudeRefresh(home, [join(home, 'never-indexed')], true).status, 0);
+  const db = openClaudeIndex(home);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE source = 'claude'").get().count, 0);
+  db.close();
+});
+
 test('claude migration: replacing a historical alias by a directory keeps cached anchors through repeated refreshes', () => {
   const home = makeTempDir('obelisk-claude-legacy-alias-directory-');
   const store = join(home, 'store');
@@ -263,17 +294,15 @@ test('claude migration: replacing a historical alias by a directory keeps cached
   for (const force of [false, true, false]) {
     assert.equal(runClaudeRefresh(home, [alias], force).status, 0);
     db = openClaudeIndex(home);
-    const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(oldPath)?.cursor;
-    assert.equal(cursor, indexCursor);
+    const checkpoint = db.prepare('SELECT cursor, replay_required FROM index_state WHERE jsonl_path = ?').get(oldPath);
+    assert.equal(checkpoint?.cursor, indexCursor);
+    assert.equal(checkpoint?.replay_required, 1);
     const original = db.prepare(`
       SELECT m.text FROM memories AS n JOIN messages AS m ON m.uuid = n.message_start AND m.session_id = n.session_id
       WHERE n.id = 'note'
     `).get();
     assert.equal(original?.text, REAL_FIXTURE_USER.message.content);
-    assert.equal(createClaudeProvider().raw({
-      source: 'claude', messageUuid: REAL_FIXTURE_USER.uuid,
-      session: { id: REAL_SID, jsonl_path: oldPath }, agentId: null, cursor,
-    }), null);
+    assert.equal(createQueryApi(db).raw(REAL_FIXTURE_USER.uuid), null);
     db.close();
   }
 });
