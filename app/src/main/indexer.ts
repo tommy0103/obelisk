@@ -10,7 +10,7 @@ import Database from 'better-sqlite3';
 import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import { CLAUDE_CANONICAL_TRANSCRIPT_MARKER } from '../../../packages/core/src/providers/claude.ts';
-import { needsClaudeIdentityMigration, reconcileLegacyClaudeRootIdentities } from '../../../packages/core/src/providers/claude-migration.ts';
+import { planLegacyClaudeRootIdentityMigration, reconcileLegacyClaudeRootIdentities } from '../../../packages/core/src/providers/claude-migration.ts';
 import {
   backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
@@ -369,33 +369,31 @@ function buildIndex({
             openDevinDatabase,
           }).registry);
       const claudeProvider = registry.get('claude');
-      const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER;
-      const claudeWatchRoots = shouldReconcileClaude
-        ? claudeProvider.watchTargets(claudeProvider.descriptor.defaultRoot)
-          .filter((target) => target.kind === 'tree' && path.basename(target.path) === 'projects')
-          .map((target) => path.dirname(target.path))
+      const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER
+        && !priorIndexState?.has(CLAUDE_CANONICAL_TRANSCRIPT_MARKER)
+        && !db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
+      const claudeMigration = shouldReconcileClaude
+        ? planLegacyClaudeRootIdentityMigration(db, claudeProvider.descriptor.defaultRoot,
+          claudeProvider.watchTargets(claudeProvider.descriptor.defaultRoot)
+            .filter((target) => target.kind === 'tree' && path.basename(target.path) === 'projects')
+            .map((target) => path.dirname(target.path)),
+          priorSessions,
+          priorIndexState)
         : [];
-      if (!force && shouldReconcileClaude) {
-        const markerPresent = Boolean(
-          db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER),
-        );
-        if (!markerPresent && needsClaudeIdentityMigration(db, claudeProvider.descriptor.defaultRoot, claudeWatchRoots)) {
-          try {
-            runRetryableWriteTransaction(
-              txDb,
-              () => reconcileLegacyClaudeRootIdentities(db, claudeProvider.descriptor.defaultRoot, claudeWatchRoots),
-              { label: 'claude-identity-migration' },
-            );
-          } catch (error) {
-            if (isBeginBusyFailure(error)) {
-              return deferredBuildResult('database_busy');
-            }
-            throw error;
+      if (!force && claudeMigration.length > 0) {
+        try {
+          runRetryableWriteTransaction(
+            txDb,
+            () => reconcileLegacyClaudeRootIdentities(db, claudeMigration),
+            { label: 'claude-identity-migration' },
+          );
+        } catch (error) {
+          if (isBeginBusyFailure(error)) {
+            return deferredBuildResult('database_busy');
           }
+          throw error;
         }
       }
-      const effectivePriorSessions = priorSessions
-        ?? (force && shouldReconcileClaude ? readProviderSessionProvenance(db) : undefined);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
         changedPaths,
@@ -499,14 +497,7 @@ function buildIndex({
             dropMessageFtsTriggers(db);
             messageFtsTriggersDropped = true;
             retainedSnapshot.reset();
-            if (shouldReconcileClaude) {
-              reconcileLegacyClaudeRootIdentities(
-                db,
-                claudeProvider.descriptor.defaultRoot,
-                claudeWatchRoots,
-                effectivePriorSessions,
-              );
-            }
+            reconcileLegacyClaudeRootIdentities(db, claudeMigration);
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,
