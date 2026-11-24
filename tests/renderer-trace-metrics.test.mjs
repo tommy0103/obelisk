@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { rendererTaskMetrics } from '../app/tests/renderer-trace-metrics.mjs';
+import { rendererTaskMetrics, stationaryTimingVerdict, wheelTimingVerdict } from '../app/tests/renderer-trace-metrics.mjs';
 
 // Actual Electron 43.2.0 trace, 2026-10-02: 2,000-message timeline, native
 // 960px wheel gesture, 24x CPU stress. Only renderer task/function durations
@@ -56,4 +56,37 @@ test('work on other threads or outside the probe cannot distort its CPU budget',
 test('missing trace marks and missing renderer tasks fail measurement', () => {
   assert.throws(() => measure([]), /Missing renderer trace marks/);
   assert.throws(() => measure([start, end]), /no RunTask/);
+});
+
+const gesture = (maxTaskWorkMs, maxFrameGap, maxFunctionWorkMs = 1) => ({ maxTaskWorkMs, maxFrameGap, maxFunctionWorkMs });
+
+test('one catastrophic wheel stall fails although the other gestures are smooth', () => {
+  const baselines = [gesture(3, 30), gesture(3, 30), gesture(3, 30)];
+  const verdict = wheelTimingVerdict(baselines, [gesture(3, 310), gesture(3, 30), gesture(3, 31)]);
+  assert.equal(verdict.stall, false);
+  assert.equal(verdict.longTask, true);
+});
+
+test('one long task fails although the other gestures stay short', () => {
+  const baselines = [gesture(3, 30), gesture(3, 30), gesture(3, 30)];
+  const verdict = wheelTimingVerdict(baselines, [gesture(65, 30), gesture(22, 30), gesture(23, 30)]);
+  assert.equal(verdict.longTask, false);
+  assert.equal(verdict.stall, true);
+});
+
+test('patch preparation holds its 2ms budget for the median, not a single noisy gesture', () => {
+  const baselines = [gesture(3, 30, 1), gesture(3, 30, 1), gesture(3, 30, 8)];
+  assert.equal(wheelTimingVerdict(baselines, [gesture(3, 30, 6), gesture(3, 30, 1), gesture(3, 30, 1.5)]).patchPreparation, true);
+  assert.equal(wheelTimingVerdict(baselines, [gesture(3, 30, 6), gesture(3, 30, 4), gesture(3, 30, 1.5)]).patchPreparation, false);
+});
+
+test('one stationary commit with a long task fails although the median is inside 120Hz', () => {
+  const verdict = stationaryTimingVerdict([{ maxTaskWorkMs: 60 }, { maxTaskWorkMs: 2 }, { maxTaskWorkMs: 2 }]);
+  assert.equal(verdict.longTask, false);
+  assert.equal(verdict.budget, true);
+});
+
+test('stationary commits that all exceed 120Hz fail the work budget', () => {
+  assert.equal(stationaryTimingVerdict([{ maxTaskWorkMs: 9 }, { maxTaskWorkMs: 40 }, { maxTaskWorkMs: 2 }]).budget, false);
+  assert.equal(stationaryTimingVerdict([{ maxTaskWorkMs: 17 }, { maxTaskWorkMs: 17 }, { maxTaskWorkMs: 17 }]).budget, false);
 });
