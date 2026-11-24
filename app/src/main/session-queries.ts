@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import type { IpcMain, IpcMainInvokeEvent } from 'electron';
 import type Database from 'better-sqlite3';
-import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
+import { storedRawCursor, storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
 import type { SqliteRow } from '../../../packages/core/src/sqlite-types.ts';
 import type { createWorkerBuildIndex } from './indexer-worker-client.ts';
@@ -378,7 +378,7 @@ export function registerSessionQueryHandlers({ ipcMain, getDb, getRuntimePaths, 
         return msg.text ?? null;
       }
     }
-    const raw = paths.providerRegistry.raw(lookup);
+    const raw = paths.providerRegistry.raw({ ...lookup, cursorForPath: path => storedRawCursor(db, path) });
     return raw?.messageText ?? msg.text ?? null;
   });
 

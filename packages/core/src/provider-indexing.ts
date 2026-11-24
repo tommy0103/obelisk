@@ -217,6 +217,11 @@ export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
   return state?.replayRequired ? null : checkpointCursor(state);
 }
 
+/** Committed source evidence remains usable when a later replay is pending. */
+export function storedRawCursor(db: SqliteDb, key: string): Cursor {
+  return checkpointCursor(storedCheckpoint(db, key));
+}
+
 function providerSessionUnitKey(
   provider: ProviderAdapter | undefined,
   session: IndexedSession,
@@ -235,7 +240,7 @@ export function storedSessionCursor(
     sessionId: typeof session.id === 'string' ? session.id : '',
     jsonlPath: session.jsonl_path,
   });
-  return storedProviderCursor(db, unitKey);
+  return source === 'codex' ? storedRawCursor(db, unitKey) : storedProviderCursor(db, unitKey);
 }
 
 export function readProviderSessionProvenance(db: SqliteDb, schema: 'main' | 'previous_obelisk' = 'main'): ProviderSessionProvenance[] {

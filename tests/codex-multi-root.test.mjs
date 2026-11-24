@@ -9,6 +9,7 @@ import {
   appendFileSync,
   chmodSync,
   copyFileSync,
+  linkSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -29,7 +30,9 @@ import {
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
 import { createProviderIndexPlan, indexProviderPlanStrict } from '../packages/core/src/provider-indexing.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { registerSessionQueryHandlers } from '../app/src/main/session-queries.ts';
 import { runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
@@ -159,7 +162,7 @@ function legacyAliasProvider(aliasRoot) {
       discover: ctx => provider.discover(ctx).map(unit => ({
         ...unit,
         sessionId: `codex:${scope}:${unit.sessionId.slice('codex:'.length)}`,
-        meta: { ...unit.meta, rootScope: scope },
+        meta: { ...unit.meta, rootScope: scope, storeSuffix: undefined },
       })),
     },
   };
@@ -221,6 +224,7 @@ test('legacy child raw lookup and first refresh work after dropping a live alias
   const provider = createCodexProvider({ roots: [realRoot], homeDir: home });
   assert.match(provider.raw({
     source: 'codex', messageUuid: `${oldChild}:000002`, agentId: oldChild, session, cursor,
+    cursorForPath: path => db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(path)?.cursor ?? null,
   })?.text ?? '', /legacy child message/);
   const plan = planCodex(db, provider, { changedPaths: [parentPath] });
   assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
@@ -228,6 +232,58 @@ test('legacy child raw lookup and first refresh work after dropping a live alias
   assert.deepEqual(db.prepare('SELECT id FROM sessions').all().map(row => row.id), [newParent]);
   assert.ok(db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?').get(newParent, 'legacy child message'));
   assert.equal(planCodex(db, provider).items.length, 0);
+  db.close();
+});
+
+test('legacy child raw evidence and family migration require the indexed child source', async () => {
+  const home = makeTempDir('obelisk-codex-alias-child-source-');
+  const firstRoot = join(home, 'first-codex');
+  const secondRoot = join(home, 'second-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const parentId = realRolloutId();
+  const childId = '019ed000-0000-7000-8000-000000000124';
+  const originalChild = `original child ${'x'.repeat(10_010)} end`;
+  const childPath = writeRollout(firstRoot, { id: childId, parentThreadId: parentId, userText: originalChild });
+  const parentPath = join(firstRoot, 'sessions', '2026', '06', '15', `rollout-${parentId}.jsonl`);
+  copyFileSync(REAL_FIXTURE, parentPath);
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+  symlinkSync(firstRoot, aliasRoot, aliasType);
+  const legacy = legacyAliasProvider(aliasRoot);
+  const db = freshDb();
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, legacy.provider) }).complete, true);
+  const childUuid = `codex:${legacy.scope}:${childId}:000002`;
+  const next = createCodexProvider({ roots: [firstRoot], homeDir: home });
+  const raw = provider => createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) }).raw(childUuid);
+  const handlers = new Map();
+  registerSessionQueryHandlers({
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    getDb: () => db,
+    getRuntimePaths: () => ({ providerRegistry: createProviderRegistry([next]), providerRoots: {} }),
+    getIndexerWorker: () => null,
+    runAppDbWrite: () => false,
+  });
+  const fullText = () => handlers.get('db:getMessageFullText')(null, childUuid);
+  const cachedText = db.prepare('SELECT text FROM messages WHERE uuid=?').get(childUuid).text;
+  assert.notEqual(cachedText, originalChild);
+  assert.match(raw(next)?.text ?? '', /original child/);
+  db.prepare('UPDATE index_state SET replay_required = 1 WHERE jsonl_path LIKE ?').run(`%${basename(childPath)}`);
+  assert.match(raw(next)?.text ?? '', /original child/);
+  assert.equal(await fullText(), originalChild);
+  appendFileSync(childPath, '\n');
+  assert.match(raw(next)?.text ?? '', /original child/);
+  renameSync(childPath, `${childPath}.old`);
+  writeRollout(firstRoot, { id: childId, parentThreadId: parentId, userText: 'replacement child' });
+  assert.equal(raw(next), null);
+  assert.equal(await fullText(), cachedText);
+
+  const otherChild = writeRollout(secondRoot, { id: childId, parentThreadId: parentId, userText: 'other store child' });
+  linkSync(parentPath, join(otherChild, '..', basename(parentPath)));
+  unlinkSync(aliasRoot);
+  symlinkSync(secondRoot, aliasRoot, aliasType);
+  const retargeted = createCodexProvider({ roots: [aliasRoot], homeDir: home });
+  assert.equal(raw(retargeted), null);
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, retargeted) }).complete, false);
+  assert.ok(db.prepare('SELECT 1 FROM messages WHERE uuid=? AND text=?').get(childUuid, cachedText));
   db.close();
 });
 
@@ -271,7 +327,8 @@ test('retargeting a legacy alias cannot reassign its cached history or expose an
   db.close();
 });
 
-test('retargeting the default Codex alias reuses a bare ID only when its previous owner can migrate', () => {
+for (const [replacement, legacy] of [['alias', false], ['directory', false], ['alias', true], ['directory', true]]) {
+test(`replacing the ${legacy ? 'legacy' : 'canonical'} default Codex alias with a different ${replacement} preserves bare ID ownership`, () => {
   const home = makeTempDir('obelisk-codex-retargeted-default-');
   const firstRoot = join(home, 'first-codex');
   const secondRoot = join(home, 'second-codex');
@@ -285,31 +342,40 @@ test('retargeting the default Codex alias reuses a bare ID only when its previou
   const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
   symlinkSync(firstRoot, aliasRoot, aliasType);
   const db = freshDb();
-  const initial = createCodexProvider({ roots: [aliasRoot], homeDir: home });
+  const initial = createCodexProvider(legacy ? { rootDir: aliasRoot, homeDir: home } : { roots: [aliasRoot], homeDir: home });
+  if (legacy) {
+    const discover = initial.discover;
+    initial.discover = ctx => discover(ctx).map(unit => ({ ...unit, meta: { ...unit.meta, storeSuffix: undefined } }));
+  }
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, initial) }).complete, true);
   const bareParent = `codex:${parentId}`;
   const bareChild = `codex:${childId}`;
-  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(bareParent);
+  const rawChild = provider => createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) }).raw(`${bareChild}:000002`);
 
   unlinkSync(aliasRoot);
-  symlinkSync(secondRoot, aliasRoot, aliasType);
+  if (replacement === 'alias') symlinkSync(secondRoot, aliasRoot, aliasType);
+  else renameSync(secondRoot, aliasRoot);
   const next = createCodexProvider({ roots: [aliasRoot], homeDir: home });
-  assert.match(next.raw({
-    source: 'codex', messageUuid: `${bareChild}:000002`, agentId: bareChild, session,
-  })?.text ?? '', /first default child/);
+  if (legacy) assert.equal(rawChild(next), null);
+  else assert.match(rawChild(next)?.text ?? '', /first default child/);
   const blocked = planCodex(db, next);
   assert.equal(blocked.incompleteProviders.has('codex'), true);
-  assert.equal(blocked.items.length, 0);
+  assert.ok(blocked.items.every(({ unit }) => unit.sessionId !== bareParent));
+  assert.equal(indexProviderPlanStrict({ db, plan: blocked }).complete, false);
   const recover = createCodexProvider({ roots: [aliasRoot, firstRoot], homeDir: home });
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, recover) }).complete, true);
-  const scopedParent = `codex:${codexRootScope(firstRoot, home)}:${parentId}`;
   const hasMessage = db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?');
-  assert.ok(hasMessage.get(bareParent, 'second default child'));
-  assert.ok(hasMessage.get(scopedParent, 'first default child'));
+  assert.ok(hasMessage.get(bareParent, 'first default child'));
+  assert.equal(hasMessage.get(bareParent, 'second default child'), undefined);
+  assert.match(rawChild(recover)?.text ?? '', /first default child/);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM messages WHERE text='second default child'").get().count, 1);
+  assert.equal(planCodex(db, recover).items.length, 0);
   db.close();
 });
+}
 
-test('built CLI leaves its cache intact when a configured alias becomes dangling', () => {
+for (const unavailableAlias of ['dangling', 'deleted', 'deleted and reselected']) {
+test(`built CLI leaves its cache intact when a configured alias is ${unavailableAlias}`, () => {
   const home = makeTempDir('obelisk-codex-dangling-alias-');
   const realRoot = join(home, 'real-codex');
   const aliasRoot = join(home, 'alias-codex');
@@ -319,7 +385,8 @@ test('built CLI leaves its cache intact when a configured alias becomes dangling
   symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
   const obeliskDir = join(home, '.obelisk');
   mkdirSync(obeliskDir);
-  writeFileSync(join(obeliskDir, 'settings.json'), JSON.stringify({ providerRoots: { codex: [aliasRoot] } }));
+  const select = root => writeFileSync(join(obeliskDir, 'settings.json'), JSON.stringify({ providerRoots: { codex: [root] } }));
+  select(aliasRoot);
   assert.equal(runCli(['--build'], { home }).status, 0);
   const read = () => {
     const db = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'), { readOnly: true });
@@ -327,12 +394,19 @@ test('built CLI leaves its cache intact when a configured alias becomes dangling
   };
   const before = read();
   assert.equal(before.sessions.length, 1);
-  renameSync(realRoot, join(home, 'offline-codex'));
+  if (unavailableAlias === 'deleted and reselected') {
+    select(realRoot);
+    assert.equal(runCli(['--build'], { home }).status, 0);
+    select(aliasRoot);
+  }
+  if (unavailableAlias === 'dangling') renameSync(realRoot, join(home, 'offline-codex'));
+  else unlinkSync(aliasRoot);
   const unavailable = runCli(['--build'], { home });
   assert.notEqual(unavailable.status, 0);
   assert.match(unavailable.stderr + unavailable.stdout, /Source folder is unavailable/);
   assert.deepEqual(read(), before);
 });
+}
 
 test('built CLI keeps real-fixture identity stable across alias lifecycle and isolates an independent copy', () => {
   const home = makeTempDir('obelisk-codex-real-alias-cli-');

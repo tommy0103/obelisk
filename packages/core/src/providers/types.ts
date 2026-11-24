@@ -336,6 +336,8 @@ export interface RawLookup {
   readonly agentId: string | null;
   /** Cursor committed for this session's source unit, when available. */
   readonly cursor?: Cursor;
+  /** Cursor for a separate source unit contributing records to the session. */
+  readonly cursorForPath?: (path: string) => Cursor;
   readonly subagent?: Record<string, unknown> | null;
   readonly workflowAgent?: Record<string, unknown> | null;
 }

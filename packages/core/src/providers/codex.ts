@@ -96,6 +96,10 @@ function lexicalCodexRoot(rootDir: string): string {
 
 function codexScopeForPath(rootDir: string, defaultRoot: string): string | null {
   if (rootDir === defaultRoot) return null;
+  return codexScopedRootId(rootDir);
+}
+
+function codexScopedRootId(rootDir: string): string {
   const label = basename(rootDir)
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
@@ -122,6 +126,34 @@ function sameCodexRootPath(a: string, b: string): boolean {
 }
 
 const CODEX_ZST_CURSOR_TAG = 'codex-zst-v1';
+const CODEX_STORE_CURSOR_TAG = ':codex-store-v1:';
+
+function codexDirectoryIdentity(path: string): string | null {
+  try {
+    const stat = statSync(path);
+    return stat.isDirectory() && usableSourceIdentity(stat)
+      ? `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`
+      : null;
+  } catch { return null; }
+}
+
+function readCodexStore(cursor: Cursor): { identity: string; aliases: string[]; defaultOwner: boolean } | null {
+  const suffix = cursor?.split(CODEX_STORE_CURSOR_TAG)[1];
+  if (suffix === undefined) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(suffix, 'base64url').toString('utf8'));
+    if (isRecord(value) && typeof value.identity === 'string' && Array.isArray(value.aliases)
+      && value.aliases.every((alias: unknown) => typeof alias === 'string')) {
+      return { identity: value.identity, aliases: value.aliases, defaultOwner: value.defaultOwner === true };
+    }
+  } catch { /* malformed checkpoint suffix */ }
+  return null;
+}
+
+function codexStoreSuffix(identity: string | null | undefined, aliases: readonly string[], defaultOwner: boolean): string | undefined {
+  if (identity == null) return undefined;
+  return CODEX_STORE_CURSOR_TAG + Buffer.from(JSON.stringify({ identity, aliases: [...aliases].sort(), defaultOwner })).toString('base64url');
+}
 
 function encodeCodexZstCursor(stat: Stats, completeLines: number, rootScope: string | null = null): string {
   const parts = [
@@ -143,7 +175,7 @@ function encodeCodexZstCursor(stat: Stats, completeLines: number, rootScope: str
 // is now the safe restart offset, not the current EOF.
 function codexCursorSignatureDiffers(cursor: string, filePath: string, expectedRootScope: string | null = null): boolean {
   const stat = statSync(filePath);
-  const parts = cursor.split(':');
+  const parts = cursor.split(CODEX_STORE_CURSOR_TAG)[0]!.split(':');
   if (isCodexCompressedPath(filePath)) {
     const validLength = expectedRootScope === null ? parts.length === 7 : parts.length === 8;
     const cursorScope = parts[7] ?? null;
@@ -173,11 +205,11 @@ function codexCursorSignatureDiffers(cursor: string, filePath: string, expectedR
     || Number(parts[4]) !== stat.ino;
 }
 
-function cursorIdentifiesCodexFile(cursor: Cursor, filePath: string): boolean {
+function cursorIdentifiesCodexFile(cursor: Cursor, filePath: string, { unshared = false } = {}): boolean {
   if (cursor === null) return false;
   let stat: Stats;
   try { stat = statSync(filePath); } catch { return false; }
-  if (!stat.isFile() || !usableSourceIdentity(stat)) return false;
+  if (!stat.isFile() || !usableSourceIdentity(stat) || (unshared && stat.nlink !== 1)) return false;
   const parts = cursor.split(':');
   const compressed = isCodexCompressedPath(filePath);
   const checkpoint = compressed ? null : decodeCodexCursor(cursor);
@@ -223,7 +255,9 @@ function discoverAtRoot(
     usesRootSet = false,
     aliases = [rootDir],
     homeDir = homedir(),
-  }: { usesRootSet?: boolean; aliases?: readonly string[]; homeDir?: string } = {},
+    recoveredRoots = new Map<string, string>(),
+    storeSuffix,
+  }: { usesRootSet?: boolean; aliases?: readonly string[]; homeDir?: string; recoveredRoots?: ReadonlyMap<string, string>; storeSuffix?: string } = {},
 ): IndexUnit[] {
   const [sessionsDir, archivedSessionsDir] = codexTranscriptDirs(rootDir);
   const indexedList = ctx.indexedSessions?.() ?? [];
@@ -334,8 +368,11 @@ function discoverAtRoot(
   }
   const historicalAliasesByPath = new Map<string, { sessionId: string; cursor: string; path: string }[]>();
   if (usesRootSet) {
+    const rootIdentity = codexDirectoryIdentity(rootDir);
     const priorRoots = new Map<string, { physicalRoot: string | null; scope: string | null }>();
     for (const session of indexedList) {
+      const recoveredRoot = recoveredRoots.get(session.sessionId);
+      if (recoveredRoot !== undefined && recoveredRoot !== rootDir) continue;
       const priorRoot = deriveCodexRootFromSessionPath(session.jsonlPath);
       if (priorRoot === null || priorRoot === rootDir) continue;
       let prior = priorRoots.get(priorRoot);
@@ -343,17 +380,21 @@ function discoverAtRoot(
         prior = { physicalRoot: tryRealpath(priorRoot), scope: legacyCodexRootScope(priorRoot, homeDir) };
         priorRoots.set(priorRoot, prior);
       }
-      if (prior.physicalRoot !== rootDir) continue;
       const sessionScope = /^codex:([^:]+):[^:]+$/.exec(session.sessionId)?.[1] ?? null;
       if (sessionScope !== prior.scope) continue;
 
       const path = normalize(join(rootDir, relative(priorRoot, session.jsonlPath)));
       const cursor = ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath);
+      const store = readCodexStore(cursor);
+      if (prior.physicalRoot !== rootDir && (store !== null ? store.identity !== rootIdentity
+        : cursorIdentifiesCodexFile(cursor, session.jsonlPath)
+          || !cursorIdentifiesCodexFile(cursor, path, { unshared: true }))) continue;
       // A live symlink only identifies today's target. Require a historical
       // source checkpoint before transferring ownership across root paths.
-      if (cursor === null || tryRealpath(path) !== path || !cursorIdentifiesCodexFile(cursor, path)) {
+      if (cursor === null || (store !== null && store.identity !== rootIdentity)
+        || tryRealpath(path) !== path || !cursorIdentifiesCodexFile(cursor, path)) {
         ctx.retainSession?.(session.sessionId);
-        if (sessionScope === rootScope) {
+        if (sessionScope === rootScope || ctx.snapshotRequired) {
           ctx.reportIncompleteInventory?.({ path: session.jsonlPath, error: 'Codex alias no longer matches its historical source' });
         }
         continue;
@@ -371,11 +412,12 @@ function discoverAtRoot(
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged && !scopeMigration) return [];
       const cursor = ctx.lastCursor(file.path);
       const unchangedSource = cursor !== null && !codexCursorSignatureDiffers(cursor, file.path, rootScope);
+      const unchangedStore = storeSuffix === undefined || !cursor?.includes(CODEX_STORE_CURSOR_TAG) || cursor.endsWith(storeSuffix);
       // A session-index-only refresh must update the aggregate, but a
       // strengthened cursor already contains the identity needed to construct
       // the normal-session unit. Avoid reopening every historical rollout for
       // guardian classification when its source signature is unchanged.
-      if (sessionIndexChanged && !fileChanged && !scopeMigration && unchangedSource) {
+      if (sessionIndexChanged && !fileChanged && !scopeMigration && unchangedSource && unchangedStore) {
         const checkpoint = decodeCodexCursor(cursor);
         if (checkpoint !== null) {
           const parentId = codexParentThreadId(checkpoint.meta);
@@ -386,6 +428,7 @@ function discoverAtRoot(
             meta: {
               source: 'codex', guardian: false, parentThreadId: parentId, threadRawId: checkpoint.threadRawId,
               rootScope,
+              storeSuffix,
               indexedTitle: indexed?.title,
               indexedUpdatedAt: indexed?.updatedAt,
             },
@@ -397,7 +440,7 @@ function discoverAtRoot(
       // matches cannot have changed status. Pre-v3 databases may still hold
       // guardian session rows; the v3 marker bump forces one full replay that
       // retracts them.
-      if (!sessionIndexChanged && !fileChanged && !scopeMigration && unchangedSource) return [];
+      if (!sessionIndexChanged && !fileChanged && !scopeMigration && unchangedSource && unchangedStore) return [];
       let guardian: { threadRawId: string; lineNum: number } | null;
       let meta: any = null;
       try {
@@ -449,6 +492,7 @@ function discoverAtRoot(
           parentThreadId: parentId,
           threadRawId: rawId,
           rootScope,
+          storeSuffix,
           indexedTitle: indexed?.title,
           indexedUpdatedAt: indexed?.updatedAt,
           sessionIndexChanged,
@@ -505,7 +549,7 @@ function discoverAtRoot(
       censusComplete = false;
       ctx.reportIncompleteInventory?.(issue);
     },
-  }, { usesRootSet });
+  }, { usesRootSet, aliases, storeSuffix });
   const remaining = discovered.filter(unit => !transitions.has(unit.sessionId));
   const families = new Map<string, IndexUnit[]>();
   for (const unit of complete) {
@@ -526,6 +570,38 @@ function discoverAtRoot(
       }
       continue;
     }
+    const memberPaths = new Map(family.flatMap(unit => {
+      const meta = unit.meta as { parentThreadId?: string | null; threadRawId?: string };
+      return meta.parentThreadId && meta.threadRawId ? [[meta.threadRawId, unit.key]] : [];
+    }));
+    const aliasEvidence = new Map<string, { sessionId: string; cursor: string; path: string }[]>();
+    let knownFamily = true;
+    const aliasParents = historicalAliasesByPath.get(canonical(root.key)) ?? [];
+    for (const oldId of new Set([...retractSessionIds, ...aliasParents.map(alias => alias.sessionId)])) {
+      const oldSession = indexed.get(oldId);
+      if (oldSession === undefined) continue;
+      const oldRoot = deriveCodexRootFromSessionPath(oldSession.jsonlPath);
+      if (oldRoot === null || oldRoot === rootDir) continue;
+      for (const memberId of oldSession.memberSessionIds ?? []) {
+        const wireId = memberId.slice(memberId.lastIndexOf(':') + 1);
+        const memberPath = memberPaths.get(wireId);
+        const oldPath = memberPath === undefined ? null : join(oldRoot, relative(rootDir, memberPath));
+        const cursor = oldPath === null ? null : ctx.previousCursor?.(oldPath) ?? ctx.lastCursor(oldPath);
+        if (memberPath === undefined || cursor === null || tryRealpath(memberPath) !== memberPath
+          || !cursorIdentifiesCodexFile(cursor, memberPath)) {
+          knownFamily = false;
+          break;
+        }
+        const key = canonical(memberPath);
+        aliasEvidence.set(key, [...aliasEvidence.get(key) ?? [], { sessionId: oldId, cursor, path: memberPath }]);
+      }
+    }
+    if (!knownFamily) {
+      ctx.retainSession?.(sessionId);
+      for (const id of retractSessionIds) ctx.retainSession?.(id);
+      ctx.reportIncompleteInventory?.({ path: root.key, error: 'Codex alias family no longer matches its historical sources' });
+      continue;
+    }
     family.sort((a, b) => Number(b.key === root.key) - Number(a.key === root.key));
     for (const unit of family) {
       const isRootUnit = unit.key === root.key;
@@ -537,7 +613,10 @@ function discoverAtRoot(
           ...(unit.meta as object),
           forceSnapshot: true,
           replaceSnapshot: isRootUnit,
-          historicalAliases: historicalAliasesByPath.get(canonical(unit.key)),
+          historicalAliases: [
+            ...historicalAliasesByPath.get(canonical(unit.key)) ?? [],
+            ...aliasEvidence.get(canonical(unit.key)) ?? [],
+          ],
         },
       });
     }
@@ -1612,41 +1691,37 @@ function deriveCodexRootFromSessionPath(jsonlPath: string): string | null {
 function rawCodex(
   rootEntries: readonly CodexRootEntry[],
   input: RawLookup,
-  { homeDir }: { homeDir: string },
 ): RawRecord | null {
   const parsed = parseCodexMessageUuid(input.messageUuid);
   if (parsed === null) return null;
-  let path: string | null = null;
   const sessionPath = typeof input.session?.jsonl_path === 'string' ? input.session.jsonl_path : null;
   const derivedRoot = sessionPath === null ? null : deriveCodexRootFromSessionPath(sessionPath);
   const physicalRoot = derivedRoot === null ? null : tryRealpath(derivedRoot);
-  const legacyAlias = derivedRoot !== null && physicalRoot !== derivedRoot
-    && (parsed.rootScope === null || legacyCodexRootScope(derivedRoot, homeDir) === parsed.rootScope);
-  if (legacyAlias && sessionPath !== null) {
-    const physicalSession = tryRealpath(sessionPath);
-    if (physicalRoot === null || physicalSession === null || !pathInside(physicalRoot, physicalSession)
-      || !cursorIdentifiesCodexFile(input.cursor ?? null, physicalSession)) return null;
-    path = input.agentId === null ? physicalSession : findCodexFile(physicalRoot, parsed.threadRawId);
-    if (path === null || tryRealpath(path) !== path) return null;
-  } else if (input.agentId === null && typeof input.session?.jsonl_path === 'string') {
-    path = input.session.jsonl_path;
-  } else if (derivedRoot !== null && (
-    parsed.rootScope === null || codexRootScope(derivedRoot, homeDir) === parsed.rootScope
-  )) {
-    path = findCodexFile(derivedRoot, parsed.threadRawId);
-  } else {
-    const matchingRoots = rootEntries.filter((entry) => entry.rootScope === parsed.rootScope);
-    for (const entry of matchingRoots) {
-      path = findCodexFile(entry.rootDir, parsed.threadRawId);
-      if (path !== null) break;
-    }
-  }
-  const resolvedPath = legacyAlias ? path : path !== null ? existingCodexRepresentation(path) : null;
+  const resolvedPath = input.agentId === null && sessionPath !== null
+    ? existingCodexRepresentation(sessionPath)
+    : (derivedRoot === null ? rootEntries.filter(entry => entry.rootScope === parsed.rootScope).map(entry => entry.rootDir) : [derivedRoot])
+      .map(root => findCodexFile(root, parsed.threadRawId)).find(path => path !== null) ?? null;
   if (resolvedPath === null) return null;
+  const verifySource = input.cursorForPath !== undefined || input.cursor != null || derivedRoot !== physicalRoot;
+  let readPath = resolvedPath;
+  let sourceCursor: Cursor = null;
+  if (verifySource) {
+    if (derivedRoot === null || physicalRoot === null || !pathInside(derivedRoot, resolvedPath)) return null;
+    const physicalPath = tryRealpath(resolvedPath);
+    if (physicalPath === null || !pathInside(physicalRoot, physicalPath)) return null;
+    const indexedPath = join(derivedRoot, relative(physicalRoot, physicalPath));
+    const store = readCodexStore(input.cursor ?? null);
+    if (store !== null && store.identity !== codexDirectoryIdentity(physicalRoot)) return null;
+    sourceCursor = input.agentId === null
+      ? input.cursor ?? null
+      : input.cursorForPath?.(indexedPath) ?? null;
+    if (!cursorIdentifiesCodexFile(sourceCursor, physicalPath)) return null;
+    readPath = physicalPath;
+  }
   let lineNumber = 0;
   let found: string | null = null;
-  let verifiedThread = !legacyAlias;
-  readCodexLines(resolvedPath, (line: string) => {
+  let verifiedThread = !verifySource;
+  readCodexLines(readPath, (line: string) => {
     lineNumber++;
     if (!verifiedThread) {
       try {
@@ -1664,6 +1739,7 @@ function rawCodex(
     found = line;
     return false;
   });
+  if (verifySource && !cursorIdentifiesCodexFile(sourceCursor, readPath)) return null;
   const raw = found as string | null;
   let messageText: string | null = null;
   if (raw !== null) {
@@ -1742,12 +1818,105 @@ export function createCodexProvider({
       { kind: 'file' as const, path: join(root, 'session_index.jsonl') },
     ]),
     discover: (ctx) => {
-      const entries = resolvedRootEntries();
-      const discovered = entries.flatMap((entry) => discoverAtRoot(entry.rootDir, entry.rootScope, ctx, {
-        usesRootSet,
-        aliases: entry.aliases,
-        homeDir,
-      }));
+      let entries = resolvedRootEntries();
+      const defaultRoot = lexicalCodexRoot(join(homeDir, '.codex'));
+      const knownEntries = new Map(entries.map(entry => [entry.rootDir, codexDirectoryIdentity(entry.rootDir)]));
+      const observedIdentities = new Set(knownEntries.values());
+      const missingEntries = entries.filter(entry => checkDirStatus(entry.rootDir) === 'missing');
+      const prior = (ctx.indexedSessions?.() ?? []).map(session => {
+        const cursor = ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath);
+        return { session, cursor, root: deriveCodexRootFromSessionPath(session.jsonlPath), store: readCodexStore(cursor) };
+      });
+      const aliasesByIdentity = new Map<string, Set<string>>();
+      // A path may be selected again after a refresh through a different alias.
+      // Keep previous alias evidence attached to the directory that was indexed.
+      for (const { store } of prior) {
+        if (store === null || !observedIdentities.has(store.identity)) continue;
+        const aliases = aliasesByIdentity.get(store.identity) ?? new Set<string>();
+        for (const alias of store.aliases) aliases.add(alias);
+        aliasesByIdentity.set(store.identity, aliases);
+      }
+      const unavailable = (session: typeof prior[number]['session'], error: string): void => {
+        ctx.retainSession?.(session.sessionId);
+        ctx.reportIncompleteInventory?.({ path: session.jsonlPath, error });
+      };
+      const incomingBareRoot = entries.find(entry => entry.rootScope === null)?.rootDir;
+      const defaultTarget = tryRealpath(defaultRoot) ?? defaultRoot;
+      const retainedBareRoots = new Set<string>();
+      const blockedRoots = new Set<string>();
+      const recoveredRoots = new Map<string, string>();
+      let defaultDisplaced = false;
+      for (const { session, cursor, root, store } of prior) {
+        if (root === null) continue;
+        const rootIdentity = knownEntries.get(root);
+        const reachedByAlias = store !== null && observedIdentities.has(store.identity);
+        if (missingEntries.some(entry => (
+          store !== null ? store.aliases.includes(entry.rootDir) && !reachedByAlias
+            : !knownEntries.has(root) && !knownEntries.has(tryRealpath(root) ?? root)
+        ))) {
+          unavailable(session, 'Source folder is unavailable');
+        }
+        const sourceMatches = store === null && cursorIdentifiesCodexFile(cursor, session.jsonlPath);
+        const historicalDefault = usesRootSet && (store?.defaultOwner ?? true);
+        const defaultAliasMatches = incomingBareRoot !== undefined && root === defaultRoot
+          && tryRealpath(root) === incomingBareRoot
+          && (store === null ? sourceMatches : knownEntries.get(incomingBareRoot) === store.identity);
+        const currentStoreMatches = store !== null ? rootIdentity === store.identity : sourceMatches;
+        const recoverStore = () => entries.find(entry => {
+          const identity = knownEntries.get(entry.rootDir);
+          return identity != null && (store !== null ? identity === store.identity
+            : cursorIdentifiesCodexFile(cursor, join(entry.rootDir, relative(root, session.jsonlPath)), { unshared: true }));
+        })?.rootDir;
+        let recoveredRoot: string | undefined;
+        if (/^codex:[^:]+$/.test(session.sessionId) && historicalDefault
+          && (root !== defaultTarget || !currentStoreMatches)
+          && !defaultAliasMatches) {
+          defaultDisplaced = true;
+          recoveredRoot = currentStoreMatches && rootIdentity != null ? root : recoverStore();
+          if (recoveredRoot !== undefined) {
+            retainedBareRoots.add(recoveredRoot);
+            recoveredRoots.set(session.sessionId, recoveredRoot);
+          }
+          else if (incomingBareRoot !== undefined) {
+            unavailable(session, 'Codex default home changed before its indexed session could be reconciled');
+          }
+        }
+        if (rootIdentity != null && (store !== null ? store.identity !== rootIdentity
+          : usesRootSet && cursor !== null && !sourceMatches)) {
+          if (recoveredRoot !== undefined && recoveredRoot !== root && root === incomingBareRoot) continue;
+          unavailable(session, 'Codex store no longer matches its historical source');
+          blockedRoots.add(root);
+        }
+      }
+      if (retainedBareRoots.size > 1) {
+        retainedBareRoots.clear();
+        for (const { session } of prior) {
+          if (/^codex:[^:]+$/.test(session.sessionId)) {
+            unavailable(session, 'Multiple Codex stores claim historical bare IDs');
+          }
+        }
+      }
+      if (defaultDisplaced) {
+        entries = entries.map(entry => ({
+          ...entry,
+          rootScope: retainedBareRoots.has(entry.rootDir) ? null : entry.rootScope
+            ?? codexScopedRootId(entry.rootDir),
+        }));
+      }
+      entries = entries.filter(entry => !blockedRoots.has(entry.rootDir));
+      const discoverEntry = (entry: CodexRootEntry, discoveryContext: DiscoverContext) => {
+        const identity = knownEntries.get(entry.rootDir);
+        const aliases = new Set([...entry.aliases, ...(identity == null ? [] : aliasesByIdentity.get(identity) ?? [])]);
+        return discoverAtRoot(entry.rootDir, entry.rootScope, discoveryContext, {
+          usesRootSet,
+          aliases: entry.aliases,
+          homeDir,
+          recoveredRoots,
+          storeSuffix: codexStoreSuffix(identity, [...aliases], entry.rootScope === null
+            && (usesRootSet || lexicalCodexRoot(entry.rootDir) === defaultRoot)),
+        });
+      };
+      const discovered = entries.flatMap(entry => discoverEntry(entry, ctx));
       // A scope migration can retract an old sessionId (e.g. bare `codex:<id>`)
       // that is simultaneously claimed by another configured root in the same pass
       // (e.g. default `~/.codex` with an identical copied thread ID). Bind the
@@ -1756,21 +1925,6 @@ export function createCodexProvider({
       // publish or roll back together in a single transaction.
       const migrationUnits = discovered.filter((unit) => (unit.retractSessionIds?.length ?? 0) > 0);
       const bareRoots = entries.filter((entry) => entry.rootScope === null);
-      const defaultRoot = lexicalCodexRoot(join(homeDir, '.codex'));
-      const defaultTarget = tryRealpath(defaultRoot);
-      if (usesRootSet && defaultTarget !== null && defaultTarget !== defaultRoot && bareRoots.length > 0) {
-        const incomingIds = new Set(discovered.map(unit => unit.sessionId));
-        const migratedIds = new Set(migrationUnits.flatMap(unit => unit.retractSessionIds ?? []));
-        for (const session of ctx.indexedSessions?.() ?? []) {
-          if (!/^codex:[^:]+$/.test(session.sessionId) || !incomingIds.has(session.sessionId)
-            || migratedIds.has(session.sessionId) || pathInside(defaultRoot, session.jsonlPath)
-            || bareRoots.some(entry => pathInside(entry.rootDir, session.jsonlPath))) continue;
-          // Retargeting the default home also changes which store receives
-          // bare IDs. Require the old owner's migration before reusing one.
-          ctx.retainSession?.(session.sessionId);
-          ctx.reportIncompleteInventory?.({ path: session.jsonlPath, error: 'Codex default home changed before its indexed session could be reconciled' });
-        }
-      }
       if (migrationUnits.length === 0) return discovered;
 
       const migrationGroupByRetractedId = new Map<string, string>();
@@ -1786,12 +1940,12 @@ export function createCodexProvider({
       const retractedIds = new Set(migrationGroupByRetractedId.keys());
       const bareReplays = bareRoots.length > 0 && retractedIds.size > 0
         ? bareRoots
-          .flatMap((entry) => discoverAtRoot(entry.rootDir, entry.rootScope, {
+          .flatMap((entry) => discoverEntry(entry, {
             ...ctx,
             changedPaths: undefined,
             lastCursor: () => null,
             indexedSessions: () => [],
-          }, { usesRootSet, aliases: entry.aliases, homeDir }))
+          }))
           .filter((unit) => retractedIds.has(unit.sessionId))
         : [];
 
@@ -1824,8 +1978,22 @@ export function createCodexProvider({
         return aIsChild - bIsChild;
       });
     },
-    parse,
-    raw: (input) => rawCodex(resolvedRootEntries(), input, { homeDir }),
+    *parse(unit, cursor, metrics?: CodexParseMetrics, testHooks?: CodexParseTestHooks) {
+      const storeSuffix = (unit.meta as { storeSuffix?: string } | undefined)?.storeSuffix;
+      if (storeSuffix === undefined) return yield* parse(unit, cursor, metrics, testHooks);
+      const store = readCodexStore(storeSuffix);
+      const root = deriveCodexRootFromSessionPath(unit.key);
+      const requireStore = () => {
+        if (store !== null && root !== null && codexDirectoryIdentity(root) !== store.identity) {
+          throw new RetryableSourceReadError(unit.key, 'Codex store changed during indexing');
+        }
+      };
+      requireStore();
+      const result = yield* parse(unit, cursor, metrics, testHooks);
+      requireStore();
+      return result === null ? null : result.split(CODEX_STORE_CURSOR_TAG)[0] + storeSuffix;
+    },
+    raw: (input) => rawCodex(resolvedRootEntries(), input),
   };
 }
 
