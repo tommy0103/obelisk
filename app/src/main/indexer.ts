@@ -413,12 +413,13 @@ function buildIndex({
         }
       }, 0);
       const discoveredSourceMtime = latestSourceMtime;
+      const files = providerPlan.items.filter(({ unit }) => unit.sessionId !== '').length;
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
       const skipped: SkippedFile[] = [...providerPlan.skippedArtifacts];
       if (force && incompleteProviders.length > 0) {
         return {
-          files: providerPlan.items.length,
+          files,
           latestSourceMtime,
           affectedSessionIds: [],
           ftsRebuilt: false,
@@ -508,7 +509,7 @@ function buildIndex({
         } catch (error) {
           if (isBeginBusyFailure(error)) {
             return deferredBuildResult('database_busy', {
-              files: providerPlan.items.length,
+              files,
               latestSourceMtime: discoveredSourceMtime,
               incompleteProviders,
               inventoryIssues,
@@ -532,7 +533,7 @@ function buildIndex({
               `Warning: failed to index ${error.item.provider.name} unit ${error.item.unit.key}: ${error.message}`,
             );
             return {
-              files: providerPlan.items.length,
+              files,
               latestSourceMtime: discoveredSourceMtime,
               affectedSessionIds: [],
               ftsRebuilt: false,
@@ -552,7 +553,7 @@ function buildIndex({
         }
         for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
         return {
-          files: providerPlan.items.length,
+          files,
           latestSourceMtime,
           affectedSessionIds: [...affectedSessionIds],
           ftsRebuilt,
@@ -589,7 +590,7 @@ function buildIndex({
       });
       if (providerResult.stopped) {
         return deferredBuildResult('database_busy', {
-          files: providerPlan.items.length,
+          files,
           latestSourceMtime,
           affectedSessionIds: [...affectedSessionIds],
           skipped: skipped.length,
@@ -604,7 +605,7 @@ function buildIndex({
       } catch (error) {
         if (isBeginBusyFailure(error)) {
           return deferredBuildResult('database_busy', {
-            files: providerPlan.items.length,
+            files,
             latestSourceMtime,
             affectedSessionIds: [...affectedSessionIds],
             skipped: skipped.length,
@@ -617,7 +618,7 @@ function buildIndex({
       }
       for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
       return {
-        files: providerPlan.items.length,
+        files,
         latestSourceMtime,
         affectedSessionIds: [...affectedSessionIds],
         ftsRebuilt,
