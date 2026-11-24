@@ -13,6 +13,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { appendFileSync, chmodSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -243,6 +244,116 @@ test('claude explicit roots: unlinking or replacing a configured alias cannot dr
   db = openClaudeIndex(home);
   assert.deepEqual(db.prepare("SELECT jsonl_path FROM sessions WHERE source = 'claude'").all().map(row => row.jsonl_path), [replacement]);
   db.close();
+});
+
+test('claude explicit roots: reselecting an unavailable alias after an incremental exclusion keeps cached history', () => {
+  const home = makeTempDir('obelisk-claude-reselected-alias-');
+  const store = join(home, 'store');
+  const alias = join(home, 'alias');
+  const other = join(home, 'other');
+  const original = copyRealFixture(store);
+  const otherTranscript = copyRealFixture(other);
+  symlinkSync(store, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.equal(runClaudeRefresh(home, [alias, other], true).status, 0);
+  assert.equal(runClaudeRefresh(home, [other]).status, 0);
+  unlinkSync(alias);
+  assert.notEqual(runClaudeRefresh(home, [alias, other], true).status, 0);
+  const db = openClaudeIndex(home);
+  assert.deepEqual(db.prepare("SELECT jsonl_path FROM sessions WHERE source = 'claude' ORDER BY jsonl_path")
+    .all().map(row => row.jsonl_path), [otherTranscript, original].sort());
+  db.close();
+});
+
+test('claude explicit roots: independent stores with the same short root tag keep separate sessions', () => {
+  const home = makeTempDir('obelisk-claude-root-tag-collision-');
+  const seen = new Map();
+  let roots = [];
+  for (let n = 0; n < 100_000; n++) {
+    const root = join(home, String(n), 'store');
+    const key = process.platform === 'win32' ? root.toLowerCase() : root;
+    const tag = createHash('sha256').update(key).digest('hex').slice(0, 6);
+    if (seen.has(tag)) {
+      roots = [seen.get(tag), root];
+      break;
+    }
+    seen.set(tag, root);
+  }
+  assert.equal(roots.length, 2);
+  const defaultRoot = join(home, '.claude');
+  const paths = roots.map(root => copyRealFixture(root));
+  assert.equal(rootTagFor(roots[0], defaultRoot), rootTagFor(roots[1], defaultRoot));
+
+  let ids;
+  for (const order of [roots, roots.toReversed()]) {
+    assert.equal(runClaudeRefresh(home, order, true).status, 0);
+    const db = openClaudeIndex(home);
+    const sessions = db.prepare("SELECT id, jsonl_path FROM sessions WHERE source = 'claude' ORDER BY id").all();
+    assert.equal(sessions.length, 2);
+    assert.deepEqual(sessions.map(row => row.jsonl_path).sort(), paths.toSorted());
+    const currentIds = sessions.map(row => row.id);
+    if (ids !== undefined) assert.deepEqual(currentIds, ids);
+    ids = currentIds;
+    db.close();
+  }
+});
+
+test('claude explicit roots: replacing a store between discovery and parse cannot publish the replacement under its prior ID', () => {
+  const home = makeTempDir('obelisk-claude-store-swap-');
+  const store = join(home, 'store');
+  const transcript = copyRealFixture(store);
+  const provider = createClaudeProvider({ rootDir: join(home, '.claude'), sourceRoots: [store] });
+  const id = canonicalSessionId(REAL_SID, provider.rootTagFor(store));
+  const unit = provider.discover({
+    lastCursor: () => null,
+    previousCursor: () => checkpointFor(transcript),
+    indexedSessions: () => [{ sessionId: id, jsonlPath: transcript }],
+  }).find(unit => unit.sessionId === id);
+  assert.ok(unit);
+  renameSync(store, join(home, 'previous'));
+  copyRealFixture(store);
+  assert.throws(() => [...provider.parse(unit, null)], { name: 'RetryableSourceReadError' });
+});
+
+test('claude migration: an orphaned historical alias preserves its main history with or without member proof', () => {
+  for (const indexedMember of [false, true]) {
+    const home = makeTempDir('obelisk-claude-orphan-alias-');
+    const store = join(home, 'store');
+    const alias = join(home, 'alias');
+    const main = copyRealFixture(store);
+    symlinkSync(store, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const aliasMain = main.replace(store, alias);
+    seedIndexedClaudeAliases(home, [[aliasMain, '']], { legacy: true });
+    const memberDirectory = join(store, 'projects', REAL_SLUG, REAL_SID, 'subagents');
+    mkdirSync(memberDirectory, { recursive: true });
+    const memberPath = join(memberDirectory, 'agent-a.jsonl');
+    writeFileSync(memberPath, JSON.stringify({
+      ...REAL_FIXTURE_USER, uuid: 'orphan-child', isSidechain: true, agentId: 'a',
+      message: { role: 'user', content: 'surviving child' },
+    }) + '\n');
+    let db = openClaudeIndex(home);
+    if (indexedMember) {
+      const unit = { key: memberPath.replace(store, alias), sessionId: REAL_SID, project: REAL_SLUG, isSubagent: true, agentId: 'agent-a' };
+      persist(db, unit, createClaudeProvider().parse(unit, null));
+    }
+    db.prepare("INSERT INTO memories (id, session_id, message_start) VALUES ('note', ?, ?)").run(REAL_SID, REAL_FIXTURE_USER.uuid);
+    db.close();
+    unlinkSync(main);
+    unlinkSync(alias);
+    for (const force of [false, true]) {
+      assert.equal(runClaudeRefresh(home, [store], force).status, 0);
+      db = openClaudeIndex(home);
+      const sessions = db.prepare("SELECT id, jsonl_path FROM sessions WHERE source = 'claude'").all();
+      assert.deepEqual(sessions.map(row => row.id), [REAL_SID]);
+      assert.equal(sessions[0].jsonl_path, indexedMember ? main : aliasMain);
+      const note = db.prepare(`
+        SELECT m.text FROM memories AS n JOIN messages AS m ON m.uuid = n.message_start AND m.session_id = n.session_id
+        WHERE n.id = 'note'
+      `).get();
+      assert.equal(note?.text, REAL_FIXTURE_USER.message.content);
+      assert.equal(db.prepare("SELECT text FROM messages WHERE uuid = 'orphan-child'").get()?.text, indexedMember ? 'surviving child' : undefined);
+      db.close();
+    }
+  }
 });
 
 test('claude explicit roots: replacing a transcript file within its indexed store preserves the session identity', () => {
