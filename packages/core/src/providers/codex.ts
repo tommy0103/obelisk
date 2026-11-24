@@ -205,32 +205,55 @@ function codexCursorSignatureDiffers(cursor: string, filePath: string, expectedR
     || Number(parts[4]) !== stat.ino;
 }
 
-function cursorIdentifiesCodexFile(cursor: Cursor, filePath: string, { unshared = false } = {}): boolean {
-  if (cursor === null) return false;
+interface CodexFileIdentity {
+  readonly device: string;
+  readonly inode: number;
+  readonly mtime: number;
+  readonly ctime: number;
+}
+
+function codexFileIdentity(cursor: Cursor): CodexFileIdentity | null {
+  if (cursor === null) return null;
+  const parts = cursor.split(':');
+  const compressed = parts[5] === CODEX_ZST_CURSOR_TAG;
+  const device = compressed ? parts[6] : decodeCodexCursor(cursor)?.dev;
+  if (device === undefined) return null;
+  return { device, inode: Number(parts[4]), mtime: Number(parts[0]), ctime: Number(parts[3]) };
+}
+
+function codexFileMatches(identity: CodexFileIdentity | null, filePath: string, { unshared = false } = {}): boolean {
+  if (identity === null) return false;
   let stat: Stats;
   try { stat = statSync(filePath); } catch { return false; }
   if (!stat.isFile() || !usableSourceIdentity(stat) || (unshared && stat.nlink !== 1)) return false;
-  const parts = cursor.split(':');
-  const compressed = parts[5] === CODEX_ZST_CURSOR_TAG;
-  const checkpoint = compressed ? null : decodeCodexCursor(cursor);
-  const device = compressed && parts[5] === CODEX_ZST_CURSOR_TAG ? parts[6] : checkpoint?.dev;
-  const priorCtime = Number(parts[3]);
-  return device === String(stat.dev)
-    && Number(parts[4]) === stat.ino
+  return identity.device === String(stat.dev)
+    && identity.inode === stat.ino
     // A replacement can reuse an inode. When available, creation time also
     // has to predate the checkpoint. Otherwise require unchanged metadata.
     && (stat.birthtimeMs > 0
-      ? stat.birthtimeMs <= priorCtime
-      : stat.ctimeMs === priorCtime && stat.mtimeMs === Number(parts[0]));
+      ? stat.birthtimeMs <= identity.ctime
+      : stat.ctimeMs === identity.ctime && stat.mtimeMs === identity.mtime);
 }
 
-function hasRenamedCodexRollout(cursor: Cursor, path: string): boolean {
-  if (cursor === null) return false;
+function cursorIdentifiesCodexFile(cursor: Cursor, path: string, options?: { unshared?: boolean }): boolean {
+  return codexFileMatches(codexFileIdentity(cursor), path, options);
+}
+
+function hasRenamedCodexRollout(identity: CodexFileIdentity | null, path: string): boolean {
+  if (identity === null) return false;
   const parent = dirname(path);
   try {
     return readdirSync(parent, { withFileTypes: true }).some(entry => entry.isFile()
       && !isCodexTranscriptPath(entry.name)
-      && cursorIdentifiesCodexFile(cursor, join(parent, entry.name), { unshared: true }));
+      && codexFileMatches(identity, join(parent, entry.name), { unshared: true }));
+  } catch { return false; }
+}
+
+function matchesLegacyGuardian(path: string, sessionId: string, mtime: number): boolean {
+  try {
+    if (tryRealpath(path) !== path || statSync(path).mtimeMs !== mtime) return false;
+    const guardian = readCodexGuardianThreadInfo(isCodexCompressedPath(path) ? readCodexCompressedBytes(path) : path);
+    return guardian !== null && codexDbId(guardian.threadRawId) === sessionId;
   } catch { return false; }
 }
 
@@ -1846,7 +1869,12 @@ export function createCodexProvider({
       const missingEntries = entries.filter(entry => checkDirStatus(entry.rootDir) === 'missing');
       const prior = (ctx.indexedSessions?.() ?? []).map(session => {
         const cursor = ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath);
-        return { session, cursor, root: deriveCodexRootFromSessionPath(session.jsonlPath), store: readCodexStore(cursor) };
+        const store = readCodexStore(cursor);
+        return {
+          session, store, root: deriveCodexRootFromSessionPath(session.jsonlPath),
+          hasCursor: cursor !== null, file: store === null ? codexFileIdentity(cursor) : null,
+          legacyMtime: cursor === null ? Number.NaN : Number(/^([^:]+):\d+$/.exec(cursor)?.[1]),
+        };
       });
       const aliasesByIdentity = new Map<string, Set<string>>();
       // A path may be selected again after a refresh through a different alias.
@@ -1871,16 +1899,16 @@ export function createCodexProvider({
       // Legacy checkpoints describe individual rollouts. An unchanged
       // sibling or a renamed copy of the same file can establish continuity
       // before applying normal replacement semantics at a physical root.
-      for (const { session, cursor, root, store } of prior) {
+      for (const { session, file, root, store } of prior) {
         if (store === null && root !== null && knownEntries.get(root) != null
-          && cursorIdentifiesCodexFile(cursor, session.jsonlPath, { unshared: true })) verifiedLegacyRoots.add(root);
+          && codexFileMatches(file, session.jsonlPath, { unshared: true })) verifiedLegacyRoots.add(root);
       }
-      for (const { session, cursor, root, store } of prior) {
+      for (const { session, file, root, store } of prior) {
         if (store === null && root !== null && knownEntries.get(root) != null && !verifiedLegacyRoots.has(root)
-          && hasRenamedCodexRollout(cursor, session.jsonlPath)) verifiedLegacyRoots.add(root);
+          && hasRenamedCodexRollout(file, session.jsonlPath)) verifiedLegacyRoots.add(root);
       }
       let defaultDisplaced = false;
-      for (const { session, cursor, root, store } of prior) {
+      for (const { session, file, hasCursor, legacyMtime, root, store } of prior) {
         if (root === null) continue;
         const rootIdentity = knownEntries.get(root);
         const reachedByAlias = store !== null && observedIdentities.has(store.identity);
@@ -1890,7 +1918,7 @@ export function createCodexProvider({
         ))) {
           unavailable(session, 'Source folder is unavailable');
         }
-        const sourceMatches = store === null && cursorIdentifiesCodexFile(cursor, session.jsonlPath, { unshared: true });
+        const sourceMatches = store === null && codexFileMatches(file, session.jsonlPath, { unshared: true });
         const legacyPhysicalCustom = store === null && root !== defaultRoot && rootIdentity != null
           && incomingBareRoot === defaultRoot && defaultTarget === defaultRoot
           && tryRealpath(root) === root && sourceMatches;
@@ -1900,12 +1928,18 @@ export function createCodexProvider({
         const defaultAliasMatches = incomingBareRoot !== undefined && root === defaultRoot
           && tryRealpath(root) === incomingBareRoot
           && (store === null ? sourceMatches : knownEntries.get(incomingBareRoot) === store.identity);
+        // Old guardian rows can have only the pre-v3 mtime/line checkpoint.
+        // During replay, recognize their persisted self membership plus the
+        // unchanged lexical file and its explicit native guardian ID.
+        const legacyGuardianMatches = ctx.snapshotRequired && Number.isFinite(legacyMtime)
+          && session.memberSessionIds?.includes(session.sessionId)
+          && matchesLegacyGuardian(session.jsonlPath, session.sessionId, legacyMtime);
         const currentStoreMatches = store !== null ? rootIdentity === store.identity
-          : sourceMatches || verifiedLegacyRoots.has(root);
+          : sourceMatches || verifiedLegacyRoots.has(root) || legacyGuardianMatches;
         const recoverStore = () => entries.find(entry => {
           const identity = knownEntries.get(entry.rootDir);
           return identity != null && (store !== null ? identity === store.identity
-            : cursorIdentifiesCodexFile(cursor, join(entry.rootDir, relative(root, session.jsonlPath)), { unshared: true }));
+            : codexFileMatches(file, join(entry.rootDir, relative(root, session.jsonlPath)), { unshared: true }));
         })?.rootDir;
         let recoveredRoot: string | undefined;
         if (/^codex:[^:]+$/.test(session.sessionId) && historicalDefault
@@ -1922,7 +1956,7 @@ export function createCodexProvider({
           }
         }
         if (rootIdentity != null && (store !== null ? store.identity !== rootIdentity
-          : cursor !== null && !currentStoreMatches)) {
+          : hasCursor && !currentStoreMatches)) {
           if (recoveredRoot !== undefined && recoveredRoot !== root && root === incomingBareRoot) continue;
           unavailable(session, 'Codex store no longer matches its historical source');
           if (store !== null || !usesRootSet) blockedRoots.add(root);
