@@ -168,7 +168,13 @@ function checkpointMatchesSignature(cursor: Cursor, signature: string): boolean 
 }
 
 function checkpointMatchesFile(cursor: Cursor, path: string): boolean {
-  return checkpointMatchesSignature(cursor, workflowMainSignature(path));
+  if (cursor === null) return false;
+  try {
+    const stat = statSync(path);
+    // Two independent stores can share a hard-linked transcript. Its cursor
+    // proves the inode but cannot identify which root owned the indexed copy.
+    return stat.isFile() && stat.nlink === 1 && checkpointMatchesSignature(cursor, fileSignature(stat));
+  } catch { return false; }
 }
 
 function rootMatchingCheckpoint(
@@ -176,7 +182,12 @@ function rootMatchingCheckpoint(
   roots: readonly string[],
   cursor: Cursor,
 ): string | undefined {
-  const matching = roots.filter(root => checkpointMatchesFile(cursor, join(root, 'projects', location.project, location.file)));
+  const matching = roots.filter(root => {
+    const path = join(root, 'projects', location.project, location.file);
+    if (!checkpointMatchesFile(cursor, path)) return false;
+    const resolved = tryRealpath(path);
+    return resolved !== null && sameNormalizedPath(path, resolved);
+  });
   return matching.length === 1 ? matching[0] : undefined;
 }
 
@@ -354,11 +365,14 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
 
 function workflowMainSignature(mainTranscriptPath: string): string {
   try {
-    const stat = statSync(mainTranscriptPath);
-    return `${stat.mtimeMs}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+    return fileSignature(statSync(mainTranscriptPath));
   } catch {
     return 'missing';
   }
+}
+
+function fileSignature(stat: Stats): string {
+  return `${stat.mtimeMs}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
 }
 
 function assertTranscriptSignature(path: string, signature: string): void {

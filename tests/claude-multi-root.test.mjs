@@ -14,7 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -266,6 +266,30 @@ test('claude explicit roots: a retargeted default alias never publishes the repl
     assert.notEqual(replacementId, REAL_SID);
     db.close();
   }
+});
+
+test('claude explicit roots: a shared hard-linked transcript cannot transfer an old alias identity to another store', () => {
+  const home = makeTempDir('obelisk-claude-hardlink-retarget-');
+  const originalRoot = join(home, 'original');
+  const replacementRoot = join(home, 'backup');
+  const alias = join(home, 'alias');
+  const original = copyRealFixture(originalRoot);
+  const replacement = copyRealFixture(replacementRoot);
+  unlinkSync(replacement);
+  linkSync(original, replacement);
+  symlinkSync(originalRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const oldPath = original.replace(originalRoot, alias);
+  seedIndexedClaudeAliases(home, [[oldPath, 'old-alias']]);
+  unlinkSync(alias);
+  symlinkSync(replacementRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
+
+  assert.equal(runClaudeRefresh(home, [alias], true).status, 0);
+  const db = openClaudeIndex(home);
+  const oldId = canonicalSessionId(REAL_SID, 'old-alias');
+  const newId = canonicalSessionId(REAL_SID, rootTagFor(replacementRoot, join(home, '.claude')));
+  assert.equal(db.prepare('SELECT jsonl_path FROM sessions WHERE id = ?').get(oldId)?.jsonl_path, oldPath);
+  assert.equal(db.prepare('SELECT jsonl_path FROM sessions WHERE id = ?').get(newId)?.jsonl_path, replacement);
+  db.close();
 });
 
 test('claude migration: a pre-v7 alias without a verifiable target keeps its bare history and memory links', () => {
