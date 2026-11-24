@@ -3,6 +3,7 @@
 
 import { join } from 'node:path';
 
+import { createAntigravityCliProvider, type AntigravityCliDatabaseOpener } from './antigravity-cli.ts';
 import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
 import { createCodexHostAntigravityProvider } from './codexhost-antigravity.ts';
@@ -36,6 +37,7 @@ export function createBuiltinProviderRegistry(
     openKiroDatabase,
     openOpencodeDatabase,
     openDevinDatabase,
+    openAntigravityCliDatabase,
   }: {
     homeDir?: string;
     codexHomeDir?: string;
@@ -50,6 +52,7 @@ export function createBuiltinProviderRegistry(
     openKiroDatabase?: KiroDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
     openDevinDatabase?: DevinDatabaseOpener;
+    openAntigravityCliDatabase?: AntigravityCliDatabaseOpener;
   } = {},
 ): ProviderRegistry {
   const fallbackClaudeDefault = homeDir ? join(homeDir, '.claude') : undefined;
@@ -57,6 +60,7 @@ export function createBuiltinProviderRegistry(
     ? (claudeDefaultRoot ?? fallbackClaudeDefault ?? roots['claude'])
     : (roots['claude'] ?? claudeDefaultRoot ?? fallbackClaudeDefault);
   return createProviderRegistry([
+    createAntigravityCliProvider({ rootDir: roots['antigravity-cli'], homeDir, openDatabase: openAntigravityCliDatabase }),
     createClaudeProvider({
       rootDir: claudeRootDir,
       sourceRoots: claudeSourceRoots,

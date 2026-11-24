@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-Past Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Devin, Hermes Agent, Kiro, Kimi Code, OMP, OpenCode, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
+Past Antigravity CLI, Claude Code, Codex, GitHub Copilot, DeepSeek Harness, Devin, Hermes Agent, Kiro, Kimi Code, OMP, OpenCode, Pi, and ZCode sessions -- queryable by your agent, browsable by you.
 
 **English** · [中文](README.zh-CN.md)
 
@@ -215,6 +215,7 @@ non-Claude IDs are provider-prefixed so they cannot collide.
 
 | Provider | Default source |
 | --- | --- |
+| Antigravity CLI | `~/.gemini/antigravity-cli/brain` (`transcript_full.jsonl` / `transcript.jsonl`) + `conversation_summaries.db` |
 | Claude Code | `~/.claude/projects` |
 | Codex | `~/.codex/sessions`, `~/.codex/archived_sessions` |
 | GitHub Copilot | VS Code `User` data roots (Chronicle store + workspace transcripts) |
