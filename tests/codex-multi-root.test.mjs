@@ -11,12 +11,14 @@ import {
   copyFileSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, join, relative, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
 
 import {
@@ -146,32 +148,190 @@ test('explicit real and symlink roots discover one physical Codex store with a s
   assert.deepEqual(provider.discover({ lastCursor: () => null, changedPaths: [join(aliasRoot, 'sessions', '2026', '06', '15', basename(file))] }).map(unit => unit.key), [file]);
 });
 
-test('legacy alias parent and child IDs enter one atomic family transition', () => {
+// Project the pre-deduplication adapter's lexical identities and cursor keys.
+function legacyAliasProvider(aliasRoot) {
+  const provider = createCodexProvider({ rootDir: aliasRoot });
+  const scope = `${basename(aliasRoot)}-${createHash('sha256').update(`codex-root-v1\0${resolve(aliasRoot)}`).digest('hex').slice(0, 8)}`;
+  return {
+    scope,
+    provider: {
+      ...provider,
+      discover: ctx => provider.discover(ctx).map(unit => ({
+        ...unit,
+        sessionId: `codex:${scope}:${unit.sessionId.slice('codex:'.length)}`,
+        meta: { ...unit.meta, rootScope: scope },
+      })),
+    },
+  };
+}
+
+function planCodex(db, provider, options) {
+  return createProviderIndexPlan(db, createProviderRegistry([provider]), options);
+}
+
+test('legacy standalone alias child retraction commits with the migrated parent and all contributors', () => {
   const home = makeTempDir('obelisk-codex-alias-rekey-');
   const realRoot = join(home, 'real-codex');
   const aliasRoot = join(home, 'alias-codex');
   const parentId = '019ed000-0000-7000-8000-000000000121';
   const childId = '019ed000-0000-7000-8000-000000000122';
   const parentPath = writeRollout(realRoot, { id: parentId, userText: 'parent' });
-  const childPath = writeRollout(realRoot, { id: childId, parentThreadId: parentId, userText: 'child' });
+  const childPath = writeRollout(realRoot, { id: childId, userText: 'standalone child' });
   symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
-  const lexicalAlias = resolve(aliasRoot);
-  const scope = `${basename(aliasRoot)}-${createHash('sha256').update(`codex-root-v1\0${lexicalAlias}`).digest('hex').slice(0, 8)}`;
-  const oldParent = `codex:${scope}:${parentId}`;
-  const oldChild = `codex:${scope}:${childId}`;
+  const legacy = legacyAliasProvider(aliasRoot);
+  const oldParent = `codex:${legacy.scope}:${parentId}`;
+  const oldChild = `codex:${legacy.scope}:${childId}`;
+  const db = freshDb();
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, legacy.provider) }).complete, true);
+  writeRollout(realRoot, { id: childId, parentThreadId: parentId, userText: 'merged child' });
+
   const provider = createCodexProvider({ roots: [aliasRoot, realRoot], homeDir: home });
-  const units = provider.discover({
-    lastCursor: () => null,
-    indexedSessions: () => [
-      { sessionId: oldParent, jsonlPath: join(aliasRoot, relative(realRoot, parentPath)) },
-      { sessionId: oldChild, jsonlPath: join(aliasRoot, relative(realRoot, childPath)) },
-    ],
-  });
-  const parent = units.find(unit => unit.key === parentPath);
-  const child = units.find(unit => unit.key === childPath);
-  assert.ok(parent && child);
+  const plan = planCodex(db, provider, { changedPaths: [parentPath] });
+  const parent = plan.items.find(({ unit }) => unit.key === parentPath).unit;
+  const child = plan.items.find(({ unit }) => unit.key === childPath).unit;
   assert.equal(parent.atomicGroup, child.atomicGroup);
-  assert.deepEqual(new Set(parent.retractSessionIds), new Set([oldParent]));
+  assert.deepEqual(new Set(parent.retractSessionIds), new Set([oldParent, oldChild]));
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  assert.deepEqual(db.prepare('SELECT id FROM sessions ORDER BY id').all().map(row => row.id), [parent.sessionId]);
+  assert.ok(db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?').get(parent.sessionId, 'merged child'));
+  assert.equal(db.prepare('SELECT 1 FROM messages WHERE text=?').get('standalone child'), undefined);
+  db.close();
+});
+
+test('legacy child raw lookup and first refresh work after dropping a live alias from settings', () => {
+  const home = makeTempDir('obelisk-codex-unconfigured-alias-');
+  const realRoot = join(home, 'real-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const parentId = realRolloutId();
+  const childId = '019ed000-0000-7000-8000-000000000124';
+  const parentDir = join(realRoot, 'sessions', '2026', '06', '15');
+  mkdirSync(parentDir, { recursive: true });
+  const parentPath = join(parentDir, `rollout-${parentId}.jsonl`);
+  copyFileSync(REAL_FIXTURE, parentPath);
+  writeRollout(realRoot, { id: childId, parentThreadId: parentId, userText: 'legacy child message' });
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const legacy = legacyAliasProvider(aliasRoot);
+  const db = freshDb();
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, legacy.provider) }).complete, true);
+  const oldParent = `codex:${legacy.scope}:${parentId}`;
+  const oldChild = `codex:${legacy.scope}:${childId}`;
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(oldParent);
+  const { cursor } = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path);
+
+  const provider = createCodexProvider({ roots: [realRoot], homeDir: home });
+  assert.match(provider.raw({
+    source: 'codex', messageUuid: `${oldChild}:000002`, agentId: oldChild, session, cursor,
+  })?.text ?? '', /legacy child message/);
+  const plan = planCodex(db, provider, { changedPaths: [parentPath] });
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  const newParent = `codex:${codexRootScope(realRoot, home)}:${parentId}`;
+  assert.deepEqual(db.prepare('SELECT id FROM sessions').all().map(row => row.id), [newParent]);
+  assert.ok(db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?').get(newParent, 'legacy child message'));
+  assert.equal(planCodex(db, provider).items.length, 0);
+  db.close();
+});
+
+test('retargeting a legacy alias cannot reassign its cached history or expose another store via raw lookup', () => {
+  const home = makeTempDir('obelisk-codex-retargeted-alias-');
+  const firstRoot = join(home, 'first-codex');
+  const secondRoot = join(home, 'second-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const parentId = '019ed000-0000-7000-8000-000000000125';
+  const childId = '019ed000-0000-7000-8000-000000000126';
+  for (const [root, text] of [[firstRoot, 'first store'], [secondRoot, 'second store']]) {
+    writeRollout(root, { id: parentId, userText: text });
+    writeRollout(root, { id: childId, parentThreadId: parentId, userText: `${text} child` });
+  }
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+  symlinkSync(firstRoot, aliasRoot, aliasType);
+  const legacy = legacyAliasProvider(aliasRoot);
+  const db = freshDb();
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, legacy.provider) }).complete, true);
+
+  unlinkSync(aliasRoot);
+  symlinkSync(secondRoot, aliasRoot, aliasType);
+  const provider = createCodexProvider({ roots: [aliasRoot, secondRoot], homeDir: home });
+  const oldParent = `codex:${legacy.scope}:${parentId}`;
+  const oldChild = `codex:${legacy.scope}:${childId}`;
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(oldParent);
+  const { cursor } = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(session.jsonl_path);
+  assert.equal(provider.raw({
+    source: 'codex', messageUuid: `${oldChild}:000002`, agentId: oldChild, session, cursor,
+  }), null);
+
+  const forcePlan = planCodex(db, provider, { force: true });
+  assert.deepEqual(forcePlan.retainedSessions.map(row => row.sessionId), [oldParent]);
+  const plan = planCodex(db, provider);
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  const newParent = `codex:${codexRootScope(secondRoot, home)}:${parentId}`;
+  const hasMessage = db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?');
+  assert.ok(hasMessage.get(oldParent, 'first store child'));
+  assert.ok(hasMessage.get(newParent, 'second store child'));
+  assert.equal(hasMessage.get(oldParent, 'second store child'), undefined);
+  db.close();
+});
+
+test('retargeting the default Codex alias reuses a bare ID only when its previous owner can migrate', () => {
+  const home = makeTempDir('obelisk-codex-retargeted-default-');
+  const firstRoot = join(home, 'first-codex');
+  const secondRoot = join(home, 'second-codex');
+  const aliasRoot = join(home, '.codex');
+  const parentId = '019ed000-0000-7000-8000-000000000127';
+  const childId = '019ed000-0000-7000-8000-000000000128';
+  for (const [root, text] of [[firstRoot, 'first default'], [secondRoot, 'second default']]) {
+    writeRollout(root, { id: parentId, userText: text });
+    writeRollout(root, { id: childId, parentThreadId: parentId, userText: `${text} child` });
+  }
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+  symlinkSync(firstRoot, aliasRoot, aliasType);
+  const db = freshDb();
+  const initial = createCodexProvider({ roots: [aliasRoot], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, initial) }).complete, true);
+  const bareParent = `codex:${parentId}`;
+  const bareChild = `codex:${childId}`;
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(bareParent);
+
+  unlinkSync(aliasRoot);
+  symlinkSync(secondRoot, aliasRoot, aliasType);
+  const next = createCodexProvider({ roots: [aliasRoot], homeDir: home });
+  assert.match(next.raw({
+    source: 'codex', messageUuid: `${bareChild}:000002`, agentId: bareChild, session,
+  })?.text ?? '', /first default child/);
+  const blocked = planCodex(db, next);
+  assert.equal(blocked.incompleteProviders.has('codex'), true);
+  assert.equal(blocked.items.length, 0);
+  const recover = createCodexProvider({ roots: [aliasRoot, firstRoot], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, recover) }).complete, true);
+  const scopedParent = `codex:${codexRootScope(firstRoot, home)}:${parentId}`;
+  const hasMessage = db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?');
+  assert.ok(hasMessage.get(bareParent, 'second default child'));
+  assert.ok(hasMessage.get(scopedParent, 'first default child'));
+  db.close();
+});
+
+test('built CLI leaves its cache intact when a configured alias becomes dangling', () => {
+  const home = makeTempDir('obelisk-codex-dangling-alias-');
+  const realRoot = join(home, 'real-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const rolloutDir = join(realRoot, 'sessions', '2026', '06', '15');
+  mkdirSync(rolloutDir, { recursive: true });
+  copyFileSync(REAL_FIXTURE, join(rolloutDir, `rollout-${realRolloutId()}.jsonl`));
+  symlinkSync(realRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const obeliskDir = join(home, '.obelisk');
+  mkdirSync(obeliskDir);
+  writeFileSync(join(obeliskDir, 'settings.json'), JSON.stringify({ providerRoots: { codex: [aliasRoot] } }));
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  const read = () => {
+    const db = new DatabaseSync(join(obeliskDir, 'obelisk.sqlite'), { readOnly: true });
+    try { return dumpCodexState(db); } finally { db.close(); }
+  };
+  const before = read();
+  assert.equal(before.sessions.length, 1);
+  renameSync(realRoot, join(home, 'offline-codex'));
+  const unavailable = runCli(['--build'], { home });
+  assert.notEqual(unavailable.status, 0);
+  assert.match(unavailable.stderr + unavailable.stdout, /Source folder is unavailable/);
+  assert.deepEqual(read(), before);
 });
 
 test('built CLI keeps real-fixture identity stable across alias lifecycle and isolates an independent copy', () => {

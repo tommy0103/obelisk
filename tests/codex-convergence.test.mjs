@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { persist } from '../packages/core/src/persist.ts';
@@ -419,7 +419,7 @@ for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_S
       return result;
     };
     const fsMock = t.mock.module('node:fs', {
-      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+      namedExports: { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
     });
     t.after(() => fsMock.restore());
     const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?${identityName}-identity`);

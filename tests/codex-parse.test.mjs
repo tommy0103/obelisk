@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -103,7 +103,7 @@ for (const [identity, inode, expectedPlan, verifiedPrefix] of [
 ]) {
   test(`codex v4 checkpoint resumes an append with ${identity} source identity`, async t => {
     const fsMock = t.mock.module('node:fs', { namedExports: {
-      closeSync, existsSync, openSync, readdirSync, readSync,
+      closeSync, existsSync, lstatSync, openSync, readdirSync, readSync,
       statSync: (...args) => Object.assign(statSync(...args), { dev: 1, ino: inode }),
     } });
     t.after(() => fsMock.restore());
@@ -604,7 +604,7 @@ for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_S
       return result;
     };
     const fsMock = t.mock.module('node:fs', {
-      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+      namedExports: { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
     });
     t.after(() => fsMock.restore());
     const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?metadata-${identityName}-identity`);
