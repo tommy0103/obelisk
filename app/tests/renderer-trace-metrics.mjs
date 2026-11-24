@@ -57,3 +57,36 @@ export function rendererTaskMetrics(traceEvents, startMark, endMark) {
   };
 }
 
+// Host noise only adds time, and on shared CI hosts it lands on single runs, so
+// a fine budget holds for the median of an odd number of samples.
+function median(values) {
+  if (values.length % 2 === 0) throw new Error(`median needs an odd sample count, got ${values.length}`);
+  return [...values].sort((a, b) => a - b)[(values.length - 1) / 2];
+}
+
+// Wheel gestures with a live Bash update (`updates`) against plain gestures
+// (`baselines`). A long task (>=50ms work) or a catastrophic RAF stall
+// (>=250ms) fails in any single gesture; the 2ms patch-preparation budget is a
+// fine budget and holds for the medians.
+export function wheelTimingVerdict(baselines, updates) {
+  const baselineFunctionWorkMs = median(baselines.map(trace => trace.maxFunctionWorkMs));
+  const updateFunctionWorkMs = median(updates.map(trace => trace.maxFunctionWorkMs));
+  return {
+    longTask: updates.every(trace => trace.maxTaskWorkMs < 50),
+    stall: updates.every(trace => trace.maxFrameGap < 250),
+    patchPreparation: updateFunctionWorkMs <= baselineFunctionWorkMs + 2,
+    baselineFunctionWorkMs,
+    updateFunctionWorkMs,
+  };
+}
+
+// Stationary live commits: a long task (>=50ms work) fails in any commit; the
+// 8.33ms (120Hz) work budget is a fine budget and holds for the median.
+export function stationaryTimingVerdict(commits) {
+  const workMs = median(commits.map(trace => trace.maxTaskWorkMs));
+  return {
+    longTask: commits.every(trace => trace.maxTaskWorkMs < 50),
+    budget: workMs < 8.33,
+    workMs,
+  };
+}
