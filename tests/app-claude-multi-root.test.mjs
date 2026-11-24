@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
@@ -174,6 +174,9 @@ test('desktop multi-root: manual rebuild with preserveDbPath migrates pre-v7 cus
     VALUES ('orphan-main-1', ?, 'user', '2026-09-14T17:00:00.000Z', 'user', 'legacycachedmainneedle', 'text', 0, 'visible', 0, 'claude')
   `).run(orphanSid);
   seed.prepare("INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__claude_canonical_transcript_v6__', 1, 0)").run();
+  const { mtimeMs, ctimeMs, size, ino } = statSync(mainA);
+  seed.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, ?, 1, ?)')
+    .run(mainA, mtimeMs, `${mtimeMs}:1:${size}:${ctimeMs}:${ino}`);
   seed.close();
 
   // Simulate desktop `settings:rebuildIndex` building into `tempDbPath` with `preserveDbPath: oldDbPath`.

@@ -197,8 +197,9 @@ test('claude explicit roots: one prior alias scope covers main and subagent unit
     previousCursor: path => path === transcript.replace(realRoot, aliasRoot) ? checkpointFor(transcript) : null,
     indexedSessions: () => [{ sessionId: `${priorTag}:${REAL_SID}`, jsonlPath: transcript.replace(realRoot, aliasRoot) }],
   });
-  assert.ok(units.length >= 2);
-  assert.deepEqual(new Set(units.map(unit => unit.sessionId)), new Set([`${priorTag}:${REAL_SID}`]));
+  const transcripts = units.filter(unit => unit.sessionId !== '');
+  assert.ok(transcripts.length >= 2);
+  assert.deepEqual(new Set(transcripts.map(unit => unit.sessionId)), new Set([`${priorTag}:${REAL_SID}`]));
 });
 
 function checkpointFor(file) {
@@ -218,6 +219,86 @@ test('claude explicit roots: a dangling configured alias with canonical provenan
   const db = openClaudeIndex(home);
   assert.equal(db.prepare("SELECT jsonl_path FROM sessions WHERE source = 'claude'").get()?.jsonl_path, transcript);
   db.close();
+});
+
+test('claude explicit roots: unlinking or replacing a configured alias cannot drop its indexed store', () => {
+  const home = makeTempDir('obelisk-claude-alias-unlink-');
+  const store = join(home, 'store');
+  const alias = join(home, 'alias');
+  const transcript = copyRealFixture(store);
+  symlinkSync(store, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.equal(runClaudeRefresh(home, [alias], true).status, 0);
+  unlinkSync(alias);
+  assert.notEqual(runClaudeRefresh(home, [alias], true).status, 0);
+  copyRealFixture(alias);
+  assert.notEqual(runClaudeRefresh(home, [alias], true).status, 0);
+  let db = openClaudeIndex(home);
+  assert.deepEqual(db.prepare("SELECT jsonl_path FROM sessions WHERE source = 'claude'").all().map(row => row.jsonl_path), [transcript]);
+  db.close();
+
+  // Selecting the new path without the prior alias is an explicit exclusion.
+  const replacement = copyRealFixture(join(home, 'replacement'));
+  assert.equal(runClaudeRefresh(home, [join(home, 'replacement')], true).status, 0);
+  db = openClaudeIndex(home);
+  assert.deepEqual(db.prepare("SELECT jsonl_path FROM sessions WHERE source = 'claude'").all().map(row => row.jsonl_path), [replacement]);
+  db.close();
+});
+
+test('claude migration: replacing a historical alias by a directory keeps cached anchors through repeated refreshes', () => {
+  const home = makeTempDir('obelisk-claude-legacy-alias-directory-');
+  const store = join(home, 'store');
+  const alias = join(home, 'alias');
+  const transcript = copyRealFixture(store);
+  symlinkSync(store, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const oldPath = transcript.replace(store, alias);
+  seedIndexedClaudeAliases(home, [[oldPath, '']], { legacy: true });
+  let db = openClaudeIndex(home);
+  const indexCursor = checkpointFor(oldPath);
+  db.prepare('UPDATE index_state SET cursor = ? WHERE jsonl_path = ?').run(indexCursor, oldPath);
+  db.prepare("INSERT INTO memories (id, session_id, message_start) VALUES ('note', ?, ?)").run(REAL_SID, REAL_FIXTURE_USER.uuid);
+  db.close();
+  unlinkSync(alias);
+  const newPath = copyRealFixture(alias);
+  writeFileSync(newPath, REAL_FIXTURE_TEXT.replace(REAL_FIXTURE_USER.message.content, 'Replacement text at the same UUID'));
+  for (const force of [false, true, false]) {
+    assert.equal(runClaudeRefresh(home, [alias], force).status, 0);
+    db = openClaudeIndex(home);
+    const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(oldPath)?.cursor;
+    assert.equal(cursor, indexCursor);
+    const original = db.prepare(`
+      SELECT m.text FROM memories AS n JOIN messages AS m ON m.uuid = n.message_start AND m.session_id = n.session_id
+      WHERE n.id = 'note'
+    `).get();
+    assert.equal(original?.text, REAL_FIXTURE_USER.message.content);
+    assert.equal(createClaudeProvider().raw({
+      source: 'claude', messageUuid: REAL_FIXTURE_USER.uuid,
+      session: { id: REAL_SID, jsonl_path: oldPath }, agentId: null, cursor,
+    }), null);
+    db.close();
+  }
+});
+
+test('claude explicit roots: a historical alias follows an appended transcript under its existing identity', () => {
+  const home = makeTempDir('obelisk-claude-alias-append-');
+  const store = join(home, 'store');
+  const alias = join(home, 'alias');
+  const transcript = copyRealFixture(store);
+  symlinkSync(store, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const oldPath = transcript.replace(store, alias);
+  const id = canonicalSessionId(REAL_SID, 'old-alias');
+  seedIndexedClaudeAliases(home, [[oldPath, 'old-alias']]);
+  let db = openClaudeIndex(home);
+  db.prepare('UPDATE index_state SET cursor = ? WHERE jsonl_path = ?').run(checkpointFor(oldPath), oldPath);
+  db.close();
+  appendUserTurn(transcript, { uuid: 'u-aliased-append', parentUuid: REAL_FIXTURE_USER.uuid, text: 'alias append' });
+  unlinkSync(alias);
+  for (const force of [false, true]) {
+    assert.equal(runClaudeRefresh(home, [store], force).status, 0);
+    db = openClaudeIndex(home);
+    assert.deepEqual(db.prepare("SELECT id FROM sessions WHERE source = 'claude'").all().map(row => row.id), [id]);
+    assert.equal(db.prepare('SELECT session_id FROM messages WHERE uuid = ?').get(`${id}:u-aliased-append`)?.session_id, id);
+    db.close();
+  }
 });
 
 test('claude explicit roots: retargeting a historical alias keeps its identifier with the original store', () => {
@@ -664,7 +745,7 @@ test('claude migration: custom single-root pre-v7 bare IDs migrate atomically (i
     `).run(orphanSid);
     seedDb.prepare("INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__claude_canonical_transcript_v6__', 1, 0)").run();
     seedDb.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, 1, 4, ?)')
-      .run(mainA, '1:4:1:1:1');
+      .run(mainA, checkpointFor(mainA));
     seedDb.close();
 
     // Add second root containing a verbatim copy of the same real fixture.
