@@ -14,7 +14,8 @@ import {
   symlinkSync,
   utimesSync,
 } from 'node:fs';
-import { join, win32 } from 'node:path';
+import { join, normalize, win32 } from 'node:path';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { projectSlugFromPath } from '../packages/core/src/parsing.ts';
@@ -312,6 +313,48 @@ const indexedProvenance = db => readProviderSessionProvenance(db)
 /** Session ids a round scheduled, ignoring the store gate units that carry no records. */
 const scheduledSessionIds = round => sessionUnits(round.plan.items.map(item => item.unit))
   .map(unit => unit.sessionId);
+
+// A clock past the store gate's settle window: the fixture's writes are old enough that its stat
+// signature can certify an idle store. Tests about the window itself use the real clock.
+const idleClock = () => Date.now() + 60_000;
+
+/**
+ * The store-gate hash the previous release wrote: mtime + ctime + size + inode of the
+ * database and its WAL, with no domain tag. A test builds an index that still holds this
+ * signature so the first scan after upgrade can be shown to re-verify it.
+ */
+function untaggedStoreGate(dbPath) {
+  const signature = path => {
+    try {
+      const stat = statSync(path);
+      return [stat.mtimeMs, stat.ctimeMs, stat.size, stat.ino].join(':');
+    } catch {
+      return 'absent';
+    }
+  };
+  return createHash('sha256').update(`${signature(dbPath)}|${signature(`${dbPath}-wal`)}`).digest('hex');
+}
+
+function storedStoreGateKey(dbPath) {
+  return `__hermes_store_v1__:${createHash('sha256').update(`hermes-store-v1\0${normalize(dbPath)}`).digest('hex')}`;
+}
+
+/** Rewrite stored Hermes cursors so their gate field is the untagged signature of `dbPath`. */
+function rewriteCursorsToUntaggedStoreGate(db, keys, dbPath) {
+  const gate = untaggedStoreGate(dbPath);
+  const read = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?');
+  const write = db.prepare('UPDATE index_state SET cursor = ? WHERE jsonl_path = ?');
+  for (const key of keys) {
+    const row = read.get(key);
+    if (row === undefined || typeof row.cursor !== 'string') {
+      throw new Error(`missing cursor for ${key}`);
+    }
+    const parts = row.cursor.split(':');
+    if (parts.length < 5) throw new Error(`unexpected cursor for ${key}: ${row.cursor}`);
+    parts[3] = gate;
+    write.run(parts.join(':'), key);
+  }
+}
 
 /** Run rounds until the store settles, bounded so a regression fails instead of hanging. */
 function settle(index, limit = 6) {
@@ -897,7 +940,7 @@ test('persist() writes a Hermes session and a changed store replays it instead o
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
   try {
-    const provider = createHermesProvider({ rootDir: layout.base, openStore });
+    const provider = createHermesProvider({ rootDir: layout.base, openStore, now: idleClock });
     const all = discover(provider);
     const unit = all.find(candidate => candidate.meta.rawSessionId === SESSION_ALPHA);
     const firstParse = drain(provider.parse(unit, null));
@@ -1841,6 +1884,7 @@ test('a failed exact-digest read reports an incomplete inventory and does not ce
       if (failDigestRead && opens > 1) throw new Error('simulated EACCES on the digest read');
       return openStore(path);
     },
+    now: idleClock,
   });
   const index = indexFixture(provider);
   try {
@@ -2211,12 +2255,212 @@ test('a certified store is skipped without opening its database', () => {
       opens += 1;
       return openStore(path);
     },
+    now: idleClock,
   }));
   try {
     settle(index);
     opens = 0;
     assert.equal(index.run().plan.items.length, 0, 'an idle store produces no work');
     assert.equal(opens, 0, 'and is not opened at all');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('a store written within the settle window is read again instead of skipped', () => {
+  // File times tick coarsely, so a same-size rewrite in the same tick as the certified gate
+  // leaves mtime, ctime, size and inode unchanged. Until the window passes, the stat signature
+  // cannot vouch for the store and each scan reads it.
+  const layout = fixtureHome();
+  let opens = 0;
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      opens += 1;
+      return openStore(path);
+    },
+  }));
+  try {
+    settle(index);
+    opens = 0;
+    assert.equal(index.run().plan.items.length, 0, 'an unchanged store produces no work');
+    assert.ok(opens > 0, 'but its fresh gate is not trusted to skip the read');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('an upgrade re-verifies a store certified by the previous gate signature', () => {
+  // The previous release certified a store from the untagged stat signature alone. A
+  // same-tick rewrite could leave that signature in place while the index still held the
+  // earlier text. The first scan after upgrade has to compare exact digests before it
+  // re-certifies, and the next scan has to go back to skipping the store.
+  const layout = fixtureHome();
+  let opens = 0;
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      opens += 1;
+      return openStore(path);
+    },
+    now: idleClock,
+  }));
+  try {
+    settle(index);
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+    const assistantUuid = `${alphaId}:message:${layout.ids.assistant}`;
+    const textOf = () => index.db.prepare('SELECT text FROM messages WHERE uuid = ?').get(assistantUuid).text;
+    assert.equal(textOf(), 'Reading the file');
+
+    const profileId = hermesSessionId(SESSION_PROFILE, 'coder', layout.profilePath);
+    writeStore(layout.primaryPath, db => {
+      db.prepare('UPDATE messages SET content = ? WHERE id = ?')
+        .run('Xeading the file', layout.ids.assistant);
+    });
+    // The source now holds the rewritten text, but the index still has the earlier text and
+    // the cursors still carry its digest. Point those cursors at the untagged signature of
+    // the current stat, which is the certification the previous release would have written
+    // when the rewrite left mtime, ctime, size and inode unchanged. The profile store is
+    // pointed at its own untagged signature with current text, so a sibling store is not
+    // dragged into the replay.
+    rewriteCursorsToUntaggedStoreGate(
+      index.db,
+      [storedStoreGateKey(layout.primaryPath), `hermes-unit:${alphaId}`, `hermes-unit:${betaId}`],
+      layout.primaryPath,
+    );
+    rewriteCursorsToUntaggedStoreGate(
+      index.db,
+      [storedStoreGateKey(layout.profilePath), `hermes-unit:${profileId}`],
+      layout.profilePath,
+    );
+    assert.equal(textOf(), 'Reading the file', 'the index still holds the text from before the rewrite');
+
+    opens = 0;
+    const upgraded = index.run();
+    assert.deepEqual(scheduledSessionIds(upgraded), [alphaId], 'only the stale session is scheduled');
+    assert.ok(opens > 0, 'the store is opened so exact digests can be compared');
+    assert.equal(textOf(), 'Xeading the file', 'the index holds the text that is actually in the store');
+
+    // A crash here would leave the store uncertified: the rewritten text is already
+    // persisted, but the gate row is withheld while a session was scheduled.
+    opens = 0;
+    const recertify = index.run();
+    assert.equal(scheduledSessionIds(recertify).length, 0, 'the rewritten session is not scheduled again');
+    assert.ok(opens > 0, 'the store is read once more to write the new certification');
+    opens = 0;
+    assert.equal(index.run().plan.items.length, 0, 'the next pass is idle again');
+    assert.equal(opens, 0, 'and the re-certified store is skipped');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('an upgrade exposes a deletion and a new session hidden by the previous gate', () => {
+  const layout = fixtureHome();
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore,
+    now: idleClock,
+  }));
+  try {
+    settle(index);
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+    const deltaRaw = '20260104_150000_dddddd';
+    writeStore(layout.primaryPath, db => {
+      db.prepare('DELETE FROM messages WHERE session_id = ?').run(SESSION_ALPHA);
+      db.prepare('DELETE FROM sessions WHERE id = ?').run(SESSION_ALPHA);
+      insertSession(db).run(
+        deltaRaw, 'cli', 'qwen3.5:9b', 'Delta session', null,
+        1767484800, 1767488400, 'cli_close', 0, 0, layout.betaCwd, null, DEFAULT_PROFILE,
+      );
+    });
+    const deltaId = hermesSessionId(deltaRaw, DEFAULT_PROFILE, layout.primaryPath);
+    rewriteCursorsToUntaggedStoreGate(
+      index.db,
+      [storedStoreGateKey(layout.primaryPath), `hermes-unit:${alphaId}`, `hermes-unit:${betaId}`],
+      layout.primaryPath,
+    );
+
+    const upgraded = index.run();
+    const units = sessionUnits(upgraded.plan.items.map(item => item.unit));
+    assert.deepEqual(
+      new Set(units.map(unit => unit.sessionId)),
+      new Set([alphaId, deltaId]),
+      'the hidden deletion and the hidden session are both in the plan',
+    );
+    assert.equal(
+      units.find(unit => unit.sessionId === alphaId)?.meta.tombstone,
+      true,
+      'the missing session is retracted',
+    );
+    assert.equal(
+      units.find(unit => unit.sessionId === deltaId)?.meta.tombstone,
+      undefined,
+      'the new session is scheduled for indexing',
+    );
+
+    settle(index);
+    assert.equal(
+      index.db.prepare('SELECT id FROM sessions WHERE id = ?').get(alphaId),
+      undefined,
+      'the deleted session is gone from the index',
+    );
+    assert.ok(
+      index.db.prepare('SELECT id FROM sessions WHERE id = ?').get(deltaId),
+      'the new session is in the index',
+    );
+    assert.ok(
+      index.db.prepare('SELECT id FROM sessions WHERE id = ?').get(betaId),
+      'the untouched sibling remains',
+    );
+    assert.equal(index.run().plan.items.length, 0, 'the store goes idle after recertifying');
+  } finally {
+    index.close();
+    rmSync(layout.base, { recursive: true, force: true });
+  }
+});
+
+test('an upgrade recertifies a current store without replaying its sessions', () => {
+  const layout = fixtureHome();
+  let opens = 0;
+  const index = indexFixture(createHermesProvider({
+    rootDir: layout.base,
+    openStore: path => {
+      opens += 1;
+      return openStore(path);
+    },
+    now: idleClock,
+  }));
+  try {
+    settle(index);
+    const alphaId = hermesSessionId(SESSION_ALPHA, DEFAULT_PROFILE, layout.primaryPath);
+    const betaId = hermesSessionId(SESSION_BETA, DEFAULT_PROFILE, layout.primaryPath);
+    const profileId = hermesSessionId(SESSION_PROFILE, 'coder', layout.profilePath);
+    rewriteCursorsToUntaggedStoreGate(
+      index.db,
+      [storedStoreGateKey(layout.primaryPath), `hermes-unit:${alphaId}`, `hermes-unit:${betaId}`],
+      layout.primaryPath,
+    );
+    rewriteCursorsToUntaggedStoreGate(
+      index.db,
+      [storedStoreGateKey(layout.profilePath), `hermes-unit:${profileId}`],
+      layout.profilePath,
+    );
+
+    opens = 0;
+    const upgraded = index.run();
+    assert.equal(scheduledSessionIds(upgraded).length, 0, 'current sessions are not replayed');
+    assert.ok(opens > 0, 'both stores are opened for the digest pass');
+    assert.ok(upgraded.plan.items.length > 0, 'the new certifications are written');
+
+    opens = 0;
+    assert.equal(index.run().plan.items.length, 0, 'the next pass is idle');
+    assert.equal(opens, 0, 'and the recertified stores are skipped');
   } finally {
     index.close();
     rmSync(layout.base, { recursive: true, force: true });
