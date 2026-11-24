@@ -264,8 +264,7 @@ test('claude explicit roots: reselecting an unavailable alias after an increment
   db.close();
 });
 
-test('claude explicit roots: independent stores with the same short root tag keep separate sessions', () => {
-  const home = makeTempDir('obelisk-claude-root-tag-collision-');
+function collidingClaudeRoots(home) {
   const seen = new Map();
   let roots = [];
   for (let n = 0; n < 100_000; n++) {
@@ -279,6 +278,12 @@ test('claude explicit roots: independent stores with the same short root tag kee
     seen.set(tag, root);
   }
   assert.equal(roots.length, 2);
+  return roots.sort((left, right) => left.localeCompare(right));
+}
+
+test('claude explicit roots: independent stores with the same short root tag keep separate sessions', () => {
+  const home = makeTempDir('obelisk-claude-root-tag-collision-');
+  const roots = collidingClaudeRoots(home);
   const defaultRoot = join(home, '.claude');
   const paths = roots.map(root => copyRealFixture(root));
   assert.equal(rootTagFor(roots[0], defaultRoot), rootTagFor(roots[1], defaultRoot));
@@ -290,9 +295,35 @@ test('claude explicit roots: independent stores with the same short root tag kee
     const sessions = db.prepare("SELECT id, jsonl_path FROM sessions WHERE source = 'claude' ORDER BY id").all();
     assert.equal(sessions.length, 2);
     assert.deepEqual(sessions.map(row => row.jsonl_path).sort(), paths.toSorted());
-    const currentIds = sessions.map(row => row.id);
-    if (ids !== undefined) assert.deepEqual(currentIds, ids);
-    ids = currentIds;
+    if (ids !== undefined) assert.deepEqual(sessions, ids);
+    ids = sessions;
+    db.close();
+  }
+});
+
+test('claude migration: a colliding short tag cannot move a legacy memory to a different store', () => {
+  for (const force of [false, true]) {
+    const home = makeTempDir('obelisk-claude-legacy-root-tag-collision-');
+    const roots = collidingClaudeRoots(home);
+    const first = copyRealFixture(roots[0]);
+    const historical = copyRealFixture(roots[1]);
+    writeFileSync(first, REAL_FIXTURE_TEXT.replace(REAL_FIXTURE_USER.message.content, 'Independent replacement text'));
+    seedIndexedClaudeAliases(home, [[historical, '']], { legacy: true });
+    let db = openClaudeIndex(home);
+    db.prepare('UPDATE index_state SET cursor = ? WHERE jsonl_path = ?').run(checkpointFor(historical), historical);
+    db.prepare("INSERT INTO memories (id, session_id, message_start) VALUES ('note', ?, ?)").run(REAL_SID, REAL_FIXTURE_USER.uuid);
+    db.close();
+
+    assert.equal(runClaudeRefresh(home, roots, force).status, 0);
+    db = openClaudeIndex(home);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE source = 'claude'").get().count, 2);
+    const note = db.prepare(`
+      SELECT s.jsonl_path, m.text
+      FROM memories AS n JOIN messages AS m ON m.uuid = n.message_start AND m.session_id = n.session_id
+      JOIN sessions AS s ON s.id = m.session_id WHERE n.id = 'note'
+    `).get();
+    assert.equal(note?.jsonl_path, historical);
+    assert.equal(note?.text, REAL_FIXTURE_USER.message.content);
     db.close();
   }
 });

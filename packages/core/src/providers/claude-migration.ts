@@ -14,13 +14,7 @@ import { dirname, join } from 'node:path';
 import { redirectSessionMemories } from '../persist.ts';
 import { readProviderSessionProvenance, type StoredProviderState } from '../provider-indexing.ts';
 import type { SqliteDb, SqliteRow } from '../sqlite-types.ts';
-import {
-  canonicalSessionId,
-  pathInside,
-  rootTagFor,
-  sameNormalizedPath,
-  verifiedLegacyClaudeRoot,
-} from './claude.ts';
+import { legacyClaudeMigrationTargets, pathInside, sameNormalizedPath } from './claude.ts';
 
 interface PriorClaudeSession {
   readonly source: string;
@@ -186,14 +180,12 @@ export function planLegacyClaudeRootIdentityMigration(
   priorSessions: readonly PriorClaudeSession[] = readProviderSessionProvenance(db),
   priorIndexState?: ReadonlyMap<string, StoredProviderState>,
 ): LegacyClaudeMigration[] {
+  if (!priorSessions.some(session => session.source === 'claude' && !session.sessionId.includes(':'))) return [];
   const readCursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?');
-  return priorSessions.flatMap(({ source, sessionId: oldId, jsonlPath }) => {
-    if (source !== 'claude' || !oldId || oldId.includes(':') || !jsonlPath) return [];
-    const cursor = priorIndexState?.get(jsonlPath)?.cursor ?? readCursor.get(jsonlPath)?.cursor;
-    const root = verifiedLegacyClaudeRoot(jsonlPath, defaultRoot, configuredRoots, typeof cursor === 'string' ? cursor : null);
-    if (root === undefined) return [];
-    const tag = rootTagFor(root, defaultRoot);
-    return tag ? [{ oldId, newId: canonicalSessionId(oldId, tag), jsonlPath }] : [];
+  const claudeSessions = priorSessions.filter(session => session.source === 'claude' && session.sessionId && session.jsonlPath);
+  return legacyClaudeMigrationTargets(defaultRoot, configuredRoots, claudeSessions, (path) => {
+    const cursor = priorIndexState?.get(path)?.cursor ?? readCursor.get(path)?.cursor;
+    return typeof cursor === 'string' ? cursor : null;
   });
 }
 

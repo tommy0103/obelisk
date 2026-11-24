@@ -331,20 +331,6 @@ function orphanRootCandidates(
   });
 }
 
-export function verifiedLegacyClaudeRoot(
-  jsonlPath: string, defaultRoot: string, configuredRoots: readonly string[], cursor: Cursor,
-): string | undefined {
-  const location = transcriptLocation(jsonlPath);
-  if (location === null || sameNormalizedPath(location.root, defaultRoot)) return undefined;
-  const observedRoot = tryRealpath(location.root);
-  if (observedRoot !== null && sameNormalizedPath(location.root, observedRoot)
-    && checkpointOwnsStoredPath(cursor, observedRoot, jsonlPath)) return observedRoot;
-  // Discovery publishes only selected roots. A legacy alias is safe to move
-  // only when its stored checkpoint identifies exactly one of those roots.
-  const physicalRoots = [...new Set(configuredRoots.map(physicalPath))];
-  return rootMatchingCheckpoint(location, physicalRoots, cursor);
-}
-
 function sessionRootTag(sessionId: string): string {
   const separator = sessionId.indexOf(':');
   return separator < 0 ? '' : sessionId.slice(0, separator);
@@ -443,6 +429,27 @@ function resolveIndexedRoots(
     assignedTags.add(tag);
     return { root, sessions, tag, legacyBareIds, blockedPaths };
   });
+}
+
+export function legacyClaudeMigrationTargets(
+  defaultRoot: string,
+  configuredRoots: readonly string[],
+  indexed: readonly IndexedSession[],
+  previousCursor: (path: string) => Cursor,
+): { oldId: string; newId: string; jsonlPath: string }[] {
+  const roots = new Map(configuredRoots.map(configured => {
+    const root = physicalPath(configured);
+    return [lexicalPathKey(root), root];
+  }));
+  return resolveIndexedRoots([...roots.values()], defaultRoot, configuredRoots, indexed, {
+    lastCursor: previousCursor, previousCursor,
+  }).flatMap(({ sessions, tag, legacyBareIds }) => [...sessions.values()].flatMap(priors => priors
+    .filter(prior => legacyBareIds.has(prior.sessionId))
+    .map(prior => ({
+      oldId: prior.sessionId,
+      newId: canonicalSessionId(prior.sessionId, tag),
+      jsonlPath: prior.jsonlPath,
+    }))));
 }
 
 export function pathInside(root: string, candidate: unknown): boolean {
