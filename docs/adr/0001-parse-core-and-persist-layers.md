@@ -310,3 +310,42 @@ sources retain their existing authority. When a main transcript returns, its
 normal count authority resumes. This retention policy does not change the fresh
 database canonical parse/persistence invariant: a fresh source projection cannot
 reconstruct additional history that exists only in a previously populated index.
+
+
+**Amendment (2026-11-10): Hermes strict reads and bounded ordinary audits.**
+Hermes message metadata is an optimization, not proof that projected text,
+timestamps or visibility stayed unchanged. An append in one session cannot
+explain away a hidden rewrite in another. Strict query refresh passes its read
+mode to discovery and verifies every unproven session at the observed store gate.
+It bypasses the CLI's recent-build debounce; daemon heartbeat and writer-lease
+arbitration still apply. Concurrent source changes fail closed through existing
+incomplete-refresh reporting and per-session snapshot checks.
+
+Ordinary incremental refresh audits up to 64 fresh sessions per store in stable canonical-id
+order, in addition to detected changed sessions and retries of failed commits.
+The persisted epoch, position and start time survive restart. Writes during an
+active cycle never reset its position or deadline. The first refresh at or after
+60 seconds of pending work (or after a backwards clock jump) verifies the full
+store. This bounds refresh opportunities, not unattended wall time: the desktop's
+existing five-minute reconcile timer supplies a refresh without filesystem events;
+a healthy service repairs pending work by the deadline plus its next scheduled
+refresh and processing time. An offline process repairs on its next invocation.
+A completed unchanged store remains certified until its physical gate or indexed
+session inventory changes; it does not periodically reread all payloads.
+
+A recordless session checkpoint acknowledges an unchanged exact digest without
+rewriting canonical rows or advancing the original source position. Successful
+canonical replacement acknowledges the same epoch in its existing transaction.
+A complete store certificate requires every session acknowledgement; staged
+recordless acknowledgements use the existing cursor prerequisites. Failed session
+or checkpoint commits remain retryable and cannot certify the store. Unknown
+store-control formats trigger complete verification. These are provider-private
+control changes, not a canonical transcript migration. The canonical marker and
+session/message identities stay unchanged. No source database is modified.
+
+Strict refresh can still read the whole store after any physical write, including
+checkpoint-only churn. Ordinary bounded verification limits session count, not
+bytes or latency of one exceptionally large session. Metadata enumeration still
+visits message headers across the store. No universal O(delta) CLI claim follows
+from this optimization; a trusted upstream revision protocol would be a separate
+decision. Memory-only `--attune` is unaffected by transcript query refresh.
