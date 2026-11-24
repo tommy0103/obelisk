@@ -237,6 +237,36 @@ test('legacy physical custom root migrates atomically when adding the physical d
   db.close();
 });
 
+test('a stale custom-root guardian is retracted before the default publishes the same bare ID', () => {
+  const home = makeTempDir('obelisk-codex-guardian-ownership-');
+  const custom = join(home, 'custom');
+  const defaultRoot = join(home, '.codex');
+  const id = '019ed000-0000-7000-8000-000000000139';
+  const path = writeRollout(custom, { id, userText: 'stale guardian' });
+  const lines = readFileSync(path, 'utf8').split('\n');
+  const meta = JSON.parse(lines[0]);
+  meta.payload.source = { subagent: { other: 'guardian' } };
+  lines[0] = JSON.stringify(meta);
+  writeFileSync(path, lines.join('\n'));
+  writeRollout(defaultRoot, { id, userText: 'real default rollout' });
+  const db = freshDb();
+  const bareId = `codex:${id}`;
+  db.prepare("INSERT INTO sessions (id, jsonl_path, source) VALUES (?, ?, 'codex')").run(bareId, path);
+  db.prepare('INSERT INTO subagents (agent_id, session_id) VALUES (?, ?)').run(bareId, bareId);
+  db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 2)').run(path, statSync(path).mtimeMs);
+  const next = createCodexProvider({ roots: [defaultRoot, custom], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, next) }).complete, true);
+  assert.equal(db.prepare('SELECT session_id FROM messages WHERE text=?').get('real default rollout').session_id, bareId);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM subagents').get().count, 0);
+  const fresh = freshDb();
+  assert.equal(indexProviderPlanStrict({ db: fresh, plan: planCodex(fresh, next) }).complete, true);
+  assert.deepEqual(dumpCodexState(db), dumpCodexState(fresh));
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, next) }).complete, true);
+  assert.deepEqual(dumpCodexState(db), dumpCodexState(fresh));
+  fresh.close();
+  db.close();
+});
+
 test('retargeting the same single-root spelling preserves legacy bare history', () => {
   const home = makeTempDir('obelisk-codex-single-root-retarget-');
   const root = join(home, '.codex');

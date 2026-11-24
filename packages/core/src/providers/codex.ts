@@ -289,8 +289,12 @@ function discoverAtRoot(
     aliases = [rootDir],
     homeDir = homedir(),
     recoveredRoots = new Map<string, string>(),
+    confirmedGuardians = new Map<string, { sessionId: string; mtime: number }>(),
     storeSuffix,
-  }: { usesRootSet?: boolean; aliases?: readonly string[]; homeDir?: string; recoveredRoots?: ReadonlyMap<string, string>; storeSuffix?: string } = {},
+  }: {
+    usesRootSet?: boolean; aliases?: readonly string[]; homeDir?: string; recoveredRoots?: ReadonlyMap<string, string>;
+    confirmedGuardians?: ReadonlyMap<string, { sessionId: string; mtime: number }>; storeSuffix?: string;
+  } = {},
 ): IndexUnit[] {
   const [sessionsDir, archivedSessionsDir] = codexTranscriptDirs(rootDir);
   const indexedList = ctx.indexedSessions?.() ?? [];
@@ -523,9 +527,14 @@ function discoverAtRoot(
       }
       const parentId = meta ? codexParentThreadId(meta) : null;
       const indexed = rawId ? sessionIndex.get(rawId) : undefined;
+      const legacyGuardian = guardian !== null && rootScope !== null ? confirmedGuardians.get(file.path) : undefined;
       return [{
         key: file.path,
         sessionId: guardian === null ? codexDbId(parentId || rawId, rootScope) ?? '' : '',
+        ...(legacyGuardian === undefined ? {} : {
+          atomicGroup: `guardian-replay:${legacyGuardian.sessionId}`,
+          retractSessionIds: [legacyGuardian.sessionId],
+        }),
         meta: {
           source: 'codex',
           guardian: guardian !== null,
@@ -533,6 +542,7 @@ function discoverAtRoot(
           threadRawId: rawId,
           rootScope,
           storeSuffix,
+          legacyGuardian,
           indexedTitle: indexed?.title,
           indexedUpdatedAt: indexed?.updatedAt,
           sessionIndexChanged,
@@ -1895,6 +1905,7 @@ export function createCodexProvider({
       const blockedRoots = new Set<string>();
       const unverifiedMembers = new Set<string>();
       const recoveredRoots = new Map<string, string>();
+      const confirmedGuardians = new Map<string, { sessionId: string; mtime: number }>();
       const verifiedLegacyRoots = new Set<string>();
       // Legacy checkpoints describe individual rollouts. An unchanged
       // sibling or a renamed copy of the same file can establish continuity
@@ -1931,9 +1942,10 @@ export function createCodexProvider({
         // Old guardian rows can have only the pre-v3 mtime/line checkpoint.
         // During replay, recognize their persisted self membership plus the
         // unchanged lexical file and its explicit native guardian ID.
-        const legacyGuardianMatches = ctx.snapshotRequired && Number.isFinite(legacyMtime)
+        const legacyGuardianMatches = rootIdentity != null && ctx.snapshotRequired && Number.isFinite(legacyMtime)
           && session.memberSessionIds?.includes(session.sessionId)
           && matchesLegacyGuardian(session.jsonlPath, session.sessionId, legacyMtime);
+        if (legacyGuardianMatches) confirmedGuardians.set(session.jsonlPath, { sessionId: session.sessionId, mtime: legacyMtime });
         const currentStoreMatches = store !== null ? rootIdentity === store.identity
           : sourceMatches || verifiedLegacyRoots.has(root) || legacyGuardianMatches;
         const recoverStore = () => entries.find(entry => {
@@ -1942,7 +1954,7 @@ export function createCodexProvider({
             : codexFileMatches(file, join(entry.rootDir, relative(root, session.jsonlPath)), { unshared: true }));
         })?.rootDir;
         let recoveredRoot: string | undefined;
-        if (/^codex:[^:]+$/.test(session.sessionId) && historicalDefault
+        if (/^codex:[^:]+$/.test(session.sessionId) && historicalDefault && !legacyGuardianMatches
           && (root !== defaultTarget || !currentStoreMatches)
           && !defaultAliasMatches) {
           defaultDisplaced = true;
@@ -1987,6 +1999,7 @@ export function createCodexProvider({
           aliases: entry.aliases,
           homeDir,
           recoveredRoots,
+          confirmedGuardians,
           storeSuffix: codexStoreSuffix(identity, [...aliases], entry.rootScope === null
             && (usesRootSet || lexicalCodexRoot(entry.rootDir) === defaultRoot)),
         });
@@ -2061,7 +2074,9 @@ export function createCodexProvider({
       });
     },
     *parse(unit, cursor, metrics?: CodexParseMetrics, testHooks?: CodexParseTestHooks) {
-      const sourceMeta = unit.meta as { storeSuffix?: string; storeOnly?: boolean; rootScope?: string | null } | undefined;
+      const sourceMeta = unit.meta as {
+        storeSuffix?: string; storeOnly?: boolean; rootScope?: string | null; legacyGuardian?: { sessionId: string; mtime: number };
+      } | undefined;
       const storeSuffix = sourceMeta?.storeSuffix;
       if (storeSuffix === undefined) return yield* parse(unit, cursor, metrics, testHooks);
       const store = readCodexStore(storeSuffix);
@@ -2072,6 +2087,10 @@ export function createCodexProvider({
         }
       };
       requireStore();
+      const legacyGuardian = sourceMeta?.legacyGuardian;
+      if (legacyGuardian !== undefined && !matchesLegacyGuardian(unit.key, legacyGuardian.sessionId, legacyGuardian.mtime)) {
+        throw new RetryableSourceReadError(unit.key, 'Codex guardian changed before its previous rows could be retracted');
+      }
       if (sourceMeta?.storeOnly && (cursor === null || codexCursorSignatureDiffers(cursor, unit.key, sourceMeta.rootScope))) {
         throw new RetryableSourceReadError(unit.key, 'Codex rollout changed before its store checkpoint could be recorded');
       }
