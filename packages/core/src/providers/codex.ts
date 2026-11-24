@@ -211,7 +211,7 @@ function cursorIdentifiesCodexFile(cursor: Cursor, filePath: string, { unshared 
   try { stat = statSync(filePath); } catch { return false; }
   if (!stat.isFile() || !usableSourceIdentity(stat) || (unshared && stat.nlink !== 1)) return false;
   const parts = cursor.split(':');
-  const compressed = isCodexCompressedPath(filePath);
+  const compressed = parts[5] === CODEX_ZST_CURSOR_TAG;
   const checkpoint = compressed ? null : decodeCodexCursor(cursor);
   const device = compressed && parts[5] === CODEX_ZST_CURSOR_TAG ? parts[6] : checkpoint?.dev;
   const priorCtime = Number(parts[3]);
@@ -222,6 +222,16 @@ function cursorIdentifiesCodexFile(cursor: Cursor, filePath: string, { unshared 
     && (stat.birthtimeMs > 0
       ? stat.birthtimeMs <= priorCtime
       : stat.ctimeMs === priorCtime && stat.mtimeMs === Number(parts[0]));
+}
+
+function hasRenamedCodexRollout(cursor: Cursor, path: string): boolean {
+  if (cursor === null) return false;
+  const parent = dirname(path);
+  try {
+    return readdirSync(parent, { withFileTypes: true }).some(entry => entry.isFile()
+      && !isCodexTranscriptPath(entry.name)
+      && cursorIdentifiesCodexFile(cursor, join(parent, entry.name), { unshared: true }));
+  } catch { return false; }
 }
 
 function hasUnresolvedCodexAlias(path: string): boolean {
@@ -359,6 +369,7 @@ function discoverAtRoot(
     }
   }
   const forcedMigrationPaths = new Set<string>();
+  const indexedByPath = new Map(indexedList.map(session => [session.jsonlPath, session.sessionId]));
   for (const session of indexedList) {
     if (!pathInside(rootDir, session.jsonlPath)) continue;
     const scopeMismatch = rootScope !== null
@@ -413,6 +424,12 @@ function discoverAtRoot(
       const cursor = ctx.lastCursor(file.path);
       const unchangedSource = cursor !== null && !codexCursorSignatureDiffers(cursor, file.path, rootScope);
       const unchangedStore = storeSuffix === undefined || !cursor?.includes(CODEX_STORE_CURSOR_TAG) || cursor.endsWith(storeSuffix);
+      const indexedSessionId = indexedByPath.get(file.path);
+      if (unchangedSource && !scopeMigration && !sessionIndexChanged && !fileChanged && indexedSessionId !== undefined
+        && storeSuffix !== undefined && !cursor.includes(CODEX_STORE_CURSOR_TAG)
+        && cursorIdentifiesCodexFile(cursor, file.path, { unshared: true })) {
+        return [{ key: file.path, sessionId: indexedSessionId, meta: { rootScope, storeSuffix, storeOnly: true } }];
+      }
       // A session-index-only refresh must update the aggregate, but a
       // strengthened cursor already contains the identity needed to construct
       // the normal-session unit. Avoid reopening every historical rollout for
@@ -1706,15 +1723,19 @@ function rawCodex(
   let readPath = resolvedPath;
   let sourceCursor: Cursor = null;
   if (verifySource) {
-    if (derivedRoot === null || physicalRoot === null || !pathInside(derivedRoot, resolvedPath)) return null;
+    if (derivedRoot === null || physicalRoot === null) return null;
+    const sourceDir = codexTranscriptDirs(derivedRoot).find(dir => pathInside(dir, resolvedPath));
+    const physicalDir = sourceDir === undefined ? null : tryRealpath(sourceDir);
+    if (sourceDir === undefined || physicalDir === null) return null;
     const physicalPath = tryRealpath(resolvedPath);
-    if (physicalPath === null || !pathInside(physicalRoot, physicalPath)) return null;
-    const indexedPath = join(derivedRoot, relative(physicalRoot, physicalPath));
+    // Discovery follows the transcript directory itself, then skips symlink
+    // entries during its walk. Raw reads must use the same source boundary.
+    if (physicalPath !== join(physicalDir, relative(sourceDir, resolvedPath))) return null;
     const store = readCodexStore(input.cursor ?? null);
     if (store !== null && store.identity !== codexDirectoryIdentity(physicalRoot)) return null;
     sourceCursor = input.agentId === null
       ? input.cursor ?? null
-      : input.cursorForPath?.(indexedPath) ?? null;
+      : input.cursorForPath?.(resolvedPath) ?? null;
     if (!cursorIdentifiesCodexFile(sourceCursor, physicalPath)) return null;
     readPath = physicalPath;
   }
@@ -1844,7 +1865,20 @@ export function createCodexProvider({
       const defaultTarget = tryRealpath(defaultRoot) ?? defaultRoot;
       const retainedBareRoots = new Set<string>();
       const blockedRoots = new Set<string>();
+      const unverifiedMembers = new Set<string>();
       const recoveredRoots = new Map<string, string>();
+      const verifiedLegacyRoots = new Set<string>();
+      // Legacy checkpoints describe individual rollouts. An unchanged
+      // sibling or a renamed copy of the same file can establish continuity
+      // before applying normal replacement semantics at a physical root.
+      for (const { session, cursor, root, store } of prior) {
+        if (store === null && root !== null && knownEntries.get(root) != null
+          && cursorIdentifiesCodexFile(cursor, session.jsonlPath, { unshared: true })) verifiedLegacyRoots.add(root);
+      }
+      for (const { session, cursor, root, store } of prior) {
+        if (store === null && root !== null && knownEntries.get(root) != null && !verifiedLegacyRoots.has(root)
+          && hasRenamedCodexRollout(cursor, session.jsonlPath)) verifiedLegacyRoots.add(root);
+      }
       let defaultDisplaced = false;
       for (const { session, cursor, root, store } of prior) {
         if (root === null) continue;
@@ -1856,12 +1890,18 @@ export function createCodexProvider({
         ))) {
           unavailable(session, 'Source folder is unavailable');
         }
-        const sourceMatches = store === null && cursorIdentifiesCodexFile(cursor, session.jsonlPath);
-        const historicalDefault = usesRootSet && (store?.defaultOwner ?? true);
+        const sourceMatches = store === null && cursorIdentifiesCodexFile(cursor, session.jsonlPath, { unshared: true });
+        const legacyPhysicalCustom = store === null && root !== defaultRoot && rootIdentity != null
+          && incomingBareRoot === defaultRoot && defaultTarget === defaultRoot
+          && tryRealpath(root) === root && sourceMatches;
+        // Pre-feature cursors used lexical paths even through a symlink. A
+        // verified different physical path is the documented custom migration.
+        const historicalDefault = usesRootSet && (store?.defaultOwner ?? !legacyPhysicalCustom);
         const defaultAliasMatches = incomingBareRoot !== undefined && root === defaultRoot
           && tryRealpath(root) === incomingBareRoot
           && (store === null ? sourceMatches : knownEntries.get(incomingBareRoot) === store.identity);
-        const currentStoreMatches = store !== null ? rootIdentity === store.identity : sourceMatches;
+        const currentStoreMatches = store !== null ? rootIdentity === store.identity
+          : sourceMatches || verifiedLegacyRoots.has(root);
         const recoverStore = () => entries.find(entry => {
           const identity = knownEntries.get(entry.rootDir);
           return identity != null && (store !== null ? identity === store.identity
@@ -1882,10 +1922,11 @@ export function createCodexProvider({
           }
         }
         if (rootIdentity != null && (store !== null ? store.identity !== rootIdentity
-          : usesRootSet && cursor !== null && !sourceMatches)) {
+          : cursor !== null && !currentStoreMatches)) {
           if (recoveredRoot !== undefined && recoveredRoot !== root && root === incomingBareRoot) continue;
           unavailable(session, 'Codex store no longer matches its historical source');
-          blockedRoots.add(root);
+          if (store !== null || !usesRootSet) blockedRoots.add(root);
+          else for (const memberId of session.memberSessionIds ?? []) unverifiedMembers.add(memberId);
         }
       }
       if (retainedBareRoots.size > 1) {
@@ -1917,6 +1958,13 @@ export function createCodexProvider({
         });
       };
       const discovered = entries.flatMap(entry => discoverEntry(entry, ctx));
+      if (unverifiedMembers.size > 0) {
+        for (const unit of discovered) {
+          const meta = unit.meta as { threadRawId?: string; rootScope?: string | null };
+          const memberId = codexDbId(meta.threadRawId, meta.rootScope);
+          if (memberId !== null && unverifiedMembers.has(memberId)) ctx.retainSession?.(unit.sessionId);
+        }
+      }
       // A scope migration can retract an old sessionId (e.g. bare `codex:<id>`)
       // that is simultaneously claimed by another configured root in the same pass
       // (e.g. default `~/.codex` with an identical copied thread ID). Bind the
@@ -1979,7 +2027,8 @@ export function createCodexProvider({
       });
     },
     *parse(unit, cursor, metrics?: CodexParseMetrics, testHooks?: CodexParseTestHooks) {
-      const storeSuffix = (unit.meta as { storeSuffix?: string } | undefined)?.storeSuffix;
+      const sourceMeta = unit.meta as { storeSuffix?: string; storeOnly?: boolean; rootScope?: string | null } | undefined;
+      const storeSuffix = sourceMeta?.storeSuffix;
       if (storeSuffix === undefined) return yield* parse(unit, cursor, metrics, testHooks);
       const store = readCodexStore(storeSuffix);
       const root = deriveCodexRootFromSessionPath(unit.key);
@@ -1989,7 +2038,10 @@ export function createCodexProvider({
         }
       };
       requireStore();
-      const result = yield* parse(unit, cursor, metrics, testHooks);
+      if (sourceMeta?.storeOnly && (cursor === null || codexCursorSignatureDiffers(cursor, unit.key, sourceMeta.rootScope))) {
+        throw new RetryableSourceReadError(unit.key, 'Codex rollout changed before its store checkpoint could be recorded');
+      }
+      const result = sourceMeta?.storeOnly ? cursor : yield* parse(unit, cursor, metrics, testHooks);
       requireStore();
       return result === null ? null : result.split(CODEX_STORE_CURSOR_TAG)[0] + storeSuffix;
     },

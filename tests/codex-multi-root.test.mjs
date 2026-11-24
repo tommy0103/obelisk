@@ -172,6 +172,126 @@ function planCodex(db, provider, options) {
   return createProviderIndexPlan(db, createProviderRegistry([provider]), options);
 }
 
+function beforeStoreCheckpoints(provider) {
+  return {
+    ...provider,
+    discover: ctx => provider.discover(ctx).map(unit => ({ ...unit, meta: { ...unit.meta, storeSuffix: undefined } })),
+  };
+}
+
+test('legacy root allows a rollout rewrite when the original source remains in its directory', () => {
+  const home = makeTempDir('obelisk-codex-legacy-rewrite-');
+  const root = join(home, '.codex');
+  const id = '019ed000-0000-7000-8000-000000000133';
+  const source = writeRollout(root, { id, userText: 'old default rollout' });
+  const db = freshDb();
+  const previous = beforeStoreCheckpoints(createCodexProvider({ rootDir: root, homeDir: home }));
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, previous) }).complete, true);
+  renameSync(source, `${source}.old`);
+  writeRollout(root, { id, userText: 'rewritten default rollout' });
+  const next = createCodexProvider({ roots: [root], homeDir: home });
+  const plan = planCodex(db, next);
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  const query = createQueryApi(db, { providerRegistry: createProviderRegistry([next]) });
+  assert.match(query.raw(`codex:${id}:000002`)?.text ?? '', /rewritten default rollout/);
+  db.close();
+});
+
+test('verifying an unchanged legacy rollout permits a later replacement without a backup', () => {
+  const home = makeTempDir('obelisk-codex-store-backfill-');
+  const root = join(home, '.codex');
+  const id = '019ed000-0000-7000-8000-000000000138';
+  const source = writeRollout(root, { id, userText: 'old verified rollout' });
+  const db = freshDb();
+  const previous = beforeStoreCheckpoints(createCodexProvider({ rootDir: root, homeDir: home }));
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, previous) }).complete, true);
+  const next = createCodexProvider({ roots: [root], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, next) }).complete, true);
+  renameSync(source, `${source}.old`);
+  writeRollout(root, { id, userText: 'new verified rollout' });
+  unlinkSync(`${source}.old`);
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, next) }).complete, true);
+  const query = createQueryApi(db, { providerRegistry: createProviderRegistry([next]) });
+  assert.match(query.raw(`codex:${id}:000002`)?.text ?? '', /new verified rollout/);
+  db.close();
+});
+
+test('legacy physical custom root migrates atomically when adding the physical default', () => {
+  const home = makeTempDir('obelisk-codex-legacy-physical-custom-');
+  const custom = join(home, 'custom');
+  const defaultRoot = join(home, '.codex');
+  const id = '019ed000-0000-7000-8000-000000000134';
+  writeRollout(custom, { id, userText: 'old custom rollout' });
+  writeRollout(defaultRoot, { id, userText: 'new default rollout' });
+  const db = freshDb();
+  const previous = beforeStoreCheckpoints(createCodexProvider({ rootDir: custom, homeDir: home }));
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, previous) }).complete, true);
+  const next = createCodexProvider({ roots: [defaultRoot, custom], homeDir: home });
+  const plan = planCodex(db, next);
+  assert.equal(new Set(plan.items.map(({ unit }) => unit.atomicGroup)).size, 1);
+  assert.ok(plan.items.every(({ unit }) => unit.atomicGroup !== undefined));
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  const messages = db.prepare('SELECT session_id FROM messages WHERE text=?');
+  assert.equal(messages.get('old custom rollout').session_id, `codex:${codexRootScope(custom, home)}:${id}`);
+  assert.equal(messages.get('new default rollout').session_id, `codex:${id}`);
+  db.close();
+});
+
+test('retargeting the same single-root spelling preserves legacy bare history', () => {
+  const home = makeTempDir('obelisk-codex-single-root-retarget-');
+  const root = join(home, '.codex');
+  const first = join(home, 'first');
+  const second = join(home, 'second');
+  const id = '019ed000-0000-7000-8000-000000000137';
+  writeRollout(first, { id, userText: 'first single store' });
+  writeRollout(second, { id, userText: 'second single store' });
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+  symlinkSync(first, root, aliasType);
+  const db = freshDb();
+  const provider = createCodexProvider({ rootDir: root, homeDir: home });
+  const previous = beforeStoreCheckpoints(provider);
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, previous) }).complete, true);
+  unlinkSync(root);
+  symlinkSync(second, root, aliasType);
+  const plan = planCodex(db, provider, { force: true });
+  assert.equal(plan.incompleteProviders.has('codex'), true);
+  assert.equal(plan.items.length, 0);
+  const uuid = `codex:${id}:000002`;
+  assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?').get(uuid).text, 'first single store');
+  assert.equal(createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) }).raw(uuid), null);
+  unlinkSync(root);
+  symlinkSync(first, root, aliasType);
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  db.close();
+});
+
+test('raw follows an indexed transcript directory alias and rejects a redirected rollout file', () => {
+  const home = makeTempDir('obelisk-codex-sessions-alias-');
+  const root = join(home, '.codex');
+  const external = join(home, 'external');
+  const parentId = '019ed000-0000-7000-8000-000000000135';
+  const childId = '019ed000-0000-7000-8000-000000000136';
+  const parent = writeRollout(external, { id: parentId, userText: 'linked parent' });
+  writeRollout(external, { id: childId, parentThreadId: parentId, userText: 'linked child' });
+  mkdirSync(root);
+  symlinkSync(join(external, 'sessions'), join(root, 'sessions'), process.platform === 'win32' ? 'junction' : 'dir');
+  const db = freshDb();
+  const provider = createCodexProvider({ roots: [root], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  const query = createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) });
+  const parentUuid = `codex:${parentId}:000002`;
+  const childUuid = `codex:${childId}:000002`;
+  assert.match(query.raw(parentUuid)?.text ?? '', /linked parent/);
+  assert.match(query.raw(childUuid)?.text ?? '', /linked child/);
+  if (process.platform !== 'win32') {
+    const moved = join(home, basename(parent));
+    renameSync(parent, moved);
+    symlinkSync(moved, parent);
+    assert.equal(query.raw(parentUuid), null);
+  }
+  db.close();
+});
+
 test('legacy standalone alias child retraction commits with the migrated parent and all contributors', () => {
   const home = makeTempDir('obelisk-codex-alias-rekey-');
   const realRoot = join(home, 'real-codex');
@@ -342,11 +462,8 @@ test(`replacing the ${legacy ? 'legacy' : 'canonical'} default Codex alias with 
   const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
   symlinkSync(firstRoot, aliasRoot, aliasType);
   const db = freshDb();
-  const initial = createCodexProvider(legacy ? { rootDir: aliasRoot, homeDir: home } : { roots: [aliasRoot], homeDir: home });
-  if (legacy) {
-    const discover = initial.discover;
-    initial.discover = ctx => discover(ctx).map(unit => ({ ...unit, meta: { ...unit.meta, storeSuffix: undefined } }));
-  }
+  const initial = legacy ? beforeStoreCheckpoints(createCodexProvider({ rootDir: aliasRoot, homeDir: home }))
+    : createCodexProvider({ roots: [aliasRoot], homeDir: home });
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, initial) }).complete, true);
   const bareParent = `codex:${parentId}`;
   const bareChild = `codex:${childId}`;
