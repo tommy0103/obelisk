@@ -193,9 +193,21 @@ function statements(db: SqliteDb) {
         duration_ms=COALESCE(excluded.duration_ms, subagents.duration_ms),
         total_tokens=COALESCE(excluded.total_tokens, subagents.total_tokens)`),
     wf: db.prepare(`
-      INSERT OR REPLACE INTO workflows
+      INSERT INTO workflows
         (run_id,session_id,parent_tool_use_id,task_id,script,result_json,timestamp,agent_count,duration_ms,total_tokens,status,workflow_name)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(run_id) DO UPDATE SET
+        session_id=excluded.session_id,
+        parent_tool_use_id=COALESCE(excluded.parent_tool_use_id, workflows.parent_tool_use_id),
+        task_id=excluded.task_id,
+        script=excluded.script,
+        result_json=excluded.result_json,
+        timestamp=excluded.timestamp,
+        agent_count=excluded.agent_count,
+        duration_ms=excluded.duration_ms,
+        total_tokens=excluded.total_tokens,
+        status=excluded.status,
+        workflow_name=excluded.workflow_name`),
     wa: db.prepare(`
       INSERT INTO workflow_agents
         (agent_id,run_id,session_id,agent_type,description,phase,label,model,state,duration_ms,tokens,tool_calls)
@@ -229,11 +241,31 @@ function deleteSession(db: SqliteDb, sessionId: string) {
   db.prepare('DELETE FROM sessions WHERE id=?').run(sessionId);
 }
 
+export function redirectSessionMemories(db: SqliteDb, { oldId, newId, oldPrefix, newPrefix }: {
+  oldId: string;
+  newId: string;
+  oldPrefix: string;
+  newPrefix: string;
+}): void {
+  db.prepare(`
+    UPDATE memories SET session_id = ?,
+      message_start = CASE WHEN message_start != '' AND substr(message_start, 1, ?) = ? THEN ? || substr(message_start, ?) ELSE message_start END,
+      message_end = CASE WHEN message_end != '' AND substr(message_end, 1, ?) = ? THEN ? || substr(message_end, ?) ELSE message_end END
+    WHERE session_id = ?
+  `).run(newId,
+    oldPrefix.length, oldPrefix, newPrefix, oldPrefix.length + 1,
+    oldPrefix.length, oldPrefix, newPrefix, oldPrefix.length + 1,
+    oldId);
+}
+
 // Consume one unit's record stream into the database and return the new cursor
 // (also written to index_state). `db` is any SQLite handle sharing prepare/run.
 export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<TranscriptRecord, Cursor>): Cursor {
   const st = statements(db);
-  for (const sessionId of unit.retractSessionIds ?? []) deleteSession(db, sessionId);
+  const redirect = unit.redirectRetractedSessionMemories;
+  if (redirect === undefined) {
+    for (const sessionId of unit.retractSessionIds ?? []) deleteSession(db, sessionId);
+  }
 
   const write = (r: TranscriptRecord, replay: ReplayState | null) => {
     switch (r.kind) {
@@ -345,6 +377,26 @@ export function persist(db: SqliteDb, unit: IndexUnit, gen: Generator<Transcript
     step = gen.next();
   }
   flush();
+  if (redirect !== undefined) {
+    const getMessage = db.prepare('SELECT 1 FROM messages WHERE uuid = ? AND session_id = ?');
+    const getMemories = db.prepare('SELECT message_start, message_end FROM memories WHERE session_id = ?');
+    for (const sessionId of unit.retractSessionIds ?? []) {
+      const oldPrefix = redirect.oldMessagePrefixes.get(sessionId);
+      if (oldPrefix !== undefined) {
+        for (const memory of getMemories.all(sessionId)) {
+          for (const anchor of [memory.message_start, memory.message_end]) {
+            if (typeof anchor !== 'string' || anchor === '' || !anchor.startsWith(oldPrefix)) continue;
+            const nextAnchor = redirect.newMessagePrefix + anchor.slice(oldPrefix.length);
+            if (!getMessage.get(nextAnchor, unit.sessionId)) {
+              throw new Error('Cannot reconcile session aliases while a memory anchor is unavailable');
+            }
+          }
+        }
+        redirectSessionMemories(db, { oldId: sessionId, newId: unit.sessionId, oldPrefix, newPrefix: redirect.newMessagePrefix });
+      }
+      deleteSession(db, sessionId);
+    }
+  }
   const cursor = step.value;
 
   if (cursor != null) {

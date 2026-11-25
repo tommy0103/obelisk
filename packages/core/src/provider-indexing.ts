@@ -240,7 +240,10 @@ export function storedSessionCursor(
     sessionId: typeof session.id === 'string' ? session.id : '',
     jsonlPath: session.jsonl_path,
   });
-  return source === 'codex' ? storedRawCursor(db, unitKey) : storedProviderCursor(db, unitKey);
+  // Both providers verify retained source data even when indexing requires replay.
+  return source === 'claude' || source === 'codex'
+    ? storedRawCursor(db, unitKey)
+    : storedProviderCursor(db, unitKey);
 }
 
 export function readProviderSessionProvenance(db: SqliteDb, schema: 'main' | 'previous_obelisk' = 'main'): ProviderSessionProvenance[] {

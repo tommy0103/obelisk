@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { CLAUDE_CANONICAL_TRANSCRIPT_MARKER } from '../../../packages/core/src/providers/claude.ts';
+import { planLegacyClaudeRootIdentityMigration, reconcileLegacyClaudeRootIdentities } from '../../../packages/core/src/providers/claude-migration.ts';
 import {
   backfillSessionTitles,
   backfillUnresolvedSessionProjectPathsOnce,
@@ -206,6 +208,7 @@ interface BuildIndexOptions {
   providerSettings?: PersistedProviderSettings;
   providerRegistry?: ProviderRegistry;
   claudeDir?: string;
+  defaultClaudeDir?: string;
   codexDir?: string;
   projectsDir?: string;
   dbPath?: string;
@@ -271,6 +274,7 @@ function buildIndex({
   providerSettings,
   providerRegistry,
   claudeDir = DEFAULT_CLAUDE_DIR,
+  defaultClaudeDir = undefined,
   codexDir = undefined,
   projectsDir = path.join(claudeDir, 'projects'),
   dbPath = DEFAULT_DB_PATH,
@@ -314,7 +318,8 @@ function buildIndex({
         priorIndexState = previous.indexState;
       }
       const defaultHome = os.homedir();
-      const compatibilityHome = path.dirname(claudeDir);
+      const effectiveDefaultClaudeDir = defaultClaudeDir ?? claudeDir;
+      const compatibilityHome = path.dirname(effectiveDefaultClaudeDir);
       // Match main-process home resolution when settings are explicit (e.g.
       // providerRoots.claude or providerRoots.codex) so Codex root scoping
       // agrees across main, worker, and CLI. Keep compatibilityHome for
@@ -358,12 +363,18 @@ function buildIndex({
       const openDevinDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots, { homeDir: compatibilityHome, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase })
+          ? createBuiltinProviderRegistry(roots, {
+            homeDir: compatibilityHome,
+            claudeDefaultRoot: effectiveDefaultClaudeDir,
+            openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
+            openDevinDatabase,
+          })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             homeDir: compatibilityHome,
             codexHomeDir: settingsHomeDir,
             baseRoots: {
               ...roots,
+              claude: effectiveDefaultClaudeDir,
               ...(!hasExplicitProviderRoot(providerSettings, 'copilot') ? { copilot: undefined } : {}),
               ...(!hasExplicitProviderRoot(providerSettings, 'opencode') ? { opencode: undefined } : {}),
               ...(!hasExplicitProviderRoot(providerSettings, 'codex') && codexDir === undefined && !Object.prototype.hasOwnProperty.call(providerRoots, 'codex') ? { codex: undefined } : {}),
@@ -375,6 +386,32 @@ function buildIndex({
             openOpencodeDatabase,
             openDevinDatabase,
           }).registry);
+      const claudeProvider = registry.get('claude');
+      const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER
+        && !priorIndexState?.has(CLAUDE_CANONICAL_TRANSCRIPT_MARKER)
+        && !db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER);
+      const claudeMigration = shouldReconcileClaude
+        ? planLegacyClaudeRootIdentityMigration(db, claudeProvider.descriptor.defaultRoot,
+          claudeProvider.watchTargets(claudeProvider.descriptor.defaultRoot)
+            .filter((target) => target.kind === 'tree' && path.basename(target.path) === 'projects')
+            .map((target) => path.dirname(target.path)),
+          priorSessions,
+          priorIndexState)
+        : [];
+      if (!force && claudeMigration.length > 0) {
+        try {
+          runRetryableWriteTransaction(
+            txDb,
+            () => reconcileLegacyClaudeRootIdentities(db, claudeMigration),
+            { label: 'claude-identity-migration' },
+          );
+        } catch (error) {
+          if (isBeginBusyFailure(error)) {
+            return deferredBuildResult('database_busy');
+          }
+          throw error;
+        }
+      }
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
         changedPaths,
@@ -394,12 +431,13 @@ function buildIndex({
         }
       }, 0);
       const discoveredSourceMtime = latestSourceMtime;
+      const files = providerPlan.items.filter(({ unit }) => unit.sessionId !== '').length;
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
       const skipped: SkippedFile[] = [...providerPlan.skippedArtifacts];
       if (force && incompleteProviders.length > 0) {
         return {
-          files: providerPlan.items.length,
+          files,
           latestSourceMtime,
           affectedSessionIds: [],
           ftsRebuilt: false,
@@ -478,6 +516,7 @@ function buildIndex({
             dropMessageFtsTriggers(db);
             messageFtsTriggersDropped = true;
             retainedSnapshot.reset();
+            reconcileLegacyClaudeRootIdentities(db, claudeMigration);
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,
@@ -488,7 +527,7 @@ function buildIndex({
         } catch (error) {
           if (isBeginBusyFailure(error)) {
             return deferredBuildResult('database_busy', {
-              files: providerPlan.items.length,
+              files,
               latestSourceMtime: discoveredSourceMtime,
               incompleteProviders,
               inventoryIssues,
@@ -512,7 +551,7 @@ function buildIndex({
               `Warning: failed to index ${error.item.provider.name} unit ${error.item.unit.key}: ${error.message}`,
             );
             return {
-              files: providerPlan.items.length,
+              files,
               latestSourceMtime: discoveredSourceMtime,
               affectedSessionIds: [],
               ftsRebuilt: false,
@@ -532,7 +571,7 @@ function buildIndex({
         }
         for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
         return {
-          files: providerPlan.items.length,
+          files,
           latestSourceMtime,
           affectedSessionIds: [...affectedSessionIds],
           ftsRebuilt,
@@ -569,7 +608,7 @@ function buildIndex({
       });
       if (providerResult.stopped) {
         return deferredBuildResult('database_busy', {
-          files: providerPlan.items.length,
+          files,
           latestSourceMtime,
           affectedSessionIds: [...affectedSessionIds],
           skipped: skipped.length,
@@ -584,7 +623,7 @@ function buildIndex({
       } catch (error) {
         if (isBeginBusyFailure(error)) {
           return deferredBuildResult('database_busy', {
-            files: providerPlan.items.length,
+            files,
             latestSourceMtime,
             affectedSessionIds: [...affectedSessionIds],
             skipped: skipped.length,
@@ -597,7 +636,7 @@ function buildIndex({
       }
       for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
       return {
-        files: providerPlan.items.length,
+        files,
         latestSourceMtime,
         affectedSessionIds: [...affectedSessionIds],
         ftsRebuilt,

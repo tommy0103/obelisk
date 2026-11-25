@@ -168,6 +168,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   process.argv = [originalArgv[0] || 'node', originalArgv[1] || 'electron', ...flags];
 
   const windows = [];
+  const appHandlers = new Map();
 
   class FakeDatabase {
     function() {}
@@ -204,7 +205,7 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
   }
 
   const restore = registerMocks([
-    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow }) }],
+    [ELECTRON_URL, { namedExports: electronNamespace({ app: captureAppHandlers(appHandlers), BrowserWindow: FakeBrowserWindow }) }],
     [DATABASE_URL, { defaultExport: FakeDatabase }],
     [WATCHER_URL, { namedExports: noopWatcher() }],
     [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
@@ -217,11 +218,12 @@ async function loadMainForWindowFlags(flags, { settingsText } = {}) {
     return windows;
   } finally {
     restore();
+    appHandlers.get('window-all-closed')?.();
     process.argv = originalArgv;
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
-    // The startup watcher may still be creating the directory.
-    // makeTempDir cleans it up when the test process exits.
+    // `makeTempDir` owns cleanup at process exit. Do not race the main-process
+    // watcher teardown by recursively deleting this home here.
   }
 }
 
@@ -2356,6 +2358,54 @@ test('a refused settings save does not poison the next queued save', async () =>
     assert.equal(saved.editorScheme, 'zed');
     assert.equal(saved.recapDir, '/before');
   } finally {
+    cleanup();
+  }
+});
+
+test('multi-root providerRoots.claude array survives unrelated settings saves and rejects single-path overwrite', async () => {
+  const rootA = makeTempDir('obelisk-settings-claude-a-');
+  const rootB = makeTempDir('obelisk-settings-claude-b-');
+  const missingRoot = join(rootA, 'does-not-exist');
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({
+    settingsText: JSON.stringify({
+      providerRoots: { claude: [rootA, rootB] },
+      editorScheme: 'vscode',
+    }),
+  });
+  try {
+    // Unrelated settings save preserves the array verbatim
+    await ipcHandlers.get('settings:set')(null, 'editorScheme', 'cursor');
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(saved.providerRoots.claude, [rootA, rootB]);
+    assert.equal(saved.editorScheme, 'cursor');
+
+    // Single-string overwrite via IPC is refused
+    await assert.rejects(
+      () => ipcHandlers.get('settings:set')(null, 'providerRoots.claude', rootA),
+      /Multiple Claude roots/,
+    );
+    const afterRefusal = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(afterRefusal.providerRoots.claude, [rootA, rootB]);
+
+    // settings:get exposes multiRoot + paths and detects when a configured root is missing
+    let payload = await ipcHandlers.get('settings:get')();
+    let claudeSource = payload.sources.find((s) => s.id === 'claude');
+    assert.equal(claudeSource.multiRoot, true);
+    assert.deepEqual(claudeSource.paths, [rootA, rootB]);
+    assert.equal(claudeSource.exists, true);
+
+    writeFileSync(join(home, '.obelisk', 'settings.json'), JSON.stringify({
+      providerRoots: { claude: [rootA, missingRoot] },
+    }));
+    payload = await ipcHandlers.get('settings:get')();
+    claudeSource = payload.sources.find((s) => s.id === 'claude');
+    assert.equal(claudeSource.multiRoot, true);
+    assert.equal(claudeSource.exists, false);
+    assert.equal(claudeSource.status, 'error');
+    assert.match(claudeSource.statusText, /Folder not found/);
+  } finally {
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
     cleanup();
   }
 });

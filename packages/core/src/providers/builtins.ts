@@ -1,6 +1,8 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { join } from 'node:path';
+
 import { createClaudeProvider } from './claude.ts';
 import { createCodexProvider } from './codex.ts';
 import { createCodexHostAntigravityProvider } from './codexhost-antigravity.ts';
@@ -25,6 +27,8 @@ export function createBuiltinProviderRegistry(
     codexHomeDir = homeDir,
     cwd,
     copilotUserDataRoots,
+    claudeSourceRoots,
+    claudeDefaultRoot,
     codexRoots,
     openCopilotChronicle,
     openHermesStore,
@@ -37,6 +41,8 @@ export function createBuiltinProviderRegistry(
     codexHomeDir?: string;
     cwd?: string;
     copilotUserDataRoots?: readonly string[];
+    claudeSourceRoots?: readonly string[];
+    claudeDefaultRoot?: string;
     codexRoots?: readonly string[];
     openCopilotChronicle?: CopilotChronicleOpener;
     openHermesStore?: HermesStoreOpener;
@@ -46,8 +52,15 @@ export function createBuiltinProviderRegistry(
     openDevinDatabase?: DevinDatabaseOpener;
   } = {},
 ): ProviderRegistry {
+  const fallbackClaudeDefault = homeDir ? join(homeDir, '.claude') : undefined;
+  const claudeRootDir = claudeSourceRoots !== undefined
+    ? (claudeDefaultRoot ?? fallbackClaudeDefault ?? roots['claude'])
+    : (roots['claude'] ?? claudeDefaultRoot ?? fallbackClaudeDefault);
   return createProviderRegistry([
-    createClaudeProvider({ rootDir: roots['claude'] }),
+    createClaudeProvider({
+      rootDir: claudeRootDir,
+      sourceRoots: claudeSourceRoots,
+    }),
     createCodexProvider({ rootDir: roots['codex'], roots: codexRoots, homeDir: codexHomeDir, cwd }),
     createCodexHostAntigravityProvider({ rootDir: roots['codexhost-antigravity'] }),
     createCopilotProvider({ rootDir: roots['copilot'], userDataRoots: copilotUserDataRoots, openChronicle: openCopilotChronicle }),

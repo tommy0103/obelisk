@@ -306,10 +306,10 @@ test('providerRoots.codex accepts validated non-empty root arrays and rejects in
     assert.deepEqual(disabled.discover({ lastCursor: () => null, indexedSessions: () => [] }), []);
   }
 
-  // Other providers still reject array values in providerRoots.
-  const claudeArrayRuntime = createConfiguredBuiltinProviderRuntime({
-    providerRoots: { claude: ['/a', '/b'] },
+  // Providers that accept a single root still reject array values.
+  const hermesArrayRuntime = createConfiguredBuiltinProviderRuntime({
+    providerRoots: { hermes: ['/a', '/b'] },
   }, { homeDir });
-  assert.equal(claudeArrayRuntime.roots.claude, undefined);
-  assert.equal(claudeArrayRuntime.registry.get('claude').descriptor.requiresExplicitRoot, true);
+  assert.equal(hermesArrayRuntime.roots.hermes, undefined);
+  assert.equal(hermesArrayRuntime.registry.get('hermes').descriptor.requiresExplicitRoot, true);
 });

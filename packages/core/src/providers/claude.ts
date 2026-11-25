@@ -11,9 +11,9 @@
 
 import { createHash } from 'node:crypto';
 import { RetryableSourceReadError } from './source-read-error.ts';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize, posix, relative, resolve, win32 } from 'node:path';
 
 import {
   TEXT_LIMIT, extractText, extractContentType, extractHarnessKind,
@@ -24,6 +24,7 @@ import {
 import type {
   Cursor,
   DiscoverContext,
+  IndexedSession,
   TranscriptRecord,
   IndexUnit,
   ProviderAdapter,
@@ -40,7 +41,8 @@ function cursorToSkip(cursor: Cursor): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
+// Cursor format: mtime:lines:size:ctime:inode:device:birthtime, optionally
+// followed by the physical root's device, inode and creation time. The
 // mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
 // same-millisecond rewrites) lets a same-mtime tail completion or a
 // same-mtime replacement back into discovery. Legacy `${mtime}:${lines}`
@@ -52,17 +54,460 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
   return Number(parts[0]) !== stat.mtimeMs
     || Number(parts[2]) !== stat.size
     || Number(parts[3]) !== stat.ctimeMs
-    || Number(parts[4]) !== stat.ino;
+    || Number(parts[4]) !== stat.ino
+    || (parts.length >= 7 && (Number(parts[5]) !== stat.dev || Number(parts[6]) !== stat.birthtimeMs));
 }
 
-const name = 'claude';
-// v6 composes v5 canonical timestamp repair with orphan-family session rows.
-// Existing installs must replay once even when their family cursors are current.
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v6__';
+export const name = 'claude';
+// v7 introduces namespaced session and message IDs for multi-root Claude Code.
+// Existing installs must replay once to upgrade already indexed rows.
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v7__';
+
+function isWindowsStylePath(value: string): boolean {
+  return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\');
+}
+
+export function canonicalRootPath(dir: string): string {
+  const useWin32 = process.platform === 'win32' || isWindowsStylePath(dir);
+  const pathImpl = useWin32 ? win32 : posix;
+  const norm = pathImpl.normalize(dir);
+  const parsedRoot = pathImpl.parse(norm).root;
+  if (norm.length > parsedRoot.length && (norm.endsWith('/') || (useWin32 && norm.endsWith('\\')))) {
+    return norm.slice(0, -1);
+  }
+  return norm;
+}
+
+function sanitizeRootTag(dir: string): string {
+  return basename(canonicalRootPath(dir)).replace(/^\./, '').replace(/:/g, '-') || 'alt';
+}
+
+export function rootTagFor(rootDir: string, defaultRoot: string): string {
+  const normalizedRoot = physicalPath(rootDir);
+  const normalizedDefault = physicalPath(defaultRoot);
+  if (sameNormalizedPath(normalizedRoot, normalizedDefault)) return '';
+  const base = sanitizeRootTag(normalizedRoot);
+  const hashInput = (process.platform === 'win32' || isWindowsStylePath(normalizedRoot))
+    ? normalizedRoot.toLowerCase()
+    : normalizedRoot;
+  const hash = createHash('sha256').update(hashInput).digest('hex').slice(0, 6);
+  return `${base}-${hash}`;
+}
+
+function lexicalPathInside(root: string, candidate: string): boolean {
+  const useWin32 = process.platform === 'win32' || (isWindowsStylePath(root) && isWindowsStylePath(candidate));
+  const pathImpl = useWin32 ? win32 : { normalize, relative, isAbsolute };
+  const base = pathImpl.normalize(root);
+  const target = pathImpl.normalize(candidate);
+  const cmpBase = useWin32 ? base.toLowerCase() : base;
+  const cmpTarget = useWin32 ? target.toLowerCase() : target;
+  if (cmpBase === cmpTarget) return true;
+  const rel = pathImpl.relative(cmpBase, cmpTarget);
+  if (rel.length === 0) return false;
+  return !pathImpl.isAbsolute(rel) && !/(^|[/\\])\.\.([/\\]|$)/.test(rel);
+}
+
+export function sameNormalizedPath(left: string, right: string): boolean {
+  const useWin32 = process.platform === 'win32' || (isWindowsStylePath(left) && isWindowsStylePath(right));
+  const norm = useWin32 ? win32.normalize : normalize;
+  const a = norm(left);
+  const b = norm(right);
+  return useWin32 ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function tryRealpath(target: string): string | null {
+  try {
+    return realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+function physicalPath(target: string): string {
+  return canonicalRootPath(tryRealpath(target) ?? target);
+}
+
+function lexicalPathKey(path: string): string {
+  const normalized = canonicalRootPath(path);
+  return process.platform === 'win32' || isWindowsStylePath(path) ? normalized.toLowerCase() : normalized;
+}
+
+function watchPathOnDisk(path: string): string {
+  // Deletion events identify a path that no longer resolves. Resolve its
+  // closest surviving ancestor to recover the physical watcher spelling.
+  let ancestor = normalize(path);
+  for (;;) {
+    const resolved = tryRealpath(ancestor);
+    if (resolved !== null) return join(resolved, relative(ancestor, path));
+    const parent = dirname(ancestor);
+    if (parent === ancestor) return path;
+    ancestor = parent;
+  }
+}
+
+function hasUnresolvedLink(path: string): boolean {
+  try { return lstatSync(path).isSymbolicLink(); }
+  catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) return false;
+    const parent = dirname(path);
+    return parent !== path && tryRealpath(parent) === null && hasUnresolvedLink(parent);
+  }
+}
+
+const CLAUDE_ROOT_OBSERVATION_KEY = '__claude_configured_roots__';
+
+interface ClaudePhysicalRoot {
+  readonly path: string;
+  readonly identity: string | null;
+}
+
+interface ClaudeRootObservation {
+  readonly kind: 'root-observation';
+  readonly roots: ReadonlyMap<string, ClaudePhysicalRoot | null>;
+  readonly cursor: string;
+}
+
+function readRootObservations(cursor: Cursor): Map<string, string> | null {
+  if (!cursor?.startsWith('0:0:')) return null;
+  try {
+    const entries: unknown = JSON.parse(cursor.slice(4));
+    if (!Array.isArray(entries)) return null;
+    return new Map(entries.filter((entry): entry is [string, string] =>
+      Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && typeof entry[1] === 'string'));
+  } catch { return null; }
+}
+
+function rootObservationUnits(
+  observedRoots: ReadonlyMap<string, ClaudePhysicalRoot | null>,
+  physicalRoots: ReadonlyMap<string, ClaudePhysicalRoot>,
+  indexed: readonly IndexedSession[],
+  ctx: DiscoverContext,
+  usesRootSet: boolean,
+): IndexUnit[] {
+  if (ctx.previousCursor === undefined || ctx.indexedSessions === undefined) return [];
+  const previous = readRootObservations(ctx.previousCursor(CLAUDE_ROOT_OBSERVATION_KEY));
+  if (!usesRootSet && previous === null && ![...observedRoots].some(([configured, physical]) =>
+    physical !== null && !sameNormalizedPath(configured, physical.path))) return [];
+  const indexedRoots = new Set(indexed.flatMap(session => {
+    const location = transcriptLocation(session.jsonlPath);
+    return location === null ? [] : [lexicalPathKey(location.root)];
+  }));
+  const hasUnselectedHistory = [...indexedRoots].some(root => !physicalRoots.has(root));
+  // An incremental exclusion leaves the store's rows in the index. Keep its
+  // association available in case the setting is restored before the store.
+  const recorded = new Map([...previous ?? []].filter(([, root]) => indexedRoots.has(lexicalPathKey(root))));
+  for (const [configured, physical] of observedRoots) {
+    const key = lexicalPathKey(configured);
+    const priorRoot = previous?.get(key);
+    const priorKey = priorRoot === undefined ? null : lexicalPathKey(priorRoot);
+    const displacedHistory = priorKey === null
+      ? previous === null && physical === null && hasUnselectedHistory
+      : indexedRoots.has(priorKey) && !physicalRoots.has(priorKey);
+    if (displacedHistory) {
+      ctx.reportIncompleteInventory?.({ path: configured, error: 'Configured Claude root no longer resolves to its indexed store' });
+      if (priorRoot === undefined) return [];
+      recorded.set(key, priorRoot);
+    } else if (physical !== null) {
+      recorded.set(key, physical.path);
+    }
+  }
+  const cursor = `0:0:${JSON.stringify([...recorded].sort(([left], [right]) => left.localeCompare(right)))}`;
+  if (ctx.lastCursor(CLAUDE_ROOT_OBSERVATION_KEY) === cursor) return [];
+  return [{
+    key: CLAUDE_ROOT_OBSERVATION_KEY, sessionId: '',
+    meta: { kind: 'root-observation', roots: observedRoots, cursor } satisfies ClaudeRootObservation,
+  }];
+}
+
+function transcriptLocation(path: string) {
+  const pathImpl = process.platform === 'win32' || isWindowsStylePath(path) ? win32 : posix;
+  const projectDir = pathImpl.dirname(path);
+  const projectsDir = pathImpl.dirname(projectDir);
+  if (pathImpl.basename(projectsDir) !== 'projects') return null;
+  const root = pathImpl.dirname(projectsDir);
+  return { root, project: pathImpl.basename(projectDir), file: pathImpl.basename(path) };
+}
+
+function checkpointIdentifiesFile(fields: readonly string[], stat: Stats): boolean {
+  if (fields.length < 5 || stat.ino === 0 || !stat.isFile()) return false;
+  // Older full cursors lack a device and creation time. A file created
+  // after that checkpoint cannot be the original inode, even if its
+  // inode number has since been reused.
+  return Number(fields[4]) === stat.ino
+    && stat.ctimeMs >= Number(fields[3])
+    && (fields.length >= 7
+      ? Number(fields[5]) === stat.dev && Number(fields[6]) === stat.birthtimeMs
+      : stat.birthtimeMs > 0 && stat.birthtimeMs <= Number(fields[3]));
+}
+
+function checkpointMatchesFile(cursor: Cursor, path: string): string | null {
+  try {
+    const stat = statSync(path);
+    // A hard-linked transcript can live in independent selected stores.
+    // For a relocation, require either the old snapshot or a growing file
+    // with the same filesystem identity.
+    const fields = cursor?.split(':') ?? [];
+    if (stat.nlink !== 1 || !checkpointIdentifiesFile(fields, stat)) return null;
+    const mtime = Number(fields[0]);
+    const size = Number(fields[2]);
+    const ctime = Number(fields[3]);
+    return (stat.size === size && stat.mtimeMs === mtime && stat.ctimeMs === ctime)
+      || (stat.size > size && stat.mtimeMs >= mtime)
+      ? fileSignature(stat) : null;
+  } catch { return null; }
+}
+
+function mayUseStoredPath(cursor: Cursor, path: string): boolean {
+  try {
+    const stat = statSync(path);
+    return checkpointIdentifiesFile(cursor?.split(':') ?? [], stat);
+  } catch (error) {
+    // Surviving children may still attest a missing main transcript.
+    return error instanceof Error && 'code' in error && error.code === 'ENOENT';
+  }
+}
+
+function physicalDirectoryIdentity(root: string): string | null {
+  try {
+    const stat = statSync(root);
+    return stat.isDirectory() && stat.ino !== 0 ? `${stat.dev}:${stat.ino}:${stat.birthtimeMs}` : null;
+  } catch { return null; }
+}
+
+function checkpointRootIdentity(cursor: Cursor): string | null {
+  const fields = cursor?.split(':') ?? [];
+  return fields.length === 10 ? fields.slice(7).join(':') : null;
+}
+
+function checkpointOwnsStoredPath(cursor: Cursor, root: string, path: string): boolean {
+  const identity = checkpointRootIdentity(cursor);
+  return identity === null ? mayUseStoredPath(cursor, path) : identity === physicalDirectoryIdentity(root);
+}
+
+function rootMatchingCheckpoint(
+  location: NonNullable<ReturnType<typeof transcriptLocation>>,
+  roots: readonly string[],
+  cursor: Cursor,
+): string | undefined {
+  const rootIdentity = checkpointRootIdentity(cursor);
+  const matching = roots.filter(root => {
+    if (rootIdentity !== null && rootIdentity !== physicalDirectoryIdentity(root)) return false;
+    const path = join(root, 'projects', location.project, location.file);
+    if (checkpointMatchesFile(cursor, path) === null) return false;
+    const resolved = tryRealpath(path);
+    return resolved !== null && sameNormalizedPath(path, resolved);
+  });
+  return matching.length === 1 ? matching[0] : undefined;
+}
+
+function orphanRootCandidates(
+  location: NonNullable<ReturnType<typeof transcriptLocation>>,
+  roots: readonly string[],
+  cursor: Cursor,
+  ctx: DiscoverContext,
+) {
+  const session = location.file.slice(0, -'.jsonl'.length);
+  if (!location.file.endsWith('.jsonl') || !isSafePathSegment(session)) return [];
+  const parent = join('projects', location.project);
+  const historicalDirectory = join(location.root, parent, session, 'subagents');
+  const rootIdentity = checkpointRootIdentity(cursor);
+  return roots.flatMap(root => {
+    const mainPath = join(root, parent, location.file);
+    if (!transcriptProvedMissing(mainPath)) return [];
+    const directory = join(root, parent, session, 'subagents');
+    let members: string[];
+    try { members = orphanMemberPaths(directory); } catch { return []; }
+    if (members.length === 0) return [];
+    const verified = rootIdentity !== null
+      ? rootIdentity === physicalDirectoryIdentity(root)
+      : members.some(member => {
+        const historicalPath = join(historicalDirectory, relative(directory, member));
+        const prior = ctx.previousCursor?.(historicalPath) ?? ctx.lastCursor(historicalPath);
+        if (checkpointMatchesFile(prior, member) === null) return false;
+        const resolved = tryRealpath(member);
+        return resolved !== null && sameNormalizedPath(member, resolved);
+      });
+    return [{ root, mainPath, verified }];
+  });
+}
+
+function sessionRootTag(sessionId: string): string {
+  const separator = sessionId.indexOf(':');
+  return separator < 0 ? '' : sessionId.slice(0, separator);
+}
+
+function resolveIndexedRoots(
+  roots: readonly string[],
+  defaultRoot: string,
+  configured: readonly string[],
+  indexed: readonly IndexedSession[],
+  ctx: DiscoverContext,
+) {
+  const preV7 = (ctx.previousCursor?.(CLAUDE_CANONICAL_TRANSCRIPT_MARKER) ?? null) === null;
+  const canonicalTags = new Map(roots.map(root => [root, rootTagFor(root, defaultRoot)]));
+  const legacyBareIds = new Set<string>();
+  const byRoot = new Map(roots.map(root => [root, new Map<string, IndexedSession[]>()]));
+  const rootByKey = new Map(roots.map(root => [lexicalPathKey(root), root]));
+  const observedPriorRoots = new Map<string, string | null>();
+  const reservedTags = new Set<string>();
+  const blockedPaths = new Set<string>();
+  for (const session of indexed) {
+    const location = transcriptLocation(session.jsonlPath);
+    if (location === null) continue;
+    const cursor = ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath);
+    let root = rootByKey.get(lexicalPathKey(location.root));
+    if (root !== undefined && !checkpointOwnsStoredPath(cursor, root, session.jsonlPath)) root = undefined;
+    if (root === undefined) {
+      // A currently resolving symlink says nothing about where it pointed at
+      // indexing time. Match the prior checkpoint against the selected stores.
+      root = rootMatchingCheckpoint(location, roots, cursor);
+    }
+    const orphanCandidates = root === undefined ? orphanRootCandidates(location, roots, cursor, ctx) : [];
+    const verifiedOrphans = orphanCandidates.filter(candidate => candidate.verified);
+    const orphanRelocation = root === undefined && verifiedOrphans.length === 1;
+    if (orphanRelocation) root = verifiedOrphans[0]?.root;
+    if (root === undefined) {
+      if (!observedPriorRoots.has(location.root)) observedPriorRoots.set(location.root, tryRealpath(location.root));
+      const observedPriorRoot = observedPriorRoots.get(location.root) ?? null;
+      const ambiguousOrphans = orphanCandidates.filter(candidate => candidate.verified
+        || observedPriorRoot === null || sameNormalizedPath(observedPriorRoot, candidate.root));
+      const possiblySelected = configured.some(candidate => sameNormalizedPath(candidate, location.root))
+        || (observedPriorRoot !== null && rootByKey.has(lexicalPathKey(observedPriorRoot)))
+        || (observedPriorRoot === null && roots.some(candidate => existsSync(join(candidate, 'projects', location.project, location.file))))
+        || ambiguousOrphans.length > 0;
+      if (possiblySelected) {
+        for (const { mainPath } of ambiguousOrphans) blockedPaths.add(lexicalPathKey(mainPath));
+        // An unresolved prior row and its replacement must not share a
+        // path-keyed cursor, even when their session IDs are distinct.
+        if (rootByKey.has(lexicalPathKey(location.root))) blockedPaths.add(lexicalPathKey(session.jsonlPath));
+        ctx.retainSession?.(session.sessionId);
+        ctx.reportSkippedArtifact?.({ path: session.jsonlPath, error: 'Prior Claude root identity cannot be verified' });
+      }
+      // A former path can become a new default root or acquire the same
+      // deterministic tag. Keep unverified history out of its namespace.
+      reservedTags.add(sessionRootTag(session.sessionId));
+      continue;
+    }
+    if (preV7 && !orphanRelocation && sessionRootTag(session.sessionId) === ''
+      && canonicalTags.get(root) !== '' && !sameNormalizedPath(location.root, defaultRoot)) {
+      legacyBareIds.add(session.sessionId);
+    }
+    const sessions = byRoot.get(root)!;
+    const key = lexicalPathKey(join(root, 'projects', location.project, location.file));
+    const sameFile = sessions.get(key) ?? [];
+    sameFile.push(session);
+    sessions.set(key, sameFile);
+  }
+
+  const tagOwners = new Map<string, Set<string>>();
+  for (const [root, sessions] of byRoot) {
+    for (const session of [...sessions.values()].flat()) {
+      const tag = sessionRootTag(session.sessionId);
+      if (legacyBareIds.has(session.sessionId)) continue;
+      const owners = tagOwners.get(tag) ?? new Set<string>();
+      owners.add(root);
+      tagOwners.set(tag, owners);
+    }
+  }
+
+  const assignedTags = new Set<string>();
+  return [...roots].sort((a, b) => lexicalPathKey(a).localeCompare(lexicalPathKey(b))).map(root => {
+    const sessions = byRoot.get(root)!;
+    const canonical = canonicalTags.get(root)!;
+    const established = [...tagOwners].filter(([, owners]) => owners.size === 1 && owners.has(root)).map(([tag]) => tag);
+    const available = (tag: string) => !assignedTags.has(tag)
+      && !reservedTags.has(tag) && (!tagOwners.has(tag) || established.includes(tag));
+    // Prefer an established scope even when this physical store is now the
+    // default. When there are established duplicates, prefer the canonical tag.
+    let tag = established.includes(canonical) ? canonical
+      : established.length === 1 ? established[0]!
+      : canonical;
+    if (!available(tag) && !established.includes(tag)) {
+      const digest = createHash('sha256').update(lexicalPathKey(root)).digest('hex');
+      tag = `${sanitizeRootTag(root)}-${digest}`;
+    }
+    assignedTags.add(tag);
+    return { root, sessions, tag, legacyBareIds, blockedPaths };
+  });
+}
+
+export function legacyClaudeMigrationTargets(
+  defaultRoot: string,
+  configuredRoots: readonly string[],
+  indexed: readonly IndexedSession[],
+  previousCursor: (path: string) => Cursor,
+): { oldId: string; newId: string; jsonlPath: string }[] {
+  const roots = new Map(configuredRoots.map(configured => {
+    const root = physicalPath(configured);
+    return [lexicalPathKey(root), root];
+  }));
+  return resolveIndexedRoots([...roots.values()], defaultRoot, configuredRoots, indexed, {
+    lastCursor: previousCursor, previousCursor,
+  }).flatMap(({ sessions, tag, legacyBareIds }) => [...sessions.values()].flatMap(priors => priors
+    .filter(prior => legacyBareIds.has(prior.sessionId))
+    .map(prior => ({
+      oldId: prior.sessionId,
+      newId: canonicalSessionId(prior.sessionId, tag),
+      jsonlPath: prior.jsonlPath,
+    }))));
+}
+
+export function pathInside(root: string, candidate: unknown): boolean {
+  if (typeof candidate !== 'string' || candidate.length === 0) return false;
+  if (lexicalPathInside(root, candidate)) return true;
+  const realRoot = tryRealpath(root);
+  const realCandidate = tryRealpath(candidate);
+  if (realRoot !== null && realCandidate !== null) {
+    return lexicalPathInside(realRoot, realCandidate);
+  }
+  return false;
+}
+
+function isSafePathSegment(value: string): boolean {
+  return value.length > 0
+    && value !== '.'
+    && value !== '..'
+    && !value.includes('/')
+    && !value.includes('\\')
+    && !value.includes('\0');
+}
+
+export function canonicalSessionId(rawSessionId: string, rootTag: string): string {
+  return rootTag ? `${rootTag}:${rawSessionId}` : rawSessionId;
+}
+
+export function bareSessionId(sessionId: unknown): string {
+  const text = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '');
+  const separator = text.indexOf(':');
+  return separator === -1 ? text : text.slice(separator + 1);
+}
+
+function messageUuid(sessionId: string, rawUuid: string): string {
+  return sessionId.includes(':') ? `${sessionId}:${rawUuid}` : rawUuid;
+}
+
+function scopedId(sessionId: string, rawId: string): string {
+  return sessionId.includes(':') ? `${sessionId}:${rawId}` : rawId;
+}
+
+function extractRawUuid(messageUuid: string, sessionId?: unknown): string {
+  const sessionStr = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '');
+  if (sessionStr && messageUuid.startsWith(`${sessionStr}:`)) {
+    return messageUuid.slice(sessionStr.length + 1);
+  }
+  const idx = messageUuid.lastIndexOf(':');
+  return idx === -1 ? messageUuid : messageUuid.slice(idx + 1);
+}
 
 interface ClaudeWorkflowUnitMeta {
   readonly kind: 'workflow';
   readonly mainTranscriptPath: string;
+  readonly aliasTransition?: ClaudeAliasTransition;
+}
+
+interface ClaudeAliasTransition {
+  readonly path: string;
+  readonly signature: string;
 }
 
 function totalInputTokens(usage: Record<string, unknown>): number | null {
@@ -82,10 +527,64 @@ function totalInputTokens(usage: Record<string, unknown>): number | null {
   return seen ? total : null;
 }
 
-function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
+function workflowMainSignature(mainTranscriptPath: string): string {
+  try {
+    return fileSignature(statSync(mainTranscriptPath));
+  } catch {
+    return 'missing';
+  }
+}
+
+function fileSignature(stat: Stats): string {
+  return `${stat.mtimeMs}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+}
+
+function assertRootIdentity(root: ClaudePhysicalRoot): void {
+  if (root.identity !== null && physicalDirectoryIdentity(root.path) !== root.identity) {
+    throw new RetryableSourceReadError(root.path, 'Claude store changed during indexing');
+  }
+}
+
+function assertTranscriptSignature(path: string, signature: string): void {
+  if (signature === 'missing' || workflowMainSignature(path) !== signature) {
+    throw new RetryableSourceReadError(path, 'Claude transcript changed during alias reconciliation');
+  }
+}
+
+function discoverAt(
+  rootDir: string,
+  ctx: DiscoverContext,
+  rootTag: string,
+  priorByPath: ReadonlyMap<string, IndexedSession[]>,
+  indexed: readonly IndexedSession[],
+  usesRootSet: boolean,
+  legacyBareIds: ReadonlySet<string>,
+  blockedPaths: ReadonlySet<string>,
+  sourceRoot: ClaudePhysicalRoot,
+): IndexUnit[] {
   const projectsDir = join(rootDir, 'projects');
-  if (!existsSync(projectsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
-    ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
+  let projectsStat: Stats | null = null;
+  let projectsStatError: NodeJS.ErrnoException | null = null;
+  try {
+    projectsStat = statSync(projectsDir);
+  } catch (error) {
+    projectsStatError = error as NodeJS.ErrnoException;
+  }
+  if (projectsStatError !== null) {
+    if (projectsStatError.code !== 'ENOENT') {
+      ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectsDir, projectsStatError));
+      return [];
+    }
+    const rootWasIndexed = indexed.some((session) => pathInside(rootDir, session.jsonlPath));
+    const rootExists = existsSync(rootDir);
+    if (rootWasIndexed || hasUnresolvedLink(rootDir) || (!usesRootSet && !rootExists && indexed.length > 0)) {
+      ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is unavailable' });
+    }
+    return [];
+  }
+  if (!projectsStat!.isDirectory()) {
+    ctx.reportIncompleteInventory?.({ path: projectsDir, error: 'Source folder is not a directory' });
+    return [];
   }
   const historyPath = normalize(join(rootDir, 'history.jsonl'));
   const historyTitles = new Map<string, string>();
@@ -102,12 +601,15 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const forcedPaths = new Set<string>();
   let historyChanged = false;
   for (const changedPath of ctx.changedPaths ?? []) {
-    const rootRelative = isAbsolute(changedPath)
-      ? normalize(changedPath)
+    const observedPath = isAbsolute(changedPath)
+      ? watchPathOnDisk(changedPath)
+      : changedPath;
+    const rootRelative = isAbsolute(observedPath)
+      ? normalize(observedPath)
       : normalize(join(rootDir, changedPath));
     if (rootRelative === historyPath) historyChanged = true;
-    const absolute = isAbsolute(changedPath)
-      ? normalize(changedPath)
+    const absolute = isAbsolute(observedPath)
+      ? normalize(observedPath)
       : normalize(join(projectsDir, changedPath));
     const inside = relative(projectsDir, absolute);
     if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
@@ -125,7 +627,42 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const files = discoverJsonlFiles(projectsDir, issue => {
     inventoryComplete = false;
     ctx.reportIncompleteInventory?.(issue);
+  }).filter(file => {
+    const path = file.isSubagent ? join(projectsDir, file.project, `${file.sessionId}.jsonl`) : file.path;
+    return !blockedPaths.has(lexicalPathKey(path));
   });
+  const identityFor = (path: string, rawId: string) => {
+    const canonicalId = canonicalSessionId(rawId, rootTag);
+    const candidates = (priorByPath.get(lexicalPathKey(path)) ?? [])
+      // Pre-v7 bare custom identities use the existing schema migration.
+      .filter(session => bareSessionId(session.sessionId) === rawId && !legacyBareIds.has(session.sessionId));
+    const surviving = candidates.find(session => session.sessionId === canonicalId)
+      ?? candidates.sort((a, b) => a.sessionId.localeCompare(b.sessionId))[0];
+    const sessionId = surviving?.sessionId ?? canonicalId;
+    return {
+      sessionId,
+      aliases: candidates.filter(session => session.sessionId !== sessionId),
+      relocated: candidates.filter(session => !sameNormalizedPath(path, session.jsonlPath)),
+    };
+  };
+  const transitions = new Map<string, ClaudeAliasTransition & { previousIds: string[] }>();
+  for (const file of files) {
+    if (file.isSubagent) continue;
+    const identity = identityFor(file.path, file.sessionId);
+    if (identity.relocated.length > 0 || identity.aliases.length > 0) {
+      const signature = workflowMainSignature(file.path);
+      if (signature === 'missing' || identity.relocated.some(session =>
+        checkpointMatchesFile(ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath), file.path) !== signature)) {
+        inventoryComplete = false;
+        ctx.reportIncompleteInventory?.({ path: file.path, error: 'Claude transcript changed during alias discovery' });
+      }
+      transitions.set(lexicalPathKey(file.path), {
+        path: file.path,
+        signature,
+        previousIds: [identity.sessionId, ...identity.aliases.map(alias => alias.sessionId)],
+      });
+    }
+  }
   const orphanMembers = new Map<string, IndexUnit[]>();
   for (const file of files) {
     if (!file.isSubagent) continue;
@@ -133,7 +670,7 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     if (!transcriptProvedMissing(mainPath)) continue;
     const key = join(projectsDir, file.project, file.sessionId, 'subagents');
     const members = orphanMembers.get(key) ?? [];
-    members.push({ key: file.path, sessionId: file.sessionId, project: file.project,
+    members.push({ key: file.path, sessionId: identityFor(mainPath, file.sessionId).sessionId, project: file.project,
       isSubagent: true, agentId: file.agentId,
       meta: file.workflowRunId ? { workflowRunId: file.workflowRunId } : {} });
     orphanMembers.set(key, members);
@@ -142,65 +679,105 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const orphanUnits: IndexUnit[] = [];
   for (const [key, members] of orphanMembers) {
     const member = members[0]!;
-    if (!inventoryComplete) { ctx.retainSession?.(member.sessionId); continue; }
-    const mainPath = join(dirname(key), '..', `${member.sessionId}.jsonl`);
-    const mainCursor = ctx.previousCursor?.(normalize(mainPath)) ?? ctx.lastCursor(normalize(mainPath));
+    const rawMainPath = join(dirname(key), '..', `${bareSessionId(member.sessionId)}.jsonl`);
+    const mainPath = normalize(rawMainPath);
+    const prior = priorByPath.get(lexicalPathKey(mainPath))?.[0];
+    if (!inventoryComplete) {
+      ctx.retainSession?.(member.sessionId);
+      if (prior && prior.sessionId !== member.sessionId) ctx.retainSession?.(prior.sessionId);
+      continue;
+    }
+    const mainCursor = ctx.previousCursor?.(mainPath) ?? ctx.lastCursor(mainPath);
     let signature: string;
     try { signature = orphanFingerprint([...members.map(unit => unit.key), ...orphanWorkflowPaths(key)], mainCursor); }
     catch (error) {
       ctx.retainSession?.(member.sessionId);
+      if (prior && prior.sessionId !== member.sessionId) ctx.retainSession?.(prior.sessionId);
       ctx.reportIncompleteInventory?.(sourceInventoryIssue(key, error));
       continue;
     }
     if (ctx.lastCursor(key) === signature) continue;
+    if (prior && prior.sessionId !== member.sessionId) {
+      ctx.retainSession?.(prior.sessionId);
+    }
     // A missing main file does not revoke already indexed history. Preserve
     // that evidence during force cleanup while refreshing surviving children.
     orphanUnits.push({ key, sessionId: member.sessionId, project: member.project, preserveSessionHistory: true,
-      meta: { kind: 'orphan-family', members, signature, mainPath: normalize(mainPath), mainCursor } satisfies ClaudeOrphanFamilyMeta });
+      meta: { kind: 'orphan-family', members, signature, mainPath, mainCursor } satisfies ClaudeOrphanFamilyMeta });
   }
-  const transcriptUnits = files.filter((file) => {
-    if (orphanPaths.has(file.path)) return false;
+  const transcriptUnits: IndexUnit[] = files.flatMap((file) => {
+    if (orphanPaths.has(file.path)) return [];
+    const mainPath = file.isSubagent ? join(projectsDir, file.project, `${file.sessionId}.jsonl`) : file.path;
+    const transition = transitions.get(lexicalPathKey(mainPath));
     const normalizedPath = normalize(file.path);
-    if (ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath)) return false;
+    if (!transition && ctx.changedPaths !== undefined && !historyChanged && !changedTranscriptPaths.has(normalizedPath)) return [];
     const cursor = ctx.lastCursor(file.path);
-    return historyChanged
-      || forcedPaths.has(normalizedPath)
-      || cursor === null
-      || cursorSignatureDiffers(cursor, file.path);
-  }).map((f: any) => ({
-    key: f.path,
-    sessionId: f.sessionId,
-    project: f.project,
-    isSubagent: f.isSubagent,
-    agentId: f.agentId,
-    meta: {
-      ...(f.workflowRunId ? { workflowRunId: f.workflowRunId } : {}),
-      ...(historyTitles.has(f.sessionId) ? { historyTitle: historyTitles.get(f.sessionId) } : {}),
-    },
-  }));
+    if (!transition && !historyChanged && !forcedPaths.has(normalizedPath) && cursor !== null
+      && !cursorSignatureDiffers(cursor, file.path)) return [];
+    const { sessionId, aliases } = identityFor(mainPath, file.sessionId);
+    return [{
+      key: file.path,
+      sessionId,
+      project: file.project,
+      isSubagent: file.isSubagent,
+      agentId: file.agentId,
+      ...(!file.isSubagent && aliases.length > 0 ? {
+        retractSessionIds: aliases.map(alias => alias.sessionId),
+        redirectRetractedSessionMemories: {
+          newMessagePrefix: scopedId(sessionId, ''),
+          oldMessagePrefixes: new Map(aliases.map(alias => [alias.sessionId, scopedId(alias.sessionId, '')])),
+        },
+      } : {}),
+      ...(transition ? { atomicGroup: mainPath } : {}),
+      meta: {
+        ...(file.workflowRunId ? { workflowRunId: file.workflowRunId } : {}),
+        ...(historyTitles.has(file.sessionId) ? { historyTitle: historyTitles.get(file.sessionId) } : {}),
+        ...(transition ? { aliasTransition: transition } : {}),
+      },
+    }];
+  });
 
   const workflowUnits: IndexUnit[] = [];
-  if (!existsSync(projectsDir)) return [...transcriptUnits, ...orphanUnits];
+  const reportWorkflowIssue = (path: string, error: unknown) => {
+    inventoryComplete = false;
+    ctx.reportIncompleteInventory?.(sourceInventoryIssue(path, error));
+  };
+  const finish = (units: IndexUnit[]) => {
+    if (!inventoryComplete) {
+      for (const { previousIds } of transitions.values()) {
+        for (const id of previousIds) ctx.retainSession?.(id);
+      }
+      units = units.filter(unit => unit.atomicGroup === undefined);
+    }
+    // Publish children before the main unit verifies and redirects anchors
+    // to the surviving family, all inside the same publication transaction.
+    return units.filter(unit => !unit.redirectRetractedSessionMemories)
+      .concat(units.filter(unit => unit.redirectRetractedSessionMemories))
+      .map(unit => ({ ...unit, meta: { ...unit.meta as object, sourceRoot } }));
+  };
   let projects: string[];
   try { projects = readdirSync(projectsDir); } catch (error) {
-    ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectsDir, error));
-    return [...transcriptUnits, ...orphanUnits];
+    reportWorkflowIssue(projectsDir, error);
+    return finish([...transcriptUnits, ...orphanUnits]);
   }
   for (const project of projects) {
     const projectPath = join(projectsDir, project);
     if (!isDir(projectPath)) continue;
     let sessionIds: string[];
     try { sessionIds = readdirSync(projectPath); } catch (error) {
-      ctx.reportIncompleteInventory?.(sourceInventoryIssue(projectPath, error));
+      reportWorkflowIssue(projectPath, error);
       continue;
     }
     for (const sessionId of sessionIds) {
       const workflowDir = join(projectPath, sessionId, 'workflows');
       if (!isDir(workflowDir)) continue;
       const mainTranscriptPath = join(projectPath, `${sessionId}.jsonl`);
+      if (blockedPaths.has(lexicalPathKey(mainTranscriptPath))) continue;
+      const transition = transitions.get(lexicalPathKey(mainTranscriptPath));
+      const currentMainSig = workflowMainSignature(mainTranscriptPath);
       let files: string[];
       try { files = readdirSync(workflowDir); } catch (error) {
-        ctx.reportIncompleteInventory?.(sourceInventoryIssue(workflowDir, error));
+        reportWorkflowIssue(workflowDir, error);
         continue;
       }
       for (const file of files) {
@@ -209,26 +786,33 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
         const normalizedPath = normalize(workflowPath);
         const relationshipChanged = changedTranscriptPaths.has(normalize(mainTranscriptPath));
         if (
-          ctx.changedPaths !== undefined
+          !transition && ctx.changedPaths !== undefined
           && !changedWorkflowPaths.has(normalizedPath)
           && !relationshipChanged
         ) continue;
         const mtime = statSync(workflowPath).mtimeMs;
         const cursor = ctx.lastCursor(workflowPath);
-        if (!relationshipChanged && cursor !== null && Number(cursor.split(':')[0]) >= mtime) continue;
+        const cursorParts = cursor?.split(':');
+        const cursorMtime = cursorParts ? Number(cursorParts[0]) : NaN;
+        const cursorMainSig = cursorParts && cursorParts.length >= 3 ? cursorParts.slice(2).join(':') : null;
+        if (!transition && !relationshipChanged && cursor !== null && cursorMtime >= mtime && cursorMainSig === currentMainSig) continue;
         workflowUnits.push({
           key: workflowPath,
-          sessionId,
+          sessionId: identityFor(mainTranscriptPath, sessionId).sessionId,
           project,
-          meta: { kind: 'workflow', mainTranscriptPath } satisfies ClaudeWorkflowUnitMeta,
+          ...(transition ? { atomicGroup: mainTranscriptPath } : {}),
+          meta: { kind: 'workflow', mainTranscriptPath, ...(transition ? { aliasTransition: transition } : {}) } satisfies ClaudeWorkflowUnitMeta,
         });
       }
     }
   }
-  return [...transcriptUnits, ...orphanUnits, ...workflowUnits.filter(unit =>
-    !orphanMembers.has(join(projectsDir, unit.project!, unit.sessionId, 'subagents')))];
+  return finish([...transcriptUnits, ...orphanUnits, ...workflowUnits.filter(unit =>
+    !orphanMembers.has(join(projectsDir, unit.project!, bareSessionId(unit.sessionId), 'subagents')))]);
 }
 
+export function discover(ctx: DiscoverContext): IndexUnit[] {
+  return createClaudeProvider().discover(ctx);
+}
 function toolResultText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -269,21 +853,24 @@ function workflowParentToolUseId(
 
 function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
   const mtime = statSync(unit.key).mtimeMs;
-  const outCursor = `${mtime}:1`;
+  const meta = unit.meta as ClaudeWorkflowUnitMeta;
+  const mainSig = workflowMainSignature(meta.mainTranscriptPath);
+  const outCursor = `${mtime}:1:${mainSig}`;
   let workflow: any;
   try { workflow = JSON.parse(readFileSync(unit.key, 'utf8')); } catch { return outCursor; }
   if (!workflow?.runId) return outCursor;
-  const meta = unit.meta as ClaudeWorkflowUnitMeta;
   const progress = Array.isArray(workflow.workflowProgress) ? workflow.workflowProgress : [];
   const agents = progress.filter((item: any) => item?.type === 'workflow_agent' && item.agentId);
+  const rawParentToolUseId = workflowParentToolUseId(
+    meta.mainTranscriptPath,
+    workflow.runId,
+  );
+  const canonicalRunId = scopedId(unit.sessionId, String(workflow.runId));
   yield {
     kind: 'workflow',
-    run_id: workflow.runId,
+    run_id: canonicalRunId,
     session_id: unit.sessionId,
-    parent_tool_use_id: workflowParentToolUseId(
-      meta.mainTranscriptPath,
-      workflow.runId,
-    ),
+    parent_tool_use_id: rawParentToolUseId ? scopedId(unit.sessionId, rawParentToolUseId) : null,
     task_id: workflow.taskId || null,
     script: workflow.script || null,
     result_json: workflow.result ? JSON.stringify(workflow.result) : null,
@@ -297,8 +884,8 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
   for (const item of agents) {
     yield {
       kind: 'workflow_agent',
-      agent_id: `agent-${item.agentId}`,
-      run_id: workflow.runId,
+      agent_id: scopedId(unit.sessionId, `agent-${item.agentId}`),
+      run_id: canonicalRunId,
       session_id: unit.sessionId,
       phase: item.phaseTitle || null,
       label: item.label || null,
@@ -313,16 +900,52 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
 }
 
 export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+  const meta = unit.meta as { aliasTransition?: ClaudeAliasTransition; sourceRoot?: ClaudePhysicalRoot } | undefined;
+  const { aliasTransition: transition, sourceRoot } = meta ?? {};
+  if (sourceRoot !== undefined) assertRootIdentity(sourceRoot);
+  if (transition === undefined) {
+    const nextCursor = yield* parseUnit(unit, cursor);
+    if (sourceRoot !== undefined) assertRootIdentity(sourceRoot);
+    return nextCursor;
+  }
+  const memberSignature = workflowMainSignature(unit.key);
+  assertTranscriptSignature(transition.path, transition.signature);
+  assertTranscriptSignature(unit.key, memberSignature);
+  const nextCursor = yield* parseUnit(unit, null);
+  assertTranscriptSignature(unit.key, memberSignature);
+  assertTranscriptSignature(transition.path, transition.signature);
+  if (sourceRoot !== undefined) assertRootIdentity(sourceRoot);
+  return nextCursor;
+}
+
+function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+  const rootObservation = unit.meta as ClaudeRootObservation | undefined;
+  if (rootObservation?.kind === 'root-observation') {
+    for (const [configured, physical] of rootObservation.roots) {
+      const resolved = tryRealpath(configured);
+      if (resolved === null ? physical !== null : physical === null || !sameNormalizedPath(resolved, physical.path)) {
+        throw new RetryableSourceReadError(configured, 'Configured Claude root changed during discovery');
+      }
+      if (physical !== null) assertRootIdentity(physical);
+    }
+    return rootObservation.cursor;
+  }
   if ((unit.meta as ClaudeOrphanFamilyMeta | undefined)?.kind === 'orphan-family') {
     return yield* parseOrphanFamily(unit, cursor);
   }
   if ((unit.meta as ClaudeWorkflowUnitMeta | undefined)?.kind === 'workflow') {
     return yield* parseWorkflow(unit);
   }
-  const skip = cursorToSkip(cursor);
   const stat = statSync(unit.key);
+  const fields = cursor?.split(':') ?? [];
+  const resume = fields.length < 5 || (checkpointIdentifiesFile(fields, stat) && stat.size >= Number(fields[2]));
+  const skip = resume ? cursorToSkip(cursor) : 0;
   const mtime = stat.mtimeMs;
   const isSubagent = unit.isSubagent === true;
+  const location = isSubagent ? null : transcriptLocation(unit.key);
+  const physical = location === null ? null : tryRealpath(location.root);
+  const rootIdentity = physical !== null && location !== null && sameNormalizedPath(location.root, physical)
+    ? physicalDirectoryIdentity(physical) : null;
   const records: TranscriptRecord[] = [];
   const historyTitle = ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null;
   let aiTitle: string | null = null;
@@ -379,11 +1002,11 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (lineNum <= skip) return;
 
     if (obj.type === 'system' && obj.subtype === 'away_summary' && obj.content) {
-      records.push({ kind: 'summary', id: obj.uuid || `${sid}-away-${ts}`, session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content });
+      records.push({ kind: 'summary', id: scopedId(sid, obj.uuid || `${bareSessionId(sid)}-away-${ts}`), session_id: sid, timestamp: ts, source: 'away_summary', content: obj.content, visibility: 'visible' });
       return;
     }
     if (obj.type === 'system' && obj.subtype === 'turn_duration' && obj.parentUuid && obj.durationMs) {
-      records.push({ kind: 'message-turn-duration', uuid: obj.parentUuid, turn_duration_ms: obj.durationMs });
+      records.push({ kind: 'message-turn-duration', uuid: messageUuid(sid, obj.parentUuid), turn_duration_ms: obj.durationMs });
       return;
     }
     if (obj.type !== 'user' && obj.type !== 'assistant') return;
@@ -401,12 +1024,14 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     const rawContentType = extractContentType(msg.content);
     const harnessKind = extractHarnessKind(obj, classificationText);
     const contentType = harnessKind === 'skill' ? 'skill_instructions' : rawContentType;
-    const aid = isSubagent ? (unit.agentId ?? null) : (obj.agentId || null);
+    const rawAid = isSubagent ? (unit.agentId ?? null) : (obj.agentId || null);
+    const aid = rawAid ? scopedId(sid, rawAid) : null;
 
+    const msgUuid = messageUuid(sid, obj.uuid);
     if (obj.uuid) {
       records.push({
-        kind: 'message', uuid: obj.uuid, session_id: sid, type: obj.type,
-        parent_uuid: obj.parentUuid || null, timestamp: ts, role: msg.role || obj.type,
+        kind: 'message', uuid: msgUuid, session_id: sid, type: obj.type,
+        parent_uuid: obj.parentUuid ? messageUuid(sid, obj.parentUuid) : null, timestamp: ts, role: msg.role || obj.type,
         text, content_type: contentType, is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind, visibility: 'visible',
         model: msg.model || null,
         is_sidechain: obj.isSidechain ? 1 : 0, agent_id: aid,
@@ -418,7 +1043,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
     if (obj.type === 'assistant' && Array.isArray(msg.content)) {
       for (const b of msg.content) {
         if (b.type === 'tool_use' && b.id)
-          records.push({ kind: 'tool_call', id: b.id, message_uuid: obj.uuid, session_id: sid, name: b.name, presentation: b.name === 'Skill' ? 'skill' : 'default', input_json: truncJson(b.input || {}) as string, file_path: filePath(b.name, b.input) });
+          records.push({ kind: 'tool_call', id: scopedId(sid, b.id), message_uuid: msgUuid, session_id: sid, name: b.name, presentation: b.name === 'Skill' ? 'skill' : 'default', input_json: truncJson(b.input || {}) as string, file_path: filePath(b.name, b.input) });
       }
     }
 
@@ -427,7 +1052,7 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
         if (b.type !== 'tool_result' || !b.tool_use_id) continue;
         const rt = typeof b.content === 'string' ? b.content
           : Array.isArray(b.content) ? b.content.map((c: any) => c.text || '').join('\n') : '';
-        records.push({ kind: 'tool_result', tool_use_id: b.tool_use_id, message_uuid: obj.uuid, session_id: sid, content: trunc(rt), file_path: obj.toolUseResult?.filePath || null, is_error: b.is_error ? 1 : 0 });
+        records.push({ kind: 'tool_result', tool_use_id: scopedId(sid, b.tool_use_id), message_uuid: msgUuid, session_id: sid, content: trunc(rt), file_path: obj.toolUseResult?.filePath || null, is_error: b.is_error ? 1 : 0 });
       }
     }
   });
@@ -441,8 +1066,8 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
         if (workflowRunId) {
           records.push({
             kind: 'workflow_agent',
-            agent_id: unit.agentId,
-            run_id: workflowRunId,
+            agent_id: scopedId(unit.sessionId, unit.agentId),
+            run_id: scopedId(unit.sessionId, workflowRunId),
             session_id: unit.sessionId,
             agent_type: meta.agentType || null,
             description: meta.description || null,
@@ -452,9 +1077,9 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
           const ended = subagentStats.endedAt ? new Date(subagentStats.endedAt).getTime() : null;
           records.push({
             kind: 'subagent',
-            agent_id: unit.agentId,
+            agent_id: scopedId(unit.sessionId, unit.agentId),
             session_id: unit.sessionId,
-            parent_tool_use_id: meta.toolUseId || null,
+            parent_tool_use_id: meta.toolUseId ? scopedId(unit.sessionId, meta.toolUseId) : null,
             agent_type: meta.agentType || null,
             description: meta.description || null,
             duration_ms: started !== null && ended !== null ? ended - started : null,
@@ -495,7 +1120,8 @@ export function* parse(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRec
   }
 
   yield* records;
-  return `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
+  const fileCursor = `${mtime}:${cursorLines}:${stat.size}:${stat.ctimeMs}:${stat.ino}:${stat.dev}:${stat.birthtimeMs}`;
+  return rootIdentity === null ? fileCursor : `${fileCursor}:${rootIdentity}`;
 }
 
 /**
@@ -607,10 +1233,11 @@ function mainTranscriptPathOf(unit: IndexUnit): string | null {
   // Match the owning session directory rather than the first ancestor named
   // subagents (the user's home or project can legally contain that name).
   let directory = dirname(unit.key);
+  const rawId = bareSessionId(unit.sessionId);
   while (dirname(directory) !== directory) {
     const parent = dirname(directory);
-    if (basename(directory) === 'subagents' && basename(parent) === unit.sessionId) {
-      return join(dirname(parent), `${unit.sessionId}.jsonl`);
+    if (basename(directory) === 'subagents' && basename(parent) === rawId) {
+      return join(dirname(parent), `${rawId}.jsonl`);
     }
     directory = parent;
   }
@@ -625,19 +1252,44 @@ function transcriptProvedMissing(path: string): boolean {
 function rawClaude(input: RawLookup): RawRecord | null {
   const mainPath = typeof input.session?.jsonl_path === 'string' ? input.session.jsonl_path : null;
   if (mainPath === null) return null;
+  const location = transcriptLocation(mainPath);
+  if (location !== null) {
+    const realRoot = tryRealpath(location.root);
+    const rootIdentity = checkpointRootIdentity(input.cursor ?? null);
+    if (rootIdentity !== null && rootIdentity !== physicalDirectoryIdentity(location.root)) return null;
+    if (realRoot !== null && !sameNormalizedPath(location.root, realRoot)) {
+      if (checkpointMatchesFile(input.cursor ?? null, mainPath) === null) return null;
+    } else if (input.cursor != null && !mayUseStoredPath(input.cursor, mainPath)) {
+      return null;
+    }
+  }
   let sourcePath = mainPath;
   if (input.agentId !== null) {
     const runId = input.workflowAgent?.['run_id'];
-    sourcePath = typeof runId === 'string'
-      ? join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', 'workflows', runId, `${input.agentId}.jsonl`)
-      : join(dirname(mainPath), String(input.session?.id ?? ''), 'subagents', `${input.agentId}.jsonl`);
+    const bareId = bareSessionId(input.session?.id);
+    const rawAgentId = extractRawUuid(input.agentId, input.session?.id);
+    const rawRunId = typeof runId === 'string' ? extractRawUuid(runId, input.session?.id) : null;
+    if (!isSafePathSegment(bareId) || !isSafePathSegment(rawAgentId)) return null;
+    if (rawRunId !== null && !isSafePathSegment(rawRunId)) return null;
+    const subagentsDir = resolve(dirname(mainPath), bareId, 'subagents');
+    const containerDir = rawRunId !== null ? resolve(subagentsDir, 'workflows', rawRunId) : subagentsDir;
+    sourcePath = resolve(containerDir, `${rawAgentId}.jsonl`);
+    if (!lexicalPathInside(containerDir, sourcePath)) return null;
+    if (!existsSync(sourcePath)) return null;
+    const realContainer = tryRealpath(subagentsDir);
+    const realSource = tryRealpath(sourcePath);
+    if (realContainer === null || realSource === null || !lexicalPathInside(realContainer, realSource)) {
+      return null;
+    }
+  } else if (!existsSync(sourcePath)) {
+    return null;
   }
-  if (!existsSync(sourcePath)) return null;
   let found: string | null = null;
+  const rawMsgUuid = extractRawUuid(input.messageUuid, input.session?.id);
   readLines(sourcePath, (line: string) => {
-    if (!line.includes(input.messageUuid)) return;
+    if (!line.includes(rawMsgUuid)) return;
     try {
-      if (JSON.parse(line)?.uuid === input.messageUuid) {
+      if (JSON.parse(line)?.uuid === rawMsgUuid) {
         found = line;
         return false;
       }
@@ -660,16 +1312,63 @@ function rawClaude(input: RawLookup): RawRecord | null {
     : { text: raw, totalLength: raw.length, offset: 0, limit: raw.length, hasMore: false, messageText };
 }
 
-export function createClaudeProvider({ rootDir = join(homedir(), '.claude') }: { rootDir?: string } = {}): ProviderAdapter {
+export function createClaudeProvider({
+  rootDir = join(homedir(), '.claude'),
+  sourceRoots,
+  id = name,
+  displayName = 'Claude Code',
+  vendor = 'Anthropic',
+  color = '#d97757',
+}: {
+  rootDir?: string;
+  sourceRoots?: readonly string[];
+  id?: string;
+  displayName?: string;
+  vendor?: string;
+  color?: string;
+} = {}): ProviderAdapter & { rootTagFor?: (root: string) => string } {
+  const defaultRoot = rootDir;
+  const usesRootSet = sourceRoots !== undefined;
+  const configuredRoots = usesRootSet ? [...sourceRoots] : [rootDir];
+
   return {
-    name,
-    descriptor: { id: name, name: 'Claude Code', vendor: 'Anthropic', defaultRoot: rootDir, color: '#d97757' },
-    indexVersionMarker: CLAUDE_CANONICAL_TRANSCRIPT_MARKER,
-    watchTargets: (configuredRoot) => [
-      { kind: 'tree', path: join(configuredRoot, 'projects') },
-      { kind: 'file', path: join(configuredRoot, 'history.jsonl') },
-    ],
-    discover: (ctx) => discoverAt(rootDir, ctx),
+    name: id,
+    descriptor: { id, name: displayName, vendor, defaultRoot, color },
+    indexVersionMarker: id === name
+      ? CLAUDE_CANONICAL_TRANSCRIPT_MARKER
+      : `${CLAUDE_CANONICAL_TRANSCRIPT_MARKER}:${id}`,
+    rootTagFor: (root: string) => rootTagFor(root, defaultRoot),
+    watchTargets: (configuredRoot) => {
+      const targets = (
+        usesRootSet
+        && (sameNormalizedPath(configuredRoot, defaultRoot)
+          || configuredRoots.some((r) => sameNormalizedPath(r, configuredRoot)))
+      ) ? configuredRoots : [configuredRoot];
+      return targets.flatMap((root) => [
+        { kind: 'tree' as const, path: join(root, 'projects') },
+        { kind: 'file' as const, path: join(root, 'history.jsonl') },
+      ]);
+    },
+    discover: (ctx) => {
+      const indexed = ctx.indexedSessions?.() ?? [];
+      const roots = new Map<string, string>();
+      const physicalRoots = new Map<string, ClaudePhysicalRoot>();
+      const observedRoots = new Map<string, ClaudePhysicalRoot | null>();
+      for (const configured of configuredRoots) {
+        const resolved = tryRealpath(configured);
+        const root = canonicalRootPath(resolved ?? configured);
+        const key = lexicalPathKey(root);
+        roots.set(key, root);
+        const observed = resolved === null ? null : physicalRoots.get(key) ?? { path: root, identity: physicalDirectoryIdentity(root) };
+        if (observed !== null) physicalRoots.set(key, observed);
+        observedRoots.set(configured, observed);
+      }
+      const transcripts = resolveIndexedRoots([...roots.values()], defaultRoot, configuredRoots, indexed, ctx)
+        .flatMap(({ root, sessions, tag, legacyBareIds, blockedPaths }) =>
+          discoverAt(root, ctx, id === name ? tag : id, sessions, indexed, usesRootSet, legacyBareIds, blockedPaths,
+            physicalRoots.get(lexicalPathKey(root)) ?? { path: root, identity: null }));
+      return [...rootObservationUnits(observedRoots, physicalRoots, indexed, ctx, usesRootSet), ...transcripts];
+    },
     parse,
     raw: rawClaude,
   };
