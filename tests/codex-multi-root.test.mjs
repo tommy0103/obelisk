@@ -49,6 +49,17 @@ function freshDb() {
   return db;
 }
 
+function freshFileDb(t) {
+  const dir = makeTempDir('obelisk-codex-readonly-query-');
+  const path = join(dir, 'index.sqlite');
+  const db = new DatabaseSync(path);
+  db.exec(SCHEMA);
+  const reader = new DatabaseSync(path, { readOnly: true });
+  const close = () => { reader.close(); db.close(); };
+  t.after(close);
+  return { db, reader };
+}
+
 function drain(gen) {
   const values = [];
   let step = gen.next();
@@ -267,7 +278,7 @@ test('a stale custom-root guardian is retracted before the default publishes the
   db.close();
 });
 
-test('retargeting the same single-root spelling preserves legacy bare history', () => {
+test('retargeting the same single-root spelling preserves legacy bare history', t => {
   const home = makeTempDir('obelisk-codex-single-root-retarget-');
   const root = join(home, '.codex');
   const first = join(home, 'first');
@@ -277,7 +288,7 @@ test('retargeting the same single-root spelling preserves legacy bare history', 
   writeRollout(second, { id, userText: 'second single store' });
   const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
   symlinkSync(first, root, aliasType);
-  const db = freshDb();
+  const { db, reader } = freshFileDb(t);
   const provider = createCodexProvider({ rootDir: root, homeDir: home });
   const previous = beforeStoreCheckpoints(provider);
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, previous) }).complete, true);
@@ -288,11 +299,10 @@ test('retargeting the same single-root spelling preserves legacy bare history', 
   assert.equal(plan.items.length, 0);
   const uuid = `codex:${id}:000002`;
   assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?').get(uuid).text, 'first single store');
-  assert.equal(createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) }).raw(uuid), null);
+  assert.equal(createQueryApi(reader, { providerRegistry: createProviderRegistry([provider]) }).raw(uuid), null);
   unlinkSync(root);
   symlinkSync(first, root, aliasType);
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
-  db.close();
 });
 
 test('raw follows an indexed transcript directory alias and rejects a redirected rollout file', () => {
@@ -385,7 +395,7 @@ test('legacy child raw lookup and first refresh work after dropping a live alias
   db.close();
 });
 
-test('legacy child raw evidence and family migration require the indexed child source', async () => {
+test('legacy child raw evidence and family migration require the indexed child source', async t => {
   const home = makeTempDir('obelisk-codex-alias-child-source-');
   const firstRoot = join(home, 'first-codex');
   const secondRoot = join(home, 'second-codex');
@@ -399,11 +409,11 @@ test('legacy child raw evidence and family migration require the indexed child s
   const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
   symlinkSync(firstRoot, aliasRoot, aliasType);
   const legacy = legacyAliasProvider(aliasRoot);
-  const db = freshDb();
+  const { db, reader } = freshFileDb(t);
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, legacy.provider) }).complete, true);
   const childUuid = `codex:${legacy.scope}:${childId}:000002`;
   const next = createCodexProvider({ roots: [firstRoot], homeDir: home });
-  const raw = provider => createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) }).raw(childUuid);
+  const raw = provider => createQueryApi(reader, { providerRegistry: createProviderRegistry([provider]) }).raw(childUuid);
   const handlers = new Map();
   registerSessionQueryHandlers({
     ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
@@ -434,7 +444,6 @@ test('legacy child raw evidence and family migration require the indexed child s
   assert.equal(raw(retargeted), null);
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, retargeted) }).complete, false);
   assert.ok(db.prepare('SELECT 1 FROM messages WHERE uuid=? AND text=?').get(childUuid, cachedText));
-  db.close();
 });
 
 test('retargeting a legacy alias cannot reassign its cached history or expose another store via raw lookup', () => {
@@ -478,7 +487,7 @@ test('retargeting a legacy alias cannot reassign its cached history or expose an
 });
 
 for (const [replacement, legacy] of [['alias', false], ['directory', false], ['alias', true], ['directory', true]]) {
-test(`replacing the ${legacy ? 'legacy' : 'canonical'} default Codex alias with a different ${replacement} preserves bare ID ownership`, () => {
+test(`replacing the ${legacy ? 'legacy' : 'canonical'} default Codex alias with a different ${replacement} preserves bare ID ownership`, t => {
   const home = makeTempDir('obelisk-codex-retargeted-default-');
   const firstRoot = join(home, 'first-codex');
   const secondRoot = join(home, 'second-codex');
@@ -491,13 +500,13 @@ test(`replacing the ${legacy ? 'legacy' : 'canonical'} default Codex alias with 
   }
   const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
   symlinkSync(firstRoot, aliasRoot, aliasType);
-  const db = freshDb();
+  const { db, reader } = freshFileDb(t);
   const initial = legacy ? beforeStoreCheckpoints(createCodexProvider({ rootDir: aliasRoot, homeDir: home }))
     : createCodexProvider({ roots: [aliasRoot], homeDir: home });
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, initial) }).complete, true);
   const bareParent = `codex:${parentId}`;
   const bareChild = `codex:${childId}`;
-  const rawChild = provider => createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) }).raw(`${bareChild}:000002`);
+  const rawChild = provider => createQueryApi(reader, { providerRegistry: createProviderRegistry([provider]) }).raw(`${bareChild}:000002`);
 
   unlinkSync(aliasRoot);
   if (replacement === 'alias') symlinkSync(secondRoot, aliasRoot, aliasType);
@@ -517,7 +526,6 @@ test(`replacing the ${legacy ? 'legacy' : 'canonical'} default Codex alias with 
   assert.match(rawChild(recover)?.text ?? '', /first default child/);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM messages WHERE text='second default child'").get().count, 1);
   assert.equal(planCodex(db, recover).items.length, 0);
-  db.close();
 });
 }
 

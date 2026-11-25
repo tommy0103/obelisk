@@ -125,14 +125,16 @@ function sameCodexRootPath(a: string, b: string): boolean {
   return canonicalCodexRoot(a) === canonicalCodexRoot(b);
 }
 
-const CODEX_ZST_CURSOR_TAG = 'codex-zst-v1';
+const CODEX_ZST_CURSOR_TAG = 'codex-zst-v2';
+const CODEX_ZST_LEGACY_CURSOR_TAG = 'codex-zst-v1';
+const CODEX_BASIC_CURSOR_TAG = 'codex-basic-v2';
 const CODEX_STORE_CURSOR_TAG = ':codex-store-v1:';
 
 function codexDirectoryIdentity(path: string): string | null {
   try {
-    const stat = statSync(path);
+    const stat = codexStatSync(path);
     return stat.isDirectory() && usableSourceIdentity(stat)
-      ? `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`
+      ? `${stat.devExact}:${stat.inoExact}:${stat.birthtimeMs}`
       : null;
   } catch { return null; }
 }
@@ -155,15 +157,15 @@ function codexStoreSuffix(identity: string | null | undefined, aliases: readonly
   return CODEX_STORE_CURSOR_TAG + Buffer.from(JSON.stringify({ identity, aliases: [...aliases].sort(), defaultOwner })).toString('base64url');
 }
 
-function encodeCodexZstCursor(stat: Stats, completeLines: number, rootScope: string | null = null): string {
+function encodeCodexZstCursor(stat: CodexStats, completeLines: number, rootScope: string | null = null): string {
   const parts = [
     stat.mtimeMs,
     completeLines,
     stat.size,
     stat.ctimeMs,
-    stat.ino,
+    stat.inoExact,
     CODEX_ZST_CURSOR_TAG,
-    stat.dev,
+    stat.devExact,
   ];
   if (rootScope !== null) parts.push(rootScope);
   return parts.join(':');
@@ -174,60 +176,140 @@ function encodeCodexZstCursor(stat: Stats, completeLines: number, rootScope: str
 // rewrites. The provider state carries sourceSize because the outer size field
 // is now the safe restart offset, not the current EOF.
 function codexCursorSignatureDiffers(cursor: string, filePath: string, expectedRootScope: string | null = null): boolean {
-  const stat = statSync(filePath);
+  const stat = codexStatSync(filePath);
   const parts = cursor.split(CODEX_STORE_CURSOR_TAG)[0]!.split(':');
+  if (parts[5] === CODEX_BASIC_CURSOR_TAG) {
+    const validLength = expectedRootScope === null ? parts.length === 7 : parts.length === 8;
+    return !validLength
+      || (parts[7] ?? null) !== expectedRootScope
+      || Number(parts[0]) !== stat.mtimeMs
+      || Number(parts[2]) !== stat.size
+      || Number(parts[3]) !== stat.ctimeMs
+      || !cursorIntegerMatches(parts[4]!, stat.inoExact)
+      || !cursorIntegerMatches(parts[6]!, stat.devExact);
+  }
   if (isCodexCompressedPath(filePath)) {
     const validLength = expectedRootScope === null ? parts.length === 7 : parts.length === 8;
+    const exactFormat = parts[5] === CODEX_ZST_CURSOR_TAG;
+    const legacyUnsafeIdentity = parts[5] === CODEX_ZST_LEGACY_CURSOR_TAG
+      && (!safeLegacyIdentity(parts[6]!) || !safeLegacyIdentity(parts[4]!));
     const cursorScope = parts[7] ?? null;
     return !validLength
       || cursorScope !== expectedRootScope
-      || parts[5] !== CODEX_ZST_CURSOR_TAG
+      || (!exactFormat && parts[5] !== CODEX_ZST_LEGACY_CURSOR_TAG)
       || !Number.isSafeInteger(Number(parts[1]))
       || Number(parts[1]) < 0
       || Number(parts[0]) !== stat.mtimeMs
       || Number(parts[2]) !== stat.size
       || Number(parts[3]) !== stat.ctimeMs
-      || Number(parts[4]) !== stat.ino
-      || Number(parts[6]) !== stat.dev;
+      || legacyUnsafeIdentity
+      || !cursorIntegerMatches(parts[4]!, stat.inoExact)
+      || !cursorIntegerMatches(parts[6]!, stat.devExact);
+  }
+  if (parts.length === 5) {
+    return !safeLegacyIdentity(parts[4]!)
+      || Number(parts[0]) !== stat.mtimeMs
+      || Number(parts[2]) !== stat.size
+      || Number(parts[3]) !== stat.ctimeMs
+      || !cursorIntegerMatches(parts[4]!, stat.inoExact);
   }
   if (parts.length < 5) return true;
   let sourceSize = Number(parts[2]);
   let cursorRootScope: string | null = null;
+  let legacyUnsafeIdentity = true;
   try {
     const state = JSON.parse(Buffer.from(parts[5]!, 'base64url').toString('utf8'));
     if (Number.isSafeInteger(state?.sourceSize) && state.sourceSize >= 0) sourceSize = state.sourceSize;
     if (typeof state?.rootScope === 'string' && state.rootScope.length > 0) cursorRootScope = state.rootScope;
+    legacyUnsafeIdentity = state?.sourceIdentityEncoding !== 'uint64-decimal-v1'
+      && (!safeLegacyIdentity(state?.dev) || !safeLegacyIdentity(state?.sourceInode ?? parts[4]!));
   } catch { /* legacy or malformed cursor: force replay */ }
   return cursorRootScope !== expectedRootScope
+    || legacyUnsafeIdentity
     || Number(parts[0]) !== stat.mtimeMs
     || sourceSize !== stat.size
     || Number(parts[3]) !== stat.ctimeMs
-    || Number(parts[4]) !== stat.ino;
+    || !cursorIntegerMatches(parts[4]!, stat.inoExact);
+}
+
+function safeLegacyIdentity(value: string): boolean {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0;
+}
+
+type CodexStats = Pick<Stats, 'size' | 'mtimeMs' | 'ctimeMs' | 'birthtimeMs' | 'nlink'> & {
+  devExact: string;
+  inoExact: string;
+  mtimeNsExact: string;
+  ctimeNsExact: string;
+  birthtimeNsExact: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+};
+
+function codexStatSync(path: string): CodexStats {
+  const exact = statSync(path, { bigint: true });
+  const dev = BigInt.asUintN(64, BigInt(exact.dev));
+  const ino = BigInt.asUintN(64, BigInt(exact.ino));
+  const millis = (ns: bigint): number => Number(ns / 1_000_000_000n) * 1000
+    + Number(ns % 1_000_000_000n) / 1_000_000;
+  return {
+    size: Number(exact.size),
+    mtimeMs: millis(exact.mtimeNs), ctimeMs: millis(exact.ctimeNs),
+    birthtimeMs: millis(exact.birthtimeNs), nlink: Number(exact.nlink),
+    devExact: String(dev), inoExact: String(ino),
+    mtimeNsExact: String(exact.mtimeNs), ctimeNsExact: String(exact.ctimeNs),
+    birthtimeNsExact: String(exact.birthtimeNs),
+    isFile: () => exact.isFile(),
+    isDirectory: () => exact.isDirectory(),
+  };
+}
+
+function cursorIntegerMatches(cursorValue: string, exactValue: string): boolean {
+  return cursorValue === exactValue;
+}
+
+function trustedCursorIdentity(state: DecodedCodexCursor): boolean {
+  return state.sourceIdentityEncoding === 'uint64-decimal-v1'
+    || (safeLegacyIdentity(state.dev ?? '') && safeLegacyIdentity(state.sourceInode ?? state.inode));
 }
 
 interface CodexFileIdentity {
   readonly device: string;
-  readonly inode: number;
+  readonly inode: string;
   readonly mtime: number;
   readonly ctime: number;
+  readonly exact: boolean;
 }
 
 function codexFileIdentity(cursor: Cursor): CodexFileIdentity | null {
   if (cursor === null) return null;
   const parts = cursor.split(':');
-  const compressed = parts[5] === CODEX_ZST_CURSOR_TAG;
+  const compressed = parts[5] === CODEX_ZST_CURSOR_TAG || parts[5] === CODEX_ZST_LEGACY_CURSOR_TAG;
+  if (parts[5] === CODEX_BASIC_CURSOR_TAG) {
+    return {
+      device: parts[6]!, inode: parts[4]!, mtime: Number(parts[0]),
+      ctime: Number(parts[3]), exact: true,
+    };
+  }
   const device = compressed ? parts[6] : decodeCodexCursor(cursor)?.dev;
   if (device === undefined) return null;
-  return { device, inode: Number(parts[4]), mtime: Number(parts[0]), ctime: Number(parts[3]) };
+  const state = compressed ? null : decodeCodexCursor(cursor);
+  const exact = compressed
+    ? parts[5] === CODEX_ZST_CURSOR_TAG
+      || (safeLegacyIdentity(device) && safeLegacyIdentity(parts[4]!))
+    : state?.sourceIdentityEncoding === 'uint64-decimal-v1'
+      || (safeLegacyIdentity(device) && safeLegacyIdentity(parts[4]!));
+  return { device, inode: parts[4]!, mtime: Number(parts[0]), ctime: Number(parts[3]), exact };
 }
 
 function codexFileMatches(identity: CodexFileIdentity | null, filePath: string, { unshared = false } = {}): boolean {
-  if (identity === null) return false;
-  let stat: Stats;
-  try { stat = statSync(filePath); } catch { return false; }
+  if (identity === null || !identity.exact) return false;
+  let stat: CodexStats;
+  try { stat = codexStatSync(filePath); } catch { return false; }
   if (!stat.isFile() || !usableSourceIdentity(stat) || (unshared && stat.nlink !== 1)) return false;
-  return identity.device === String(stat.dev)
-    && identity.inode === stat.ino
+  return cursorIntegerMatches(identity.device, stat.devExact)
+    && cursorIntegerMatches(identity.inode, stat.inoExact)
     // A replacement can reuse an inode. When available, creation time also
     // has to predate the checkpoint. Otherwise require unchanged metadata.
     && (stat.birthtimeMs > 0
@@ -577,9 +659,10 @@ function discoverAtRoot(
     if (retractions.length === 0 && !meta.parentThreadId && previous && canonical(previous.jsonlPath) === path) {
       const cursor = ctx.lastCursor(unit.key);
       const prior = decodeCodexCursor(cursor);
-      const stat = statSync(unit.key);
+      const stat = codexStatSync(unit.key);
       const rootReplaced = cursor !== null && !isCodexCompressedPath(unit.key)
-        && (prior === null || prior.inode !== stat.ino || prior.dev !== String(stat.dev)
+        && (prior === null || !trustedCursorIdentity(prior)
+          || prior.inode !== stat.inoExact || prior.dev !== stat.devExact
           || (codexCursorSignatureDiffers(cursor, unit.key, rootScope) && stat.size <= (prior.sourceSize ?? prior.size)));
       archiveTransition = normalize(previous.jsonlPath) !== normalize(unit.key) || rootReplaced
         || (isCodexCompressedPath(unit.key) && cursor !== null && codexCursorSignatureDiffers(cursor, unit.key, rootScope));
@@ -704,6 +787,7 @@ interface CodexCursorState {
   sourceSize?: number;
   dev?: string;
   sourceInode?: string;
+  sourceIdentityEncoding?: 'uint64-decimal-v1';
   verifiedPrefix?: boolean;
   stateComplete?: boolean;
   /** The thread has a `user_message` event: what the person typed is recorded as such an event. */
@@ -733,7 +817,7 @@ interface DecodedCodexCursor extends CodexCursorState {
   lineCount: number;
   size: number;
   ctimeMs: number;
-  inode: number;
+  inode: string;
 }
 
 /**
@@ -799,9 +883,9 @@ function nullableString(value: unknown): boolean {
   return value === null || typeof value === 'string';
 }
 
-function usableSourceIdentity(stat: Stats): boolean {
-  return Number.isSafeInteger(stat.dev) && stat.dev > 0
-    && Number.isSafeInteger(stat.ino) && stat.ino > 0;
+function usableSourceIdentity(stat: CodexStats): boolean {
+  return /^\d+$/.test(stat.devExact) && BigInt(stat.devExact) > 0n
+    && /^\d+$/.test(stat.inoExact) && BigInt(stat.inoExact) > 0n;
 }
 
 function decodeBloom(value: unknown): Buffer | null {
@@ -871,9 +955,9 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
   const lineCount = Number(parts[1]);
   const size = Number(parts[2]);
   const ctimeMs = Number(parts[3]);
-  const inode = Number(parts[4]);
+  const inode = parts[4]!;
   if (!Number.isSafeInteger(lineCount) || !Number.isSafeInteger(size)
-    || !Number.isFinite(ctimeMs) || !Number.isFinite(inode)) return null;
+    || !Number.isFinite(ctimeMs) || !/^\d+$/.test(inode)) return null;
   try {
     const value: unknown = JSON.parse(Buffer.from(parts[5]!, 'base64url').toString('utf8'));
     if (!isRecord(value)
@@ -885,6 +969,7 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
       || (value.sourceSize !== undefined && (!Number.isSafeInteger(value.sourceSize) || value.sourceSize < 0))
       || (value.dev !== undefined && typeof value.dev !== 'string')
       || (value.sourceInode !== undefined && typeof value.sourceInode !== 'string')
+      || (value.sourceIdentityEncoding !== undefined && value.sourceIdentityEncoding !== 'uint64-decimal-v1')
       || (value.verifiedPrefix !== undefined && typeof value.verifiedPrefix !== 'boolean')
       || (value.stateComplete !== undefined && typeof value.stateComplete !== 'boolean')
       || (value.userMessageEvents !== undefined && typeof value.userMessageEvents !== 'boolean')
@@ -928,25 +1013,26 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
 }
 
 function encodeCodexCursor(
-  stat: Stats,
+  stat: CodexStats,
   lineCount: number,
   completeLineOffset: number,
   state: CodexCursorState,
 ): string {
-  const encoded = Buffer.from(JSON.stringify(state)).toString('base64url');
-  return `${stat.mtimeMs}:${lineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}:${encoded}`;
+  const encoded = Buffer.from(JSON.stringify({ ...state, sourceIdentityEncoding: 'uint64-decimal-v1' })).toString('base64url');
+  return `${stat.mtimeMs}:${lineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.inoExact}:${encoded}`;
 }
 
-function sameStat(a: Stats, b: Stats): boolean {
-  return a.dev === b.dev
-    && a.mtimeMs === b.mtimeMs
+function sameStat(a: CodexStats, b: CodexStats): boolean {
+  return a.mtimeMs === b.mtimeMs
     && a.ctimeMs === b.ctimeMs
     && a.size === b.size
-    && a.ino === b.ino;
+    && a.inoExact === b.inoExact && a.devExact === b.devExact
+    && a.mtimeNsExact === b.mtimeNsExact && a.ctimeNsExact === b.ctimeNsExact
+    && a.birthtimeNsExact === b.birthtimeNsExact;
 }
 
-function sameSource(a: Stats, b: Stats): boolean {
-  return a.dev === b.dev && a.ino === b.ino;
+function sameSource(a: CodexStats, b: CodexStats): boolean {
+  return a.devExact === b.devExact && a.inoExact === b.inoExact;
 }
 
 function sha256(bytes: string | Buffer): string {
@@ -1022,7 +1108,7 @@ export function* parse(
   metrics?: CodexParseMetrics,
   testHooks?: CodexParseTestHooks,
 ): Generator<TranscriptRecord, Cursor> {
-  const stat = statSync(unit.key);
+  const stat = codexStatSync(unit.key);
   const compressed = isCodexCompressedPath(unit.key);
   const sourceMeta = unit.meta as {
     guardian?: boolean;
@@ -1110,6 +1196,7 @@ export function* parse(
   // through to #148's fingerprinted verification/snapshot behavior.
   const cooperativeCandidate = !compressed && !guardianInvalidation && readMode === 'normal'
     && prior !== null
+    && trustedCursorIdentity(prior)
     && (prior.rootScope ?? null) === rootScope
     && usableSourceIdentity(stat)
     && prior.completeLineOffset !== undefined
@@ -1118,9 +1205,9 @@ export function* parse(
     && prior.sourceInode !== undefined
     && prior.stateComplete !== false
     && prior.threadRawId === codexRawId(prior.meta.id)
-    && prior.dev === String(stat.dev)
-    && prior.sourceInode === String(stat.ino)
-    && prior.inode === stat.ino
+    && prior.dev === stat.devExact
+    && prior.sourceInode === stat.inoExact
+    && prior.inode === stat.inoExact
     && prior.terminated
     && prior.completeLineOffset === prior.size
     && prior.sourceSize === prior.size
@@ -1179,16 +1266,17 @@ export function* parse(
         complete: stat.size <= CODEX_MAX_CURSOR_CHUNK_HASHES * CODEX_FINGERPRINT_CHUNK_BYTES,
       }
       : fingerprintCodexFile(unit.key, stat.size, prior, metrics));
-  const afterFingerprint = statSync(unit.key);
+  const afterFingerprint = codexStatSync(unit.key);
   if ((!cooperativeAppend && (fingerprint.bytesRead !== stat.size || !sameStat(stat, afterFingerprint)))
     || (cooperativeAppend && !sameSource(stat, afterFingerprint))) return _cursor;
   const appendCandidate = !compressed && !guardianInvalidation && (cooperativeAppend || (prior !== null
+    && trustedCursorIdentity(prior)
     && (prior.rootScope ?? null) === rootScope
     && prior.verifiedPrefix === true
     && prior.threadRawId === codexRawId(prior.meta.id)
-    && prior.dev === String(stat.dev)
-    && prior.sourceInode === String(stat.ino)
-    && prior.inode === stat.ino
+    && prior.dev === stat.devExact
+    && prior.sourceInode === stat.inoExact
+    && prior.inode === stat.inoExact
     && prior.terminated
     && prior.stateComplete !== false
     && prior.completeLineOffset !== undefined
@@ -1272,7 +1360,7 @@ export function* parse(
   testHooks?.beforeScan?.();
   let scanResult = scan(appendCandidate ? prior.size : 0, appendCandidate);
   testHooks?.afterScan?.();
-  const afterScan = statSync(unit.key);
+  const afterScan = codexStatSync(unit.key);
   // A read-time mutation is transient: keep the old cursor and let the next
   // build retry. A malformed completed JSONL line is a durable source defect
   // and fails closed. With a prior checkpoint the throw surfaces the frozen
@@ -1356,7 +1444,7 @@ export function* parse(
     sawAutoReviewModel = false;
     sawUserMessageEvent = false;
     scanResult = scan(0, false);
-    if (!sameStat(stat, statSync(unit.key))) return _cursor;
+    if (!sameStat(stat, codexStatSync(unit.key))) return _cursor;
     if (scanResult.malformed) throw new Error(CODEX_MALFORMED_LINE_ERROR);
   }
   const { lineCount: lineNum, completeLineCount, completeLineOffset, terminated } = scanResult;
@@ -1367,7 +1455,7 @@ export function* parse(
   const userMessageEvents = sawUserMessageEvent || previous?.userMessageEvents === true;
   const basicCursor = compressed
     ? encodeCodexZstCursor(stat, completeLineCount, rootScope)
-    : `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.ino}`;
+    : `${stat.mtimeMs}:${completeLineCount}:${completeLineOffset}:${stat.ctimeMs}:${stat.inoExact}:${CODEX_BASIC_CURSOR_TAG}:${stat.devExact}${rootScope === null ? '' : `:${rootScope}`}`;
   const capturedMeta = metaRecord as { lineNum: number; obj: any } | null;
   if (capturedMeta === null) return basicCursor;
 
@@ -1607,7 +1695,7 @@ export function* parse(
       }
     },
   });
-  const afterParse = statSync(unit.key);
+  const afterParse = codexStatSync(unit.key);
   // `out` is only a staging buffer. If the source changed during the second
   // pass, abandon before adding aggregates or yielding anything; returning an
   // old cursor after emitting a mixed view would split source and projection.
@@ -1640,8 +1728,9 @@ export function* parse(
         meta,
         completeLineOffset: checkpointSize,
         sourceSize: stat.size,
-        dev: String(stat.dev),
-        sourceInode: String(stat.ino),
+        dev: stat.devExact,
+        sourceInode: stat.inoExact,
+        sourceIdentityEncoding: 'uint64-decimal-v1',
         // A complete initial snapshot is verified by definition. Cooperative
         // append keeps the old hashes only as stale metadata and must not claim
         // that the enlarged prefix was verified.
@@ -1881,7 +1970,7 @@ export function createCodexProvider({
         const cursor = ctx.previousCursor?.(session.jsonlPath) ?? ctx.lastCursor(session.jsonlPath);
         const store = readCodexStore(cursor);
         return {
-          session, store, root: deriveCodexRootFromSessionPath(session.jsonlPath),
+          session, store, cursor, root: deriveCodexRootFromSessionPath(session.jsonlPath),
           hasCursor: cursor !== null, file: store === null ? codexFileIdentity(cursor) : null,
           legacyMtime: cursor === null ? Number.NaN : Number(/^([^:]+):\d+$/.exec(cursor)?.[1]),
         };
@@ -1919,7 +2008,7 @@ export function createCodexProvider({
           && hasRenamedCodexRollout(file, session.jsonlPath)) verifiedLegacyRoots.add(root);
       }
       let defaultDisplaced = false;
-      for (const { session, file, hasCursor, legacyMtime, root, store } of prior) {
+      for (const { session, file, cursor, hasCursor, legacyMtime, root, store } of prior) {
         if (root === null) continue;
         const rootIdentity = knownEntries.get(root);
         const reachedByAlias = store !== null && observedIdentities.has(store.identity);
@@ -1929,10 +2018,12 @@ export function createCodexProvider({
         ))) {
           unavailable(session, 'Source folder is unavailable');
         }
-        const sourceMatches = store === null && codexFileMatches(file, session.jsonlPath, { unshared: true });
+        const exactSourceMatches = store === null
+          && cursorIdentifiesCodexFile(cursor, session.jsonlPath, { unshared: true });
+        const sourceMatches = store === null && exactSourceMatches;
         const legacyPhysicalCustom = store === null && root !== defaultRoot && rootIdentity != null
           && incomingBareRoot === defaultRoot && defaultTarget === defaultRoot
-          && tryRealpath(root) === root && sourceMatches;
+          && tryRealpath(root) === root && exactSourceMatches;
         // Pre-feature cursors used lexical paths even through a symlink. A
         // verified different physical path is the documented custom migration.
         const historicalDefault = usesRootSet && (store?.defaultOwner ?? !legacyPhysicalCustom);

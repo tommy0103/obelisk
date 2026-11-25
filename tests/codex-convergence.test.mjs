@@ -92,14 +92,15 @@ function writeJsonl(path, lines) {
   writeFileSync(path, `${lines.map(line => JSON.stringify(line)).join('\n')}\n`);
 }
 
-function assertNormalAppendReads(metrics, sourceStat, suffixBytes) {
+function assertNormalAppendReads(metrics, sourceStat, suffixBytes, expectedPlan) {
   const usableIdentity = Number.isSafeInteger(sourceStat.dev) && sourceStat.dev > 0
     && Number.isSafeInteger(sourceStat.ino) && sourceStat.ino > 0;
-  const expectedPlan = usableIdentity ? 'cooperative-append' : 'verified-append';
-  assert.equal(metrics.plan, expectedPlan, `normal append read plan (dev=${sourceStat.dev}, ino=${sourceStat.ino})`);
+  const plan = expectedPlan ?? (usableIdentity ? 'cooperative-append' : 'verified-append');
+  const cooperative = plan === 'cooperative-append';
+  assert.equal(metrics.plan, plan, `normal append read plan (dev=${sourceStat.dev}, ino=${sourceStat.ino})`);
   assert.equal(metrics.suffixBytesRead, suffixBytes * 2, 'pre-scan and emit each read the suffix once');
-  assert.equal(metrics.sourceBytesRead, suffixBytes * 2 + (usableIdentity ? 0 : sourceStat.size),
-    'unsupported identity adds exactly one complete fingerprint pass to the two suffix reads');
+  assert.equal(metrics.sourceBytesRead, suffixBytes * 2 + (cooperative ? 0 : sourceStat.size),
+    'verified append adds exactly one complete fingerprint pass to the two suffix reads');
 }
 
 const REAL_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url);
@@ -409,17 +410,23 @@ test('Codex prefix snapshot plus identity-gated append converges SQLite projecti
   dbSplit.close();
 });
 
-// Cooperative resume requires a positive, safely representable source identity.
-// Exercise the fallback deterministically, including on POSIX test machines.
-for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
-  test(`Codex append with ${identityName} file identity verifies the prefix and converges`, async t => {
-    const unsupportedStat = (...args) => {
+// A zero identity still verifies the prefix. Exact identities above Number's
+// precision, including the uint64 high bit, can use cooperative append.
+for (const [identityName, inode, expectedPlan] of [
+  ['zero', 0n, 'verified-append'],
+  ['large inode', 9_007_199_254_740_993n, 'cooperative-append'],
+  ['high-bit inode', 0x8000_0000_0000_0001n, 'cooperative-append'],
+]) {
+  test(`Codex append with ${identityName} identity converges`, async t => {
+    const exactStat = (...args) => {
       const result = statSync(...args);
-      result.ino = inode;
-      return result;
+      return Object.assign(result, {
+        dev: args[1]?.bigint ? 1n : 1,
+        ino: args[1]?.bigint ? inode : Number(inode),
+      });
     };
     const fsMock = t.mock.module('node:fs', {
-      namedExports: { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+      namedExports: { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync, statSync: exactStat },
     });
     t.after(() => fsMock.restore());
     const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?${identityName}-identity`);
@@ -436,13 +443,15 @@ for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_S
     t.after(() => dbSplit.close());
     const sourceUnit = { key: path, sessionId: '', meta: { source: 'codex', guardian: false } };
     const cursor = persist(dbSplit, sourceUnit, parseWithoutIdentity(sourceUnit, null));
+    const cursorState = JSON.parse(Buffer.from(cursor.split(':', 6)[5], 'base64url').toString('utf8'));
+    assert.equal(cursorState.sourceInode, String(inode), 'checkpoint retains the exact BigInt inode');
     const lines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
     const suffix = `${lines.join('\n')}\n`;
     appendFileSync(path, suffix);
     const metrics = createCodexParseMetrics();
     persist(dbSplit, sourceUnit, parseWithoutIdentity(sourceUnit, cursor, metrics));
-    assertNormalAppendReads(metrics, unsupportedStat(path), Buffer.byteLength(suffix));
-    assert.equal(metrics.jsonLinesParsed, lines.length * 2, 'verified append parses only the suffix');
+    assertNormalAppendReads(metrics, statSync(path), Buffer.byteLength(suffix), expectedPlan);
+    assert.equal(metrics.jsonLinesParsed, lines.length * 2, 'append parses only the suffix records');
     assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFinal));
   });
 }

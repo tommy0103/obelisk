@@ -177,10 +177,10 @@ test('parse() produces identical canonical records for plain and compressed roll
 
   assert.deepEqual(normalize(plainRes.values), normalize(zstRes.values));
 
-  // Verify zst cursor format: mtime:lines:size:ctimeMs:ino:codex-zst-v1:dev
+  // Verify zst cursor format: mtime:lines:size:ctimeMs:ino:codex-zst-v2:dev
   const parts = zstRes.ret.split(':');
   assert.equal(parts.length, 7);
-  assert.equal(parts[5], 'codex-zst-v1');
+  assert.equal(parts[5], 'codex-zst-v2');
 
   // ADR-0007 verification: direct assembly equals SQLite round-trip
   const db = freshDb();

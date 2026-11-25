@@ -97,14 +97,17 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
 // Real filesystem identities vary by Windows volume. Exercise both contracts
 // deterministically without requiring the host to offer a safe numeric inode.
 for (const [identity, inode, expectedPlan, verifiedPrefix] of [
-  ['safe', 123, 'cooperative-append', false],
-  ['unavailable', 0, 'verified-append', true],
-  ['unsafe', Number.MAX_SAFE_INTEGER + 1, 'verified-append', true],
+  ['safe', 123n, 'cooperative-append', false],
+  ['unavailable', 0n, 'verified-append', true],
+  ['large exact', BigInt(Number.MAX_SAFE_INTEGER) + 1n, 'cooperative-append', false],
 ]) {
   test(`codex v4 checkpoint resumes an append with ${identity} source identity`, async t => {
     const fsMock = t.mock.module('node:fs', { namedExports: {
       closeSync, existsSync, lstatSync, openSync, readdirSync, readSync,
-      statSync: (...args) => Object.assign(statSync(...args), { dev: 1, ino: inode }),
+      statSync: (...args) => Object.assign(statSync(...args), {
+        dev: args[1]?.bigint ? 1n : 1,
+        ino: args[1]?.bigint ? inode : Number(inode),
+      }),
     } });
     t.after(() => fsMock.restore());
     const { parse: parseWithIdentity } = await import(`../packages/core/src/providers/codex.ts?append-${identity}`);
@@ -136,6 +139,45 @@ for (const [identity, inode, expectedPlan, verifiedPrefix] of [
     assert.equal(cursorState(second.ret).verifiedPrefix, verifiedPrefix);
   });
 }
+
+test('Codex cursor distinguishes adjacent exact inode values above Number precision and replays old rounded cursors', async t => {
+  let inode = 9_007_199_254_740_992n;
+  const fsMock = t.mock.module('node:fs', { namedExports: {
+    closeSync, existsSync, lstatSync, openSync, readdirSync, readSync,
+    statSync: (...args) => Object.assign(statSync(...args), {
+      dev: args[1]?.bigint ? 1n : 1,
+      ino: args[1]?.bigint ? inode : Number(inode),
+    }),
+  } });
+  t.after(() => fsMock.restore());
+  const { parse: parseWithIdentity } = await import('../packages/core/src/providers/codex.ts?exact-inode-regression');
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'exact prefix' } },
+  ]);
+  const first = drain(parseWithIdentity({ key: path, sessionId: '' }, null));
+  assert.equal(first.ret.split(':')[4], '9007199254740992');
+
+  const oldState = cursorState(first.ret);
+  oldState.sourceInode = '9007199254740992';
+  delete oldState.sourceIdentityEncoding;
+  const oldCursorParts = first.ret.split(':', 6);
+  const baseStyleCursor = `${oldCursorParts.slice(0, 5).join(':')}:${Buffer.from(JSON.stringify(oldState)).toString('base64url')}`;
+  const legacyMetrics = createCodexParseMetrics();
+  const legacySameFile = drain(parseWithIdentity({ key: path, sessionId: '' }, baseStyleCursor, legacyMetrics));
+  assert.notEqual(legacyMetrics.plan, 'noop', 'lossy legacy identity cannot authorize a no-op');
+  assert.notEqual(legacyMetrics.plan, 'cooperative-append', 'lossy legacy identity cannot authorize cooperative append');
+  assert.deepEqual(legacySameFile.values.filter(record => record.kind === 'message').map(record => record.text), ['exact prefix']);
+
+  inode = 9_007_199_254_740_993n;
+  const exactCursor = drain(parseWithIdentity({ key: path, sessionId: '' }, first.ret));
+  assert.equal(exactCursor.ret.split(':')[4], '9007199254740993');
+  assert.deepEqual(exactCursor.values.filter(record => record.kind === 'message').map(record => record.uuid), [`codex:${META.id}:000002`]);
+
+  const legacyReplay = drain(parseWithIdentity({ key: path, sessionId: '' }, baseStyleCursor));
+  assert.deepEqual(legacyReplay.values.filter(record => record.kind === 'message').map(record => record.text), ['exact prefix']);
+  assert.equal(legacyReplay.ret.split(':')[4], '9007199254740993');
+});
 
 test('codex parse() accepts a legacy #148 v4 cursor but replays it conservatively', () => {
   const path = writeFixture([
@@ -596,7 +638,7 @@ test('codex strict reconcile persists a session-index-only metadata refresh with
   assertVerifiedMetadataRefresh(parse, 'strict');
 });
 
-for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
+for (const [identityName, inode] of [['unavailable', 0]]) {
   test(`codex metadata refresh with ${identityName} file identity persists without replay`, async t => {
     const unsupportedStat = (...args) => {
       const result = statSync(...args);
