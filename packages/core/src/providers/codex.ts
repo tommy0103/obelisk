@@ -1827,6 +1827,50 @@ function deriveCodexRootFromSessionPath(jsonlPath: string): string | null {
   return index > 0 ? normalized.slice(0, index) : null;
 }
 
+// Verify the preceding chunks as well as the target line's chunks. The raw
+// UUID is a line ordinal, so unverified earlier bytes could shift its meaning.
+function readVerifiedCodexRawLines(
+  path: string,
+  prior: DecodedCodexCursor,
+  visit: (line: string) => boolean | void,
+): void {
+  const sourceSize = prior.sourceSize ?? prior.size;
+  const committed = prior.completeLineOffset ?? prior.size;
+  const chunkSize = CODEX_FINGERPRINT_CHUNK_BYTES;
+  if (!prior.verifiedPrefix || committed <= 0 || committed > sourceSize
+    || prior.chunkHashes.length !== Math.ceil(sourceSize / chunkSize)) return;
+
+  const fd = openSync(path, 'r');
+  const buffer = Buffer.allocUnsafe(Math.min(chunkSize, sourceSize));
+  let remainder = Buffer.alloc(0);
+  try {
+    for (let offset = 0; offset < committed; offset += chunkSize) {
+      const length = Math.min(chunkSize, sourceSize - offset);
+      let filled = 0;
+      while (filled < length) {
+        const count = readSync(fd, buffer, filled, length - filled, offset + filled);
+        if (count === 0) return;
+        filled += count;
+      }
+      if (sha256(buffer.subarray(0, length)) !== prior.chunkHashes[offset / chunkSize]) return;
+      const chunk = buffer.subarray(0, Math.min(length, committed - offset));
+      const data = remainder.length === 0 ? chunk : Buffer.concat([remainder, chunk]);
+      const lastNewline = data.lastIndexOf(0x0a);
+      let stopped = false;
+      readCodexBufferLines(data.subarray(0, lastNewline + 1), line => {
+        if (visit(line) === false) {
+          stopped = true;
+          return false;
+        }
+      });
+      if (stopped) return;
+      remainder = Buffer.from(data.subarray(lastNewline + 1));
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function rawCodex(
   rootEntries: readonly CodexRootEntry[],
   input: RawLookup,
@@ -1844,6 +1888,7 @@ function rawCodex(
   const verifySource = input.cursorForPath !== undefined || input.cursor != null || derivedRoot !== physicalRoot;
   let readPath = resolvedPath;
   let sourceCursor: Cursor = null;
+  let verifiedPrefix: DecodedCodexCursor | null = null;
   if (verifySource) {
     if (derivedRoot === null || physicalRoot === null) return null;
     const sourceDir = codexTranscriptDirs(derivedRoot).find(dir => pathInside(dir, resolvedPath));
@@ -1858,13 +1903,21 @@ function rawCodex(
     sourceCursor = input.agentId === null
       ? input.cursor ?? null
       : input.cursorForPath?.(resolvedPath) ?? null;
-    if (!cursorIdentifiesCodexFile(sourceCursor, physicalPath)) return null;
+    if (!cursorIdentifiesCodexFile(sourceCursor, physicalPath)) {
+      try {
+        const stat = codexStatSync(physicalPath);
+        if (!stat.isFile() || isCodexCompressedPath(physicalPath)
+          || (codexFileIdentity(sourceCursor)?.exact && usableSourceIdentity(stat))) return null;
+      } catch { return null; }
+      verifiedPrefix = decodeCodexCursor(sourceCursor);
+      if (verifiedPrefix?.threadRawId !== parsed.threadRawId || !verifiedPrefix.verifiedPrefix) return null;
+    }
     readPath = physicalPath;
   }
   let lineNumber = 0;
   let found: string | null = null;
   let verifiedThread = !verifySource;
-  readCodexLines(readPath, (line: string) => {
+  const visit = (line: string) => {
     lineNumber++;
     if (!verifiedThread) {
       try {
@@ -1881,8 +1934,13 @@ function rawCodex(
     if (!verifiedThread) return false;
     found = line;
     return false;
-  });
-  if (verifySource && !cursorIdentifiesCodexFile(sourceCursor, readPath)) return null;
+  };
+  if (verifiedPrefix === null) {
+    readCodexLines(readPath, visit);
+    if (verifySource && !cursorIdentifiesCodexFile(sourceCursor, readPath)) return null;
+  } else {
+    try { readVerifiedCodexRawLines(readPath, verifiedPrefix, visit); } catch { return null; }
+  }
   const raw = found as string | null;
   let messageText: string | null = null;
   if (raw !== null) {

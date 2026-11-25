@@ -305,6 +305,53 @@ test('retargeting the same single-root spelling preserves legacy bare history', 
   assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
 });
 
+test('raw verifies legacy parent and child content without changing their checkpoints', t => {
+  const home = makeTempDir('obelisk-codex-legacy-raw-hash-');
+  const root = join(home, '.codex');
+  const parentId = '019ed000-0000-7000-8000-000000000139';
+  const childId = '019ed000-0000-7000-8000-000000000140';
+  const parentPath = writeRollout(root, { id: parentId, userText: 'original parent' });
+  const childPath = writeRollout(root, {
+    id: childId, parentThreadId: parentId, userText: 'original child',
+  });
+  const { db, reader } = freshFileDb(t);
+  const provider = createCodexProvider({ roots: [root], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  const cursorAt = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?');
+  const setCursor = db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?');
+  const legacy = (path, device, inode) => {
+    const parts = cursorAt.get(path).cursor.split(':');
+    const state = JSON.parse(Buffer.from(parts[5], 'base64url').toString('utf8'));
+    assert.equal(state.verifiedPrefix, true);
+    delete state.sourceIdentityEncoding;
+    state.dev = device;
+    state.sourceInode = inode;
+    parts[4] = inode;
+    parts[5] = Buffer.from(JSON.stringify(state)).toString('base64url');
+    const cursor = parts.join(':');
+    setCursor.run(cursor, path);
+    return cursor;
+  };
+  const parentCursor = legacy(parentPath, '0', '0');
+  const childCursor = legacy(childPath, String(statSync(childPath).dev), '9007199254740992');
+  const query = createQueryApi(reader, { providerRegistry: createProviderRegistry([provider]) });
+  const parentUuid = `codex:${parentId}:000002`;
+  const childUuid = `codex:${childId}:000002`;
+  assert.match(query.raw(parentUuid)?.text ?? '', /original parent/);
+  assert.match(query.raw(childUuid)?.text ?? '', /original child/);
+
+  const childSource = readFileSync(childPath, 'utf8');
+  appendFileSync(childPath, childSource.split('\n')[1] + '\n');
+  assert.match(query.raw(childUuid)?.text ?? '', /original child/);
+  const { atime, mtime } = statSync(childPath);
+  writeFileSync(childPath, childSource.replace('original child', 'replaced child'));
+  utimesSync(childPath, atime, mtime);
+  assert.equal(query.raw(childUuid), null);
+  assert.match(query.raw(parentUuid)?.text ?? '', /original parent/);
+  assert.equal(cursorAt.get(parentPath).cursor, parentCursor);
+  assert.equal(cursorAt.get(childPath).cursor, childCursor);
+});
+
 test('raw follows an indexed transcript directory alias and rejects a redirected rollout file', () => {
   const home = makeTempDir('obelisk-codex-sessions-alias-');
   const root = join(home, '.codex');
