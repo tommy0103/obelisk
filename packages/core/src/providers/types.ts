@@ -42,6 +42,12 @@ export interface IndexUnit {
   meta?: unknown;
   /** Previously indexed sessions atomically retracted by persist before this unit is written. */
   retractSessionIds?: readonly string[];
+  /** The retracted sessions are proven aliases of this unit's session. Move their
+   * durable memory links to the surviving identity in the same transaction. */
+  redirectRetractedSessionMemories?: {
+    newMessagePrefix: string;
+    oldMessagePrefixes: ReadonlyMap<string, string>;
+  };
   /** Preserve this session's cached canonical history across force cleanup,
    * then upsert this unit's readable records. Unlike retainSession, this does
    * not withhold projection; unavailable historical sources remain evidence. */

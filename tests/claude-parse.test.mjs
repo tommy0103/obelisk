@@ -89,7 +89,7 @@ test('claude parse() yields the expected record stream for a main session', () =
 
   // Cursor encodes mtime:lines:signature (6 lines consumed).
   const stat = statSync(path);
-  assert.equal(ret, `${stat.mtimeMs}:6:${stat.size}:${stat.ctimeMs}:${stat.ino}`);
+  assert.equal(ret, `${stat.mtimeMs}:6:${stat.size}:${stat.ctimeMs}:${stat.ino}:${stat.dev}:${stat.birthtimeMs}`);
 });
 
 test('claude parse() emits no session record for a subagent transcript', () => {
