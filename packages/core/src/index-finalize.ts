@@ -77,14 +77,21 @@ export function refreshSessionProjectPaths(
   }
 
   const cwdStmt = db.prepare(`
-    SELECT cwd
+    SELECT cwd, COUNT(*) AS cnt
     FROM messages
     WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
+    GROUP BY cwd
+    ORDER BY MIN(CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END), MIN(timestamp), MIN(rowid)
   `);
   const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
   for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map((row: SqliteRow) => row.cwd);
+    const cwds: string[] = [];
+    for (const row of cwdStmt.all(session.id) as SqliteRow[]) {
+      const cnt = Number(row.cnt);
+      for (let i = 0; i < cnt; i++) {
+        cwds.push(String(row.cwd));
+      }
+    }
     const projectPath = inferProjectPath(session.project, cwds);
     if (projectPath) update.run(projectPath, session.id);
   }
