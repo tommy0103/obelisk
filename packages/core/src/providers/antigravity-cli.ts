@@ -13,13 +13,14 @@
 import { existsSync, readFileSync, readdirSync, statSync, type Stats } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { isAbsolute, join, normalize, relative } from 'node:path';
+import { basename, isAbsolute, join, normalize, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   normalizeObservedCwd, normalizeTranscriptTimestamp, projectSlugFromPath, sourceInventoryIssue, trunc, truncJson,
 } from '../parsing.ts';
 import type { SqliteDb } from '../sqlite-types.ts';
+import { RetryableSourceReadError } from './source-read-error.ts';
 import type {
   Cursor, DiscoverContext, HarnessKind, IndexUnit, MessageRecord, ProviderAdapter,
   RawLookup, RawRecord, TranscriptRecord, WatchTarget,
@@ -53,6 +54,7 @@ const SUMMARY_COLUMNS = ['conversation_id', 'title', 'workspace_uris', 'parent_c
 interface TranscriptUnitMeta extends ConversationMeta {
   readonly conversationId: string;
   readonly path: string;
+  readonly expectedFingerprint: string;
   readonly currentCursor: string;
 }
 
@@ -214,10 +216,20 @@ function decodeCursorMeta(cursor: Cursor | undefined): ConversationMeta | null {
   }
 }
 
+function fileFingerprint(stat: Stats): string {
+  return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
+}
+
 // mtime + ctime + size + inode + encoded metadata so a rewrite or summary
 // update triggers re-projection, while DB locks preserve prior metadata.
 function cursorFor(stat: Stats, meta: ConversationMeta): string {
   return `${stat.mtimeMs}:0:${CURSOR_TAG}:${stat.ctimeMs}:${stat.size}:${stat.ino}:${encodeMeta(meta)}`;
+}
+
+// Node's SQLite binding truncates TEXT at embedded NULs; escape them in
+// canonical fields so direct assembly and persisted rows stay identical.
+function escapeNul(value: string): string {
+  return value.replaceAll('\0', '\\^@');
 }
 
 // Only complete newline-terminated lines count; a line being written is read next time.
@@ -376,7 +388,7 @@ function projectedRecords(snapshot: TranscriptSnapshot, id: string): TranscriptR
     const isMeta: 0 | 1 = harnessKind === null || (role === 'user' && harnessKind === 'task') ? 0 : 1;
     const message: MessageRecord = {
       kind: 'message', uuid, session_id: id, type: role, parent_uuid: parent,
-      timestamp, role, text: body === null ? null : trunc(body), content_type: contentType,
+      timestamp, role, text: body === null ? null : trunc(escapeNul(body)), content_type: contentType,
       is_meta: isMeta, harness_kind: harnessKind, visibility: 'visible',
       model: null, is_sidechain: 0, agent_id: null, input_tokens: inputTokens, output_tokens: outputTokens,
       cwd, skill: null, source: name,
@@ -442,7 +454,7 @@ function projectedRecords(snapshot: TranscriptSnapshot, id: string): TranscriptR
           if (output === undefined) continue;
           out.push({
             kind: 'tool_result', tool_use_id: callId, message_uuid: uuid,
-            session_id: id, content: trunc(output.content), file_path: null, is_error: output.failed ? 1 : 0,
+            session_id: id, content: trunc(escapeNul(output.content)), file_path: null, is_error: output.failed ? 1 : 0,
           });
         }
       }
@@ -477,8 +489,9 @@ function projectedRecords(snapshot: TranscriptSnapshot, id: string): TranscriptR
     });
   }
   const fallbackTitle = firstUserText ? firstUserText.replace(/\s+/g, ' ').trim().slice(0, 80) : null;
+  const rawTitle = snapshot.title ?? fallbackTitle;
   out.push({
-    kind: 'session', id, title: snapshot.title ?? fallbackTitle, project: projectSlugFromPath(cwd),
+    kind: 'session', id, title: rawTitle === null ? null : escapeNul(rawTitle), project: projectSlugFromPath(cwd),
     started_at: firstAt, ended_at: lastAt, git_branch: null, version: null,
     message_count: messageCount, countMode: 'total', jsonl_path: snapshot.path, source: name,
     started_by: snapshot.startedByAgent ? 'agent' : null,
@@ -513,6 +526,7 @@ export function createAntigravityCliProvider({
       ctx.reportIncompleteInventory?.(sourceInventoryIssue(join(rootDir, SUMMARY_DB), summariesResult.error));
     }
 
+    const indexedById = new Map(indexed.map((session) => [session.sessionId, session]));
     const live = new Set<string>();
     const units: IndexUnit[] = [];
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -521,6 +535,13 @@ export function createAntigravityCliProvider({
         ctx.reportIncompleteInventory?.(sourceInventoryIssue(path, error));
       });
       if (file === null) continue;
+      const id = antigravityCliSessionId(entry.name);
+      const prior = indexedById.get(id);
+      // Never downgrade a session previously indexed from transcript_full.jsonl
+      // to the truncated transcript.jsonl fallback; retain it until full returns.
+      if (prior && basename(prior.jsonlPath) === TRANSCRIPT_FILES[0] && basename(file) !== TRANSCRIPT_FILES[0]) {
+        continue;
+      }
       let stat: Stats;
       try {
         stat = statSync(file);
@@ -529,7 +550,6 @@ export function createAntigravityCliProvider({
         continue;
       }
       const key = normalize(file);
-      const id = antigravityCliSessionId(entry.name);
       live.add(id);
 
       const priorMeta = decodeCursorMeta(ctx.previousCursor?.(key) ?? ctx.lastCursor(key));
@@ -547,6 +567,7 @@ export function createAntigravityCliProvider({
           ...meta,
           conversationId: entry.name,
           path: file,
+          expectedFingerprint: fileFingerprint(stat),
           currentCursor: cursor,
         } satisfies TranscriptUnitMeta,
         retractSessionIds: [id],
@@ -562,8 +583,24 @@ export function createAntigravityCliProvider({
 
   function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
     const meta = unit.meta as TranscriptUnitMeta;
-    const before = statSync(meta.path);
+    const assertStable = (): Stats => {
+      let current: Stats;
+      try {
+        current = statSync(meta.path);
+      } catch (error) {
+        throw new RetryableSourceReadError(meta.path, 'Antigravity CLI transcript is unavailable', { cause: error });
+      }
+      if (fileFingerprint(current) !== meta.expectedFingerprint) {
+        throw new RetryableSourceReadError(meta.path, 'Antigravity CLI transcript changed during indexing');
+      }
+      return current;
+    };
+    const before = assertStable();
     const lines = readCompleteLines(meta.path);
+    assertStable();
+    if (before.size > 0 && lines.length === 0) {
+      throw new RetryableSourceReadError(meta.path, 'Antigravity CLI transcript has no complete lines');
+    }
     yield* projectedRecords({ ...meta, lines }, unit.sessionId);
     return cursorFor(before, meta);
   }
