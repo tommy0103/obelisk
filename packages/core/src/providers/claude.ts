@@ -495,7 +495,7 @@ function scopedId(sessionId: string, rawId: string): string {
 }
 
 function queuedAttachmentMessageUuid(sessionId: string, rawUuid: string): string {
-  return `${sessionId}:${rawUuid}`;
+  return messageUuid(sessionId, `${bareSessionId(sessionId)}:${rawUuid}`);
 }
 
 function parentMessageUuid(sessionId: string, rawUuid: string, queuedAttachmentUuids: ReadonlySet<string>): string {
@@ -544,6 +544,17 @@ function extractRawUuid(messageUuid: string, sessionId?: unknown): string {
   }
   const idx = messageUuid.lastIndexOf(':');
   return idx === -1 ? messageUuid : messageUuid.slice(idx + 1);
+}
+
+function extractQueuedAttachmentRawUuid(messageUuid: string, sessionId: unknown): string {
+  const sessionStr = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '');
+  const providerId = extractRawUuid(messageUuid, sessionStr);
+  const localPrefix = `${bareSessionId(sessionStr)}:`;
+  if (providerId.startsWith(localPrefix)) {
+    const wireUuid = providerId.slice(localPrefix.length);
+    if (isWireUuid(wireUuid)) return wireUuid;
+  }
+  return providerId;
 }
 
 interface ClaudeWorkflowUnitMeta {
@@ -1353,7 +1364,9 @@ function rawClaude(input: RawLookup): RawRecord | null {
     return null;
   }
   let found: string | null = null;
-  const rawMsgUuid = extractRawUuid(input.messageUuid, input.session?.id);
+  // Alias reconciliation rewrites the root prefix while preserving Claude's
+  // local attachment key; decode that extra session prefix only for messages.
+  const rawMsgUuid = extractQueuedAttachmentRawUuid(input.messageUuid, input.session?.id);
   readLines(sourcePath, (line: string) => {
     if (!line.includes(rawMsgUuid)) return;
     try {

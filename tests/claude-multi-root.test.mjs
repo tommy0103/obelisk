@@ -14,8 +14,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { appendFileSync, chmodSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -123,6 +124,18 @@ function runClaudeRefresh(home, roots, force = false) {
   const query = join(home, 'sessions.mjs');
   writeFileSync(query, 'return sessions();');
   return runCli(force ? ['--build'] : ['--query', query], { home });
+}
+
+function runCoreBuild(home, force = false) {
+  const indexerUrl = new URL('../packages/core/src/indexer.ts', import.meta.url).href;
+  const source = `const { buildIndex } = await import(${JSON.stringify(indexerUrl)});\n`
+    + `const result = buildIndex({ ignoreRecentBuild: true, force: ${force} });\n`
+    + `console.log(JSON.stringify(result));\n`
+    + `if (result.skip || !result.complete) process.exitCode = 1;`;
+  return spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', source], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, OBELISK_HOME: join(home, '.obelisk') },
+    encoding: 'utf8',
+  });
 }
 
 test('claude explicit roots: unconfigured ignores sibling directories and array replaces default root', () => {
@@ -628,6 +641,81 @@ test('claude explicit roots: proven historical duplicates converge and memory li
     assert.equal(message_end, message_start);
     assert.equal(db.prepare('SELECT session_id FROM messages WHERE uuid = ?').get(message_start)?.session_id, keptId);
     db.close();
+  }
+});
+
+test('claude v7 alias repair preserves queued attachment anchors and Raw lookup on refresh and force', () => {
+  const fixture = readFileSync(new URL('./fixtures/claude/mid-turn-interject-redacted.jsonl', import.meta.url), 'utf8');
+  const sessionId = 'd2510000-0000-4000-8000-000000000001';
+  const wireUuid = '685dc2b5-a360-4708-856b-1cbed9776a97';
+  for (const force of [false, true]) {
+    const home = makeTempDir('obelisk-claude-v7-queued-alias-');
+    const defaultRoot = join(home, '.claude');
+    const store = join(home, 'profile');
+    const alias = join(home, 'alias');
+    const project = '-redacted-project';
+    const transcript = join(store, 'projects', project, `${sessionId}.jsonl`);
+    mkdirSync(join(store, 'projects', project), { recursive: true });
+    writeFileSync(transcript, fixture);
+    symlinkSync(store, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    writeSettings(home, { providerRoots: { claude: [store, alias] } });
+
+    const provider = createClaudeProvider({ rootDir: defaultRoot, sourceRoots: [store, alias] });
+    const db = openClaudeIndex(home);
+    const taggedId = canonicalSessionId(sessionId, rootTagFor(store, defaultRoot));
+    for (const [key, id] of [[transcript, sessionId], [transcript.replace(store, alias), taggedId]]) {
+      const unit = { key, sessionId: id, project };
+      let skippedAttachment = false;
+      function* parseV7() {
+        const parsed = provider.parse(unit, null);
+        while (true) {
+          const next = parsed.next();
+          if (next.done) return next.value;
+          const record = next.value;
+          if (record.kind === 'message' && record.uuid.endsWith(`:${wireUuid}`)) {
+            skippedAttachment = true;
+            continue;
+          }
+          yield record.kind === 'session' && skippedAttachment
+            ? { ...record, message_count: record.message_count - 1 }
+            : record;
+        }
+      }
+      persist(db, unit, parseV7());
+    }
+    db.prepare("INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__claude_canonical_transcript_v7__', 1, 0)").run();
+    db.close();
+    const touched = new Date(Date.now() + 2_500);
+    utimesSync(transcript, touched, touched);
+
+    const upgraded = runCoreBuild(home);
+    assert.equal(upgraded.status, 0, upgraded.stderr + upgraded.stdout);
+    let current = openClaudeIndex(home);
+    const oldAnchor = `${sessionId}:${wireUuid}`;
+    assert.ok(current.prepare('SELECT 1 FROM messages WHERE uuid=? AND session_id=?').get(oldAnchor, sessionId),
+      'v8 replay exposes the queued attachment under the previous bare session ID');
+    current.prepare("INSERT INTO memories (id, session_id, message_start, message_end) VALUES ('note', ?, ?, ?)")
+      .run(sessionId, oldAnchor, oldAnchor);
+    current.close();
+
+    appendFileSync(transcript, JSON.stringify({ type: 'progress' }) + '\n');
+    const refreshed = runCoreBuild(home, force);
+    assert.equal(refreshed.status, 0, refreshed.stderr + refreshed.stdout);
+    current = openClaudeIndex(home);
+    const sessions = current.prepare("SELECT id FROM sessions WHERE source='claude'").all().map(row => row.id);
+    assert.equal(sessions.length, 1, 'alias reconciliation removes the duplicate session');
+    const memory = current.prepare("SELECT session_id, message_start, message_end FROM memories WHERE id='note'").get();
+    assert.equal(memory.session_id, sessions[0]);
+    assert.ok(current.prepare('SELECT 1 FROM messages WHERE uuid=? AND session_id=?').get(memory.message_start, memory.session_id));
+    assert.equal(memory.message_end, memory.message_start);
+    const raw = provider.raw({
+      source: 'claude', messageUuid: memory.message_start,
+      session: current.prepare('SELECT * FROM sessions WHERE id=?').get(memory.session_id),
+      agentId: null,
+    });
+    assert.equal(JSON.parse(raw.text).uuid, wireUuid);
+    assert.equal(raw.messageText, 'Please keep the existing design and include a short migration note.');
+    current.close();
   }
 });
 

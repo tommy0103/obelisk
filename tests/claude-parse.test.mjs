@@ -284,6 +284,32 @@ test('captured text-image and humanTurn-omitted prompts use ordinary text extrac
   }
 });
 
+test('root-tagged Claude queued attachments keep their local key and resolve Raw after alias prefix changes', () => {
+  const sessionId = 'd2510000-0000-4000-8000-000000000010';
+  const wireUuid = 'bdbdd6cf-f72b-4b31-86f1-abae65f4199d';
+  const root = makeTempDir('obelisk-claude-tagged-attachment-');
+  const path = join(root, 'projects', '-redacted-content', `${sessionId}.jsonl`);
+  mkdirSync(join(root, 'projects', '-redacted-content'), { recursive: true });
+  writeFileSync(path, readFileSync(new URL('./fixtures/claude/mid-turn-interject-image-redacted.jsonl', import.meta.url)));
+  const provider = createClaudeProvider({ rootDir: root });
+  const discovered = provider.discover({ lastCursor: () => null }).find(unit => unit.sessionId === sessionId);
+  assert.ok(discovered);
+  const taggedId = `profile-root:${sessionId}`;
+  const unit = { ...discovered, sessionId: taggedId };
+  const parsed = drain(provider.parse(unit, null));
+  const attachment = parsed.values.find(record => record.kind === 'message');
+  assert.ok(attachment);
+  assert.equal(attachment.uuid, `${taggedId}:${sessionId}:${wireUuid}`);
+  const raw = provider.raw({
+    source: 'claude', messageUuid: attachment.uuid,
+    session: { id: taggedId, jsonl_path: path }, agentId: null,
+    subagent: null, workflowAgent: null,
+  });
+  assert.ok(raw);
+  assert.equal(JSON.parse(raw.text).uuid, wireUuid);
+  assert.equal(raw.messageText, 'Review this geometry image during the running command.');
+});
+
 test('an appended child record keeps the queued attachment parent scope across cursor resume', () => {
   const path = join(makeTempDir('obelisk-claude-interject-append-'), 'sid-append.jsonl');
   const wireUuid = 'd2510000-0000-4000-8000-000000000010';
