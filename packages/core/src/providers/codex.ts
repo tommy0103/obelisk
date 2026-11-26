@@ -852,6 +852,9 @@ function discoverAtRoot(
       const rootReplaced = cursor !== null && !isCodexCompressedPath(unit.key)
         && (prior === null || !trustedCursorIdentity(prior)
           || prior.inode !== stat.inoExact || prior.dev !== stat.devExact
+          || (usableBirthtimeNs(prior.sourceBirthtimeNs)
+            && usableBirthtimeNs(stat.birthtimeNsExact)
+            && BigInt(stat.birthtimeNsExact) > BigInt(prior.sourceBirthtimeNs))
           || stat.size < (prior.sourceSize ?? prior.size)
           || (ctx.readMode === 'strict' && hasKnownChildren
             && codexCursorSignatureDiffers(cursor, unit.key, rootScope)
