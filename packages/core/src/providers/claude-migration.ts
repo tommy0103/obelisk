@@ -14,7 +14,12 @@ import { dirname, join } from 'node:path';
 import { redirectSessionMemories } from '../persist.ts';
 import { readProviderSessionProvenance, type StoredProviderState } from '../provider-indexing.ts';
 import type { SqliteDb, SqliteRow } from '../sqlite-types.ts';
-import { legacyClaudeMigrationTargets, pathInside, sameNormalizedPath } from './claude.ts';
+import {
+  CLAUDE_CANONICAL_TRANSCRIPT_MARKER,
+  legacyClaudeMigrationTargets,
+  pathInside,
+  sameNormalizedPath,
+} from './claude.ts';
 
 interface PriorClaudeSession {
   readonly source: string;
@@ -180,11 +185,22 @@ export function planLegacyClaudeRootIdentityMigration(
   priorSessions: readonly PriorClaudeSession[] = readProviderSessionProvenance(db),
   priorIndexState?: ReadonlyMap<string, StoredProviderState>,
 ): LegacyClaudeMigration[] {
+  const hasStoredState = db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?');
+  const hasIndexState = (key: string) => priorIndexState === undefined
+    ? Boolean(hasStoredState.get(key))
+    : priorIndexState.has(key);
+  // A durable v7 marker records that bare-ID identities were already handled.
+  // Its cursor is normally NULL, so cursor value cannot distinguish the row
+  // from an absent marker. The v8 marker has the same row-presence contract.
+  if (hasIndexState('__claude_canonical_transcript_v7__')
+    || hasIndexState(CLAUDE_CANONICAL_TRANSCRIPT_MARKER)) return [];
   if (!priorSessions.some(session => session.source === 'claude' && !session.sessionId.includes(':'))) return [];
   const readCursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?');
   const claudeSessions = priorSessions.filter(session => session.source === 'claude' && session.sessionId && session.jsonlPath);
   return legacyClaudeMigrationTargets(defaultRoot, configuredRoots, claudeSessions, (path) => {
-    const cursor = priorIndexState?.get(path)?.cursor ?? readCursor.get(path)?.cursor;
+    const cursor = priorIndexState?.has(path)
+      ? priorIndexState.get(path)?.cursor
+      : readCursor.get(path)?.cursor;
     return typeof cursor === 'string' ? cursor : null;
   });
 }

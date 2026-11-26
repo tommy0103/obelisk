@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,9 @@ import { discoverJsonlFiles } from '../packages/core/src/parsing.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { assembleUsf } from '../packages/core/src/usf.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
+import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
+import { createProviderIndexPlan, indexProviderPlanStrict, writeProviderIndexMarkers } from '../packages/core/src/provider-indexing.ts';
 import { repairOrphanedSessionMetadata } from '../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../packages/core/src/indexer.ts';
 import { assertHarnessConformance } from './harness-conformance.mjs';
@@ -90,6 +93,334 @@ test('claude parse() yields the expected record stream for a main session', () =
   // Cursor encodes mtime:lines:signature (6 lines consumed).
   const stat = statSync(path);
   assert.equal(ret, `${stat.mtimeMs}:6:${stat.size}:${stat.ctimeMs}:${stat.ino}:${stat.dev}:${stat.birthtimeMs}`);
+});
+
+test('a captured human mid-turn message is visible, searchable, and keeps its attachment identity', () => {
+  // Redacted allowlisted excerpt from Claude Code 2.1.304: prose, cwd, and tool
+  // output are controlled; wire UUID relationships, timestamps, order, and
+  // attachment shape are retained. The assistant is parented to a reminder,
+  // while the interjection itself is parented to an ignored prompt_snapshot.
+  const fixture = fileURLToPath(new URL('./fixtures/claude/mid-turn-interject-redacted.jsonl', import.meta.url));
+  const root = makeTempDir('obelisk-claude-interject-');
+  const projectDir = join(root, 'projects', '-redacted-project');
+  mkdirSync(projectDir, { recursive: true });
+  const path = join(projectDir, 'd2510000-0000-4000-8000-000000000001.jsonl');
+  writeFileSync(path, readFileSync(fixture));
+  const provider = createClaudeProvider({ rootDir: root });
+  const units = provider.discover({ lastCursor: () => null });
+  const unit = units.find(candidate => candidate.sessionId === 'd2510000-0000-4000-8000-000000000001');
+  assert.ok(unit);
+
+  const first = drain(provider.parse(unit, null));
+  const second = drain(provider.parse(unit, null));
+  assert.deepEqual(second.values, first.values, 'replaying the same source preserves canonical identity');
+  assertHarnessConformance(first.values);
+  const interjection = first.values.find(record => record.kind === 'message'
+    && record.uuid === `${unit.sessionId}:685dc2b5-a360-4708-856b-1cbed9776a97`);
+  assert.ok(interjection);
+  assert.deepEqual({
+    type: interjection.type,
+    role: interjection.role,
+    parent_uuid: interjection.parent_uuid,
+    timestamp: interjection.timestamp,
+    text: interjection.text,
+    content_type: interjection.content_type,
+    is_meta: interjection.is_meta,
+    harness_kind: interjection.harness_kind,
+    visibility: interjection.visibility,
+  }, {
+    type: 'user', role: 'user',
+    parent_uuid: 'e7dc6ebc-0798-4ea0-9219-f94c9658dc56',
+    timestamp: '2026-11-26T00:17:44.259Z',
+    text: 'Please keep the existing design and include a short migration note.',
+    content_type: 'text', is_meta: 0, harness_kind: null, visibility: 'visible',
+  });
+  const sessionRecord = first.values.find(record => record.kind === 'session');
+  assert.equal(sessionRecord.message_count, 4);
+  assert.equal(sessionRecord.started_at, '2026-11-26T00:17:44.259Z');
+  assert.equal(sessionRecord.ended_at, '2026-11-26T00:18:03.643Z');
+  assert.equal(first.values.find(record => record.kind === 'message' && record.uuid === '3b7ad34e-fa0a-4b6d-a121-e004047ed6f4').parent_uuid,
+    '7971a9af-4799-44f1-b1d0-424a2f19ba42', 'the following assistant keeps its actual reminder parent');
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  persist(db, unit, provider.parse(unit, null));
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(unit.sessionId);
+  const direct = assembleSessionDetail(first.values);
+  const persisted = assembleSessionDetail({
+    session,
+    messages: db.prepare('SELECT * FROM messages WHERE session_id=? ORDER BY timestamp, uuid').all(unit.sessionId),
+    toolCalls: db.prepare('SELECT * FROM tool_calls WHERE session_id=?').all(unit.sessionId),
+    toolResults: db.prepare('SELECT * FROM tool_results WHERE session_id=?').all(unit.sessionId),
+    subagents: db.prepare('SELECT * FROM subagents WHERE session_id=?').all(unit.sessionId),
+    workflows: db.prepare('SELECT * FROM workflows WHERE session_id=?').all(unit.sessionId),
+    summaries: db.prepare('SELECT * FROM summaries WHERE session_id=?').all(unit.sessionId),
+  });
+  assert.deepEqual(persisted, direct, 'canonical session detail is unchanged by SQLite persistence');
+  const assembledInterjectionIndex = direct.messages.findIndex(message => message.uuid === interjection.uuid);
+  const followingAssistantIndex = direct.messages.findIndex(message => message.uuid === '3b7ad34e-fa0a-4b6d-a121-e004047ed6f4');
+  assert.notEqual(assembledInterjectionIndex, -1, 'the assembled detail contains the interjection');
+  assert.notEqual(followingAssistantIndex, -1, 'the assembled detail contains the following assistant');
+  assert.ok(assembledInterjectionIndex < followingAssistantIndex,
+  'the interjection appears before the following assistant in assembled detail');
+  assert.deepEqual(db.prepare('SELECT uuid FROM messages WHERE session_id=? ORDER BY timestamp, uuid').all(unit.sessionId).map(row => row.uuid).slice(0, 3), [
+    interjection.uuid,
+    '2be89809-847b-408c-a28a-67f4c49f24e2',
+    '3b7ad34e-fa0a-4b6d-a121-e004047ed6f4',
+  ], 'the interjection is timestamped before the later tool result and assistant rows');
+  assert.equal(direct.messages.filter(message => message.text === interjection.text).length, 1,
+    'the request snapshot does not duplicate the attachment message');
+  assert.equal(first.values.filter(record => record.kind === 'message' && record.harness_kind === 'notification').length, 1,
+    'the existing captured task-notification user remains one notification message');
+  assert.ok(first.values.some(record => record.kind === 'message'
+    && record.text?.includes('<task-notification>')));
+  assert.equal(first.values.filter(record => record.kind === 'message' && record.text === interjection.text).length, 1,
+    'the api-request-blob copy does not become a duplicate transcript message');
+
+  const api = createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) });
+  assert.ok(api.messages({ sessionId: unit.sessionId }).messages.some(message => message.uuid === interjection.uuid));
+  assert.ok(api.search('migration note', { sessionId: unit.sessionId }).some(hit => hit.message.uuid === interjection.uuid));
+  assert.equal(api.context(interjection.uuid).message.text, interjection.text);
+  assert.equal(JSON.parse(api.raw(interjection.uuid).text).attachment.prompt, interjection.text);
+  const raw = provider.raw({
+    source: 'claude', messageUuid: interjection.uuid, session,
+    agentId: null, subagent: null, workflowAgent: null,
+  });
+  assert.equal(JSON.parse(raw.text).attachment.prompt, interjection.text);
+  assert.equal(raw.messageText, interjection.text);
+  db.close();
+});
+
+test('only valid human queued commands become messages, without text deduplication or harness inference', () => {
+  const path = join(makeTempDir('obelisk-claude-interject-gates-'), 'sid.jsonl');
+  const prompt = '<system-reminder>retain this human instruction</system-reminder>';
+  const attachment = (uuid, extra = {}) => ({
+    type: 'attachment', uuid, parentUuid: null, timestamp: '2026-06-10T10:00:00Z',
+    attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, humanTurn: true },
+    ...extra,
+  });
+  writeFileSync(path, [
+    attachment('d2510000-0000-4000-8000-000000000001'),
+    attachment('d2510000-0000-4000-8000-000000000002'),
+    attachment('d2510000-0000-4000-8000-000000000003', { attachment: { type: 'queued_command', prompt, origin: { kind: 'task-notification' }, humanTurn: true } }),
+    attachment('d2510000-0000-4000-8000-000000000004', { attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, humanTurn: false } }),
+    attachment('not-a-wire-uuid'),
+    attachment('d2510000-0000-4000-8000-000000000005', { attachment: { type: 'queued_command', prompt: '   ', origin: { kind: 'human' }, humanTurn: true } }),
+    attachment('d2510000-0000-4000-8000-000000000006', { attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, humanTurn: true, isMeta: true } }),
+    attachment('d2510000-0000-4000-8000-000000000007', { attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, commandMode: 'shell' } }),
+    attachment('d2510000-0000-4000-8000-000000000008', { attachment: {
+      type: 'queued_command', prompt: [null, { type: 'text', text: 'safe array text' },
+        { type: 'image', source: { type: 'base64', data: 'do not index' } }],
+      origin: { kind: 'human' }, commandMode: 'prompt',
+    } }),
+    attachment('d2510000-0000-4000-8000-000000000009', { attachment: {
+      type: 'queued_command', prompt: [{ type: 'image', source: { type: 'base64', data: 'do not index' } }],
+      origin: { kind: 'human' }, commandMode: 'prompt',
+    } }),
+    { type: 'queue-operation', operation: 'enqueue', content: prompt },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n');
+
+  const { values } = drain(parse({ key: path, sessionId: 'sid-gates' }, null));
+  const messages = values.filter(record => record.kind === 'message');
+  assert.deepEqual(messages.map(message => message.uuid), [
+    'sid-gates:d2510000-0000-4000-8000-000000000001',
+    'sid-gates:d2510000-0000-4000-8000-000000000002',
+    'sid-gates:d2510000-0000-4000-8000-000000000008',
+    'sid-gates:d2510000-0000-4000-8000-000000000009',
+  ]);
+  assert.deepEqual(messages.map(message => message.text), [prompt, prompt, 'safe array text', null]);
+  assert.ok(messages.every(message => message.role === 'user' && message.is_meta === 0
+    && message.visibility === 'visible' && message.harness_kind === null));
+  assert.equal(messages.at(-1).content_type, 'unknown', 'image-only human prompts remain countable messages');
+  assert.equal(values.find(record => record.kind === 'session').message_count, 4);
+
+  const subagent = drain(parse({ key: path, sessionId: 'sid-gates', isSubagent: true, agentId: 'agent-1' }, null));
+  assert.equal(subagent.values.filter(record => record.kind === 'message').length, 0);
+});
+
+test('captured text-image and humanTurn-omitted prompts use ordinary text extraction without indexing image data', () => {
+  const root = makeTempDir('obelisk-claude-interject-content-');
+  const provider = createClaudeProvider({ rootDir: root });
+  const captures = [
+    {
+      fixture: 'mid-turn-interject-image-redacted.jsonl',
+      sessionId: 'd2510000-0000-4000-8000-000000000010',
+      wireUuid: 'bdbdd6cf-f72b-4b31-86f1-abae65f4199d',
+      text: 'Review this geometry image during the running command.',
+      contentType: 'unknown',
+    },
+    {
+      fixture: 'mid-turn-interject-no-human-turn-redacted.jsonl',
+      sessionId: 'd2510000-0000-4000-8000-000000000011',
+      wireUuid: '5f0ed9e9-854c-4f49-9bb8-b6ea5e7757c9',
+      text: 'flagoffinterject251',
+      contentType: 'text',
+    },
+  ];
+
+  for (const capture of captures) {
+    const projectDir = join(root, 'projects', '-redacted-content');
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, `${capture.sessionId}.jsonl`);
+    writeFileSync(path, readFileSync(new URL(`./fixtures/claude/${capture.fixture}`, import.meta.url)));
+    const unit = provider.discover({ lastCursor: () => null }).find(candidate => candidate.sessionId === capture.sessionId);
+    assert.ok(unit);
+    const { values } = drain(provider.parse(unit, null));
+    const message = values.find(record => record.kind === 'message');
+    assert.ok(message);
+    assert.equal(message.uuid, `${capture.sessionId}:${capture.wireUuid}`);
+    assert.equal(message.text, capture.text);
+    assert.equal(message.content_type, capture.contentType);
+    assert.equal(message.is_meta, 0);
+    assert.equal(message.harness_kind, null);
+    assert.equal(values.find(record => record.kind === 'session').message_count, 1);
+    assert.equal(values.some(record => record.kind === 'message' && record.text?.includes('[redacted image bytes]')), false);
+    const raw = provider.raw({
+      source: 'claude', messageUuid: message.uuid,
+      session: { id: unit.sessionId, jsonl_path: path }, agentId: null,
+      subagent: null, workflowAgent: null,
+    });
+    assert.equal(raw.messageText, capture.text);
+  }
+});
+
+test('root-tagged Claude queued attachments keep their local key and resolve Raw after alias prefix changes', () => {
+  const sessionId = 'd2510000-0000-4000-8000-000000000010';
+  const wireUuid = 'bdbdd6cf-f72b-4b31-86f1-abae65f4199d';
+  const root = makeTempDir('obelisk-claude-tagged-attachment-');
+  const path = join(root, 'projects', '-redacted-content', `${sessionId}.jsonl`);
+  mkdirSync(join(root, 'projects', '-redacted-content'), { recursive: true });
+  writeFileSync(path, readFileSync(new URL('./fixtures/claude/mid-turn-interject-image-redacted.jsonl', import.meta.url)));
+  const provider = createClaudeProvider({ rootDir: root });
+  const discovered = provider.discover({ lastCursor: () => null }).find(unit => unit.sessionId === sessionId);
+  assert.ok(discovered);
+  const taggedId = `profile-root:${sessionId}`;
+  const unit = { ...discovered, sessionId: taggedId };
+  const parsed = drain(provider.parse(unit, null));
+  const attachment = parsed.values.find(record => record.kind === 'message');
+  assert.ok(attachment);
+  assert.equal(attachment.uuid, `${taggedId}:${sessionId}:${wireUuid}`);
+  const raw = provider.raw({
+    source: 'claude', messageUuid: attachment.uuid,
+    session: { id: taggedId, jsonl_path: path }, agentId: null,
+    subagent: null, workflowAgent: null,
+  });
+  assert.ok(raw);
+  assert.equal(JSON.parse(raw.text).uuid, wireUuid);
+  assert.equal(raw.messageText, 'Review this geometry image during the running command.');
+});
+
+test('an appended child record keeps the queued attachment parent scope across cursor resume', () => {
+  const path = join(makeTempDir('obelisk-claude-interject-append-'), 'sid-append.jsonl');
+  const wireUuid = 'd2510000-0000-4000-8000-000000000010';
+  const prompt = {
+    type: 'attachment', uuid: wireUuid, parentUuid: null, timestamp: '2026-06-10T10:00:00Z',
+    attachment: { type: 'queued_command', prompt: 'resume safely', origin: { kind: 'human' } },
+  };
+  writeFileSync(path, `${JSON.stringify(prompt)}\n`);
+  const provider = createClaudeProvider();
+  const initial = drain(provider.parse({ key: path, sessionId: 'sid-append' }, null));
+  assert.equal(initial.values.find(record => record.kind === 'message').uuid,
+    `sid-append:${wireUuid}`);
+  appendFileSync(path, `${JSON.stringify({
+    type: 'assistant', uuid: 'd2510000-0000-4000-8000-000000000011', parentUuid: wireUuid,
+    timestamp: '2026-06-10T10:00:01Z', message: { role: 'assistant', content: [{ type: 'text', text: 'continued' }] },
+  })}\n`);
+  const delta = drain(provider.parse({ key: path, sessionId: 'sid-append' }, initial.ret));
+  const child = delta.values.find(record => record.kind === 'message');
+  assert.equal(child.uuid, 'd2510000-0000-4000-8000-000000000011', 'ordinary message identity remains unchanged');
+  assert.equal(child.parent_uuid, `sid-append:${wireUuid}`);
+  assert.equal(delta.values.find(record => record.kind === 'session').message_count, 1);
+});
+
+test('forked sessions scope shared attachment UUIDs and preserve raw lookup and detail parity', () => {
+  const root = makeTempDir('obelisk-claude-interject-fork-');
+  const projectDir = join(root, 'projects', '-redacted-fork');
+  mkdirSync(projectDir, { recursive: true });
+  const fixture = readFileSync(new URL('./fixtures/claude/mid-turn-interject-fork-redacted.jsonl', import.meta.url));
+  const sessionIds = [
+    'ec2e416d-0dd9-4852-b7de-f564ed92a5e8',
+    'fe9dd08a-5499-4902-995b-7d3938b05315',
+  ];
+  for (const sessionId of sessionIds) writeFileSync(join(projectDir, `${sessionId}.jsonl`), fixture);
+
+  const provider = createClaudeProvider({ rootDir: root });
+  const units = provider.discover({ lastCursor: () => null }).filter(unit => sessionIds.includes(unit.sessionId));
+  assert.equal(units.length, 2);
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  for (const unit of units) persist(db, unit, provider.parse(unit, null));
+
+  const api = createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) });
+  const canonicalUuids = sessionIds.map(sessionId => `${sessionId}:041419b3-b696-41f8-b31c-ecd063383719`);
+  assert.notEqual(canonicalUuids[0], canonicalUuids[1]);
+  for (const unit of units) {
+    const uuid = canonicalUuids[sessionIds.indexOf(unit.sessionId)];
+    const detail = assembleSessionDetail([...provider.parse(unit, null)]);
+    const stored = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
+    assert.ok(stored);
+    assert.equal(stored.session_id, unit.sessionId);
+    assert.equal(stored.uuid, uuid);
+    const raw = api.raw(uuid);
+    assert.equal(JSON.parse(raw.text).uuid, '041419b3-b696-41f8-b31c-ecd063383719', 'Raw retains the original wire identity');
+    assert.equal(JSON.parse(raw.text).attachment.prompt, 'nocutleftnocutright');
+    const adapterRaw = provider.raw({
+      source: 'claude', messageUuid: uuid,
+      session: db.prepare('SELECT * FROM sessions WHERE id=?').get(unit.sessionId), agentId: null,
+      subagent: null, workflowAgent: null,
+    });
+    assert.equal(adapterRaw.messageText, 'nocutleftnocutright');
+    assert.ok(api.messages({ sessionId: unit.sessionId }).messages.some(message => message.uuid === uuid));
+    const persistedDetail = assembleSessionDetail({
+      session: db.prepare('SELECT * FROM sessions WHERE id=?').get(unit.sessionId),
+      messages: db.prepare('SELECT * FROM messages WHERE session_id=? ORDER BY timestamp, uuid').all(unit.sessionId),
+      toolCalls: [], toolResults: [], subagents: [], workflows: [], summaries: [],
+    });
+    assert.deepEqual(persistedDetail, detail);
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE text=?').get('nocutleftnocutright').count, 2);
+  db.close();
+});
+
+test('an unchanged v7 Claude index replays attachments and converges on the v8 marker', () => {
+  const fixture = fileURLToPath(new URL('./fixtures/claude/mid-turn-interject-redacted.jsonl', import.meta.url));
+  const root = makeTempDir('obelisk-claude-v7-replay-');
+  const projectDir = join(root, 'projects', '-redacted-project');
+  mkdirSync(projectDir, { recursive: true });
+  const path = join(projectDir, 'd2510000-0000-4000-8000-000000000001.jsonl');
+  writeFileSync(path, readFileSync(fixture));
+  const provider = createClaudeProvider({ rootDir: root });
+  const registry = createProviderRegistry([provider]);
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  try {
+    const units = provider.discover({ lastCursor: () => null });
+    const unit = units.find(candidate => candidate.sessionId === 'd2510000-0000-4000-8000-000000000001');
+    assert.ok(unit);
+    const parsed = drain(provider.parse(unit, null));
+    const oldRecords = parsed.values
+      .filter(record => !(record.kind === 'message'
+        && record.uuid === `${unit.sessionId}:685dc2b5-a360-4708-856b-1cbed9776a97`))
+      .map(record => record.kind === 'session' ? { ...record, message_count: record.message_count - 1 } : record);
+    function* oldParse() { yield* oldRecords; return parsed.ret; }
+    persist(db, unit, oldParse());
+    db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed, cursor) VALUES (?, 1, 0, ?)')
+      .run('__claude_canonical_transcript_v7__', '1:0');
+
+    const plan = createProviderIndexPlan(db, registry);
+    assert.ok(plan.items.length > 0, 'the v8 marker absence schedules unchanged transcript paths');
+    const result = indexProviderPlanStrict({ db, plan });
+    writeProviderIndexMarkers(db, plan, result);
+
+    assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?')
+      .get(`${unit.sessionId}:685dc2b5-a360-4708-856b-1cbed9776a97`).text,
+      'Please keep the existing design and include a short migration note.');
+    assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id=?').get(unit.sessionId).message_count, 4);
+    assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__claude_canonical_transcript_v7__'),
+      'the historical identity marker remains available to the root resolver');
+    assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get(provider.indexVersionMarker));
+    assert.equal(createProviderIndexPlan(db, registry).items.length, 0, 'the next refresh does not replay again');
+  } finally { db.close(); }
 });
 
 test('claude parse() emits no session record for a subagent transcript', () => {
