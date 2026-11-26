@@ -24,6 +24,7 @@ import {
   rootTagFor,
   canonicalSessionId,
   bareSessionId,
+  legacyClaudeMigrationTargets,
 } from '../packages/core/src/providers/claude.ts';
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
@@ -33,6 +34,26 @@ import { runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const require = createRequire(import.meta.url);
+
+test('v8 replay recognizes the literal v7 identity marker as post-migration', () => {
+  const home = makeTempDir('obelisk-claude-v7-marker-');
+  const defaultRoot = join(home, '.claude');
+  const customRoot = join(home, 'profiles', 'work');
+  const transcript = copyRealFixture(customRoot);
+  const sessionId = REAL_SID;
+  const indexed = [{ sessionId, jsonlPath: transcript }];
+  const checkpoint = checkpointFor(transcript);
+  const resolve = marker => legacyClaudeMigrationTargets(defaultRoot, [customRoot], indexed, key => {
+    if (key === transcript) return checkpoint;
+    if (key === marker) return '1:0';
+    return null;
+  });
+
+  assert.deepEqual(resolve('__claude_canonical_transcript_v7__'), [],
+    'an old DB with v7 identities must not be mistaken for pre-v7 bare IDs during v8 replay');
+  assert.equal(resolve('__claude_canonical_transcript_v6__').length, 1,
+    'a genuinely pre-v7 DB still plans the established root identity migration');
+});
 const { DatabaseSync } = require('node:sqlite');
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 

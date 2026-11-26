@@ -59,9 +59,10 @@ function cursorSignatureDiffers(cursor: string, filePath: string): boolean {
 }
 
 export const name = 'claude';
-// v7 introduces namespaced session and message IDs for multi-root Claude Code.
-// Existing installs must replay once to upgrade already indexed rows.
-export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v7__';
+// v8 adds Claude's human-authored mid-turn queued commands to the canonical
+// transcript. Existing installs must replay once to index those attachments.
+export const CLAUDE_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v8__';
+const CLAUDE_V7_CANONICAL_TRANSCRIPT_MARKER = '__claude_canonical_transcript_v7__';
 
 function isWindowsStylePath(value: string): boolean {
   return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\');
@@ -343,7 +344,10 @@ function resolveIndexedRoots(
   indexed: readonly IndexedSession[],
   ctx: DiscoverContext,
 ) {
-  const preV7 = (ctx.previousCursor?.(CLAUDE_CANONICAL_TRANSCRIPT_MARKER) ?? null) === null;
+  // Keep v7 identity upgrades distinguishable from older bare-ID indexes after
+  // v8 becomes the current replay marker.
+  const preV7 = (ctx.previousCursor?.(CLAUDE_CANONICAL_TRANSCRIPT_MARKER) ?? null) === null
+    && (ctx.previousCursor?.(CLAUDE_V7_CANONICAL_TRANSCRIPT_MARKER) ?? null) === null;
   const canonicalTags = new Map(roots.map(root => [root, rootTagFor(root, defaultRoot)]));
   const legacyBareIds = new Set<string>();
   const byRoot = new Map(roots.map(root => [root, new Map<string, IndexedSession[]>()]));
@@ -488,6 +492,24 @@ function messageUuid(sessionId: string, rawUuid: string): string {
 
 function scopedId(sessionId: string, rawId: string): string {
   return sessionId.includes(':') ? `${sessionId}:${rawId}` : rawId;
+}
+
+function isWireUuid(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function humanQueuedPrompt(record: any): string | null {
+  const attachment = record?.type === 'attachment' ? record.attachment : null;
+  const prompt = attachment?.prompt;
+  return attachment?.type === 'queued_command'
+    && attachment.origin?.kind === 'human'
+    && attachment.humanTurn === true
+    && isWireUuid(record.uuid)
+    && typeof prompt === 'string'
+    && prompt.trim().length > 0
+    ? prompt
+    : null;
 }
 
 function extractRawUuid(messageUuid: string, sessionId?: unknown): string {
@@ -1009,6 +1031,24 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
       records.push({ kind: 'message-turn-duration', uuid: messageUuid(sid, obj.parentUuid), turn_duration_ms: obj.durationMs });
       return;
     }
+    const queuedPrompt = isSubagent ? null : humanQueuedPrompt(obj);
+    if (queuedPrompt !== null) {
+      if (ts && (!sm.started_at || ts < sm.started_at)) sm.started_at = ts;
+      if (ts && (!sm.ended_at || ts > sm.ended_at)) sm.ended_at = ts;
+      sm.n++;
+      records.push({
+        kind: 'message', uuid: messageUuid(sid, obj.uuid), session_id: sid,
+        type: 'user', parent_uuid: typeof obj.parentUuid === 'string' && obj.parentUuid.length > 0
+          ? messageUuid(sid, obj.parentUuid) : null,
+        timestamp: ts, role: 'user', text: trunc(queuedPrompt), content_type: 'text',
+        is_meta: 0, harness_kind: null, visibility: 'visible', model: null,
+        is_sidechain: obj.isSidechain ? 1 : 0,
+        agent_id: typeof obj.agentId === 'string' && obj.agentId ? scopedId(sid, obj.agentId) : null,
+        input_tokens: null, output_tokens: null,
+        cwd: typeof obj.cwd === 'string' && obj.cwd ? obj.cwd : null, skill: null, source: 'claude',
+      });
+      return;
+    }
     if (obj.type !== 'user' && obj.type !== 'assistant') return;
 
     if (ts && (!sm.started_at || ts < sm.started_at)) sm.started_at = ts;
@@ -1299,11 +1339,16 @@ function rawClaude(input: RawLookup): RawRecord | null {
   let messageText: string | null = null;
   if (raw !== null) {
     try {
-      const content = JSON.parse(raw)?.message?.content;
-      if (typeof content === 'string') messageText = content;
-      else if (Array.isArray(content)) {
-        const parts = content.map((part) => part?.text ?? part?.thinking).filter((part) => typeof part === 'string');
-        messageText = parts.length > 0 ? parts.join('\n') : null;
+      const parsed = JSON.parse(raw);
+      const queuedPrompt = humanQueuedPrompt(parsed);
+      if (queuedPrompt !== null) messageText = queuedPrompt;
+      else {
+        const content = parsed?.message?.content;
+        if (typeof content === 'string') messageText = content;
+        else if (Array.isArray(content)) {
+          const parts = content.map((part) => part?.text ?? part?.thinking).filter((part) => typeof part === 'string');
+          messageText = parts.length > 0 ? parts.join('\n') : null;
+        }
       }
     } catch { /* malformed source line */ }
   }
