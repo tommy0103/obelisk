@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-你的 Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Devin、Hermes Agent、Kiro、Kimi Code、OMP、OpenCode、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
+你的 Antigravity、Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Devin、Hermes Agent、Kiro、Kimi Code、OMP、OpenCode、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
 
 [English](README.md) · **中文**
 
@@ -192,6 +192,7 @@ provider 前缀，不会撞。
 
 | Provider | 默认读取位置 |
 | --- | --- |
+| Antigravity | `~/.gemini/antigravity/brain/*/.system_generated/logs`；标题、工作区和是否由子 agent 发起取自 `conversation_summaries.db` |
 | Claude Code | `~/.claude/projects` |
 | Codex | `~/.codex/sessions`、`~/.codex/archived_sessions` |
 | GitHub Copilot | VS Code `User` 数据目录（Chronicle 存储 + workspace transcripts） |
@@ -218,6 +219,7 @@ inactive——默认查询看不到，支持的查询方法可以用 `includeIna
 | Hermes Agent | 不细分：压缩归档和 rewind 的行都存为 `inactive` |
 | OpenCode | 会话 revert 状态判定 inactive 历史 |
 | Devin | 任何存活链都到不了的消息（rewind 掉的轮次、压缩前的历史）记为 inactive |
+| Antigravity | 步骤日志不标记 rewind；压缩检查点存为 `compaction` 行，之前的步骤仍算有效 |
 | Claude Code | 来源本身不标记 rewind / 当前叶子状态 |
 | Codex | 会话没有分支概念 |
 

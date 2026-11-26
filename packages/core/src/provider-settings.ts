@@ -22,6 +22,7 @@ import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 import type { KiroDatabaseOpener } from './providers/kiro.ts';
 import type { OpencodeDatabaseOpener } from './providers/opencode.ts';
 import type { DevinDatabaseOpener } from './providers/devin.ts';
+import type { AntigravityDatabaseOpener } from './providers/antigravity.ts';
 
 export type PersistedProviderSettings = Record<string, unknown> & {
   providerRoots?: Record<string, unknown>;
@@ -210,6 +211,7 @@ export function createConfiguredBuiltinProviderRuntime(
     openKiroDatabase,
     openOpencodeDatabase,
     openDevinDatabase,
+    openAntigravityDatabase,
   }: {
     homeDir?: string;
     cwd?: string;
@@ -220,9 +222,10 @@ export function createConfiguredBuiltinProviderRuntime(
     openKiroDatabase?: KiroDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
     openDevinDatabase?: DevinDatabaseOpener;
+    openAntigravityDatabase?: AntigravityDatabaseOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase, openAntigravityDatabase });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir });
   const copilotUsesAutomaticRoots = baseRoots.copilot === undefined
     && !hasExplicitProviderRoot(persisted, 'copilot');
@@ -244,7 +247,7 @@ export function createConfiguredBuiltinProviderRuntime(
       ...(opencodeUsesAutomaticRoots ? { opencode: undefined } : {}),
     },
     {
-      cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase,
+      cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase, openAntigravityDatabase,
       copilotUserDataRoots,
       claudeSourceRoots,
       claudeDefaultRoot,
