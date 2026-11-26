@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
@@ -216,6 +216,75 @@ test('desktop multi-root: manual rebuild with preserveDbPath migrates pre-v7 cus
   assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id = ?').get(migratedOrphanSid).message_count, 2);
   assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path = ?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER));
   db.exec("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)");
+  db.close();
+});
+
+test('desktop force rebuild treats a staged v7 marker row with null cursor as established identity', () => {
+  const fakeHome = makeTempDir('obelisk-app-claude-v7-marker-presence-');
+  const defaultRoot = join(fakeHome, '.claude');
+  const rootA = join(fakeHome, 'profiles', 'profileA');
+  const rootB = join(fakeHome, 'profiles', 'profileB');
+  const codexRoot = join(fakeHome, '.codex');
+  mkdirSync(rootA, { recursive: true });
+  mkdirSync(rootB, { recursive: true });
+  symlinkSync(rootA, defaultRoot, 'dir');
+  copyRealFixture(rootA);
+  const oldPath = join(rootA, 'projects', REAL_SLUG, `${REAL_SID}.jsonl`);
+
+  const oldDbPath = join(fakeHome, '.obelisk', 'obelisk.sqlite');
+  mkdirSync(join(fakeHome, '.obelisk'), { recursive: true });
+  const oldDb = new DatabaseSync(oldDbPath);
+  oldDb.exec(SCHEMA);
+  oldDb.prepare(`
+    INSERT INTO sessions (id,title,project,started_at,ended_at,message_count,jsonl_path,source)
+    VALUES (?,?,?,?,?,1,?,'claude')
+  `).run(REAL_SID, 'prior default-root session', REAL_SLUG, REAL_FIXTURE_USER.timestamp,
+    REAL_FIXTURE_USER.timestamp, oldPath);
+  oldDb.prepare(`
+    INSERT INTO messages (uuid,session_id,type,timestamp,role,text,content_type,is_meta,visibility,is_sidechain,source)
+    VALUES (?,?,'user',?,'user',?,'text',0,'visible',0,'claude')
+  `).run(REAL_FIXTURE_USER.uuid, REAL_SID, REAL_FIXTURE_USER.timestamp, REAL_FIXTURE_USER.message.content);
+  oldDb.prepare(`
+    INSERT INTO memories (id,session_id,project,path,summary,created_at,message_start)
+    VALUES ('anchor-v7',?,?,'notes/v7.md','preserve the old identity anchor','2026-09-14T18:10:00.000Z',?)
+  `).run(REAL_SID, REAL_SLUG, REAL_FIXTURE_USER.uuid);
+  const { mtimeMs, ctimeMs, size, ino } = statSync(oldPath);
+  oldDb.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,1,0,NULL)')
+    .run('__claude_canonical_transcript_v7__');
+  oldDb.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,?,1,?)')
+    .run(oldPath, mtimeMs, `${mtimeMs}:1:${size}:${ctimeMs}:${ino}`);
+  oldDb.close();
+
+  unlinkSync(defaultRoot);
+  symlinkSync(rootB, defaultRoot, 'dir');
+  const settings = { providerRoots: { claude: [rootA, defaultRoot] } };
+  const runtime = createConfiguredBuiltinProviderRuntime(settings, {
+    homeDir: fakeHome,
+    baseRoots: { claude: defaultRoot, codex: codexRoot },
+  });
+  const tempDbPath = join(fakeHome, '.obelisk', 'obelisk.sqlite.rebuild.tmp');
+  const rebuilt = buildIndex({
+    reason: 'manual-rebuild',
+    force: true,
+    providerRoots: runtime.roots,
+    providerSettings: settings,
+    claudeDir: runtime.roots.claude,
+    defaultClaudeDir: defaultRoot,
+    codexDir: codexRoot,
+    dbPath: tempDbPath,
+    preserveDbPath: oldDbPath,
+    DatabaseImpl: TestDatabase,
+  });
+  assert.equal(rebuilt.complete, true, JSON.stringify(rebuilt));
+
+  const db = new DatabaseSync(tempDbPath);
+  const rows = db.prepare("SELECT id,jsonl_path FROM sessions WHERE source='claude' ORDER BY jsonl_path").all();
+  assert.deepEqual(rows.map(row => ({ ...row })), [{ id: REAL_SID, jsonl_path: oldPath }]);
+  assert.deepEqual({ ...db.prepare('SELECT session_id,message_start FROM memories WHERE id=?').get('anchor-v7') }, {
+    session_id: REAL_SID,
+    message_start: REAL_FIXTURE_USER.uuid,
+  });
+  assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get(CLAUDE_CANONICAL_TRANSCRIPT_MARKER));
   db.close();
 });
 

@@ -494,22 +494,47 @@ function scopedId(sessionId: string, rawId: string): string {
   return sessionId.includes(':') ? `${sessionId}:${rawId}` : rawId;
 }
 
+function queuedAttachmentMessageUuid(sessionId: string, rawUuid: string): string {
+  return `${sessionId}:${rawUuid}`;
+}
+
+function parentMessageUuid(sessionId: string, rawUuid: string, queuedAttachmentUuids: ReadonlySet<string>): string {
+  return queuedAttachmentUuids.has(rawUuid)
+    ? queuedAttachmentMessageUuid(sessionId, rawUuid)
+    : messageUuid(sessionId, rawUuid);
+}
+
 function isWireUuid(value: unknown): value is string {
   return typeof value === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
-function humanQueuedPrompt(record: any): string | null {
+function humanQueuedContent(record: any): { text: string | null; contentType: string } | null {
   const attachment = record?.type === 'attachment' ? record.attachment : null;
   const prompt = attachment?.prompt;
-  return attachment?.type === 'queued_command'
-    && attachment.origin?.kind === 'human'
-    && attachment.humanTurn === true
-    && isWireUuid(record.uuid)
-    && typeof prompt === 'string'
-    && prompt.trim().length > 0
+  const promptContent = typeof prompt === 'string'
     ? prompt
-    : null;
+    : Array.isArray(prompt)
+      ? prompt.filter((part) => part !== null && typeof part === 'object' && !Array.isArray(part)
+        && ((part.type === 'text' && typeof part.text === 'string')
+          || (part.type === 'thinking' && typeof part.thinking === 'string')
+          || part.type === 'image'))
+      : null;
+  if (attachment?.type !== 'queued_command'
+    || attachment.origin?.kind !== 'human'
+    || (attachment.humanTurn !== undefined && attachment.humanTurn !== true)
+    || attachment.isMeta === true || record.isMeta === true
+    || (attachment.commandMode !== undefined && attachment.commandMode !== 'prompt')
+    || !isWireUuid(record.uuid)
+    || promptContent === null || (Array.isArray(promptContent) && promptContent.length === 0)) return null;
+  const extractedText = extractText(promptContent, Infinity);
+  const text = typeof extractedText === 'string' && extractedText.trim().length > 0 ? extractedText : null;
+  const includesImage = Array.isArray(promptContent) && promptContent.some((part) => part.type === 'image');
+  if (text === null && !includesImage) return null;
+  return {
+    text,
+    contentType: extractContentType(promptContent),
+  };
 }
 
 function extractRawUuid(messageUuid: string, sessionId?: unknown): string {
@@ -969,6 +994,7 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
   const rootIdentity = physical !== null && location !== null && sameNormalizedPath(location.root, physical)
     ? physicalDirectoryIdentity(physical) : null;
   const records: TranscriptRecord[] = [];
+  const queuedAttachmentUuids = new Set<string>();
   const historyTitle = ((unit.meta as { historyTitle?: string } | undefined)?.historyTitle ?? null) as string | null;
   let aiTitle: string | null = null;
   let customTitle: string | null = null;
@@ -1002,6 +1028,8 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
     const ts = normalizeTranscriptTimestamp(obj.timestamp);
     const msg = obj.message || {};
     const usage = msg.usage || {};
+    const queuedContent = isSubagent ? null : humanQueuedContent(obj);
+    if (queuedContent !== null) queuedAttachmentUuids.add(obj.uuid);
 
     // Claude Code now persists app-, CLI-, and hook-assigned session names as
     // `custom-title` records. Scan title metadata across the whole transcript,
@@ -1028,19 +1056,18 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
       return;
     }
     if (obj.type === 'system' && obj.subtype === 'turn_duration' && obj.parentUuid && obj.durationMs) {
-      records.push({ kind: 'message-turn-duration', uuid: messageUuid(sid, obj.parentUuid), turn_duration_ms: obj.durationMs });
+      records.push({ kind: 'message-turn-duration', uuid: parentMessageUuid(sid, obj.parentUuid, queuedAttachmentUuids), turn_duration_ms: obj.durationMs });
       return;
     }
-    const queuedPrompt = isSubagent ? null : humanQueuedPrompt(obj);
-    if (queuedPrompt !== null) {
+    if (queuedContent !== null) {
       if (ts && (!sm.started_at || ts < sm.started_at)) sm.started_at = ts;
       if (ts && (!sm.ended_at || ts > sm.ended_at)) sm.ended_at = ts;
       sm.n++;
       records.push({
-        kind: 'message', uuid: messageUuid(sid, obj.uuid), session_id: sid,
+        kind: 'message', uuid: queuedAttachmentMessageUuid(sid, obj.uuid), session_id: sid,
         type: 'user', parent_uuid: typeof obj.parentUuid === 'string' && obj.parentUuid.length > 0
-          ? messageUuid(sid, obj.parentUuid) : null,
-        timestamp: ts, role: 'user', text: trunc(queuedPrompt), content_type: 'text',
+          ? parentMessageUuid(sid, obj.parentUuid, queuedAttachmentUuids) : null,
+        timestamp: ts, role: 'user', text: trunc(queuedContent.text), content_type: queuedContent.contentType,
         is_meta: 0, harness_kind: null, visibility: 'visible', model: null,
         is_sidechain: obj.isSidechain ? 1 : 0,
         agent_id: typeof obj.agentId === 'string' && obj.agentId ? scopedId(sid, obj.agentId) : null,
@@ -1071,7 +1098,8 @@ function* parseUnit(unit: IndexUnit, cursor: Cursor): Generator<TranscriptRecord
     if (obj.uuid) {
       records.push({
         kind: 'message', uuid: msgUuid, session_id: sid, type: obj.type,
-        parent_uuid: obj.parentUuid ? messageUuid(sid, obj.parentUuid) : null, timestamp: ts, role: msg.role || obj.type,
+        parent_uuid: obj.parentUuid ? parentMessageUuid(sid, obj.parentUuid, queuedAttachmentUuids) : null,
+        timestamp: ts, role: msg.role || obj.type,
         text, content_type: contentType, is_meta: harnessKind === null ? 0 : 1, harness_kind: harnessKind, visibility: 'visible',
         model: msg.model || null,
         is_sidechain: obj.isSidechain ? 1 : 0, agent_id: aid,
@@ -1340,8 +1368,8 @@ function rawClaude(input: RawLookup): RawRecord | null {
   if (raw !== null) {
     try {
       const parsed = JSON.parse(raw);
-      const queuedPrompt = humanQueuedPrompt(parsed);
-      if (queuedPrompt !== null) messageText = queuedPrompt;
+      const queuedContent = humanQueuedContent(parsed);
+      if (queuedContent !== null) messageText = queuedContent.text;
       else {
         const content = parsed?.message?.content;
         if (typeof content === 'string') messageText = content;

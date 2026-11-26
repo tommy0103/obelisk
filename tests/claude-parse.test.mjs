@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, utimesSync, writeFileSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -115,7 +115,8 @@ test('a captured human mid-turn message is visible, searchable, and keeps its at
   const second = drain(provider.parse(unit, null));
   assert.deepEqual(second.values, first.values, 'replaying the same source preserves canonical identity');
   assertHarnessConformance(first.values);
-  const interjection = first.values.find(record => record.kind === 'message' && record.uuid === '685dc2b5-a360-4708-856b-1cbed9776a97');
+  const interjection = first.values.find(record => record.kind === 'message'
+    && record.uuid === `${unit.sessionId}:685dc2b5-a360-4708-856b-1cbed9776a97`);
   assert.ok(interjection);
   assert.deepEqual({
     type: interjection.type,
@@ -205,22 +206,154 @@ test('only valid human queued commands become messages, without text deduplicati
     attachment('d2510000-0000-4000-8000-000000000004', { attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, humanTurn: false } }),
     attachment('not-a-wire-uuid'),
     attachment('d2510000-0000-4000-8000-000000000005', { attachment: { type: 'queued_command', prompt: '   ', origin: { kind: 'human' }, humanTurn: true } }),
+    attachment('d2510000-0000-4000-8000-000000000006', { attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, humanTurn: true, isMeta: true } }),
+    attachment('d2510000-0000-4000-8000-000000000007', { attachment: { type: 'queued_command', prompt, origin: { kind: 'human' }, commandMode: 'shell' } }),
+    attachment('d2510000-0000-4000-8000-000000000008', { attachment: {
+      type: 'queued_command', prompt: [null, { type: 'text', text: 'safe array text' },
+        { type: 'image', source: { type: 'base64', data: 'do not index' } }],
+      origin: { kind: 'human' }, commandMode: 'prompt',
+    } }),
+    attachment('d2510000-0000-4000-8000-000000000009', { attachment: {
+      type: 'queued_command', prompt: [{ type: 'image', source: { type: 'base64', data: 'do not index' } }],
+      origin: { kind: 'human' }, commandMode: 'prompt',
+    } }),
     { type: 'queue-operation', operation: 'enqueue', content: prompt },
   ].map(line => JSON.stringify(line)).join('\n') + '\n');
 
   const { values } = drain(parse({ key: path, sessionId: 'sid-gates' }, null));
   const messages = values.filter(record => record.kind === 'message');
   assert.deepEqual(messages.map(message => message.uuid), [
-    'd2510000-0000-4000-8000-000000000001',
-    'd2510000-0000-4000-8000-000000000002',
+    'sid-gates:d2510000-0000-4000-8000-000000000001',
+    'sid-gates:d2510000-0000-4000-8000-000000000002',
+    'sid-gates:d2510000-0000-4000-8000-000000000008',
+    'sid-gates:d2510000-0000-4000-8000-000000000009',
   ]);
-  assert.deepEqual(messages.map(message => message.text), [prompt, prompt]);
+  assert.deepEqual(messages.map(message => message.text), [prompt, prompt, 'safe array text', null]);
   assert.ok(messages.every(message => message.role === 'user' && message.is_meta === 0
     && message.visibility === 'visible' && message.harness_kind === null));
-  assert.equal(values.find(record => record.kind === 'session').message_count, 2);
+  assert.equal(messages.at(-1).content_type, 'unknown', 'image-only human prompts remain countable messages');
+  assert.equal(values.find(record => record.kind === 'session').message_count, 4);
 
   const subagent = drain(parse({ key: path, sessionId: 'sid-gates', isSubagent: true, agentId: 'agent-1' }, null));
   assert.equal(subagent.values.filter(record => record.kind === 'message').length, 0);
+});
+
+test('captured text-image and humanTurn-omitted prompts use ordinary text extraction without indexing image data', () => {
+  const root = makeTempDir('obelisk-claude-interject-content-');
+  const provider = createClaudeProvider({ rootDir: root });
+  const captures = [
+    {
+      fixture: 'mid-turn-interject-image-redacted.jsonl',
+      sessionId: 'd2510000-0000-4000-8000-000000000010',
+      wireUuid: 'bdbdd6cf-f72b-4b31-86f1-abae65f4199d',
+      text: 'Review this geometry image during the running command.',
+      contentType: 'unknown',
+    },
+    {
+      fixture: 'mid-turn-interject-no-human-turn-redacted.jsonl',
+      sessionId: 'd2510000-0000-4000-8000-000000000011',
+      wireUuid: '5f0ed9e9-854c-4f49-9bb8-b6ea5e7757c9',
+      text: 'flagoffinterject251',
+      contentType: 'text',
+    },
+  ];
+
+  for (const capture of captures) {
+    const projectDir = join(root, 'projects', '-redacted-content');
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, `${capture.sessionId}.jsonl`);
+    writeFileSync(path, readFileSync(new URL(`./fixtures/claude/${capture.fixture}`, import.meta.url)));
+    const unit = provider.discover({ lastCursor: () => null }).find(candidate => candidate.sessionId === capture.sessionId);
+    assert.ok(unit);
+    const { values } = drain(provider.parse(unit, null));
+    const message = values.find(record => record.kind === 'message');
+    assert.ok(message);
+    assert.equal(message.uuid, `${capture.sessionId}:${capture.wireUuid}`);
+    assert.equal(message.text, capture.text);
+    assert.equal(message.content_type, capture.contentType);
+    assert.equal(message.is_meta, 0);
+    assert.equal(message.harness_kind, null);
+    assert.equal(values.find(record => record.kind === 'session').message_count, 1);
+    assert.equal(values.some(record => record.kind === 'message' && record.text?.includes('[redacted image bytes]')), false);
+    const raw = provider.raw({
+      source: 'claude', messageUuid: message.uuid,
+      session: { id: unit.sessionId, jsonl_path: path }, agentId: null,
+      subagent: null, workflowAgent: null,
+    });
+    assert.equal(raw.messageText, capture.text);
+  }
+});
+
+test('an appended child record keeps the queued attachment parent scope across cursor resume', () => {
+  const path = join(makeTempDir('obelisk-claude-interject-append-'), 'sid-append.jsonl');
+  const wireUuid = 'd2510000-0000-4000-8000-000000000010';
+  const prompt = {
+    type: 'attachment', uuid: wireUuid, parentUuid: null, timestamp: '2026-06-10T10:00:00Z',
+    attachment: { type: 'queued_command', prompt: 'resume safely', origin: { kind: 'human' } },
+  };
+  writeFileSync(path, `${JSON.stringify(prompt)}\n`);
+  const provider = createClaudeProvider();
+  const initial = drain(provider.parse({ key: path, sessionId: 'sid-append' }, null));
+  assert.equal(initial.values.find(record => record.kind === 'message').uuid,
+    `sid-append:${wireUuid}`);
+  appendFileSync(path, `${JSON.stringify({
+    type: 'assistant', uuid: 'd2510000-0000-4000-8000-000000000011', parentUuid: wireUuid,
+    timestamp: '2026-06-10T10:00:01Z', message: { role: 'assistant', content: [{ type: 'text', text: 'continued' }] },
+  })}\n`);
+  const delta = drain(provider.parse({ key: path, sessionId: 'sid-append' }, initial.ret));
+  const child = delta.values.find(record => record.kind === 'message');
+  assert.equal(child.uuid, 'd2510000-0000-4000-8000-000000000011', 'ordinary message identity remains unchanged');
+  assert.equal(child.parent_uuid, `sid-append:${wireUuid}`);
+  assert.equal(delta.values.find(record => record.kind === 'session').message_count, 1);
+});
+
+test('forked sessions scope shared attachment UUIDs and preserve raw lookup and detail parity', () => {
+  const root = makeTempDir('obelisk-claude-interject-fork-');
+  const projectDir = join(root, 'projects', '-redacted-fork');
+  mkdirSync(projectDir, { recursive: true });
+  const fixture = readFileSync(new URL('./fixtures/claude/mid-turn-interject-fork-redacted.jsonl', import.meta.url));
+  const sessionIds = [
+    'ec2e416d-0dd9-4852-b7de-f564ed92a5e8',
+    'fe9dd08a-5499-4902-995b-7d3938b05315',
+  ];
+  for (const sessionId of sessionIds) writeFileSync(join(projectDir, `${sessionId}.jsonl`), fixture);
+
+  const provider = createClaudeProvider({ rootDir: root });
+  const units = provider.discover({ lastCursor: () => null }).filter(unit => sessionIds.includes(unit.sessionId));
+  assert.equal(units.length, 2);
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  for (const unit of units) persist(db, unit, provider.parse(unit, null));
+
+  const api = createQueryApi(db, { providerRegistry: createProviderRegistry([provider]) });
+  const canonicalUuids = sessionIds.map(sessionId => `${sessionId}:041419b3-b696-41f8-b31c-ecd063383719`);
+  assert.notEqual(canonicalUuids[0], canonicalUuids[1]);
+  for (const unit of units) {
+    const uuid = canonicalUuids[sessionIds.indexOf(unit.sessionId)];
+    const detail = assembleSessionDetail([...provider.parse(unit, null)]);
+    const stored = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
+    assert.ok(stored);
+    assert.equal(stored.session_id, unit.sessionId);
+    assert.equal(stored.uuid, uuid);
+    const raw = api.raw(uuid);
+    assert.equal(JSON.parse(raw.text).uuid, '041419b3-b696-41f8-b31c-ecd063383719', 'Raw retains the original wire identity');
+    assert.equal(JSON.parse(raw.text).attachment.prompt, 'nocutleftnocutright');
+    const adapterRaw = provider.raw({
+      source: 'claude', messageUuid: uuid,
+      session: db.prepare('SELECT * FROM sessions WHERE id=?').get(unit.sessionId), agentId: null,
+      subagent: null, workflowAgent: null,
+    });
+    assert.equal(adapterRaw.messageText, 'nocutleftnocutright');
+    assert.ok(api.messages({ sessionId: unit.sessionId }).messages.some(message => message.uuid === uuid));
+    const persistedDetail = assembleSessionDetail({
+      session: db.prepare('SELECT * FROM sessions WHERE id=?').get(unit.sessionId),
+      messages: db.prepare('SELECT * FROM messages WHERE session_id=? ORDER BY timestamp, uuid').all(unit.sessionId),
+      toolCalls: [], toolResults: [], subagents: [], workflows: [], summaries: [],
+    });
+    assert.deepEqual(persistedDetail, detail);
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE text=?').get('nocutleftnocutright').count, 2);
+  db.close();
 });
 
 test('an unchanged v7 Claude index replays attachments and converges on the v8 marker', () => {
@@ -240,7 +373,8 @@ test('an unchanged v7 Claude index replays attachments and converges on the v8 m
     assert.ok(unit);
     const parsed = drain(provider.parse(unit, null));
     const oldRecords = parsed.values
-      .filter(record => !(record.kind === 'message' && record.uuid === '685dc2b5-a360-4708-856b-1cbed9776a97'))
+      .filter(record => !(record.kind === 'message'
+        && record.uuid === `${unit.sessionId}:685dc2b5-a360-4708-856b-1cbed9776a97`))
       .map(record => record.kind === 'session' ? { ...record, message_count: record.message_count - 1 } : record);
     function* oldParse() { yield* oldRecords; return parsed.ret; }
     persist(db, unit, oldParse());
@@ -252,7 +386,8 @@ test('an unchanged v7 Claude index replays attachments and converges on the v8 m
     const result = indexProviderPlanStrict({ db, plan });
     writeProviderIndexMarkers(db, plan, result);
 
-    assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?').get('685dc2b5-a360-4708-856b-1cbed9776a97').text,
+    assert.equal(db.prepare('SELECT text FROM messages WHERE uuid=?')
+      .get(`${unit.sessionId}:685dc2b5-a360-4708-856b-1cbed9776a97`).text,
       'Please keep the existing design and include a short migration note.');
     assert.equal(db.prepare('SELECT message_count FROM sessions WHERE id=?').get(unit.sessionId).message_count, 4);
     assert.ok(db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__claude_canonical_transcript_v7__'),
