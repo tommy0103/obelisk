@@ -314,6 +314,8 @@ export function createProviderIndexPlan(
     const retainedIds = new Set<string>();
     const previousState = (key: string) => priorIndexState?.get(key) ?? storedCheckpoint(db, key);
     const units = provider.discover({
+      force,
+      readMode,
       snapshotRequired: fullReindex,
       previousCursor: key => checkpointCursor(previousState(key)),
       retainSession: id => retainedIds.add(id),

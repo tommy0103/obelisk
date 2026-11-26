@@ -2663,6 +2663,13 @@ test('main process watches all configured providerRoots.codex roots, honors CODE
     const codexSource = settingsPayload.sources.find((s) => s.id === 'codex');
     assert.equal(codexSource.exists, true, 'settings:get picks the existing root from configured array');
     assert.equal(codexSource.path, existingSecond);
+    assert.equal(codexSource.multiRoot, true);
+    assert.deepEqual(codexSource.paths, [missingFirst, existingSecond]);
+
+    await assert.rejects(
+      () => ipcHandlers.get('settings:set')(null, 'providerRoots.codex', join(home, 'single-codex')),
+      /Multiple Codex roots/,
+    );
 
     // Unrelated save preserves providerRoots.codex array.
     await ipcHandlers.get('settings:set')(null, 'editorScheme', 'cursor');

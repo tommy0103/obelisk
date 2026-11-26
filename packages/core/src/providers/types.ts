@@ -77,6 +77,10 @@ export interface InventoryIssue {
 
 /** Context the orchestration provides to discovery. */
 export interface DiscoverContext {
+  /** A user-requested full rebuild, distinct from marker-migration replay. */
+  force?: boolean;
+  /** Requested source read mode for planning family-safe replays. */
+  readMode?: 'normal' | 'strict';
   /** Require a complete projection: an unstable unit must fail, not return a no-op. */
   snapshotRequired?: boolean;
   /** Look up the cursor persisted for a unit key on a previous run. */

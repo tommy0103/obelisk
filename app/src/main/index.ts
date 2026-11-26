@@ -662,6 +662,7 @@ ipcMain.handle('settings:get', async () => {
   const claudeRootConfig = resolveConfiguredClaudeRoots(persisted);
   const claudeHasArrayConfig = Array.isArray(persisted.providerRoots?.claude);
   const configuredClaudeList = claudeHasArrayConfig ? (claudeRootConfig.roots ?? []) : [];
+  const codexHasArrayConfig = Array.isArray(persisted.providerRoots?.codex);
   const codexConfiguredRoots = resolveCodexConfiguredRoots(persisted);
   const sourcePaths = new Set([
     ...(codexConfiguredRoots ?? []),
@@ -707,6 +708,13 @@ ipcMain.handle('settings:get', async () => {
           status: 'error',
           statusText: `Folder not found: ${missingPath}`,
         }),
+      };
+    }
+    if (source.id === 'codex' && codexHasArrayConfig) {
+      return {
+        ...source,
+        multiRoot: true,
+        paths: codexConfiguredRoots ?? [],
       };
     }
     if (source.id !== 'copilot' || copilotCustomRoot) return source;
@@ -761,12 +769,18 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
       rename: (from, to) => fs.promises.rename(from, to),
       copyFile: (from, to) => fs.promises.copyFile(from, to),
     }, currentRead);
+    const persistedRoots = persisted.providerRoots as Record<string, unknown> | undefined;
+    const multiRootGuard = key === 'providerRoots.claude'
+      ? { field: 'claude', label: 'Claude' }
+      : key === 'providerRoots.codex'
+        ? { field: 'codex', label: 'Codex' }
+        : null;
     if (
-      key === 'providerRoots.claude'
+      multiRootGuard !== null
       && typeof value === 'string'
-      && Array.isArray((persisted.providerRoots as Record<string, unknown> | undefined)?.claude)
+      && Array.isArray(persistedRoots?.[multiRootGuard.field])
     ) {
-      throw new Error('Multiple Claude roots are configured in settings.json; edit settings.json to update or remove them');
+      throw new Error(`Multiple ${multiRootGuard.label} roots are configured in settings.json; edit settings.json to update or remove them`);
     }
     const providerRootChanged = setPersistedSetting(persisted, key, value);
     await savePersistedSettings(persisted);

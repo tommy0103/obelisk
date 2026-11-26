@@ -791,3 +791,50 @@ for (const eventFirst of [false, true]) {
     }
   });
 }
+
+test('codex parse() heals APFS sub-ms birthtime downward clamping via verified-append without snapshot fallback', async t => {
+  const clampedPaths = new Set();
+  const fsMock = t.mock.module('node:fs', {
+    namedExports: {
+      closeSync, existsSync, lstatSync, openSync, readdirSync, readSync,
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        if (!clampedPaths.has(target)) return result;
+        const clampMs = (ns) => (ns / 1_000_000n) * 1_000_000n;
+        if (options?.bigint) {
+          const birthNs = clampMs(result.birthtimeNs);
+          return Object.assign(result, {
+            birthtimeNs: birthNs,
+            birthtimeMs: Number(birthNs / 1_000_000n),
+          });
+        }
+        return result;
+      },
+    },
+  });
+  t.after(() => fsMock.restore());
+  const { createCodexParseMetrics: createMockMetrics, parse: parseMock } = await import('../packages/core/src/providers/codex.ts?apfs-birthtime-clamp');
+
+  for (let iteration = 0; iteration < 25; iteration++) {
+    clampedPaths.clear();
+    const path = writeFixture([
+      { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+      { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: `apfs clamp ${iteration}` } },
+    ]);
+    const initial = drain(parseMock({ key: path, sessionId: '' }, null));
+    const before = statSync(path);
+    // Simulate APFS utimesSync clamping birthtimeNs downward to whole ms while advancing ctime.
+    touchWithChangedCtime(path, before);
+    clampedPaths.add(path);
+
+    const healMetrics = createMockMetrics();
+    const healed = drain(parseMock({ key: path, sessionId: '' }, initial.ret, healMetrics));
+    assert.equal(healMetrics.plan, 'verified-append', `iteration ${iteration} must heal via verified-append, never snapshot`);
+    assert.deepEqual(healed.values, []);
+
+    const noopMetrics = createMockMetrics();
+    const settled = drain(parseMock({ key: path, sessionId: '' }, healed.ret, noopMetrics));
+    assert.equal(noopMetrics.plan, 'noop');
+    assert.equal(settled.ret, healed.ret);
+  }
+});

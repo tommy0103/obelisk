@@ -8,10 +8,16 @@ import { createRequire } from 'node:module';
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   copyFileSync,
+  existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
+  openSync,
+  readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   statSync,
   symlinkSync,
@@ -32,6 +38,7 @@ import { createProviderIndexPlan, indexProviderPlanStrict } from '../packages/co
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { createQueryApi } from '../packages/core/src/query.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
+import { prepareRetainedSnapshot } from '../packages/core/src/snapshot.ts';
 import { registerSessionQueryHandlers } from '../app/src/main/session-queries.ts';
 import { runCli } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
@@ -189,6 +196,226 @@ function beforeStoreCheckpoints(provider) {
     discover: ctx => provider.discover(ctx).map(unit => ({ ...unit, meta: { ...unit.meta, storeSuffix: undefined } })),
   };
 }
+
+test('nested configured root does not inherit its parent root history', () => {
+  const home = makeTempDir('obelisk-nested-independent-codex-');
+  const outer = join(home, 'outer');
+  const inner = join(outer, 'inner');
+  const parent = '019ed000-0000-7000-8000-000000000711';
+  const child = '019ed000-0000-7000-8000-000000000712';
+  writeRollout(inner, { id: parent, userText: 'inner original user prompt' });
+  writeRollout(outer, { id: parent, userText: 'outer distinct user prompt' });
+  writeRollout(outer, { id: child, parentThreadId: parent, userText: 'outer child' });
+  const db = freshDb();
+  const single = createCodexProvider({ rootDir: inner, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, single) }).complete, true);
+  const bare = `codex:${parent}`;
+  db.prepare(`INSERT INTO memories (id, session_id, project, message_start, message_end, path, summary, created_at)
+    VALUES ('mem-1', ?, 'proj', ?, ?, 'note.md', 'original inner', '2026-06-15T10:00:00Z')`).run(bare, `${bare}:000002`, `${bare}:000002`);
+  const multi = createCodexProvider({ roots: [outer], homeDir: home });
+  const outcome = indexProviderPlanStrict({ db, plan: planCodex(db, multi) });
+  const rows = db.prepare("SELECT session_id, text FROM messages WHERE role='user' ORDER BY session_id").all();
+  const memory = db.prepare("SELECT session_id, message_start FROM memories WHERE id='mem-1'").get();
+  assert.equal(outcome.complete, true);
+  assert.ok(rows.some(row => row.session_id === bare && row.text === 'inner original user prompt'));
+  assert.equal(memory.session_id, bare);
+  assert.equal(rows.length, 3);
+  db.close();
+});
+
+test('APFS birthtime clamp during append keeps family replay incremental', async t => {
+  const home = makeTempDir('obelisk-codex-clamp-family-');
+  const parent = '019ed000-0000-7000-8000-000000000731';
+  const child = '019ed000-0000-7000-8000-000000000732';
+  const root = join(home, '.codex');
+  const path = writeRollout(root, { id: parent, userText: 'parent before clamp' });
+  const childPath = writeRollout(root, { id: child, parentThreadId: parent, userText: 'old child' });
+  let clamp = false;
+  let rawReadBytes = 0;
+  const fsMock = t.mock.module('node:fs', {
+    namedExports: {
+      closeSync, existsSync, lstatSync, openSync, readdirSync,
+      readSync: (...args) => {
+        const count = readSync(...args);
+        rawReadBytes += count;
+        return count;
+      },
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        if (!options?.bigint || target !== path) return result;
+        const boundary = result.birthtimeNs / 1_000_000n * 1_000_000n;
+        return Object.assign(result, { birthtimeNs: clamp ? boundary : boundary + 150_000n });
+      },
+    },
+  });
+  t.after(() => fsMock.restore());
+  const { createCodexProvider: mockProvider } = await import('../packages/core/src/providers/codex.ts?apfs-clamp-family');
+  const db = freshDb();
+  const provider = mockProvider({ rootDir: root, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  clamp = true;
+  appendFileSync(path, `${JSON.stringify({ type: 'event_msg', timestamp: '2026-06-15T10:00:05Z', payload: { type: 'user_message', message: 'appended prompt' } })}\n`);
+  const plan = planCodex(db, provider, { changedPaths: [path] });
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='appended prompt'").get().n, 1);
+  assert.deepEqual(plan.items.map(({ unit }) => unit.key), [path]);
+  assert.equal(plan.items[0].unit.meta.forceSnapshot, undefined);
+  renameSync(childPath, join(home, 'offline-child.jsonl'));
+  appendFileSync(path, `${JSON.stringify({ type: 'event_msg', timestamp: '2026-06-15T10:00:06Z', payload: { type: 'user_message', message: 'second appended prompt' } })}\n`);
+  const secondPlan = planCodex(db, provider, { changedPaths: [path, childPath] });
+  const secondOutcome = indexProviderPlanStrict({ db, plan: secondPlan });
+  assert.equal(secondOutcome.complete, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='old child'").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='second appended prompt'").get().n, 1);
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(`codex:${parent}`);
+  const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(path).cursor;
+  rawReadBytes = 0;
+  assert.match(provider.raw({ source: 'codex', messageUuid: `codex:${parent}:000002`, agentId: null, session, cursor })?.text ?? '', /parent before clamp/);
+  assert.ok(rawReadBytes < 1_000_000, `raw lookup verifies only the needed prefix chunk (${rawReadBytes} bytes)`);
+  db.close();
+});
+
+test('native APFS birthtime clamp preserves an offline child projection', { skip: process.platform !== 'darwin' }, t => {
+  const home = makeTempDir('obelisk-native-apfs-family-');
+  const root = join(home, '.codex');
+  const parent = '019ed000-0000-7000-8000-000000000753';
+  const child = '019ed000-0000-7000-8000-000000000754';
+  const path = writeRollout(root, { id: parent, userText: 'parent before native clamp' });
+  const childPath = writeRollout(root, { id: child, parentThreadId: parent, userText: 'last cached child prompt' });
+  const db = freshDb();
+  const provider = createCodexProvider({ rootDir: root, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  renameSync(childPath, join(home, 'offline-child.jsonl'));
+  const before = statSync(path, { bigint: true });
+  appendFileSync(path, `${JSON.stringify({ type: 'event_msg', timestamp: '2026-06-15T10:00:06Z', payload: { type: 'user_message', message: 'native appended prompt' } })}\n`);
+  utimesSync(path, new Date(Number(before.atimeMs)), new Date(Number(before.birthtimeNs / 1_000_000n)));
+  const after = statSync(path, { bigint: true });
+  if (after.birthtimeNs >= before.birthtimeNs) {
+    t.skip('native filesystem did not clamp birthtime for this append');
+    db.close();
+    return;
+  }
+  const outcome = indexProviderPlanStrict({ db, plan: planCodex(db, provider, { changedPaths: [path, childPath] }) });
+  assert.equal(outcome.complete, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='last cached child prompt'").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='native appended prompt'").get().n, 1);
+  db.close();
+});
+
+test('raw lookup verifies only the first hashed chunk for an early line in a long zero-birthtime rollout', async t => {
+  let source;
+  let tracked = false;
+  let bytesRead = 0;
+  const mock = t.mock.module('node:fs', {
+    namedExports: {
+      closeSync, existsSync, lstatSync, openSync, readdirSync,
+      readSync: (...args) => {
+        const count = readSync(...args);
+        if (tracked) bytesRead += count;
+        return count;
+      },
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        if (options?.bigint && source && basename(target) === basename(source)) result.birthtimeNs = 0n;
+        return result;
+      },
+    },
+  });
+  t.after(() => mock.restore());
+  const { createCodexProvider: mockedProvider } = await import('../packages/core/src/providers/codex.ts?raw-bounded-zero-birthtime');
+  const home = makeTempDir('obelisk-raw-bounded-prefix-');
+  const root = join(home, 'real');
+  const alias = join(home, 'alias');
+  source = writeRollout(root, { id: '019ed000-0000-7000-8000-000000000861', userText: 'early raw target' });
+  const padding = `${JSON.stringify({ type: 'unrecognized', payload: { padding: 'x'.repeat(4096) } })}\n`;
+  appendFileSync(source, padding.repeat(4096));
+  symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const provider = mockedProvider({ rootDir: alias, homeDir: home });
+  const { db, reader } = freshFileDb(t);
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  const query = createQueryApi(reader, { providerRegistry: createProviderRegistry([provider]) });
+  const messageId = 'codex:019ed000-0000-7000-8000-000000000861:000002';
+  tracked = true;
+  assert.match(query.raw(messageId)?.text ?? '', /early raw target/);
+  const firstLookupBytes = bytesRead;
+  assert.ok(firstLookupBytes <= 8 * 1024 * 1024);
+  bytesRead = 0;
+  appendFileSync(source, '\n');
+  assert.match(query.raw(messageId)?.text ?? '', /early raw target/);
+  tracked = false;
+  assert.equal(bytesRead, 8 * 1024 * 1024);
+});
+
+test('raw lookup reads a newly indexed message ordinal after cooperative append', () => {
+  const home = makeTempDir('obelisk-raw-new-ordinal-');
+  const root = join(home, '.codex');
+  const id = '019ed000-0000-7000-8000-000000000862';
+  const source = writeRollout(root, { id, userText: 'before append' });
+  const db = freshDb();
+  const provider = createCodexProvider({ rootDir: root, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  appendFileSync(source, `${JSON.stringify({ type: 'event_msg', timestamp: '2026-06-15T10:00:05Z', payload: { type: 'user_message', message: 'new raw ordinal' } })}\n`);
+  const indexed = indexProviderPlanStrict({ db, plan: planCodex(db, provider, { changedPaths: [source] }) });
+  assert.equal(indexed.complete, true);
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(`codex:${id}`);
+  const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(source).cursor;
+  assert.match(provider.raw({ source: 'codex', messageUuid: `codex:${id}:000006`, agentId: null, session, cursor })?.text ?? '', /new raw ordinal/);
+  db.close();
+});
+
+test('raw lookup reads indexed compressed Codex messages', () => {
+  const home = makeTempDir('obelisk-raw-compressed-');
+  const root = join(home, '.codex');
+  const id = '019ed000-0000-7000-8000-000000000863';
+  const source = writeRollout(root, { id, subdir: 'archived_sessions', compressed: true, userText: 'compressed raw message' });
+  const db = freshDb();
+  const provider = createCodexProvider({ rootDir: root, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(`codex:${id}`);
+  const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(source).cursor;
+  assert.match(provider.raw({ source: 'codex', messageUuid: `codex:${id}:000002`, agentId: null, session, cursor })?.text ?? '', /compressed raw message/);
+  db.close();
+});
+
+test('bare replay excludes children whose default parent is not being reclaimed', () => {
+  const home = makeTempDir('obelisk-codex-bare-replay-orphan-');
+  const old = join(home, 'old');
+  const defaultRoot = join(home, '.codex');
+  const parent = '019ed000-0000-7000-8000-000000000741';
+  const child = '019ed000-0000-7000-8000-000000000742';
+  writeRollout(old, { id: parent, userText: 'old parent' });
+  writeRollout(defaultRoot, { id: child, parentThreadId: parent, userText: 'orphan from default' });
+  const db = freshDb();
+  const provider = createCodexProvider({ rootDir: old, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  const multi = createCodexProvider({ roots: [old, defaultRoot], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, multi) }).complete, true);
+  const orphans = db.prepare("SELECT session_id, text FROM messages WHERE role='user' AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id = messages.session_id)").all();
+  assert.equal(orphans.length, 0);
+  db.close();
+});
+
+test('strict parent rewrite stages its complete known family', () => {
+  const home = makeTempDir('obelisk-codex-strict-parent-rewrite-');
+  const root = join(home, '.codex');
+  const parent = '019ed000-0000-7000-8000-000000000781';
+  const child = '019ed000-0000-7000-8000-000000000782';
+  const parentPath = writeRollout(root, { id: parent, userText: 'old parent' });
+  writeRollout(root, { id: child, parentThreadId: parent, userText: 'cached child' });
+  const db = freshDb();
+  const provider = createCodexProvider({ rootDir: root, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, provider) }).complete, true);
+  writeFileSync(parentPath, `${JSON.stringify({ type: 'session_meta', timestamp: '2026-06-15T10:00:00Z', payload: { id: parent, cwd: '/tmp/codex-multi-root' } })}\n${JSON.stringify({ type: 'event_msg', timestamp: '2026-06-15T10:00:01Z', payload: { type: 'user_message', message: 'rewritten parent with more bytes than before and changed prefix' } })}\n`);
+  const plan = planCodex(db, provider, { readMode: 'strict' });
+  assert.equal(plan.items.length, 2);
+  assert.equal(new Set(plan.items.map(item => item.unit.atomicGroup)).size, 1);
+  assert.ok(plan.items.every(item => item.unit.meta.forceSnapshot === true));
+  const indexed = indexProviderPlanStrict({ db, plan });
+  assert.equal(indexed.complete, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='cached child'").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE text='rewritten parent with more bytes than before and changed prefix'").get().n, 1);
+  db.close();
+});
 
 test('legacy root allows a rollout rewrite when the original source remains in its directory', () => {
   const home = makeTempDir('obelisk-codex-legacy-rewrite-');
@@ -952,4 +1179,409 @@ test('multi-root changedPaths only re-plans the affected root and unreadable roo
       chmodSync(join(lockedRoot, 'sessions'), 0o755);
     }
   }
+});
+
+test('Windows CopyFileExW copied rollouts (birthtime > ctime) pass alias migration, family mismatch detection, and symlinked raw lookup', async t => {
+  const birthByIno = new Map();
+  const fsMock = t.mock.module('node:fs', {
+    namedExports: {
+      closeSync,
+      existsSync,
+      lstatSync,
+      openSync,
+      readdirSync,
+      readSync,
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        const inoKey = String(statSync(target, { bigint: true }).ino);
+        const customBirthNs = birthByIno.get(inoKey);
+        if (customBirthNs === undefined) return result;
+        const birthMs = Number(customBirthNs / 1_000_000_000n) * 1000 + Number(customBirthNs % 1_000_000_000n) / 1_000_000;
+        if (options?.bigint) {
+          return Object.assign(result, { birthtimeNs: customBirthNs, birthtimeMs: birthMs });
+        }
+        return Object.assign(result, { birthtimeMs: birthMs, birthtime: new Date(birthMs) });
+      },
+    },
+  });
+  t.after(() => fsMock.restore());
+  const {
+    codexRootScope: mockRootScope,
+    createCodexProvider: createMockCodexProvider,
+  } = await import('../packages/core/src/providers/codex.ts?win32-multi-root-copyfile');
+
+  const copyLikeWindows = (src, dst) => {
+    copyFileSync(src, dst);
+    const exact = statSync(dst, { bigint: true });
+    birthByIno.set(String(exact.ino), exact.ctimeNs + 60_000_000_000n);
+  };
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+
+  // 1. Symlinked CODEX_HOME-style root raw() lookup on copied rollout (unchanged, appended, and inode-reused).
+  const home = makeTempDir('obelisk-codex-win32-alias-');
+  const envCodex = join(home, 'env-codex');
+  const envAlias = join(home, 'env-codex-alias');
+  const rawId = realRolloutId();
+  const sessDir = join(envCodex, 'sessions', '2026', '06', '15');
+  mkdirSync(sessDir, { recursive: true });
+  const envRollout = join(sessDir, `rollout-${rawId}.jsonl`);
+  copyLikeWindows(REAL_FIXTURE, envRollout);
+  symlinkSync(envCodex, envAlias, aliasType);
+
+  const { db: envDb, reader: envReader } = freshFileDb(t);
+  const envProvider = createMockCodexProvider({ rootDir: envAlias, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db: envDb, plan: planCodex(envDb, envProvider) }).complete, true);
+  const envQuery = createQueryApi(envReader, { providerRegistry: createProviderRegistry([envProvider]) });
+  assert.match(envQuery.raw(`codex:${rawId}:000007`)?.text ?? '', /user_message/);
+
+  appendFileSync(envRollout, '\n');
+  assert.match(envQuery.raw(`codex:${rawId}:000007`)?.text ?? '', /user_message/, 'post-append raw() still recognizes copied file via recorded birthtime');
+
+  const exactEnv = statSync(envRollout, { bigint: true });
+  birthByIno.set(String(exactEnv.ino), exactEnv.ctimeNs + 120_000_000_000n);
+  assert.equal(envQuery.raw(`codex:${rawId}:000007`), null, 'reused inode with different birthtime is rejected by raw()');
+
+  // Zero-birthtime filesystem (from initial index) omits sourceBirthtimeNs, accepts unchanged ctime/mtime, and rejects modified metadata rather than matching 0 === 0.
+  const zeroBirthRollout = join(sessDir, `rollout-019ed000-0000-7000-8000-000000000199.jsonl`);
+  writeRollout(envCodex, {
+    id: '019ed000-0000-7000-8000-000000000199',
+    filename: basename(zeroBirthRollout),
+    userText: 'zero birthtime sentinel',
+  });
+  const zeroIno = String(statSync(zeroBirthRollout, { bigint: true }).ino);
+  birthByIno.set(zeroIno, 0n);
+  const { db: zeroDb, reader: zeroReader } = freshFileDb(t);
+  assert.equal(indexProviderPlanStrict({ db: zeroDb, plan: planCodex(zeroDb, envProvider) }).complete, true);
+  const zeroCursor = zeroDb.prepare('SELECT cursor FROM index_state WHERE jsonl_path LIKE ?').get(`%${basename(zeroBirthRollout)}`).cursor;
+  const zeroState = JSON.parse(Buffer.from(zeroCursor.split(':', 6)[5], 'base64url').toString('utf8'));
+  assert.equal(zeroState.sourceBirthtimeNs, undefined);
+  const zeroQuery = createQueryApi(zeroReader, { providerRegistry: createProviderRegistry([envProvider]) });
+  assert.match(zeroQuery.raw('codex:019ed000-0000-7000-8000-000000000199:000002')?.text ?? '', /zero birthtime sentinel/);
+  const zeroSource = readFileSync(zeroBirthRollout, 'utf8');
+  appendFileSync(zeroBirthRollout, '\n');
+  assert.match(zeroQuery.raw('codex:019ed000-0000-7000-8000-000000000199:000002')?.text ?? '', /zero birthtime sentinel/, 'genuine append with zero birthtime verifies SHA-256 prefix');
+  const { atime, mtime } = statSync(zeroBirthRollout);
+  writeFileSync(zeroBirthRollout, zeroSource.replace('zero birthtime sentinel', 'replaced zero birthtime'));
+  utimesSync(zeroBirthRollout, atime, mtime);
+  assert.equal(zeroQuery.raw('codex:019ed000-0000-7000-8000-000000000199:000002'), null, 'unavailable birthtime (0) rejects replaced content even with preserved mtime');
+
+  // Legacy pre-sourceBirthtimeNs and pre-store cursor on CopyFileExW rollout survives append and alias migration.
+  const legacyCopyRoot = join(home, 'legacy-copy-real');
+  const legacyCopyAlias = join(home, 'legacy-copy-alias');
+  const legacyCopyDir = join(legacyCopyRoot, 'sessions', '2026', '06', '15');
+  mkdirSync(legacyCopyDir, { recursive: true });
+  const legacyCopyPath = join(legacyCopyDir, `rollout-${rawId}.jsonl`);
+  copyLikeWindows(REAL_PREFIX_FIXTURE, legacyCopyPath);
+  symlinkSync(legacyCopyRoot, legacyCopyAlias, aliasType);
+  const { db: legacyCopyDb, reader: legacyCopyReader } = freshFileDb(t);
+  const legacyCopyProvider = beforeStoreCheckpoints(createMockCodexProvider({ rootDir: legacyCopyAlias, homeDir: home }));
+  assert.equal(indexProviderPlanStrict({ db: legacyCopyDb, plan: planCodex(legacyCopyDb, legacyCopyProvider) }).complete, true);
+  const legacyAliasRollout = join(legacyCopyAlias, 'sessions', '2026', '06', '15', `rollout-${rawId}.jsonl`);
+  const legacyStoredCursor = legacyCopyDb.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(legacyAliasRollout).cursor;
+  const legacyParts = legacyStoredCursor.split(':', 6);
+  const legacyDecoded = JSON.parse(Buffer.from(legacyParts[5], 'base64url').toString('utf8'));
+  delete legacyDecoded.sourceBirthtimeNs;
+  legacyCopyDb.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(
+    `${legacyParts.slice(0, 5).join(':')}:${Buffer.from(JSON.stringify(legacyDecoded)).toString('base64url')}`,
+    legacyAliasRollout,
+  );
+  const restLines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
+  appendFileSync(legacyCopyPath, `${restLines.join('\n')}\n`);
+  const migratedCopyProvider = createMockCodexProvider({ roots: [legacyCopyRoot], homeDir: home });
+  const legacyCopyQuery = createQueryApi(legacyCopyReader, { providerRegistry: createProviderRegistry([migratedCopyProvider]) });
+  assert.match(legacyCopyQuery.raw(`codex:${rawId}:000007`)?.text ?? '', /user_message/, 'legacy pre-birthtime cursor raw() succeeds after append');
+  assert.equal(indexProviderPlanStrict({ db: legacyCopyDb, plan: planCodex(legacyCopyDb, migratedCopyProvider) }).complete, true);
+  assert.deepEqual(
+    legacyCopyDb.prepare('SELECT id FROM sessions').all().map(row => row.id),
+    [`codex:${mockRootScope(legacyCopyRoot, home)}:${rawId}`],
+  );
+
+  // 2. Legacy alias scope migration and hard-linked parent family mismatch detection with copied parent rollout.
+  const firstRoot = join(home, 'first-codex');
+  const secondRoot = join(home, 'second-codex');
+  const aliasRoot = join(home, 'alias-codex');
+  const childId = '019ed000-0000-7000-8000-000000000124';
+  writeRollout(firstRoot, { id: childId, parentThreadId: rawId, userText: 'win32 legacy child' });
+  const parentPath = join(firstRoot, 'sessions', '2026', '06', '15', `rollout-${rawId}.jsonl`);
+  copyLikeWindows(REAL_FIXTURE, parentPath);
+  symlinkSync(firstRoot, aliasRoot, aliasType);
+
+  const baseLegacy = createMockCodexProvider({ rootDir: aliasRoot, homeDir: home });
+  const scope = `${basename(aliasRoot)}-${createHash('sha256').update(`codex-root-v1\0${resolve(aliasRoot)}`).digest('hex').slice(0, 8)}`;
+  const legacyProvider = {
+    ...baseLegacy,
+    discover: ctx => baseLegacy.discover(ctx).map(unit => ({
+      ...unit,
+      sessionId: `codex:${scope}:${unit.sessionId.slice('codex:'.length)}`,
+      meta: { ...unit.meta, rootScope: scope, storeSuffix: undefined },
+    })),
+  };
+
+  const migrateDb = freshDb();
+  t.after(() => migrateDb.close());
+  assert.equal(indexProviderPlanStrict({ db: migrateDb, plan: planCodex(migrateDb, legacyProvider) }).complete, true);
+  const realProvider = createMockCodexProvider({ roots: [firstRoot], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db: migrateDb, plan: planCodex(migrateDb, realProvider, { changedPaths: [parentPath] }) }).complete, true);
+  assert.deepEqual(
+    migrateDb.prepare('SELECT id FROM sessions').all().map(row => row.id),
+    [`codex:${mockRootScope(firstRoot, home)}:${rawId}`],
+  );
+
+  const familyDb = freshDb();
+  t.after(() => familyDb.close());
+  assert.equal(indexProviderPlanStrict({ db: familyDb, plan: planCodex(familyDb, legacyProvider) }).complete, true);
+  const otherChild = writeRollout(secondRoot, { id: childId, parentThreadId: rawId, userText: 'other store child' });
+  linkSync(parentPath, join(otherChild, '..', basename(parentPath)));
+  unlinkSync(aliasRoot);
+  symlinkSync(secondRoot, aliasRoot, aliasType);
+  const retargeted = createMockCodexProvider({ roots: [aliasRoot], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db: familyDb, plan: planCodex(familyDb, retargeted) }).complete, false);
+});
+
+test('retargeting a multi-root alias on force rebuild marks codex incomplete and preserves cached sessions', () => {
+  const home = makeTempDir('obelisk-codex-force-alias-retarget-');
+  const realA = join(home, 'real-a');
+  const realB = join(home, 'real-b');
+  const aliasA = join(home, 'alias-a');
+  const idA = '019ed000-0000-7000-8000-000000000801';
+  const idB = '019ed000-0000-7000-8000-000000000802';
+  writeRollout(realA, { id: idA, userText: 'cached store A' });
+  writeRollout(realB, { id: idB, userText: 'different store B' });
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+  symlinkSync(realA, aliasA, aliasType);
+
+  const db = freshDb();
+  const initialProvider = createCodexProvider({ roots: [aliasA], homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, initialProvider) }).complete, true);
+
+  unlinkSync(aliasA);
+  symlinkSync(realB, aliasA, aliasType);
+  const retargetedProvider = createCodexProvider({ roots: [aliasA], homeDir: home });
+  const forcePlan = planCodex(db, retargetedProvider, { force: true });
+  assert.equal(forcePlan.incompleteProviders.has('codex'), true);
+  const retainedId = `codex:${codexRootScope(realA, home)}:${idA}`;
+  assert.deepEqual(forcePlan.retainedSessions.map(row => row.sessionId), [retainedId]);
+  const snapshot = prepareRetainedSnapshot(db, forcePlan.retainedSessions);
+  assert.equal(db.prepare('SELECT id FROM sessions').get().id, retainedId);
+  snapshot.close();
+
+  // Removing aliasA and configuring realB directly drops realA cleanly without incomplete inventory.
+  const directProvider = createCodexProvider({ roots: [realB], homeDir: home });
+  const directForcePlan = planCodex(db, directProvider, { force: true });
+  assert.equal(directForcePlan.incompleteProviders.has('codex'), false);
+  db.close();
+});
+
+test('single-root custom symlink migrates to multi-root without duplicates and redirects parent and child memories', () => {
+  const home = makeTempDir('obelisk-codex-symlink-mem-migrate-');
+  const customA = join(home, 'custom-a');
+  const customB = join(home, 'custom-b');
+  const defaultRoot = join(home, '.codex');
+  const aliasA = join(home, 'alias-a');
+  const parentId = '019ed000-0000-7000-8000-000000000811';
+  const childId = '019ed000-0000-7000-8000-000000000812';
+  writeRollout(customA, { id: parentId, userText: 'custom parent prompt' });
+  writeRollout(customA, { id: childId, parentThreadId: parentId, userText: 'custom child prompt' });
+  writeRollout(customB, { id: '019ed000-0000-7000-8000-000000000813', userText: 'root B prompt' });
+  writeRollout(defaultRoot, { id: parentId, userText: 'default home copy' });
+  symlinkSync(customA, aliasA, process.platform === 'win32' ? 'junction' : 'dir');
+
+  const db = freshDb();
+  const single = createCodexProvider({ rootDir: aliasA, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, single) }).complete, true);
+
+  const bareParent = `codex:${parentId}`;
+  db.prepare(`
+    INSERT INTO memories (id, session_id, project, message_start, message_end, path, summary, created_at)
+    VALUES ('mem-codex-1', ?, 'proj', ?, ?, 'note.md', 'linked across parent and child', '2026-06-15T10:00:00Z')
+  `).run(bareParent, `codex:${parentId}:000002`, `codex:${childId}:000002`);
+
+  const multi = createCodexProvider({ roots: [customA, customB, defaultRoot], homeDir: home });
+  const plan = planCodex(db, multi);
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+
+  const scopeA = codexRootScope(customA, home);
+  const scopedParent = `codex:${scopeA}:${parentId}`;
+  const sessionIds = db.prepare('SELECT id FROM sessions ORDER BY id').all().map(r => r.id);
+  assert.deepEqual(sessionIds, [
+    bareParent,
+    `codex:${codexRootScope(customB, home)}:019ed000-0000-7000-8000-000000000813`,
+    scopedParent,
+  ].sort());
+  const mem = db.prepare('SELECT session_id, message_start, message_end FROM memories WHERE id=?').get('mem-codex-1');
+  assert.deepEqual({ ...mem }, {
+    session_id: scopedParent,
+    message_start: `codex:${scopeA}:${parentId}:000002`,
+    message_end: `codex:${scopeA}:${childId}:000002`,
+  });
+  assert.equal(db.prepare('SELECT text FROM messages WHERE session_id=?').get(bareParent).text, 'default home copy');
+  db.close();
+});
+
+test('orphan subagent rollout during scope migration withholds child messages, retains bare session, and reports incomplete', () => {
+  const home = makeTempDir('obelisk-codex-orphan-migrate-');
+  const customA = join(home, 'custom-a');
+  const customB = join(home, 'custom-b');
+  const parentId = '019ed000-0000-7000-8000-000000000821';
+  const childId = '019ed000-0000-7000-8000-000000000822';
+  const parentPath = writeRollout(customA, { id: parentId, userText: 'ephemeral parent' });
+  writeRollout(customA, { id: childId, parentThreadId: parentId, userText: 'orphan child' });
+  writeRollout(customB, { id: '019ed000-0000-7000-8000-000000000823', userText: 'other root' });
+
+  const db = freshDb();
+  const single = createCodexProvider({ rootDir: customA, homeDir: home });
+  assert.equal(indexProviderPlanStrict({ db, plan: planCodex(db, single) }).complete, true);
+
+  unlinkSync(parentPath);
+  const multi = createCodexProvider({ roots: [customA, customB], homeDir: home });
+  const plan = planCodex(db, multi);
+  assert.equal(plan.incompleteProviders.has('codex'), true);
+  assert.equal(plan.items.some(item => item.unit.sessionId.includes(parentId)), false, 'orphan child scoped unit is withheld');
+  assert.deepEqual(plan.retainedSessions.map(r => r.sessionId), [`codex:${parentId}`]);
+  const snapshot = prepareRetainedSnapshot(db, plan.retainedSessions);
+  assert.ok(db.prepare('SELECT 1 FROM messages WHERE session_id=? AND text=?').get(`codex:${parentId}`, 'orphan child'));
+  snapshot.close();
+  db.close();
+});
+
+test('excluded legacy root with missing new root succeeds and symlinked default home keeps bare ID alongside legacy custom root', () => {
+  const home = makeTempDir('obelisk-codex-legacy-mixed-');
+  const excludedLegacy = join(home, 'excluded-legacy');
+  const existingCustom = join(home, 'existing-custom');
+  const missingNewRoot = join(home, 'not-created-yet');
+  writeRollout(excludedLegacy, { id: '019ed000-0000-7000-8000-000000000831', userText: 'excluded legacy' });
+  writeRollout(existingCustom, { id: '019ed000-0000-7000-8000-000000000832', userText: 'existing custom' });
+
+  const dbExcluded = freshDb();
+  const prevExcluded = beforeStoreCheckpoints(createCodexProvider({ rootDir: excludedLegacy, homeDir: home }));
+  assert.equal(indexProviderPlanStrict({ db: dbExcluded, plan: planCodex(dbExcluded, prevExcluded) }).complete, true);
+  const nextExcluded = createCodexProvider({ roots: [existingCustom, missingNewRoot], homeDir: home });
+  const forceExcluded = planCodex(dbExcluded, nextExcluded, { force: true });
+  assert.equal(forceExcluded.incompleteProviders.has('codex'), false);
+  assert.deepEqual(forceExcluded.inventoryIssues, []);
+  dbExcluded.close();
+
+  const homeSym = makeTempDir('obelisk-codex-sym-default-legacy-');
+  const realDefault = join(homeSym, 'real-default');
+  const defaultLink = join(homeSym, '.codex');
+  const legacyCustom = join(homeSym, 'custom-legacy');
+  const sharedId = '019ed000-0000-7000-8000-000000000833';
+  writeRollout(realDefault, { id: sharedId, userText: 'default symlink target' });
+  writeRollout(legacyCustom, { id: sharedId, userText: 'legacy custom rollout' });
+  symlinkSync(realDefault, defaultLink, process.platform === 'win32' ? 'junction' : 'dir');
+
+  const dbSym = freshDb();
+  const prevCustom = beforeStoreCheckpoints(createCodexProvider({ rootDir: legacyCustom, homeDir: homeSym }));
+  assert.equal(indexProviderPlanStrict({ db: dbSym, plan: planCodex(dbSym, prevCustom) }).complete, true);
+  const nextSym = createCodexProvider({ roots: [legacyCustom, defaultLink], homeDir: homeSym });
+  assert.equal(indexProviderPlanStrict({ db: dbSym, plan: planCodex(dbSym, nextSym) }).complete, true);
+  assert.equal(dbSym.prepare('SELECT session_id FROM messages WHERE text=?').get('default symlink target').session_id, `codex:${sharedId}`);
+  assert.equal(
+    dbSym.prepare('SELECT session_id FROM messages WHERE text=?').get('legacy custom rollout').session_id,
+    `codex:${codexRootScope(legacyCustom, homeSym)}:${sharedId}`,
+  );
+  dbSym.close();
+});
+
+test('Windows path casing preserves distinct unverified roots and scopes', async t => {
+  assert.notEqual(codexRootScope('C:\\Users\\Alice\\.codex', 'c:\\users\\alice'), null);
+  assert.notEqual(
+    codexRootScope('C:\\Codex-Work', 'C:\\Users\\Alice'),
+    codexRootScope('c:\\codex-work', 'c:\\users\\alice'),
+  );
+
+  const path = await import('node:path');
+  const pathMock = t.mock.module('node:path', {
+    namedExports: {
+      ...path,
+      isAbsolute: (p) => path.win32.isAbsolute(p),
+    },
+  });
+  t.after(() => pathMock.restore());
+  const { resolveCodexConfiguredRoots } = await import('../packages/core/src/provider-settings.ts?win32-dedupe');
+  assert.deepEqual(
+    resolveCodexConfiguredRoots({ providerRoots: { codex: ['C:\\Codex-Work', 'c:\\codex-work\\'] } }),
+    ['C:\\Codex-Work', 'c:\\codex-work'],
+  );
+});
+
+test('Windows live path casing follows physical root identity', { skip: process.platform !== 'win32' }, () => {
+  const home = makeTempDir('obelisk-windows-physical-case-');
+  const defaultRoot = join(home, '.codex');
+  const differentlyCased = join(home, '.CODEX');
+  mkdirSync(defaultRoot, { recursive: true });
+  assert.equal(codexRootScope(differentlyCased, home), null);
+  mkdirSync(differentlyCased, { recursive: true });
+  const lower = statSync(defaultRoot);
+  const upper = statSync(differentlyCased);
+  const sameDirectory = lower.dev === upper.dev && lower.ino === upper.ino;
+  assert.equal(codexRootScope(differentlyCased, home) === null, sameDirectory);
+});
+
+test('legacy selected root remains unavailable through its surviving alias ancestor', () => {
+  const home = makeTempDir('obelisk-codex-offline-legacy-root-');
+  const real = join(home, 'real');
+  const alias = join(home, 'alias');
+  mkdirSync(real, { recursive: true });
+  symlinkSync(real, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const selectedAlias = join(alias, 'profile');
+  const selectedReal = join(real, 'profile');
+  const other = join(home, 'other');
+  const id = '019ed000-0000-7000-8000-000000000821';
+  const source = writeRollout(selectedAlias, { id, userText: 'offline legacy profile' });
+  writeRollout(other, { id: '019ed000-0000-7000-8000-000000000822', userText: 'other root' });
+  const settingsPath = join(home, '.obelisk', 'settings.json');
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(settingsPath, JSON.stringify({ providerRoots: { codex: selectedAlias } }));
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const db = new DatabaseSync(dbPath);
+  const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(source).cursor;
+  const parts = cursor.split(':codex-store-v1:')[0].split(':');
+  const state = JSON.parse(Buffer.from(parts[5], 'base64url').toString('utf8'));
+  delete state.sourceBirthtimeNs;
+  parts[5] = Buffer.from(JSON.stringify(state)).toString('base64url');
+  db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(parts.join(':'), source);
+  db.close();
+  renameSync(selectedReal, join(real, 'offline-profile'));
+  writeFileSync(settingsPath, JSON.stringify({ providerRoots: { codex: [selectedReal, other] } }));
+  const result = runCli(['--build'], { home });
+  assert.notEqual(result.status, 0);
+  const readDb = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    assert.deepEqual(readDb.prepare("SELECT id FROM sessions WHERE source='codex' ORDER BY id").all().map(row => row.id), [`codex:${id}`]);
+  } finally { readDb.close(); }
+});
+
+test('force snapshot removes a retargeted alias from the still-selected old root checkpoint', () => {
+  const home = makeTempDir('obelisk-codex-force-alias-checkpoint-');
+  const a = join(home, 'a');
+  const b = join(home, 'b');
+  const alias = join(home, 'alias');
+  const idA = '019ed000-0000-7000-8000-000000000841';
+  const idB = '019ed000-0000-7000-8000-000000000842';
+  writeRollout(a, { id: idA, userText: 'store A' });
+  writeRollout(b, { id: idB, userText: 'store B' });
+  const aliasType = process.platform === 'win32' ? 'junction' : 'dir';
+  symlinkSync(a, alias, aliasType);
+  const settingsPath = join(home, '.obelisk', 'settings.json');
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  const select = roots => writeFileSync(settingsPath, JSON.stringify({ providerRoots: { codex: roots } }));
+  select([alias, a]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  unlinkSync(alias);
+  symlinkSync(b, alias, aliasType);
+  select([alias, a]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  const dbPath = join(home, '.obelisk', 'obelisk.sqlite');
+  const afterCoPublish = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    assert.equal(afterCoPublish.prepare("SELECT COUNT(*) AS n FROM sessions WHERE source='codex'").get().n, 2);
+  } finally { afterCoPublish.close(); }
+  select([alias]);
+  assert.equal(runCli(['--build'], { home }).status, 0);
+  const afterExclude = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    assert.deepEqual(afterExclude.prepare("SELECT id FROM sessions WHERE source='codex'").all().map(row => row.id), [`codex:${codexRootScope(b, home)}:${idB}`]);
+  } finally { afterExclude.close(); }
 });
