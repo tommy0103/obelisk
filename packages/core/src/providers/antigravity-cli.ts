@@ -232,7 +232,42 @@ function escapeNul(value: string): string {
   return value.replaceAll('\0', '\\^@');
 }
 
-// Only complete newline-terminated lines count; a line being written is read next time.
+type TranscriptValidation =
+  | { readonly ok: true; readonly lines: string[] }
+  | { readonly ok: false; readonly reason: string };
+
+// Reject empty, truncated, or malformed transcripts before replacing indexed
+// history or certifying an empty inventory.
+function validateTranscriptBuffer(buffer: Buffer): TranscriptValidation {
+  if (buffer.length === 0) {
+    return { ok: false, reason: 'Antigravity CLI transcript is empty' };
+  }
+  const end = buffer.lastIndexOf(0x0a);
+  const trailing = (end < 0 ? buffer : buffer.subarray(end + 1)).toString('utf8');
+  if (trailing.trim().length > 0) {
+    return { ok: false, reason: 'Antigravity CLI transcript has an incomplete trailing line' };
+  }
+  const body = end < 0 ? '' : buffer.subarray(0, end + 1).toString('utf8');
+  const lines = body.length > 0 ? body.split('\n').slice(0, -1) : [];
+  let validSteps = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const step = object(JSON.parse(line));
+      if (step === null || typeof step.type !== 'string') {
+        return { ok: false, reason: 'Antigravity CLI transcript contains a non-step JSON line' };
+      }
+      validSteps++;
+    } catch {
+      return { ok: false, reason: 'Antigravity CLI transcript contains invalid JSON' };
+    }
+  }
+  if (validSteps === 0) {
+    return { ok: false, reason: 'Antigravity CLI transcript has no steps' };
+  }
+  return { ok: true, lines };
+}
+
 function readCompleteLines(path: string): string[] {
   const buffer = readFileSync(path);
   const end = buffer.lastIndexOf(0x0a);
@@ -488,10 +523,12 @@ function projectedRecords(snapshot: TranscriptSnapshot, id: string): TranscriptR
       input_tokens: null, output_tokens: null, cwd, skill: null, source: name,
     });
   }
-  const fallbackTitle = firstUserText ? firstUserText.replace(/\s+/g, ' ').trim().slice(0, 80) : null;
+  const fallbackTitle = firstUserText
+    ? trunc(escapeNul(firstUserText).replace(/\s+/g, ' ').trim(), 80)
+    : null;
   const rawTitle = snapshot.title ?? fallbackTitle;
   out.push({
-    kind: 'session', id, title: rawTitle === null ? null : escapeNul(rawTitle), project: projectSlugFromPath(cwd),
+    kind: 'session', id, title: rawTitle === null ? null : trunc(escapeNul(rawTitle)), project: projectSlugFromPath(cwd),
     started_at: firstAt, ended_at: lastAt, git_branch: null, version: null,
     message_count: messageCount, countMode: 'total', jsonl_path: snapshot.path, source: name,
     started_by: snapshot.startedByAgent ? 'agent' : null,
@@ -550,14 +587,33 @@ export function createAntigravityCliProvider({
         continue;
       }
       const key = normalize(file);
-      live.add(id);
-
-      const priorMeta = decodeCursorMeta(ctx.previousCursor?.(key) ?? ctx.lastCursor(key));
+      const priorKey = prior ? normalize(prior.jsonlPath) : null;
+      const priorMeta = decodeCursorMeta(
+        ctx.previousCursor?.(key)
+        ?? ctx.lastCursor(key)
+        ?? (priorKey && priorKey !== key ? (ctx.previousCursor?.(priorKey) ?? ctx.lastCursor(priorKey)) : null),
+      );
       const meta = summariesResult.ok
         ? (summariesResult.summaries.get(entry.name) ?? NO_META)
         : (priorMeta ?? NO_META);
       const cursor = cursorFor(stat, meta);
-      if (ctx.lastCursor(key) === cursor) continue;
+      if (ctx.lastCursor(key) === cursor) {
+        live.add(id);
+        continue;
+      }
+
+      let validation: TranscriptValidation;
+      try {
+        validation = validateTranscriptBuffer(readFileSync(file));
+      } catch (error) {
+        ctx.reportIncompleteInventory?.(sourceInventoryIssue(file, error));
+        continue;
+      }
+      if (!validation.ok) {
+        ctx.reportIncompleteInventory?.(sourceInventoryIssue(file, validation.reason));
+        continue;
+      }
+      live.add(id);
 
       units.push({
         key,
@@ -596,12 +652,19 @@ export function createAntigravityCliProvider({
       return current;
     };
     const before = assertStable();
-    const lines = readCompleteLines(meta.path);
-    assertStable();
-    if (before.size > 0 && lines.length === 0) {
-      throw new RetryableSourceReadError(meta.path, 'Antigravity CLI transcript has no complete lines');
+    let buffer: Buffer;
+    try {
+      buffer = readFileSync(meta.path);
+    } catch (error) {
+      assertStable();
+      throw new RetryableSourceReadError(meta.path, 'Antigravity CLI transcript is unavailable', { cause: error });
     }
-    yield* projectedRecords({ ...meta, lines }, unit.sessionId);
+    assertStable();
+    const validation = validateTranscriptBuffer(buffer);
+    if (!validation.ok) {
+      throw new RetryableSourceReadError(meta.path, validation.reason);
+    }
+    yield* projectedRecords({ ...meta, lines: validation.lines }, unit.sessionId);
     return cursorFor(before, meta);
   }
 
@@ -610,14 +673,25 @@ export function createAntigravityCliProvider({
       const path = text(input.session?.jsonl_path);
       const id = text(input.session?.id);
       if (path === null || id === null || !inside(brainRoot, path) || !input.messageUuid.startsWith(`${id}:`)) return null;
-      const match = /:L(\d{6})(?::[\w-]+)?$/.exec(input.messageUuid);
+      const match = /:L(\d{6})(?::([\w-]+))?$/.exec(input.messageUuid);
       if (match === null) return null;
       const line = readCompleteLines(path)[Number(match[1]) - 1];
       if (line === undefined) return null;
+      const suffix = match[2] ?? null;
       let messageText: string | null = null;
       try {
         const step = object(JSON.parse(line));
-        messageText = step?.type === 'USER_INPUT' ? userRequestText(step.content) : text(step?.content);
+        if (step?.type === 'USER_INPUT') {
+          messageText = userRequestText(step.content);
+        } else if (suffix === '1-thinking') {
+          messageText = text(step?.thinking);
+        } else if (suffix === '2-text') {
+          messageText = text(step?.content);
+        } else if (suffix === '3-tools' || suffix === 'empty') {
+          messageText = null;
+        } else {
+          messageText = text(step?.content) ?? text(step?.error);
+        }
       } catch {
         // Malformed JSON still returns the raw line without parsed messageText.
       }

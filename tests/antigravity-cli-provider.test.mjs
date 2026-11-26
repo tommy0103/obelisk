@@ -254,7 +254,7 @@ test('indexes new and resumed sessions and retains cached sessions after transcr
   assert.equal(first.plan.items.length, 1);
   assert.equal(searchCount('needlealpha'), 2);
 
-  // 2. Resumed session appends lines (and ignores an incomplete trailing line)
+  // 2. Resumed session with an incomplete trailing line is withheld until the line finishes
   const resumedLines = [
     { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-21T09:00:00Z', content: '<USER_REQUEST>\nFind needlealpha in repo\n</USER_REQUEST>' },
     { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T09:00:05Z', content: 'Found needlealpha.' },
@@ -262,9 +262,15 @@ test('indexes new and resumed sessions and retains cached sessions after transcr
     { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-21T09:05:03Z', content: 'Checked needlebeta.' },
   ];
   writeFileSync(transcriptFile, resumedLines.map((l) => JSON.stringify(l)).join('\n') + '\n{"partial":true');
+  const midWrite = runIndex(db, provider);
+  assert.equal(midWrite.plan.items.length, 0);
+  assert.equal(midWrite.plan.incompleteProviders.has('antigravity-cli'), true);
+  assert.equal(searchCount('needlealpha'), 2);
 
+  writeFileSync(transcriptFile, resumedLines.map((l) => JSON.stringify(l)).join('\n') + '\n');
   const second = runIndex(db, provider);
   assert.equal(second.plan.items.length, 1);
+  assert.equal(second.plan.incompleteProviders.size, 0);
   assert.equal(searchCount('needlebeta'), 2);
 
   // 3. Transcript deleted -> cached session stays searchable on incremental and force rebuilds
@@ -510,4 +516,208 @@ test('escapes embedded NUL bytes in canonical message text and tool results acro
   assert.equal(rawSys?.messageText, 'sys-prefix\0sys-suffix');
   assert.ok(rawSys?.text.includes('sys-prefix\\u0000sys-suffix'));
   db.close();
+});
+
+for (const [label, brokenBody] of [
+  ['empty file', ''],
+  ['invalid JSON only', '{not valid json\n'],
+  ['valid step plus unfinished trailing line', `${JSON.stringify({
+    step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T08:00:00Z', content: '<USER_REQUEST>\nPartial\n</USER_REQUEST>',
+  })}\n{"step_index":1,"type":"PLANNER_`],
+]) {
+  test(`retains cached hits across incremental and force rebuilds when pre-discovery transcript is ${label}`, () => {
+    const rootDir = makeTempDir('obelisk-ag-cli-broken-');
+    const convId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const transcriptFile = writeTranscript(rootDir, convId, [
+      { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T08:00:00Z', content: '<USER_REQUEST>\nFind uniqueBrokenRetainToken\n</USER_REQUEST>' },
+      { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-25T08:00:02Z', content: 'Found uniqueBrokenRetainToken.' },
+    ]);
+
+    const dbDir = makeTempDir('obelisk-ag-cli-broken-db-');
+    const dbPath = join(dbDir, 'index.sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec(INDEX_SCHEMA);
+    const provider = createAntigravityCliProvider({ rootDir });
+
+    const hits = (q) => {
+      const reader = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        return createQueryApi(reader).search(q, { source: 'antigravity-cli' }).length;
+      } finally {
+        reader.close();
+      }
+    };
+
+    assert.equal(runIndex(db, provider).plan.items.length, 1);
+    assert.equal(hits('uniqueBrokenRetainToken'), 2);
+
+    // Replace with broken content before discover()
+    writeFileSync(transcriptFile, brokenBody);
+
+    const inc = runIndex(db, provider);
+    assert.equal(inc.plan.items.length, 0);
+    assert.equal(inc.plan.incompleteProviders.has('antigravity-cli'), true);
+    assert.equal(hits('uniqueBrokenRetainToken'), 2);
+
+    const forced = runIndex(db, provider, { force: true });
+    assert.equal(forced.plan.items.length, 0);
+    assert.equal(forced.plan.incompleteProviders.has('antigravity-cli'), true);
+    assert.equal(hits('uniqueBrokenRetainToken'), 2);
+
+    // Deleting the broken file and rebuilding still keeps the cached hits
+    rmSync(transcriptFile);
+    const afterDelete = runIndex(db, provider, { force: true });
+    assert.equal(afterDelete.plan.items.length, 0);
+    assert.equal(afterDelete.plan.incompleteProviders.size, 0);
+    assert.equal(hits('uniqueBrokenRetainToken'), 2);
+
+    // Restoring a valid transcript resumes indexing cleanly
+    writeTranscript(rootDir, convId, [
+      { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T08:00:00Z', content: '<USER_REQUEST>\nFind uniqueBrokenRetainToken\n</USER_REQUEST>' },
+      { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-25T08:00:02Z', content: 'Found uniqueBrokenRetainToken.' },
+      { step_index: 2, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T08:05:00Z', content: '<USER_REQUEST>\nRecovered uniqueBrokenRecoveredToken\n</USER_REQUEST>' },
+    ]);
+    const recovered = runIndex(db, provider);
+    assert.equal(recovered.plan.items.length, 1);
+    assert.equal(recovered.plan.incompleteProviders.size, 0);
+    assert.equal(hits('uniqueBrokenRecoveredToken'), 1);
+    db.close();
+  });
+}
+
+test('preserves title, project, and started_by when switching from transcript.jsonl to transcript_full.jsonl under DB lock', () => {
+  const rootDir = makeTempDir('obelisk-ag-cli-switch-lock-');
+  const convId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const sessionId = antigravityCliSessionId(convId);
+  const workspaceDir = join(rootDir, 'switch-repo');
+  mkdirSync(workspaceDir, { recursive: true });
+  const summaryDbPath = createSummaryDb(rootDir, [
+    {
+      id: convId,
+      title: 'Initial Summary Title',
+      workspaceUris: [pathToFileURL(workspaceDir).href],
+      parentConversationId: '00000000-0000-4000-8000-000000000000',
+      nestingDepth: 1,
+    },
+  ]);
+
+  writeTranscript(rootDir, convId, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T09:00:00Z', content: '<USER_REQUEST>\nFirst fallback request\n</USER_REQUEST>' },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-25T09:00:01Z', content: 'Fallback answer.' },
+  ], 'transcript.jsonl');
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(INDEX_SCHEMA);
+  const provider = createAntigravityCliProvider({
+    rootDir,
+    openDatabase: (path) => new DatabaseSync(path, { readOnly: true, timeout: 0 }),
+  });
+
+  assert.equal(runIndex(db, provider).plan.items.length, 1);
+  const readRow = () => {
+    const row = db.prepare('SELECT title, project, started_by FROM sessions WHERE id = ?').get(sessionId);
+    return row ? { ...row } : null;
+  };
+  const expectedProject = readRow().project;
+  assert.equal(readRow().title, 'Initial Summary Title');
+  assert.ok(expectedProject);
+  assert.equal(readRow().started_by, 'agent');
+
+  // Lock summary DB, then introduce transcript_full.jsonl so the unit path switches
+  const locker = new DatabaseSync(summaryDbPath);
+  locker.exec('BEGIN EXCLUSIVE');
+  try {
+    writeTranscript(rootDir, convId, [
+      { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T09:00:00Z', content: '<USER_REQUEST>\nFull request\n</USER_REQUEST>' },
+      { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-25T09:00:01Z', content: 'Full answer.' },
+    ], 'transcript_full.jsonl');
+
+    const switchedLocked = runIndex(db, provider);
+    assert.equal(switchedLocked.plan.items.length, 1);
+    assert.equal(switchedLocked.plan.incompleteProviders.has('antigravity-cli'), true);
+    assert.deepEqual(readRow(), {
+      title: 'Initial Summary Title',
+      project: expectedProject,
+      started_by: 'agent',
+    });
+
+    locker.prepare('UPDATE conversation_summaries SET title = ?, nesting_depth = 0, parent_conversation_id = \'\' WHERE conversation_id = ?')
+      .run('Updated After Unlock', convId);
+    locker.exec('COMMIT');
+  } finally {
+    locker.close();
+  }
+
+  const unlocked = runIndex(db, provider);
+  assert.equal(unlocked.plan.items.length, 1);
+  assert.equal(unlocked.plan.incompleteProviders.size, 0);
+  assert.deepEqual(readRow(), {
+    title: 'Updated After Unlock',
+    project: expectedProject,
+    started_by: null,
+  });
+  db.close();
+});
+
+test('fallback title truncation does not split surrogate pairs across SQLite persistence', () => {
+  const rootDir = makeTempDir('obelisk-ag-cli-emoji-');
+  const convId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const sessionId = antigravityCliSessionId(convId);
+  const boundaryTitle = `${'a'.repeat(79)}🚀`;
+  writeTranscript(rootDir, convId, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T10:00:00Z', content: `<USER_REQUEST>\n${boundaryTitle}\n</USER_REQUEST>` },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-25T10:00:01Z', content: 'Ok.' },
+  ]);
+
+  const provider = createAntigravityCliProvider({ rootDir });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const directSession = [...provider.parse(unit, null)].find((r) => r.kind === 'session');
+  assert.equal(directSession.title, 'a'.repeat(79));
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(INDEX_SCHEMA);
+  runIndex(db, provider);
+  const persisted = db.prepare('SELECT title FROM sessions WHERE id = ?').get(sessionId);
+  assert.equal(persisted.title, directSession.title);
+  db.close();
+});
+
+test('raw() returns thinking text for :1-thinking UUIDs and response content for :2-text UUIDs', () => {
+  const rootDir = makeTempDir('obelisk-ag-cli-raw-parts-');
+  const convId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  writeTranscript(rootDir, convId, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-25T11:00:00Z', content: '<USER_REQUEST>\nExplain why\n</USER_REQUEST>' },
+    {
+      step_index: 1,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-25T11:00:02Z',
+      thinking: 'Private chain of thought.',
+      content: 'Public final answer.',
+    },
+  ]);
+
+  const provider = createAntigravityCliProvider({ rootDir });
+  const unit = provider.discover({ lastCursor: () => null })[0];
+  const records = [...provider.parse(unit, null)];
+  const session = records.find((r) => r.kind === 'session');
+  const thinkingMsg = records.find((r) => r.kind === 'message' && r.content_type === 'thinking');
+  const answerMsg = records.find((r) => r.kind === 'message' && r.role === 'assistant' && r.content_type === 'text');
+  assert.ok(thinkingMsg && answerMsg);
+
+  const rawThinking = provider.raw({
+    source: 'antigravity-cli',
+    messageUuid: thinkingMsg.uuid,
+    session: { id: session.id, jsonl_path: session.jsonl_path },
+    agentId: null,
+  });
+  const rawAnswer = provider.raw({
+    source: 'antigravity-cli',
+    messageUuid: answerMsg.uuid,
+    session: { id: session.id, jsonl_path: session.jsonl_path },
+    agentId: null,
+  });
+  assert.equal(rawThinking?.messageText, 'Private chain of thought.');
+  assert.equal(rawAnswer?.messageText, 'Public final answer.');
 });
