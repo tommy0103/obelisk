@@ -217,6 +217,11 @@ export function storedProviderCursor(db: SqliteDb, key: string): Cursor {
   return state?.replayRequired ? null : checkpointCursor(state);
 }
 
+/** Committed source evidence remains usable when a later replay is pending. */
+export function storedRawCursor(db: SqliteDb, key: string): Cursor {
+  return checkpointCursor(storedCheckpoint(db, key));
+}
+
 function providerSessionUnitKey(
   provider: ProviderAdapter | undefined,
   session: IndexedSession,
@@ -235,10 +240,9 @@ export function storedSessionCursor(
     sessionId: typeof session.id === 'string' ? session.id : '',
     jsonlPath: session.jsonl_path,
   });
-  // Claude verifies the backing file of retained rows even when their
-  // checkpoint has been invalidated for resuming an indexing pass.
-  return source === 'claude'
-    ? checkpointCursor(storedCheckpoint(db, unitKey))
+  // Both providers verify retained source data even when indexing requires replay.
+  return source === 'claude' || source === 'codex'
+    ? storedRawCursor(db, unitKey)
     : storedProviderCursor(db, unitKey);
 }
 
@@ -310,6 +314,8 @@ export function createProviderIndexPlan(
     const retainedIds = new Set<string>();
     const previousState = (key: string) => priorIndexState?.get(key) ?? storedCheckpoint(db, key);
     const units = provider.discover({
+      force,
+      readMode,
       snapshotRequired: fullReindex,
       previousCursor: key => checkpointCursor(previousState(key)),
       retainSession: id => retainedIds.add(id),

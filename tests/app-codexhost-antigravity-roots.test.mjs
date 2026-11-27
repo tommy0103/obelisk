@@ -35,7 +35,7 @@ for (const runtime of ['Core', 'App', 'built CLI']) for (const nested of [false,
     const env = { ...process.env, HOME: home, USERPROFILE: home, OBELISK_USE_XDG: '1',
       XDG_CONFIG_HOME: join(home, 'config'), XDG_DATA_HOME: join(home, 'data'),
       XDG_CACHE_HOME: join(home, 'cache'), XDG_RUNTIME_DIR: join(home, 'runtime'),
-      CODEXHOST_DATA_DIR: join(home, 'unused-env-root'), DSH_HOME: join(home, 'dsh'), HERMES_HOME: join(home, 'hermes') };
+      CODEX_HOME: join(home, 'codex'), CODEXHOST_DATA_DIR: join(home, 'unused-env-root'), DSH_HOME: join(home, 'dsh'), HERMES_HOME: join(home, 'hermes') };
     delete env.OBELISK_HOME;
     const seed = (root, cwd) => {
       const mapping = structuredClone(mappingFixture);

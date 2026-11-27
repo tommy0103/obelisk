@@ -152,6 +152,10 @@ function registerHandlers() {
         id: 'copilot', name: 'GitHub Copilot', vendor: 'GitHub', color: '#8957e5',
         path: '/fixture/Code/User', settingKey: 'providerRoots.copilot',
         status: 'warn', statusText: 'No sessions found', sessionCount: 0, lastIndexed: '',
+      }, {
+        id: 'codex', name: 'Codex', vendor: 'OpenAI', color: '#10a37f',
+        paths: ['/fixture/Codex/sessions', '/fixture/.codex/sessions'], multiRoot: true,
+        status: 'warn', statusText: 'No sessions found', sessionCount: 0, lastIndexed: '',
       }],
       copilotEditions: [
         { id: 'stable', name: 'VS Code', path: '/fixture/Code/User', enabled: stableEnabled },
@@ -322,6 +326,28 @@ async function run() {
   assert(
     settingsState.indexError === INDEX_ERROR,
     `Settings shows an unreadable index (${settingsState.indexError})`,
+  );
+
+  const codexRootState = await win.webContents.executeJavaScript(`(() => {
+    const card = [...document.querySelectorAll('.source-card')]
+      .find(source => source.querySelector('.source-card-name')?.textContent.includes('Codex'));
+    const inputs = [...(card?.querySelectorAll('.multi-root-list input.path-field') || [])];
+    return {
+      paths: inputs.map(input => input.value),
+      allReadonly: inputs.length > 0 && inputs.every(input => input.readOnly),
+      browseButtons: card?.querySelectorAll('button').length ?? null,
+      hint: card?.querySelector('.form-label-hint')?.textContent || '',
+    };
+  })()`, true);
+  assert(
+    JSON.stringify(codexRootState.paths) === JSON.stringify(['/fixture/Codex/sessions', '/fixture/.codex/sessions']),
+    `Codex renders both configured roots (${JSON.stringify(codexRootState.paths)})`,
+  );
+  assert(codexRootState.allReadonly, 'Codex roots render as readonly paths');
+  assert(codexRootState.browseButtons === 0, 'Codex multi-root display has no Browse button');
+  assert(
+    codexRootState.hint.includes('providerRoots.codex'),
+    `Codex multi-root hint names its settings key (${codexRootState.hint.trim()})`,
   );
 
   const copilotCheckboxes = await win.webContents.executeJavaScript(`(() =>

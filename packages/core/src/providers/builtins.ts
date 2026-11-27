@@ -24,10 +24,12 @@ export function createBuiltinProviderRegistry(
   roots: BuiltinProviderRoots = {},
   {
     homeDir,
+    codexHomeDir = homeDir,
     cwd,
     copilotUserDataRoots,
     claudeSourceRoots,
     claudeDefaultRoot,
+    codexRoots,
     openCopilotChronicle,
     openHermesStore,
     openZcodeDatabase,
@@ -36,10 +38,12 @@ export function createBuiltinProviderRegistry(
     openDevinDatabase,
   }: {
     homeDir?: string;
+    codexHomeDir?: string;
     cwd?: string;
     copilotUserDataRoots?: readonly string[];
     claudeSourceRoots?: readonly string[];
     claudeDefaultRoot?: string;
+    codexRoots?: readonly string[];
     openCopilotChronicle?: CopilotChronicleOpener;
     openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
@@ -57,7 +61,7 @@ export function createBuiltinProviderRegistry(
       rootDir: claudeRootDir,
       sourceRoots: claudeSourceRoots,
     }),
-    createCodexProvider({ rootDir: roots['codex'] }),
+    createCodexProvider({ rootDir: roots['codex'], roots: codexRoots, homeDir: codexHomeDir, cwd }),
     createCodexHostAntigravityProvider({ rootDir: roots['codexhost-antigravity'] }),
     createCopilotProvider({ rootDir: roots['copilot'], userDataRoots: copilotUserDataRoots, openChronicle: openCopilotChronicle }),
     createDeepseekProvider({ rootDir: roots['deepseek'] }),

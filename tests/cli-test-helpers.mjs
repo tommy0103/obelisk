@@ -19,17 +19,20 @@ export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
     } : {}),
     ...env,
   };
+  // The codex provider resolves `$CODEX_HOME` with higher precedence than
+  // `~/.codex`; a harness-exported CODEX_HOME would point CLI tests at the
+  // real sessions root instead of the temp HOME.
+  if (!Object.hasOwn(env, 'CODEX_HOME')) delete childEnv.CODEX_HOME;
   // The deepseek provider resolves `$DSH_HOME/sessions` with higher precedence
   // than `~/.dsh/sessions`; a harness-exported DSH_HOME would point CLI tests
   // at the real sessions root instead of the temp HOME.
-  delete childEnv.DSH_HOME;
+  if (!Object.hasOwn(env, 'DSH_HOME')) delete childEnv.DSH_HOME;
   // The hermes provider resolves $HERMES_HOME/state.db with higher precedence than
   // ~/.hermes/state.db; a harness-exported HERMES_HOME would point CLI tests at the
   // real store instead of the temp HOME.
-  delete childEnv.HERMES_HOME;
-  // The devin provider reads $XDG_DATA_HOME/devin before ~/.local/share/devin;
-  // keep an inherited value from pointing CLI tests at a real store.
-  if (!('XDG_DATA_HOME' in env)) delete childEnv.XDG_DATA_HOME;
+  if (!Object.hasOwn(env, 'HERMES_HOME')) delete childEnv.HERMES_HOME;
+  // Keep an inherited Devin data root from pointing CLI tests at the real store.
+  if (!Object.hasOwn(env, 'XDG_DATA_HOME')) delete childEnv.XDG_DATA_HOME;
   return spawnSync(process.execPath, [
     '--disable-warning=ExperimentalWarning',
     cliEntry,

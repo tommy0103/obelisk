@@ -250,7 +250,7 @@ function fmtRelative(iso) {
               <div v-for="rootPath in (src.paths || [])" :key="rootPath" class="path-input">
                 <input class="path-field" :class="{ error: src.status === 'error' }" type="text" :value="rootPath" spellcheck="false" readonly/>
               </div>
-              <div class="form-label-hint">Configured via <code>settings.json</code> (<code>providerRoots.claude</code>).</div>
+              <div class="form-label-hint">Configured via <code>settings.json</code> (<code>providerRoots.{{ src.id }}</code>).</div>
             </div>
             <div v-else-if="src.id !== 'copilot' || copilotCustomRoot" class="path-input">
               <input class="path-field" :class="{ error: src.status === 'error' }" type="text" :value="src.path" spellcheck="false" readonly/>

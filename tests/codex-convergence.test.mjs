@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { persist } from '../packages/core/src/persist.ts';
@@ -92,14 +92,15 @@ function writeJsonl(path, lines) {
   writeFileSync(path, `${lines.map(line => JSON.stringify(line)).join('\n')}\n`);
 }
 
-function assertNormalAppendReads(metrics, sourceStat, suffixBytes) {
+function assertNormalAppendReads(metrics, sourceStat, suffixBytes, expectedPlan) {
   const usableIdentity = Number.isSafeInteger(sourceStat.dev) && sourceStat.dev > 0
     && Number.isSafeInteger(sourceStat.ino) && sourceStat.ino > 0;
-  const expectedPlan = usableIdentity ? 'cooperative-append' : 'verified-append';
-  assert.equal(metrics.plan, expectedPlan, `normal append read plan (dev=${sourceStat.dev}, ino=${sourceStat.ino})`);
+  const plan = expectedPlan ?? (usableIdentity ? 'cooperative-append' : 'verified-append');
+  const cooperative = plan === 'cooperative-append';
+  assert.equal(metrics.plan, plan, `normal append read plan (dev=${sourceStat.dev}, ino=${sourceStat.ino})`);
   assert.equal(metrics.suffixBytesRead, suffixBytes * 2, 'pre-scan and emit each read the suffix once');
-  assert.equal(metrics.sourceBytesRead, suffixBytes * 2 + (usableIdentity ? 0 : sourceStat.size),
-    'unsupported identity adds exactly one complete fingerprint pass to the two suffix reads');
+  assert.equal(metrics.sourceBytesRead, suffixBytes * 2 + (cooperative ? 0 : sourceStat.size),
+    'verified append adds exactly one complete fingerprint pass to the two suffix reads');
 }
 
 const REAL_FIXTURE = new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url);
@@ -409,17 +410,23 @@ test('Codex prefix snapshot plus identity-gated append converges SQLite projecti
   dbSplit.close();
 });
 
-// Cooperative resume requires a positive, safely representable source identity.
-// Exercise the fallback deterministically, including on POSIX test machines.
-for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_SAFE_INTEGER + 1]]) {
-  test(`Codex append with ${identityName} file identity verifies the prefix and converges`, async t => {
-    const unsupportedStat = (...args) => {
+// A zero identity still verifies the prefix. Exact identities above Number's
+// precision, including the uint64 high bit, can use cooperative append.
+for (const [identityName, inode, expectedPlan] of [
+  ['zero', 0n, 'verified-append'],
+  ['large inode', 9_007_199_254_740_993n, 'cooperative-append'],
+  ['high-bit inode', 0x8000_0000_0000_0001n, 'cooperative-append'],
+]) {
+  test(`Codex append with ${identityName} identity converges`, async t => {
+    const exactStat = (...args) => {
       const result = statSync(...args);
-      result.ino = inode;
-      return result;
+      return Object.assign(result, {
+        dev: args[1]?.bigint ? 1n : 1,
+        ino: args[1]?.bigint ? inode : Number(inode),
+      });
     };
     const fsMock = t.mock.module('node:fs', {
-      namedExports: { closeSync, existsSync, openSync, readdirSync, readSync, statSync: unsupportedStat },
+      namedExports: { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync, statSync: exactStat },
     });
     t.after(() => fsMock.restore());
     const { parse: parseWithoutIdentity } = await import(`../packages/core/src/providers/codex.ts?${identityName}-identity`);
@@ -436,13 +443,164 @@ for (const [identityName, inode] of [['unavailable', 0], ['unsafe', Number.MAX_S
     t.after(() => dbSplit.close());
     const sourceUnit = { key: path, sessionId: '', meta: { source: 'codex', guardian: false } };
     const cursor = persist(dbSplit, sourceUnit, parseWithoutIdentity(sourceUnit, null));
+    const cursorState = JSON.parse(Buffer.from(cursor.split(':', 6)[5], 'base64url').toString('utf8'));
+    assert.equal(cursorState.sourceInode, String(inode), 'checkpoint retains the exact BigInt inode');
     const lines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
     const suffix = `${lines.join('\n')}\n`;
     appendFileSync(path, suffix);
     const metrics = createCodexParseMetrics();
     persist(dbSplit, sourceUnit, parseWithoutIdentity(sourceUnit, cursor, metrics));
-    assertNormalAppendReads(metrics, unsupportedStat(path), Buffer.byteLength(suffix));
-    assert.equal(metrics.jsonLinesParsed, lines.length * 2, 'verified append parses only the suffix');
+    assertNormalAppendReads(metrics, statSync(path), Buffer.byteLength(suffix), expectedPlan);
+    assert.equal(metrics.jsonLinesParsed, lines.length * 2, 'append parses only the suffix records');
     assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFinal));
   });
 }
+
+test('Codex copied rollout with Windows CopyFileExW birthtime newer than preserved ctime backfills, appends, and rejects inode reuse', async t => {
+  const birthByPath = new Map();
+  const fsMock = t.mock.module('node:fs', {
+    namedExports: {
+      closeSync,
+      existsSync,
+      lstatSync,
+      openSync,
+      readdirSync,
+      readSync,
+      copyFileSync: (src, dst, ...rest) => {
+        copyFileSync(src, dst, ...rest);
+        const exact = statSync(dst, { bigint: true });
+        birthByPath.set(dst, exact.ctimeNs + 60_000_000_000n);
+      },
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        const customBirthNs = birthByPath.get(target);
+        if (customBirthNs === undefined) return result;
+        if (options?.bigint) {
+          return Object.assign(result, {
+            birthtimeNs: customBirthNs,
+            birthtimeMs: Number(customBirthNs / 1_000_000_000n) * 1000 + Number(customBirthNs % 1_000_000_000n) / 1_000_000,
+          });
+        }
+        const birthMs = Number(customBirthNs / 1_000_000_000n) * 1000 + Number(customBirthNs % 1_000_000_000n) / 1_000_000;
+        return Object.assign(result, { birthtimeMs: birthMs, birthtime: new Date(birthMs) });
+      },
+    },
+  });
+  t.after(() => fsMock.restore());
+  const {
+    createCodexParseMetrics: createMockMetrics,
+    createCodexProvider: createMockProvider,
+    parse: parseMock,
+  } = await import('../packages/core/src/providers/codex.ts?win32-copyfile-birthtime');
+
+  const root = makeTempDir('obelisk-codex-win32-copyfile-');
+  const sessionsDir = join(root, 'sessions');
+  mkdirSync(sessionsDir);
+  const path = join(sessionsDir, 'rollout.jsonl');
+  copyFileSync(REAL_PREFIX_FIXTURE, path);
+  const copiedBirthNs = statSync(path, { bigint: true }).ctimeNs + 60_000_000_000n;
+  birthByPath.set(path, copiedBirthNs);
+
+  const rawId = JSON.parse(readFileSync(path, 'utf8').split('\n')[0]).payload.id;
+  const sessionId = `codex:${rawId}`;
+  const provider = createMockProvider({ rootDir: root });
+  const registry = createProviderRegistry([provider]);
+  const db = freshDb();
+  t.after(() => db.close());
+
+  const initialUnit = { key: path, sessionId, meta: { indexedTitle: 'Before', indexedUpdatedAt: 'p-9991' } };
+  const initialCursor = persist(db, initialUnit, parseMock(initialUnit, null));
+  const decodedState = JSON.parse(Buffer.from(initialCursor.split(':', 6)[5], 'base64url').toString('utf8'));
+  assert.equal(decodedState.sourceBirthtimeNs, String(copiedBirthNs));
+
+  db.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed) VALUES (?,0,0)')
+    .run('__codex_canonical_transcript_v3__');
+  writeFileSync(join(root, 'session_index.jsonl'), `${JSON.stringify({
+    id: rawId, thread_name: 'After', updated_at: 'p-9992',
+  })}\n`);
+
+  const plan = createProviderIndexPlan(db, registry, { readMode: 'strict' });
+  assert.equal(plan.items.length, 1, 'unchanged copied rollout with birthtime > ctime is recognized during marker backfill');
+
+  // Legacy cursor without sourceBirthtimeNs also recognizes an unchanged copied rollout.
+  delete decodedState.sourceBirthtimeNs;
+  const legacyParts = initialCursor.split(':', 6);
+  const legacyCursor = `${legacyParts.slice(0, 5).join(':')}:${Buffer.from(JSON.stringify(decodedState)).toString('base64url')}`;
+  db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(legacyCursor, path);
+  const legacyPlan = createProviderIndexPlan(db, registry, { readMode: 'strict' });
+  assert.equal(legacyPlan.items.length, 1, 'legacy cursor without sourceBirthtimeNs still matches unchanged copied rollout');
+
+  // Restore full cursor, finish migration, then append lines (ctime advances while birthtime stays > initial ctime).
+  db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(initialCursor, path);
+  db.exec('BEGIN');
+  assert.equal(indexProviderPlanStrict({ db, plan: createProviderIndexPlan(db, registry, { readMode: 'strict' }) }).complete, true);
+  db.exec('COMMIT');
+
+  const migratedCursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(path).cursor;
+  const restLines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
+  appendFileSync(path, `${restLines.join('\n')}\n`);
+  const appendMetrics = createMockMetrics();
+  const afterAppendCursor = persist(db, { key: path, sessionId, meta: { indexedTitle: 'After', indexedUpdatedAt: 'p-9992' } }, parseMock({ key: path, sessionId, meta: { indexedTitle: 'After', indexedUpdatedAt: 'p-9992' } }, migratedCursor, appendMetrics));
+  assert.equal(appendMetrics.plan, 'cooperative-append');
+
+  // Reused inode with a newer creation time must not take noop or cooperative-append.
+  birthByPath.set(path, copiedBirthNs + 5_000_000_000n);
+  const reusedMetrics = createMockMetrics();
+  persist(db, { key: path, sessionId, meta: { indexedTitle: 'After', indexedUpdatedAt: 'p-9992' } }, parseMock({ key: path, sessionId, meta: { indexedTitle: 'After', indexedUpdatedAt: 'p-9992' } }, afterAppendCursor, reusedMetrics));
+  assert.equal(reusedMetrics.plan, 'snapshot', 'inode reuse with different birthtime forces a full snapshot');
+});
+
+test('legacy cursor without sourceBirthtimeNs or store tag converges after append on CopyFileExW rollout', async t => {
+  const birthByPath = new Map();
+  const fsMock = t.mock.module('node:fs', {
+    namedExports: {
+      closeSync,
+      existsSync,
+      lstatSync,
+      openSync,
+      readdirSync,
+      readSync,
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        const customBirthNs = birthByPath.get(target);
+        if (customBirthNs === undefined) return result;
+        const birthMs = Number(customBirthNs / 1_000_000_000n) * 1000 + Number(customBirthNs % 1_000_000_000n) / 1_000_000;
+        if (options?.bigint) {
+          return Object.assign(result, { birthtimeNs: customBirthNs, birthtimeMs: birthMs });
+        }
+        return Object.assign(result, { birthtimeMs: birthMs, birthtime: new Date(birthMs) });
+      },
+    },
+  });
+  t.after(() => fsMock.restore());
+  const { createCodexProvider: createMockProvider, parse: parseMock } = await import('../packages/core/src/providers/codex.ts?win32-legacy-append-converge');
+
+  const home = makeTempDir('obelisk-codex-win32-legacy-append-');
+  const root = join(home, '.codex');
+  const sessionsDir = join(root, 'sessions', '2026', '06', '15');
+  mkdirSync(sessionsDir, { recursive: true });
+  const path = join(sessionsDir, 'rollout.jsonl');
+  copyFileSync(REAL_PREFIX_FIXTURE, path);
+  birthByPath.set(path, statSync(path, { bigint: true }).ctimeNs + 60_000_000_000n);
+
+  const rawId = JSON.parse(readFileSync(path, 'utf8').split('\n')[0]).payload.id;
+  const sessionId = `codex:${rawId}`;
+  const db = freshDb();
+  t.after(() => db.close());
+
+  const initialCursor = persist(db, { key: path, sessionId }, parseMock({ key: path, sessionId }, null));
+  const parts = initialCursor.split(':', 6);
+  const state = JSON.parse(Buffer.from(parts[5], 'base64url').toString('utf8'));
+  delete state.sourceBirthtimeNs;
+  const legacyNoStoreCursor = `${parts.slice(0, 5).join(':')}:${Buffer.from(JSON.stringify(state)).toString('base64url')}`;
+  db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(legacyNoStoreCursor, path);
+
+  const restLines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
+  appendFileSync(path, `${restLines.join('\n')}\n`);
+
+  const provider = createMockProvider({ roots: [root], homeDir: home });
+  const plan = createProviderIndexPlan(db, createProviderRegistry([provider]));
+  assert.equal(plan.incompleteProviders.has('codex'), false);
+  assert.equal(indexProviderPlanStrict({ db, plan }).complete, true);
+  assert.deepEqual(db.prepare('SELECT id FROM sessions').all().map(row => row.id), [`codex:${rawId}`]);
+});

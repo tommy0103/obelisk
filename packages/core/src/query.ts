@@ -6,7 +6,7 @@ import { statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
 import { constants as sqliteConstants } from 'node:sqlite';
-import { storedSessionCursor } from './provider-indexing.ts';
+import { storedRawCursor, storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
@@ -1028,6 +1028,7 @@ function createQueryApi(
       session,
       agentId: message.agent_id || null,
       cursor: storedSessionCursor(db, providerRegistry, session),
+      cursorForPath: path => storedRawCursor(db, path),
       subagent,
       workflowAgent,
     });

@@ -69,6 +69,7 @@ function invoke(f, fault, { reader = false, args = [] } = {}) {
     : [cliEntry, ...args];
   const env = { ...process.env, HOME: f.home, USERPROFILE: f.home,
     APPDATA: join(f.home, 'AppData/Roaming'), XDG_CONFIG_HOME: join(f.home, '.config') };
+  delete env.CODEX_HOME;
   delete env.DSH_HOME;
   delete env.HERMES_HOME;
   return spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning',

@@ -4,13 +4,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, writeFileSync } from 'node:fs';
-import { join, normalize } from 'node:path';
+import { join, normalize, resolve } from 'node:path';
 
 import {
   createConfiguredBuiltinProviderRuntime,
   getCopilotEditions,
   readPersistedProviderSettings,
   resolveProviderRoots,
+  resolveCodexConfiguredRoots,
 } from '../packages/core/src/provider-settings.ts';
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import {
@@ -18,6 +19,8 @@ import {
   setPersistedSetting,
 } from '../app/src/main/provider-settings.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+
+const probeHomeDir = resolve('obelisk-provider-settings-home');
 
 function provider(id, defaultRoot, color, descriptor = {}) {
   return {
@@ -41,8 +44,8 @@ test('provider roots and source settings are derived from the registry without s
   };
 
   assert.deepEqual(resolveProviderRoots(registry, persisted), {
-    alpha: '/legacy/alpha',
-    beta: '/custom/beta',
+    alpha: normalize('/legacy/alpha'),
+    beta: normalize('/custom/beta'),
   });
 
   const rootsChanged = setPersistedSetting(persisted, 'providerRoots.alpha', '/custom/alpha');
@@ -59,19 +62,19 @@ test('provider roots and source settings are derived from the registry without s
       ['alpha', { sessionCount: 2, lastIndexed: '2026-07-20T10:00:00.000Z' }],
       ['beta', { sessionCount: 0, lastIndexed: '' }],
     ]),
-    pathExists: path => path === '/custom/alpha' || path === '/custom/beta',
+    pathExists: path => path === normalize('/custom/alpha') || path === normalize('/custom/beta'),
   });
 
   assert.deepEqual(sources, [
     {
       id: 'alpha', name: 'alpha name', vendor: 'alpha vendor', color: '#112233',
-      path: '/custom/alpha', settingKey: 'providerRoots.alpha', exists: true,
+      path: normalize('/custom/alpha'), settingKey: 'providerRoots.alpha', exists: true,
       sessionCount: 2, lastIndexed: '2026-07-20T10:00:00.000Z',
       status: 'ok', statusText: 'Connected',
     },
     {
       id: 'beta', name: 'beta name', vendor: 'beta vendor', color: '#445566',
-      path: '/custom/beta', settingKey: 'providerRoots.beta', exists: true,
+      path: normalize('/custom/beta'), settingKey: 'providerRoots.beta', exists: true,
       sessionCount: 0, lastIndexed: '', status: 'warn', statusText: 'No sessions found',
     },
   ]);
@@ -143,7 +146,7 @@ test('an ambiguous provider default stays omitted until the user selects a root'
   assert.deepEqual(resolveProviderRoots(registry, {
     providerRoots: { relative: '/fallback/relative' },
   }), {
-    relative: '/fallback/relative',
+    relative: normalize('/fallback/relative'),
   });
   assert.deepEqual(buildSourceCatalog({
     registry,
@@ -172,9 +175,9 @@ test('provider roots expand a persisted home-relative path before registry const
   assert.deepEqual(resolveProviderRoots(
     registry,
     { providerRoots: { alpha: '~/custom/sessions' } },
-    { homeDir: '/home/probe' },
+    { homeDir: probeHomeDir },
   ), {
-    alpha: '/home/probe/custom/sessions',
+    alpha: join(probeHomeDir, 'custom', 'sessions'),
   });
 });
 
@@ -196,7 +199,7 @@ test('an invalid persisted root disables that provider instead of selecting its 
   const runtime = createConfiguredBuiltinProviderRuntime({
     providerRoots: { claude: './relative-claude' },
   }, {
-    homeDir: '/home/probe',
+    homeDir: probeHomeDir,
     baseRoots: { claude: '/default/claude' },
   });
   const claude = runtime.registry.get('claude');
@@ -257,4 +260,56 @@ test('settings reader rejects malformed provider root containers', () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('providerRoots.codex accepts validated non-empty root arrays and rejects invalid arrays without fallback', () => {
+  const homeDir = probeHomeDir;
+  const valid = {
+    providerRoots: {
+      codex: ['~/.codex', '~/profiles/codex-work', join(probeHomeDir, '.codex')],
+    },
+  };
+  assert.deepEqual(resolveCodexConfiguredRoots(valid, { homeDir }), [
+    normalize(join(probeHomeDir, '.codex')),
+    normalize(join(probeHomeDir, 'profiles', 'codex-work')),
+  ]);
+  const runtime = createConfiguredBuiltinProviderRuntime(valid, { homeDir });
+  assert.equal(runtime.roots.codex, normalize(join(probeHomeDir, '.codex')));
+  const codex = runtime.registry.get('codex');
+  assert.equal(codex.descriptor.requiresExplicitRoot, undefined);
+  assert.deepEqual(codex.watchTargets(runtime.roots.codex), [
+    { kind: 'tree', path: join(normalize(join(probeHomeDir, '.codex')), 'sessions') },
+    { kind: 'tree', path: join(normalize(join(probeHomeDir, '.codex')), 'archived_sessions') },
+    { kind: 'file', path: join(normalize(join(probeHomeDir, '.codex')), 'session_index.jsonl') },
+    { kind: 'tree', path: join(normalize(join(probeHomeDir, 'profiles', 'codex-work')), 'sessions') },
+    { kind: 'tree', path: join(normalize(join(probeHomeDir, 'profiles', 'codex-work')), 'archived_sessions') },
+    { kind: 'file', path: join(normalize(join(probeHomeDir, 'profiles', 'codex-work')), 'session_index.jsonl') },
+  ]);
+
+  // Saving unrelated settings preserves the configured codex array.
+  assert.equal(setPersistedSetting(valid, 'editorScheme', 'cursor'), false);
+  assert.equal(setPersistedSetting(valid, 'providerRoots.claude', '/custom/claude'), true);
+  assert.deepEqual(valid.providerRoots.codex, ['~/.codex', '~/profiles/codex-work', join(probeHomeDir, '.codex')]);
+
+  for (const invalidCodex of [[], [''], ['/valid', './relative'], [123]]) {
+    const invalidRuntime = createConfiguredBuiltinProviderRuntime({
+      providerRoots: { codex: invalidCodex },
+    }, {
+      homeDir,
+      baseRoots: { codex: '/default/codex' },
+    });
+    assert.equal(invalidRuntime.roots.codex, undefined);
+    const disabled = invalidRuntime.registry.get('codex');
+    assert.equal(disabled.descriptor.requiresExplicitRoot, true);
+    assert.match(disabled.descriptor.rootResolutionReason, /non-empty list/i);
+    assert.deepEqual(disabled.watchTargets('/default/codex'), []);
+    assert.deepEqual(disabled.discover({ lastCursor: () => null, indexedSessions: () => [] }), []);
+  }
+
+  // Providers that accept a single root still reject array values.
+  const hermesArrayRuntime = createConfiguredBuiltinProviderRuntime({
+    providerRoots: { hermes: ['/a', '/b'] },
+  }, { homeDir });
+  assert.equal(hermesArrayRuntime.roots.hermes, undefined);
+  assert.equal(hermesArrayRuntime.registry.get('hermes').descriptor.requiresExplicitRoot, true);
 });

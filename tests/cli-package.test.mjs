@@ -183,7 +183,7 @@ test('npm pack installs one platform-neutral CLI with its schema resource', () =
       ...process.env,
       HOME: home, USERPROFILE: home,
       APPDATA: join(home, 'AppData', 'Roaming'), XDG_CONFIG_HOME: join(home, '.config'),
-      CODEXHOST_DATA_DIR: hostRoot, DSH_HOME: join(home, '.dsh'), HERMES_HOME: join(home, '.hermes'),
+      CODEX_HOME: join(home, '.codex'), CODEXHOST_DATA_DIR: hostRoot, DSH_HOME: join(home, '.dsh'), HERMES_HOME: join(home, '.hermes'),
     },
   });
   assert.equal(indexed.status, 0, indexed.stderr || indexed.stdout);

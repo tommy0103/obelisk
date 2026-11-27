@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, normalize, resolve } from 'node:path';
 
 import {
   createBuiltinProviderRegistry,
@@ -133,11 +133,41 @@ function configuredPaths(value: unknown, homeDir: string): string[] | undefined 
   return single !== null ? [single] : undefined;
 }
 
+function configuredPathList(value: unknown, homeDir: string): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const path = configuredPath(item, homeDir);
+    if (path === null) return null;
+    const canonical = normalize(resolve(path));
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    resolved.push(path);
+  }
+  return resolved.length > 0 ? resolved : null;
+}
+
+export function resolveCodexConfiguredRoots(
+  persisted: PersistedProviderSettings = {},
+  { homeDir = homedir() }: { homeDir?: string } = {},
+): string[] | undefined {
+  const configured = (
+    persisted.providerRoots !== null
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
+  ) ? persisted.providerRoots : {};
+  if (!Object.prototype.hasOwnProperty.call(configured, 'codex') || !Array.isArray(configured['codex'])) {
+    return undefined;
+  }
+  return configuredPathList(configured['codex'], homeDir) ?? undefined;
+}
+
 /** @internal Exported for tests. */
 export function resolveProviderRoots(
   registry: ProviderRegistry,
   persisted: PersistedProviderSettings = {},
-  { homeDir = homedir() }: { homeDir?: string } = {},
+  { homeDir = homedir(), codexHomeDir = homeDir }: { homeDir?: string; codexHomeDir?: string } = {},
 ): Record<string, string> {
   if (
     persisted.providerRoots !== undefined
@@ -157,10 +187,15 @@ export function resolveProviderRoots(
     const hasLegacy = Object.prototype.hasOwnProperty.call(persisted, legacyKey)
       && persisted[legacyKey] !== null;
     if (hasModern || hasLegacy) {
+      const targetHome = descriptor.id === 'codex' ? codexHomeDir : homeDir;
       const rawValue = hasModern ? configured[modernKey] : persisted[legacyKey];
+      if (hasModern && descriptor.id === 'codex' && Array.isArray(rawValue)) {
+        const list = configuredPathList(rawValue, targetHome);
+        return list === null ? [] : [[descriptor.id, list[0]!]];
+      }
       const explicit = descriptor.id === 'claude' && Array.isArray(rawValue)
         ? configuredPaths(rawValue, homeDir)?.[0] ?? null
-        : configuredPath(rawValue, homeDir);
+        : configuredPath(rawValue, targetHome);
       return explicit === null ? [] : [[descriptor.id, explicit]];
     }
     return descriptor.requiresExplicitRoot ? [] : [[descriptor.id, descriptor.defaultRoot]];
@@ -202,6 +237,7 @@ export function createConfiguredBuiltinProviderRuntime(
   persisted: PersistedProviderSettings = {},
   {
     homeDir = homedir(),
+    codexHomeDir = homeDir,
     cwd = process.cwd(),
     baseRoots = {},
     openCopilotChronicle,
@@ -212,6 +248,7 @@ export function createConfiguredBuiltinProviderRuntime(
     openDevinDatabase,
   }: {
     homeDir?: string;
+    codexHomeDir?: string;
     cwd?: string;
     baseRoots?: BuiltinProviderRoots;
     openCopilotChronicle?: CopilotChronicleOpener;
@@ -222,8 +259,16 @@ export function createConfiguredBuiltinProviderRuntime(
     openDevinDatabase?: DevinDatabaseOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase });
-  const roots = resolveProviderRoots(defaults, persisted, { homeDir });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, codexHomeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase });
+  const roots = resolveProviderRoots(defaults, persisted, { homeDir, codexHomeDir });
+  const codexConfiguredRoots = resolveCodexConfiguredRoots(persisted, { homeDir: codexHomeDir });
+  const codexInvalidArray = (
+    persisted.providerRoots !== null
+    && typeof persisted.providerRoots === 'object'
+    && !Array.isArray(persisted.providerRoots)
+    && Array.isArray(persisted.providerRoots['codex'])
+    && codexConfiguredRoots === undefined
+  );
   const copilotUsesAutomaticRoots = baseRoots.copilot === undefined
     && !hasExplicitProviderRoot(persisted, 'copilot');
   const copilotUserDataRoots = copilotUsesAutomaticRoots
@@ -244,10 +289,11 @@ export function createConfiguredBuiltinProviderRuntime(
       ...(opencodeUsesAutomaticRoots ? { opencode: undefined } : {}),
     },
     {
-      cwd, homeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase,
+      cwd, homeDir, codexHomeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase,
       copilotUserDataRoots,
       claudeSourceRoots,
       claudeDefaultRoot,
+      codexRoots: codexConfiguredRoots,
     },
   );
   return {
@@ -256,7 +302,9 @@ export function createConfiguredBuiltinProviderRuntime(
       if (roots[provider.name] !== undefined) return provider;
       const reason = (provider.name === 'claude' ? claudeConfig.invalidReason : undefined)
         ?? provider.descriptor.rootResolutionReason
-        ?? `Configured ${provider.name} root must be absolute or start with ~`;
+        ?? (provider.name === 'codex' && codexInvalidArray
+          ? 'Configured codex roots must be a non-empty list of absolute or ~-prefixed paths'
+          : `Configured ${provider.name} root must be absolute or start with ~`);
       return {
         ...provider,
         descriptor: {

@@ -22,11 +22,13 @@ import { createUpdateService } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { defaultCodexHome } from '../../../packages/core/src/providers/codex.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
   getCopilotEditions,
   hasExplicitProviderRoot,
   readPersistedProviderSettings,
+  resolveCodexConfiguredRoots,
   resolveConfiguredClaudeRoots,
   type PersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
@@ -74,7 +76,6 @@ function detectClaudeDir() {
 }
 
 const DEFAULT_CLAUDE_DIR = detectClaudeDir();
-const DEFAULT_CODEX_DIR = path.join(os.homedir(), '.codex');
 
 let db: Database.Database | null = null;
 let indexerService: ReturnType<typeof createIndexerService> | null = null;
@@ -101,7 +102,6 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
   const runtime = createConfiguredBuiltinProviderRuntime(persisted, {
     baseRoots: {
       claude: DEFAULT_CLAUDE_DIR,
-      codex: DEFAULT_CODEX_DIR,
     },
     openCopilotChronicle: sourcePath => new Database(sourcePath, {
       readonly: true,
@@ -121,7 +121,7 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;
   const claudeDir = providerRoots['claude'] ?? DEFAULT_CLAUDE_DIR;
-  const codexDir = providerRoots['codex'] ?? DEFAULT_CODEX_DIR;
+  const codexDir = providerRoots['codex'] ?? defaultCodexHome();
   return {
     providerRoots,
     providerSettings: persisted,
@@ -662,7 +662,10 @@ ipcMain.handle('settings:get', async () => {
   const claudeRootConfig = resolveConfiguredClaudeRoots(persisted);
   const claudeHasArrayConfig = Array.isArray(persisted.providerRoots?.claude);
   const configuredClaudeList = claudeHasArrayConfig ? (claudeRootConfig.roots ?? []) : [];
+  const codexHasArrayConfig = Array.isArray(persisted.providerRoots?.codex);
+  const codexConfiguredRoots = resolveCodexConfiguredRoots(persisted);
   const sourcePaths = new Set([
+    ...(codexConfiguredRoots ?? []),
     ...providerRegistry.catalog().map((provider) => providerRoots[provider.id] ?? provider.defaultRoot),
     ...configuredClaudeList,
     ...(!copilotCustomRoot ? selectedCopilotEditions.map((edition) => edition.path) : []),
@@ -677,11 +680,14 @@ ipcMain.handle('settings:get', async () => {
   }))).filter((sourcePath): sourcePath is string => sourcePath !== null));
   const copilotCatalogRoot = selectedCopilotEditions.find((edition) => existingPaths.has(edition.path))
     ?? selectedCopilotEditions[0];
+  const codexCatalogRoot = codexConfiguredRoots?.find((root) => existingPaths.has(root))
+    ?? codexConfiguredRoots?.[0];
   const sources = buildSourceCatalog({
     registry: providerRegistry,
-    roots: copilotCustomRoot ? providerRoots : {
+    roots: {
       ...providerRoots,
-      copilot: copilotCatalogRoot?.path ?? '',
+      ...(!copilotCustomRoot ? { copilot: copilotCatalogRoot?.path ?? '' } : {}),
+      ...(codexCatalogRoot !== undefined ? { codex: codexCatalogRoot } : {}),
     },
     stats: sourceStats,
     sourceIssues: latestSourceIssues,
@@ -702,6 +708,13 @@ ipcMain.handle('settings:get', async () => {
           status: 'error',
           statusText: `Folder not found: ${missingPath}`,
         }),
+      };
+    }
+    if (source.id === 'codex' && codexHasArrayConfig) {
+      return {
+        ...source,
+        multiRoot: true,
+        paths: codexConfiguredRoots ?? [],
       };
     }
     if (source.id !== 'copilot' || copilotCustomRoot) return source;
@@ -756,12 +769,18 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
       rename: (from, to) => fs.promises.rename(from, to),
       copyFile: (from, to) => fs.promises.copyFile(from, to),
     }, currentRead);
+    const persistedRoots = persisted.providerRoots as Record<string, unknown> | undefined;
+    const multiRootGuard = key === 'providerRoots.claude'
+      ? { field: 'claude', label: 'Claude' }
+      : key === 'providerRoots.codex'
+        ? { field: 'codex', label: 'Codex' }
+        : null;
     if (
-      key === 'providerRoots.claude'
+      multiRootGuard !== null
       && typeof value === 'string'
-      && Array.isArray((persisted.providerRoots as Record<string, unknown> | undefined)?.claude)
+      && Array.isArray(persistedRoots?.[multiRootGuard.field])
     ) {
-      throw new Error('Multiple Claude roots are configured in settings.json; edit settings.json to update or remove them');
+      throw new Error(`Multiple ${multiRootGuard.label} roots are configured in settings.json; edit settings.json to update or remove them`);
     }
     const providerRootChanged = setPersistedSetting(persisted, key, value);
     await savePersistedSettings(persisted);
@@ -781,7 +800,6 @@ ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
 
     const knownLegacyRootChanged = createBuiltinProviderRegistry({
       claude: DEFAULT_CLAUDE_DIR,
-      codex: DEFAULT_CODEX_DIR,
     }).catalog().some((provider) => key === `${provider.id}Dir`);
     if (providerRootChanged || knownLegacyRootChanged) {
       await stopIndexerServiceAndWait();

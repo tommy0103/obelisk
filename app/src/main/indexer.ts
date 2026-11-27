@@ -275,7 +275,7 @@ function buildIndex({
   providerRegistry,
   claudeDir = DEFAULT_CLAUDE_DIR,
   defaultClaudeDir = undefined,
-  codexDir = path.join(path.dirname(claudeDir), '.codex'),
+  codexDir = undefined,
   projectsDir = path.join(claudeDir, 'projects'),
   dbPath = DEFAULT_DB_PATH,
   schemaPath = resolveSchemaPath(),
@@ -320,11 +320,27 @@ function buildIndex({
       const defaultHome = os.homedir();
       const effectiveDefaultClaudeDir = defaultClaudeDir ?? claudeDir;
       const compatibilityHome = path.dirname(effectiveDefaultClaudeDir);
+      // Match main-process home resolution when settings are explicit (e.g.
+      // providerRoots.claude or providerRoots.codex) so Codex root scoping
+      // agrees across main, worker, and CLI. Keep compatibilityHome for
+      // non-Codex providers in test/relocated-home setups.
+      const hasExplicitSettingsRoots = providerSettings !== undefined
+        && (
+          hasExplicitProviderRoot(providerSettings, 'claude')
+          || hasExplicitProviderRoot(providerSettings, 'codex')
+        );
+      const settingsHomeDir = hasExplicitSettingsRoots
+        ? defaultHome
+        : compatibilityHome;
       const relocatedDefaults = Object.fromEntries(
         createBuiltinProviderRegistry().catalog().flatMap((descriptor) => {
           if (descriptor.requiresExplicitRoot) return [];
+          const hasCodexEnv = descriptor.id === 'codex'
+            && typeof process.env.CODEX_HOME === 'string'
+            && process.env.CODEX_HOME.trim().length > 0;
           const relativeDefault = path.relative(defaultHome, descriptor.defaultRoot);
-          const root = compatibilityHome !== defaultHome
+          const root = !hasCodexEnv
+            && compatibilityHome !== defaultHome
             && relativeDefault
             && !relativeDefault.startsWith('..')
             && !path.isAbsolute(relativeDefault)
@@ -336,7 +352,7 @@ function buildIndex({
       const roots = {
         ...relocatedDefaults,
         claude: claudeDir,
-        codex: codexDir,
+        ...(codexDir !== undefined ? { codex: codexDir } : {}),
         ...providerRoots,
       };
       const openCopilotChronicle = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true });
@@ -355,11 +371,13 @@ function buildIndex({
           })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             homeDir: compatibilityHome,
+            codexHomeDir: settingsHomeDir,
             baseRoots: {
               ...roots,
               claude: effectiveDefaultClaudeDir,
               ...(!hasExplicitProviderRoot(providerSettings, 'copilot') ? { copilot: undefined } : {}),
               ...(!hasExplicitProviderRoot(providerSettings, 'opencode') ? { opencode: undefined } : {}),
+              ...(!hasExplicitProviderRoot(providerSettings, 'codex') && codexDir === undefined && !Object.prototype.hasOwnProperty.call(providerRoots, 'codex') ? { codex: undefined } : {}),
             },
             openCopilotChronicle,
             openHermesStore,

@@ -5,7 +5,7 @@
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
 // typed seam while remaining limited to node:fs/path/os.
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize } from 'node:path';
 
@@ -410,23 +410,31 @@ function discoverCodexJsonlFiles(
   return files;
 }
 
-function codexDbId(id: unknown): string | null {
+function codexDbId(id: unknown, rootScope: string | null = null): string | null {
   if (!id) return null;
   const raw = String(id).replace(/^codex:/, '');
-  return `codex:${raw}`;
+  return rootScope ? `codex:${rootScope}:${raw}` : `codex:${raw}`;
 }
 
 function codexRawId(id: unknown): string | null {
   return id ? String(id).replace(/^codex:/, '') : null;
 }
 
-function codexLineUuid(threadId: unknown, lineNum: number): string {
-  return `codex:${codexRawId(threadId)}:${String(lineNum).padStart(6, '0')}`;
+function codexLineUuid(threadId: unknown, lineNum: number, rootScope: string | null = null): string {
+  const raw = codexRawId(threadId);
+  const line = String(lineNum).padStart(6, '0');
+  return rootScope ? `codex:${rootScope}:${raw}:${line}` : `codex:${raw}:${line}`;
 }
 
-function codexCallId(threadId: unknown, callId: unknown): string | null {
+function codexCallId(threadId: unknown, callId: unknown, rootScope: string | null = null): string | null {
   if (!threadId || !callId) return null;
-  return `codex:${codexRawId(threadId)}:${String(callId).replace(/^codex:/, '')}`;
+  const raw = codexRawId(threadId);
+  const cleanCall = String(callId).replace(/^codex:/, '');
+  return rootScope ? `codex:${rootScope}:${raw}:${cleanCall}` : `codex:${raw}:${cleanCall}`;
+}
+
+function tryRealpath(path: string): string | null {
+  try { return realpathSync(path); } catch { return null; }
 }
 
 function codexParentThreadId(meta: JsonRecord): string | null {
@@ -581,7 +589,7 @@ function codexToolOutput(payload: JsonRecord): string | null {
 
 export {
   CLAUDE_DIR, CODEX_DIR, TEXT_LIMIT, getTextLimit, setTextLimit,
-  trunc, truncJson, extractText, extractContentType, extractHarnessKind, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
+  trunc, truncJson, extractText, extractContentType, extractHarnessKind, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines, tryRealpath,
   isCodexCompressedPath, isCodexTranscriptPath, readCodexCompressedBytes, readCodexBufferLines, readCodexLines,
   normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
   discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue, normalizeTranscriptTimestamp,

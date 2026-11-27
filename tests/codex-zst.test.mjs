@@ -4,7 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
 
@@ -177,10 +178,10 @@ test('parse() produces identical canonical records for plain and compressed roll
 
   assert.deepEqual(normalize(plainRes.values), normalize(zstRes.values));
 
-  // Verify zst cursor format: mtime:lines:size:ctimeMs:ino:codex-zst-v1:dev
+  // Verify zst cursor format: mtime:lines:size:ctimeMs:ino:codex-zst-v2:dev
   const parts = zstRes.ret.split(':');
   assert.equal(parts.length, 7);
-  assert.equal(parts[5], 'codex-zst-v1');
+  assert.equal(parts[5], 'codex-zst-v2');
 
   // ADR-0007 verification: direct assembly equals SQLite round-trip
   const db = freshDb();
@@ -453,5 +454,71 @@ test('Plain to Compressed to Resumed Plaintext atomically preserves unchanged ch
     assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE session_id=? AND agent_id IS NOT NULL').get(sessionId).n, 40);
     assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE text=?').get('archive-resume-append').n, 1);
     assert.equal(db.prepare('SELECT count(*) n FROM subagents').get().n, 1);
+  } finally { db.close(); }
+});
+
+test('reused rollout inode with newer birthtime retains family while child is unavailable', async t => {
+  const root = makeTempDir('obelisk-codex-reused-root-');
+  const dir = join(root, 'sessions');
+  mkdirSync(dir);
+  const bytes = readFileSync(new URL('./fixtures/codex/real-rollout-structural-sanitized.jsonl', import.meta.url));
+  const lines = bytes.toString().trimEnd().split('\n').map(JSON.parse);
+  const parentId = lines[0].payload.id;
+  const sessionId = `codex:${parentId}`;
+  const childLines = structuredClone(lines);
+  childLines[0].payload.id = 'reused-inode-child';
+  childLines[0].payload.source = { subagent: { thread_spawn: { parent_thread_id: parentId, agent_role: 'worker' } } };
+  const plain = join(dir, 'a-root.jsonl');
+  const child = join(dir, 'z-child.jsonl');
+  writeFileSync(plain, bytes);
+  const childBytes = Buffer.from(childLines.map(JSON.stringify).join('\n') + '\n');
+  writeFileSync(child, childBytes);
+  let reusedBirthtimeNs = null;
+  const fsMock = t.mock.module('node:fs', {
+    namedExports: {
+      ...fs,
+      statSync: (target, options) => {
+        const result = statSync(target, options);
+        if (target !== plain || !options?.bigint) return result;
+        return Object.assign(result, {
+          ino: 777n,
+          birthtimeNs: reusedBirthtimeNs ?? result.birthtimeNs,
+          birthtimeMs: Number((reusedBirthtimeNs ?? result.birthtimeNs) / 1_000_000n),
+        });
+      },
+    },
+  });
+  t.after(() => fsMock.restore());
+  const { createCodexProvider: mockProvider } = await import('../packages/core/src/providers/codex.ts?reused-root-birthtime');
+  const db = freshDb();
+  const provider = mockProvider({ rootDir: root });
+  const registry = createProviderRegistry([provider]);
+  const projection = () => ['messages', 'tool_calls', 'tool_results', 'subagents'].map(table =>
+    JSON.stringify(db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map(row => ({ ...row }))));
+  const run = changedPaths => {
+    const plan = createProviderIndexPlan(db, registry, { changedPaths, readMode: 'strict' });
+    db.exec('BEGIN');
+    try { indexProviderPlanStrict({ db, plan }); db.exec('COMMIT'); }
+    catch (error) { db.exec('ROLLBACK'); throw error; }
+    return plan;
+  };
+  try {
+    run();
+    const initial = projection();
+    const before = statSync(plain, { bigint: true });
+    reusedBirthtimeNs = before.birthtimeNs + 1_000_000_000n;
+    writeFileSync(plain, bytes);
+    writeFileSync(child, '');
+    const pending = run([plain]);
+    assert.ok(pending.incompleteProviders.has('codex'));
+    assert.equal(pending.items.some(item => item.unit.sessionId === sessionId), false);
+    assert.deepEqual(projection(), initial, 'root replacement retains the previously indexed family');
+    writeFileSync(child, childBytes);
+    const settled = run([plain, child]);
+    assert.equal(settled.items.length, 2);
+    assert.equal(settled.items[0].unit.atomicGroup, settled.items[1].unit.atomicGroup);
+    assert.equal(settled.incompleteProviders.has('codex'), false);
+    assert.deepEqual(projection(), initial);
+    assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE session_id=?').get(sessionId).n, 80);
   } finally { db.close(); }
 });
