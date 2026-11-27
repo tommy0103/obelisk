@@ -125,37 +125,25 @@ fi
 "${isolated[@]}" timeout -k 5 180 "$desktop" "${flags[@]}" >"$work/desktop.log" 2>&1 &
 desktop_pid=$!
 
-# The CLI can build an index itself. Verify the desktop wrote the fixture before
-# allowing the CLI to open the database.
-marker="SELECT count(*) FROM index_state WHERE jsonl_path = '__app_last_successful_build__'"
-until [[ $(sqlite3 -readonly "$database" "$marker" 2>/dev/null) == 1 ]]; do
-  if ! kill -0 "$desktop_pid" 2>/dev/null; then
-    echo "The desktop app exited before finishing its first index" >&2
-    exit 1
-  fi
-  sleep 0.2
-done
-
-# A CLI pointed at its own database could index the same fixture. Require the
-# desktop-only marker in the query run by both readers.
-query="SELECT text FROM messages WHERE session_id = '$session' AND uuid = 'e895cf23-a540-4481-b1d3-9d13799d33e6' AND ($marker) = 1"
-expected='Reply with exactly: ok'
-if [[ $(sqlite3 -readonly "$database" "$query") != "$expected" ]]; then
-  echo "Desktop completed its index without the expected Claude message" >&2
-  exit 1
-fi
-printf 'return sql("%s")[0]?.text;\n' "$query" >"$work/query.mjs"
-result=$("${isolated[@]}" timeout 30 "$cli" --query "$work/query.mjs")
-if [[ $result != "\"$expected\"" ]]; then
-  echo "Expected the installed CLI to retrieve the desktop-indexed Claude message, received: $result" >&2
-  exit 1
-fi
-
 # Verify Vue mounted the shipped UI, then query its updater through the preload.
-timeout 100 node --input-type=module - "$work/user-data/DevToolsActivePort" <<'JS'
+# Do not open the WAL database with a second SQLite (the sqlite3 CLI or the
+# node:sqlite CLI) while the packaged app still has the -shm mapped: a second
+# connection can recreate the shm and the app then SIGBUS on page-in.
+timeout 100 node --input-type=module - "$work/user-data/DevToolsActivePort" "$desktop_pid" <<'JS'
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+
+const desktopPid = Number(process.argv[3]);
+
+function appStillRunning() {
+  try {
+    process.kill(desktopPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function rendererPage() {
   const portFile = await readFile(process.argv[2], 'utf8').catch(error => {
@@ -210,6 +198,9 @@ async function verifyRenderer(page) {
 const deadline = Date.now() + 60_000;
 let foundPage = false;
 while (true) {
+  if (!appStillRunning()) {
+    throw new Error('The desktop app exited before the renderer check finished');
+  }
   const page = await rendererPage();
   if (page) {
     foundPage = true;
@@ -222,3 +213,60 @@ while (true) {
   await delay(200);
 }
 JS
+
+# Quit the writer and wait until it is gone before any other SQLite opens the db.
+if ! kill -0 "$desktop_pid" 2>/dev/null; then
+  wait "$desktop_pid" 2>/dev/null || desktop_status=$?
+  echo "The desktop app exited before the renderer check finished" >&2
+  exit 1
+fi
+kill "$desktop_pid" 2>/dev/null || true
+quit_deadline=$((SECONDS + 15))
+while kill -0 "$desktop_pid" 2>/dev/null; do
+  if ((SECONDS >= quit_deadline)); then
+    kill -9 "$desktop_pid" 2>/dev/null || true
+    break
+  fi
+  sleep 0.1
+done
+wait "$desktop_pid" 2>/dev/null || desktop_status=$?
+desktop_pid=
+if ((desktop_status > 128)); then
+  sig=$(kill -l $((desktop_status - 128)) 2>/dev/null || echo $((desktop_status - 128)))
+  # SIGTERM is the signal this script sent; SIGKILL is the bounded fallback.
+  if [[ $sig != TERM && $sig != KILL ]]; then
+    echo "The installed app died from SIG$sig (status $desktop_status)" >&2
+    exit 1
+  fi
+elif ((desktop_status != 0)); then
+  echo "The installed app exited with status $desktop_status" >&2
+  exit 1
+fi
+
+# The CLI can build an index itself. Verify the desktop wrote the fixture (and
+# the desktop-only marker) after the writer has exited, before the CLI opens
+# the database.
+marker="SELECT count(*) FROM index_state WHERE jsonl_path = '__app_last_successful_build__'"
+deadline=$((SECONDS + 10))
+until [[ $(sqlite3 -readonly "$database" "$marker" 2>/dev/null) == 1 ]]; do
+  if ((SECONDS >= deadline)); then
+    echo "The desktop app exited without writing its first index" >&2
+    exit 1
+  fi
+  sleep 0.2
+done
+
+# A CLI pointed at its own database could index the same fixture. Require the
+# desktop-only marker in the query run by both readers.
+query="SELECT text FROM messages WHERE session_id = '$session' AND uuid = 'e895cf23-a540-4481-b1d3-9d13799d33e6' AND ($marker) = 1"
+expected='Reply with exactly: ok'
+if [[ $(sqlite3 -readonly "$database" "$query") != "$expected" ]]; then
+  echo "Desktop completed its index without the expected Claude message" >&2
+  exit 1
+fi
+printf 'return sql("%s")[0]?.text;\n' "$query" >"$work/query.mjs"
+result=$("${isolated[@]}" timeout 30 "$cli" --query "$work/query.mjs")
+if [[ $result != "\"$expected\"" ]]; then
+  echo "Expected the installed CLI to retrieve the desktop-indexed Claude message, received: $result" >&2
+  exit 1
+fi
