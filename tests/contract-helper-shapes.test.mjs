@@ -101,7 +101,9 @@ test('search() hit shape matches api-reference.md', () => {
   const db = fixture();
   const hit = createQueryApi(db).search('needle', { limit: 1 })[0];
 
-  exactKeys(hit, ['message', 'session', 'rank', 'context'], 'search() hit');
+  // snippet is present whenever a query term appears literally in the text,
+  // which a plain-token query like this one guarantees (api-reference.md).
+  exactKeys(hit, ['message', 'session', 'rank', 'context', 'snippet'], 'search() hit');
   exactKeys(hit.message, ['uuid', 'text', 'content_type', 'is_meta', 'role', 'timestamp', 'model', 'cwd', 'visibility', 'source'], 'search() hit.message');
   exactKeys(hit.session, ['id', 'title', 'project', 'started_at', 'source'], 'search() hit.session');
   assert.ok(Array.isArray(hit.context), 'search() hit.context is an array');

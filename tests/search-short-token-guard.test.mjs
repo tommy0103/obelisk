@@ -1,0 +1,225 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Under the trigram tokenizer, a query term shorter than three code points
+// emits no tokens: alone it can only match nothing, and next to longer terms
+// it becomes an empty phrase that constrains nothing — search('quick ok')
+// silently returned rows without 'ok' in them. These tests pin the guard
+// (post-filter short terms, LIKE-scan all-short queries), prove the default
+// unicode61 behavior is untouched, and pin the hit-centered snippet.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+
+import { createQueryApi } from '../packages/core/src/query.ts';
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite');
+const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
+
+function seed(db) {
+  db.prepare("INSERT INTO sessions (id, title, project, started_at) VALUES ('s1','Guard tests','proj','2026-06-10T10:00:00Z')").run();
+  const ins = db.prepare('INSERT INTO messages (uuid, session_id, role, text, timestamp) VALUES (?,?,?,?,?)');
+  ins.run('m-quick-only', 's1', 'user', 'the quick brown fox jumped over the lazy dog', '2026-06-10T10:00:01Z');
+  ins.run('m-quick-ok', 's1', 'user', 'quick check says ok to proceed', '2026-06-10T10:00:02Z');
+  ins.run('m-ok-only', 's1', 'user', 'all fine and ok over here', '2026-06-10T10:00:03Z');
+  ins.run('m-cjk-fix', 's1', 'user', '悬空引用的问题已经彻底修复', '2026-06-10T10:00:04Z');
+  ins.run('m-cjk-fix-ok', 's1', 'user', '修复完了，ok 可以合并', '2026-06-10T10:00:05Z');
+  ins.run('m-hyphen-ok', 's1', 'user', 'running gen-itgc ok now', '2026-06-10T10:00:06Z');
+  ins.run('m-hyphen-only', 's1', 'user', 'gen-itgc failed with an error', '2026-06-10T10:00:07Z');
+}
+
+// Same shape as the tokenizer migration: dropping an external-content FTS
+// table leaves the content table and its triggers intact, and 'rebuild'
+// repopulates the new one.
+function trigramDb() {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.exec('DROP TABLE messages_fts');
+  db.exec("CREATE VIRTUAL TABLE messages_fts USING fts5(uuid UNINDEXED, session_id UNINDEXED, text, content=messages, content_rowid=rowid, tokenize='trigram')");
+  seed(db);
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  return db;
+}
+
+function unicodeDb() {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  seed(db);
+  return db;
+}
+
+test('trigram: a short term next to a long one filters instead of silently matching everything', () => {
+  const api = createQueryApi(trigramDb());
+  const hits = api.search('quick ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-quick-ok'],
+    "rows without 'ok' must not match a query that asks for it");
+  assert.equal(hits[0].degraded, 'short-token-post-filter');
+  assert.equal(typeof hits[0].rank, 'number', 'the long-term MATCH keeps relevance ranking');
+});
+
+test('trigram: every plain query term constrains results even after the twelfth term', () => {
+  const db = trigramDb();
+  const terms = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima missing';
+  const insert = db.prepare('INSERT INTO messages (uuid, session_id, role, text) VALUES (?,?,?,?)');
+  insert.run('first-twelve', 's1', 'user', terms.split(' ').slice(0, 12).join(' '));
+  const api = createQueryApi(db);
+  assert.deepEqual(api.search(terms), [], 'a missing thirteenth term must reject the row');
+  insert.run('all-thirteen', 's1', 'user', terms);
+  assert.deepEqual(api.search(terms, { limit: 1 }).map(hit => hit.message.uuid), ['all-thirteen']);
+  db.close();
+});
+
+test('trigram: an all-short query falls back to a LIKE scan instead of zero hits', () => {
+  const api = createQueryApi(trigramDb());
+  const hits = api.search('ok');
+  assert.deepEqual(new Set(hits.map((h) => h.message.uuid)),
+    new Set(['m-quick-ok', 'm-ok-only', 'm-cjk-fix-ok', 'm-hyphen-ok']));
+  assert.equal(hits[0].degraded, 'like-scan');
+  assert.equal(hits[0].rank, null, 'a scan has no FTS rank; recency orders it');
+});
+
+test('trigram: a two-code-point CJK word plus a short ASCII word both survive', () => {
+  const api = createQueryApi(trigramDb());
+  const hits = api.search('修复 ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-cjk-fix-ok'],
+    'only the row containing both short terms matches');
+});
+
+test('trigram: the punctuation fallback path routes through the same guard', () => {
+  const api = createQueryApi(trigramDb());
+  // 'gen-itgc ok' throws as raw FTS5 (column filter syntax), falls back to
+  // token quoting — where 'ok' must still be enforced, not dropped.
+  const hits = api.search('gen-itgc ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-hyphen-ok']);
+});
+
+test('trigram: recall survives when top-ranked long-term hits lack the short term', () => {
+  // Regression: an early implementation post-filtered a small overselected
+  // window in JS; on a real index every top bm25 hit for the long term lacked
+  // the short one and the query returned zero rows. The substring condition
+  // must apply to the full MATCH set, before LIMIT.
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA);
+  db.exec('DROP TABLE messages_fts');
+  db.exec("CREATE VIRTUAL TABLE messages_fts USING fts5(uuid UNINDEXED, session_id UNINDEXED, text, content=messages, content_rowid=rowid, tokenize='trigram')");
+  db.prepare("INSERT INTO sessions (id, title, project, started_at) VALUES ('s1','t','p','2026-06-10T10:00:00Z')").run();
+  const ins = db.prepare('INSERT INTO messages (uuid, session_id, role, text, timestamp) VALUES (?,?,?,?,?)');
+  // Short, quick-dense messages rank far above the one real combined hit.
+  for (let i = 0; i < 40; i++) ins.run(`m-dense-${i}`, 's1', 'user', 'quick quick quick', '2026-06-10T10:00:01Z');
+  ins.run('m-real', 's1', 'user',
+    `quick note buried in prose ${'filler words here '.repeat(30)}and in the end it was ok`,
+    '2026-06-10T10:00:02Z');
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+
+  const hits = createQueryApi(db).search('quick ok', { limit: 3 });
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-real'],
+    'the only row containing both terms is found regardless of its bm25 position');
+  db.close();
+});
+
+test('trigram: raw FTS5 syntax is honored untouched', () => {
+  const api = createQueryApi(trigramDb());
+  const hits = api.search('"quick" OR "fine"');
+  assert.deepEqual(new Set(hits.map((h) => h.message.uuid)),
+    new Set(['m-quick-only', 'm-quick-ok', 'm-ok-only']));
+  assert.equal(hits[0].degraded, undefined, 'operator queries bypass the guard');
+});
+
+test('trigram: a short term in raw FTS5 syntax filters instead of silently matching everything', () => {
+  const api = createQueryApi(trigramDb());
+  // Quoting one term makes the query non-plain, so the token guard never ran.
+  // FTS5 accepts the query, drops 'ok', and returns rows that lack it — the
+  // same silent false positive the guard was written to remove.
+  const hits = api.search('"quick" ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-quick-ok'],
+    "rows without 'ok' must not match a query that asks for it");
+  assert.equal(hits[0].degraded, 'short-token-post-filter');
+  assert.equal(typeof hits[0].rank, 'number', 'the raw MATCH keeps relevance ranking');
+});
+
+test('trigram: a short term that cannot be enforced is reported rather than dropped in silence', () => {
+  const api = createQueryApi(trigramDb());
+  // Requiring 'ok' as a substring would turn OR into AND, so the rows stay as
+  // FTS5 answered them and the caller is told the short term did not apply.
+  const hits = api.search('quick OR ok');
+  assert.deepEqual(new Set(hits.map((h) => h.message.uuid)),
+    new Set(['m-quick-only', 'm-quick-ok']), 'the disjunction is answered unchanged');
+  assert.equal(hits[0].degraded, 'short-token-unguarded');
+});
+
+test('unicode61 default: raw FTS5 syntax with a short term is untouched', () => {
+  const api = createQueryApi(unicodeDb());
+  const hits = api.search('"quick" ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-quick-ok']);
+  assert.equal(hits[0].degraded, undefined, 'short terms are real tokens here');
+});
+
+test('unicode61 default: short terms are real tokens and the guard stays out of the way', () => {
+  const api = createQueryApi(unicodeDb());
+  const hits = api.search('quick ok');
+  assert.deepEqual(hits.map((h) => h.message.uuid), ['m-quick-ok']);
+  assert.equal(hits[0].degraded, undefined);
+  assert.equal(typeof hits[0].rank, 'number');
+});
+
+test('snippet centers on the hit that head truncation would miss', () => {
+  const db = unicodeDb();
+  const filler = 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor. '.repeat(8);
+  db.prepare('INSERT INTO messages (uuid, session_id, role, text, timestamp) VALUES (?,?,?,?,?)')
+    .run('m-deep', 's1', 'user', `${filler}the elusive needleword appears only here${filler}`, '2026-06-10T10:00:08Z');
+  const api = createQueryApi(db);
+  const hits = api.search('needleword');
+  assert.equal(hits.length, 1);
+  assert.ok(!hits[0].message.text.slice(0, 240).includes('needleword'),
+    'precondition: head truncation alone would miss this hit');
+  assert.ok(hits[0].snippet.includes('needleword'), 'the snippet window contains the hit');
+  assert.ok(hits[0].snippet.startsWith('…') && hits[0].snippet.endsWith('…'));
+  assert.ok(hits[0].snippet.length <= 200, 'the snippet stays a window, not the whole message');
+});
+
+test('trigram short-token paths preserve compact controls and exact project scope', () => {
+  const db = trigramDb();
+  db.exec("UPDATE sessions SET project_path='/wanted' WHERE id='s1'");
+  const api = createQueryApi(db);
+  for (const query of ['ok', 'quick ok']) {
+    const hits = api.search(query, { projectPath: '/wanted', contextLimit: 0, snippetTokens: 8 });
+    assert.ok(hits.length > 0);
+    for (const hit of hits) {
+      assert.deepEqual(hit.context, []);
+      assert.equal(hit.message.isSnippet, true);
+      // Eight trigram tokens span up to ten code points, plus edge ellipses.
+      assert.ok([...hit.message.text].length <= 12, hit.message.text);
+      assert.ok(hit.message.textLength >= hit.message.text.length - 2);
+    }
+    assert.deepEqual(api.search(query, { projectPath: '/other' }), []);
+  }
+  const broad = api.search('quick zz', { fallback: 'or', projectPath: '/wanted', contextLimit: 0 });
+  assert.ok(broad.some(hit => hit.message.uuid === 'm-quick-only'));
+  assert.ok(broad.every(hit => hit.degraded === 'like-scan'));
+  assert.deepEqual(api.search('quick zz', { fallback: 'or', projectPath: '/other' }), []);
+  db.close();
+});
+
+test('hit-centered previews retain original text offsets when Unicode lowercasing expands characters', () => {
+  for (const makeDb of [unicodeDb, trigramDb]) {
+    const db = makeDb();
+    try {
+      const text = 'İ'.repeat(300) + ' needle evidence';
+      db.prepare('INSERT INTO messages(uuid,session_id,role,text) VALUES(?,?,?,?)').run('unicode-preview', 's1', 'user', text);
+      const api = createQueryApi(db);
+      const hit = api.search('needle').find(hit => hit.message.uuid === 'unicode-preview');
+      assert.ok(hit);
+      assert.match(hit.snippet, /needle/);
+      assert.equal(hit.message.text, text);
+      const shortText = 'İ'.repeat(300) + ' xy evidence';
+      db.prepare('INSERT INTO messages(uuid,session_id,role,text) VALUES(?,?,?,?)').run('unicode-compact', 's1', 'user', shortText);
+      const compact = api.search('xy', { snippetTokens: 8, contextLimit: 0 }).find(hit => hit.message.uuid === 'unicode-compact');
+      assert.ok(compact);
+      assert.match(compact.message.text, /xy/);
+      assert.equal(compact.message.textLength, shortText.length);
+    } finally { db.close(); }
+  }
+});
