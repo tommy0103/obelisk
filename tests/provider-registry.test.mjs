@@ -65,6 +65,7 @@ test('provider registry drives source catalog, watch roots, and raw lookup', () 
 
 test('built-in provider registry exposes every source without caller-side branching', () => {
   const registry = createBuiltinProviderRegistry({
+    'antigravity-cli': '/sources/antigravity-cli',
     claude: '/sources/claude',
     codex: '/sources/codex',
     'codexhost-antigravity': '/sources/codexhost',
@@ -81,6 +82,7 @@ test('built-in provider registry exposes every source without caller-side branch
   });
 
   assert.deepEqual(registry.catalog().map(({ id, name }) => ({ id, name })), [
+    { id: 'antigravity-cli', name: 'Antigravity CLI' },
     { id: 'claude', name: 'Claude Code' },
     { id: 'codex', name: 'Codex' },
     { id: 'codexhost-antigravity', name: 'CodexHost Antigravity' },
@@ -96,6 +98,9 @@ test('built-in provider registry exposes every source without caller-side branch
     { id: 'zcode', name: 'ZCode' },
   ]);
   assert.deepEqual(registry.watchTargets(), [
+    { kind: 'tree', path: join('/sources/antigravity-cli', 'brain'), fileNames: ['transcript_full.jsonl', 'transcript.jsonl'] },
+    { kind: 'file', path: join('/sources/antigravity-cli', 'conversation_summaries.db') },
+    { kind: 'file', path: join('/sources/antigravity-cli', 'conversation_summaries.db-wal') },
     { kind: 'tree', path: join('/sources/claude', 'projects') },
     { kind: 'file', path: join('/sources/claude', 'history.jsonl') },
     { kind: 'tree', path: join('/sources/codex', 'sessions') },

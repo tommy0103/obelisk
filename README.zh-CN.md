@@ -9,7 +9,7 @@
 [![version](https://img.shields.io/github/v/tag/tommy0103/obelisk?label=version&style=flat-square)](https://github.com/tommy0103/obelisk/releases)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
 
-你的 Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Devin、Hermes Agent、Kiro、Kimi Code、OMP、OpenCode、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
+你的 Antigravity CLI、Claude Code、Codex、GitHub Copilot、DeepSeek Harness、Devin、Hermes Agent、Kiro、Kimi Code、OMP、OpenCode、Pi、ZCode 历史会话——agent 快速查询，你浏览它们。
 
 [English](README.md) · **中文**
 
@@ -192,6 +192,7 @@ provider 前缀，不会撞。
 
 | Provider | 默认读取位置 |
 | --- | --- |
+| Antigravity CLI | `~/.gemini/antigravity-cli/brain`（`transcript_full.jsonl` / `transcript.jsonl`）+ `conversation_summaries.db` |
 | Claude Code | `~/.claude/projects` |
 | Codex | `~/.codex/sessions`、`~/.codex/archived_sessions` |
 | GitHub Copilot | VS Code `User` 数据目录（Chronicle 存储 + workspace transcripts） |

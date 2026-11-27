@@ -361,13 +361,14 @@ function buildIndex({
       const openKiroDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const openOpencodeDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const openDevinDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openAntigravityCliDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
         ?? (providerSettings === undefined
           ? createBuiltinProviderRegistry(roots, {
             homeDir: compatibilityHome,
             claudeDefaultRoot: effectiveDefaultClaudeDir,
             openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
-            openDevinDatabase,
+            openDevinDatabase, openAntigravityCliDatabase,
           })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
             homeDir: compatibilityHome,
@@ -385,6 +386,7 @@ function buildIndex({
             openKiroDatabase,
             openOpencodeDatabase,
             openDevinDatabase,
+            openAntigravityCliDatabase,
           }).registry);
       const claudeProvider = registry.get('claude');
       const shouldReconcileClaude = claudeProvider?.indexVersionMarker === CLAUDE_CANONICAL_TRANSCRIPT_MARKER
