@@ -178,7 +178,7 @@ npm run dev
 | **Messages** | 完整文本、模型、token 用量、父子链 | 全部 |
 | **Tool calls** | 工具名、输入、文件路径 | 全部 |
 | **Subagents** | agent 类型、描述、完整对话 | Claude Code、Codex、DeepSeek Harness、Devin、Hermes Agent、Kiro V3、Kimi Code、OpenCode、ZCode |
-| **Summaries** | provider 自己产生的会话摘要 | Devin、Kiro V3、Kimi Code、OpenCode |
+| **Summaries** | provider 自己产生的会话摘要 | Devin、Kiro V3、Kimi Code、MiniMax Code、OpenCode |
 | **Workflows** | workflow 脚本、结果、每个 agent 的记录 | Claude Code |
 | **Memories** | 结论及其来源会话 | 注册的 markdown 文件 |
 
@@ -200,6 +200,7 @@ provider 前缀，不会撞。
 | Hermes Agent | `~/.hermes/state.db`（或 `$HERMES_HOME/state.db`） |
 | Kiro | `~/.kiro/sessions` 和平台 `kiro-cli/data.sqlite3` 数据库 |
 | Kimi Code | `~/.kimi-code/sessions`（或 `$KIMI_CODE_HOME/sessions`） |
+| MiniMax Code | `~/.minimax/v2/sessions`（或 `$MINIMAX_DATA_DIR`、`$MAVIS_DATA_DIR`） |
 | OMP | `~/.omp/agent/sessions` |
 | OpenCode | `~/.local/share/opencode/opencode.db`（或 `$XDG_DATA_HOME/opencode`、`$OPENCODE_DB` 与 channel 库；支持 V1/V2 SQLite，不含早期 JSON 格式） |
 | Pi | `~/.pi/agent/sessions` |

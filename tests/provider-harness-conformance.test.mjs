@@ -23,6 +23,7 @@ const CHECKED_IN = {
   hermes: 'hermes-provider.test.mjs',
   kimi: 'kimi-parse.test.mjs',
   kiro: 'kiro-provider.test.mjs',
+  minimax: 'minimax-provider.test.mjs',
   omp: 'omp-parse.test.mjs',
   opencode: 'opencode-provider.test.mjs',
   pi: 'pi-parse.test.mjs',

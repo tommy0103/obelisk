@@ -12,6 +12,7 @@ import { createDevinProvider, type DevinDatabaseOpener } from './devin.ts';
 import { createHermesProvider, type HermesStoreOpener } from './hermes.ts';
 import { createKimiProvider } from './kimi.ts';
 import { createKiroProvider, type KiroDatabaseOpener } from './kiro.ts';
+import { createMinimaxProvider, type MinimaxDatabaseOpener } from './minimax.ts';
 import { createOmpProvider } from './omp.ts';
 import { createOpencodeProvider, type OpencodeDatabaseOpener } from './opencode.ts';
 import { createPiProvider } from './pi.ts';
@@ -34,6 +35,7 @@ export function createBuiltinProviderRegistry(
     openHermesStore,
     openZcodeDatabase,
     openKiroDatabase,
+    openMinimaxDatabase,
     openOpencodeDatabase,
     openDevinDatabase,
   }: {
@@ -48,6 +50,7 @@ export function createBuiltinProviderRegistry(
     openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
     openKiroDatabase?: KiroDatabaseOpener;
+    openMinimaxDatabase?: MinimaxDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
     openDevinDatabase?: DevinDatabaseOpener;
   } = {},
@@ -69,6 +72,7 @@ export function createBuiltinProviderRegistry(
     createHermesProvider({ rootDir: roots['hermes'], openStore: openHermesStore }),
     createKimiProvider({ rootDir: roots['kimi'] }),
     createKiroProvider({ rootDir: roots['kiro'], openDatabase: openKiroDatabase }),
+    createMinimaxProvider({ rootDir: roots['minimax'], homeDir, openDatabase: openMinimaxDatabase }),
     createOmpProvider({ rootDir: roots['omp'] }),
     createOpencodeProvider({ rootDir: roots['opencode'], homeDir, openDatabase: openOpencodeDatabase }),
     createPiProvider({ rootDir: roots['pi'], cwd }),

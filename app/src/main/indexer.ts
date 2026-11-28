@@ -338,8 +338,14 @@ function buildIndex({
           const hasCodexEnv = descriptor.id === 'codex'
             && typeof process.env.CODEX_HOME === 'string'
             && process.env.CODEX_HOME.trim().length > 0;
+          const hasMinimaxEnv = descriptor.id === 'minimax'
+            && (
+              (typeof process.env.MINIMAX_DATA_DIR === 'string' && process.env.MINIMAX_DATA_DIR.trim().length > 0)
+              || (typeof process.env.MAVIS_DATA_DIR === 'string' && process.env.MAVIS_DATA_DIR.trim().length > 0)
+            );
           const relativeDefault = path.relative(defaultHome, descriptor.defaultRoot);
           const root = !hasCodexEnv
+            && !hasMinimaxEnv
             && compatibilityHome !== defaultHome
             && relativeDefault
             && !relativeDefault.startsWith('..')
@@ -359,6 +365,7 @@ function buildIndex({
       const openHermesStore = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true });
       const openZcodeDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const openKiroDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openMinimaxDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const openOpencodeDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const openDevinDatabase = (sourcePath: string) => new DatabaseImpl(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
@@ -366,7 +373,7 @@ function buildIndex({
           ? createBuiltinProviderRegistry(roots, {
             homeDir: compatibilityHome,
             claudeDefaultRoot: effectiveDefaultClaudeDir,
-            openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase,
+            openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openMinimaxDatabase, openOpencodeDatabase,
             openDevinDatabase,
           })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
@@ -383,6 +390,7 @@ function buildIndex({
             openHermesStore,
             openZcodeDatabase,
             openKiroDatabase,
+            openMinimaxDatabase,
             openOpencodeDatabase,
             openDevinDatabase,
           }).registry);

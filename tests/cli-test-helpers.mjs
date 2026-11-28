@@ -33,6 +33,9 @@ export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
   if (!Object.hasOwn(env, 'HERMES_HOME')) delete childEnv.HERMES_HOME;
   // Keep an inherited Devin data root from pointing CLI tests at the real store.
   if (!Object.hasOwn(env, 'XDG_DATA_HOME')) delete childEnv.XDG_DATA_HOME;
+  // Keep inherited MiniMax data root overrides from pointing CLI tests at a real store.
+  if (!Object.hasOwn(env, 'MINIMAX_DATA_DIR')) delete childEnv.MINIMAX_DATA_DIR;
+  if (!Object.hasOwn(env, 'MAVIS_DATA_DIR')) delete childEnv.MAVIS_DATA_DIR;
   return spawnSync(process.execPath, [
     '--disable-warning=ExperimentalWarning',
     cliEntry,
