@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { chmodSync, closeSync, copyFileSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { test } from 'node:test';
 
 import { installSchema } from '../packages/core/src/db.ts';
@@ -24,6 +24,7 @@ const BetterSqlite3 = require('../app/node_modules/better-sqlite3');
 
 const FIXTURE_DIR = new URL('./fixtures/minimax/', import.meta.url);
 const FIXTURE_SCHEMA = readFileSync(new URL('schema.sql', FIXTURE_DIR), 'utf8');
+const canTestPosixPermissionBits = process.platform !== 'win32' && process.getuid?.() !== 0;
 
 function seedFixtureSession(root, relDir = '2026/11/27/20-12-46-734-session_bXZzX2FjODYyMzIwMmQxMDQ1YjZhMjkwYTI1NDhiNjg2Yzdk') {
   const sessionDir = join(root, 'v2', 'sessions', relDir);
@@ -197,11 +198,12 @@ test('real mcode@0.8.0 fixture passes harness conformance and ADR-0007 SQLite ro
 });
 
 test('defaultMinimaxRoot respects MINIMAX_DATA_DIR > MAVIS_DATA_DIR > ~/.minimax', () => {
-  assert.equal(defaultMinimaxRoot({ homeDir: '/home/u', env: {} }), join('/home/u', '.minimax'));
-  assert.equal(defaultMinimaxRoot({ homeDir: '/home/u', env: { MAVIS_DATA_DIR: '~/mavis-custom' } }), join('/home/u', 'mavis-custom'));
+  const homeDir = resolve('/home/u');
+  assert.equal(defaultMinimaxRoot({ homeDir, env: {} }), resolve(join(homeDir, '.minimax')));
+  assert.equal(defaultMinimaxRoot({ homeDir, env: { MAVIS_DATA_DIR: '~/mavis-custom' } }), resolve(join(homeDir, 'mavis-custom')));
   assert.equal(
-    defaultMinimaxRoot({ homeDir: '/home/u', env: { MINIMAX_DATA_DIR: '/opt/mm', MAVIS_DATA_DIR: '/opt/mavis' } }),
-    '/opt/mm',
+    defaultMinimaxRoot({ homeDir, env: { MINIMAX_DATA_DIR: '/opt/mm', MAVIS_DATA_DIR: '/opt/mavis' } }),
+    resolve('/opt/mm'),
   );
 });
 
@@ -611,8 +613,8 @@ test('SQLite fail-closed when present but unreadable: corrupt, WAL-without-SHM o
   const indexed = () => db.prepare("SELECT id AS sessionId, jsonl_path AS jsonlPath FROM sessions WHERE source = 'minimax'").all();
   assert.equal(indexed().length, 1);
 
-  // 1. WAL-without-SHM on 0o555 dir (skip on root uid)
-  if (process.getuid?.() !== 0) {
+  // 1. WAL-without-SHM on 0o555 dir (POSIX permission bits do not restrict access on Windows or for root)
+  if (canTestPosixPermissionBits) {
     const sqDir = join(root, 'v2', 'sqlite');
     writeFileSync(`${sqPath}-wal`, Buffer.from('non-empty-wal'));
     rmSync(`${sqPath}-shm`, { force: true });
@@ -1056,7 +1058,7 @@ test('Round 2 fixes: edit file_path, skill presentation, snapshots symlink/EACCE
   assert.equal(symDisc.skipped.length, 1);
   assert.equal(snapProv.raw({ source: 'minimax', messageUuid: `${minimaxSessionId('mvs_symsnap')}:exfil:b0000`, session: { id: minimaxSessionId('mvs_symsnap'), jsonl_path: symMsgPath }, agentId: null }), null);
 
-  if (process.getuid?.() !== 0) {
+  if (canTestPosixPermissionBits) {
     const eaccesRoot = makeTempDir('obelisk-minimax-snapeacces-');
     const eDir = writeSessionFiles(eaccesRoot, '2026/11/27/10-00-00-000-session_eacces', {
       sessionId: 'mvs_snapeacces',
