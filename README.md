@@ -201,7 +201,7 @@ where the source tool has the concept:
 | **Messages** | Full text, model, token usage, parent chain | all providers |
 | **Tool calls** | Tool name, input, file paths | all providers |
 | **Subagents** | Agent type, description, full conversation | Claude Code, Codex, DeepSeek Harness, Devin, Hermes Agent, Kiro V3, Kimi Code, OpenCode, ZCode |
-| **Summaries** | Session summaries emitted by the provider | Devin, Kiro V3, Kimi Code, OpenCode |
+| **Summaries** | Session summaries emitted by the provider | Devin, Kiro V3, Kimi Code, MiniMax Code, OpenCode |
 | **Workflows** | Workflow script, result, and per-agent transcripts | Claude Code |
 | **Memories** | Conclusions linked to source sessions | registered markdown files |
 
@@ -223,6 +223,7 @@ non-Claude IDs are provider-prefixed so they cannot collide.
 | Hermes Agent | `~/.hermes/state.db` (or `$HERMES_HOME/state.db`) |
 | Kiro | `~/.kiro/sessions` and the platform `kiro-cli/data.sqlite3` store |
 | Kimi Code | `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`) |
+| MiniMax Code | `~/.minimax/v2/sessions` (or `$MINIMAX_DATA_DIR`, `$MAVIS_DATA_DIR`) |
 | OMP | `~/.omp/agent/sessions` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode`, `$OPENCODE_DB`, channel stores; V1/V2 SQLite, earlier JSON formats are not indexed) |
 | Pi | `~/.pi/agent/sessions` |

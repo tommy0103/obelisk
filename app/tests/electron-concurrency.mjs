@@ -198,6 +198,56 @@ async function run() {
   assert(devinMessages === 2, `the Electron binding indexes both Devin messages while the store is open, got ${devinMessages}`);
   devinIndex.close();
 
+  console.log('--- Test 7: MiniMax store opens through the Electron SQLite binding ---');
+  const minimaxRoot = join(home, 'minimax');
+  const minimaxSessionDir = join(minimaxRoot, 'v2', 'sessions', '2026', '11', '27', '20-00-00-000-session_bXZzX2VsZWN0cm9u');
+  mkdirSync(minimaxSessionDir, { recursive: true });
+  mkdirSync(join(minimaxRoot, 'v2', 'sqlite'), { recursive: true });
+  writeFileSync(join(minimaxSessionDir, 'manifest.json'), JSON.stringify({
+    schemaVersion: 1,
+    sessionId: 'mvs_electron',
+    createdAtMs: 1795810000000,
+    updatedAtMs: 1795810002000,
+    source: 'local-runtime',
+    layout: 'v2-final-dated-session',
+  }));
+  writeFileSync(join(minimaxSessionDir, 'messages.jsonl'), [
+    JSON.stringify({
+      message_id: 'msg-user-v1-e1',
+      turn_id: 't1',
+      message: { role: 'user', content: [{ type: 'text', text: 'hello minimax' }], timestamp: 1795810000000 },
+    }),
+    JSON.stringify({
+      message_id: 'msg-e2',
+      turn_id: 't1',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'hi from minimax' }], timestamp: 1795810001000 },
+    }),
+  ].join('\n') + '\n');
+  const minimaxStore = new Database(join(minimaxRoot, 'v2', 'sqlite', 'runtime-state.sqlite'));
+  minimaxStore.pragma('journal_mode = WAL');
+  minimaxStore.exec(readFileSync(new URL('../../tests/fixtures/minimax/schema.sql', import.meta.url), 'utf8'));
+  minimaxStore.prepare(`INSERT INTO local_runtime_sessions
+    (session_id, record_json, updated_at_ms, columnar_version, session_kind, visibility, workspace_dir, title, created_at_ms)
+    VALUES ('mvs_electron', '{}', 1795810002000, 3, 'conversation', 'visible', '/work', 'Electron MiniMax', 1795810000000)`).run();
+  const minimaxIndexPath = join(home, 'minimax-index.sqlite');
+  const minimaxResult = buildIndex({
+    force: true,
+    claudeDir: join(home, '.missing-claude'),
+    codexDir: join(home, '.missing-codex'),
+    projectsDir: join(home, '.missing-claude', 'projects'),
+    providerRoots: { minimax: minimaxRoot },
+    dbPath: minimaxIndexPath,
+    DatabaseImpl: Database,
+  });
+  minimaxStore.close();
+  const minimaxIndex = new Database(minimaxIndexPath, { readonly: true });
+  const minimaxSessions = minimaxIndex.prepare("SELECT title FROM sessions WHERE source='minimax'").all();
+  const minimaxMessages = minimaxIndex.prepare("SELECT COUNT(*) c FROM messages WHERE source='minimax' AND visibility='visible'").get().c;
+  assert(minimaxResult.complete === true, 'the Electron MiniMax inventory is complete');
+  assert(minimaxSessions.length === 1 && minimaxSessions[0].title === 'Electron MiniMax', 'the Electron binding enriches MiniMax session title while the store is open');
+  assert(minimaxMessages === 2, `the Electron binding indexes both MiniMax messages, got ${minimaxMessages}`);
+  minimaxIndex.close();
+
   rmSync(home, { recursive: true, force: true });
   console.log('---');
   console.log(failures ? `${failures} TEST(S) FAILED` : 'ALL TESTS PASSED');

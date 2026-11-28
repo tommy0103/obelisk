@@ -117,6 +117,11 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       fileMustExist: true,
       timeout: 500,
     }),
+    openMinimaxDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
   });
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;

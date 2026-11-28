@@ -20,6 +20,7 @@ import { canonicalRootPath } from './providers/claude.ts';
 import type { HermesStoreOpener } from './providers/hermes.ts';
 import type { ZcodeDatabaseOpener } from './providers/zcode.ts';
 import type { KiroDatabaseOpener } from './providers/kiro.ts';
+import type { MinimaxDatabaseOpener } from './providers/minimax.ts';
 import type { OpencodeDatabaseOpener } from './providers/opencode.ts';
 import type { DevinDatabaseOpener } from './providers/devin.ts';
 
@@ -244,6 +245,7 @@ export function createConfiguredBuiltinProviderRuntime(
     openHermesStore,
     openZcodeDatabase,
     openKiroDatabase,
+    openMinimaxDatabase,
     openOpencodeDatabase,
     openDevinDatabase,
   }: {
@@ -255,11 +257,12 @@ export function createConfiguredBuiltinProviderRuntime(
     openHermesStore?: HermesStoreOpener;
     openZcodeDatabase?: ZcodeDatabaseOpener;
     openKiroDatabase?: KiroDatabaseOpener;
+    openMinimaxDatabase?: MinimaxDatabaseOpener;
     openOpencodeDatabase?: OpencodeDatabaseOpener;
     openDevinDatabase?: DevinDatabaseOpener;
   } = {},
 ): { roots: Record<string, string>; registry: ProviderRegistry } {
-  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, codexHomeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase });
+  const defaults = createBuiltinProviderRegistry(baseRoots, { cwd, homeDir, codexHomeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openMinimaxDatabase, openOpencodeDatabase, openDevinDatabase });
   const roots = resolveProviderRoots(defaults, persisted, { homeDir, codexHomeDir });
   const codexConfiguredRoots = resolveCodexConfiguredRoots(persisted, { homeDir: codexHomeDir });
   const codexInvalidArray = (
@@ -289,7 +292,7 @@ export function createConfiguredBuiltinProviderRuntime(
       ...(opencodeUsesAutomaticRoots ? { opencode: undefined } : {}),
     },
     {
-      cwd, homeDir, codexHomeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase, openDevinDatabase,
+      cwd, homeDir, codexHomeDir, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openMinimaxDatabase, openOpencodeDatabase, openDevinDatabase,
       copilotUserDataRoots,
       claudeSourceRoots,
       claudeDefaultRoot,

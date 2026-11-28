@@ -259,6 +259,8 @@ test('main process watches every root declared by the built-in provider registry
   const originalCodexHome = process.env.CODEX_HOME;
   const originalHermesHome = process.env.HERMES_HOME;
   const originalCodexHostData = process.env.CODEXHOST_DATA_DIR;
+  const originalMinimaxData = process.env.MINIMAX_DATA_DIR;
+  const originalMavisData = process.env.MAVIS_DATA_DIR;
   const home = makeTempDir(`obelisk-main-watch-dirs-${Date.now()}`);
   const claudeDir = join(home, '.claude');
   const codexDir = join(home, '.codex');
@@ -274,6 +276,8 @@ test('main process watches every root declared by the built-in provider registry
   process.env.CODEX_HOME = join(home, '.codex');
   process.env.HERMES_HOME = join(home, '.hermes');
   process.env.CODEXHOST_DATA_DIR = join(home, '.codexhost');
+  delete process.env.MINIMAX_DATA_DIR;
+  delete process.env.MAVIS_DATA_DIR;
   const [stableCopilotRoot, insidersCopilotRoot] = defaultCopilotUserDataRoots();
 
   const serviceOptions = [];
@@ -371,6 +375,9 @@ test('main process watches every root declared by the built-in provider registry
       { kind: 'tree', path: join(home, '.kiro', 'sessions') },
       { kind: 'file', path: defaultKiroDatabasePath({ homeDir: home }) },
       { kind: 'file', path: `${defaultKiroDatabasePath({ homeDir: home })}-wal` },
+      { kind: 'tree', path: join(home, '.minimax', 'v2', 'sessions'), fileNames: ['manifest.json', 'messages.jsonl'] },
+      { kind: 'file', path: join(home, '.minimax', 'v2', 'sqlite', 'runtime-state.sqlite') },
+      { kind: 'file', path: join(home, '.minimax', 'v2', 'sqlite', 'runtime-state.sqlite-wal') },
       { kind: 'tree', path: join(home, '.omp', 'agent', 'sessions') },
       { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db') },
       { kind: 'file', path: join(home, '.local', 'share', 'opencode', 'opencode.db-wal') },
@@ -410,6 +417,8 @@ test('main process watches every root declared by the built-in provider registry
     restoreEnvVar('CODEX_HOME', originalCodexHome);
     restoreEnvVar('HERMES_HOME', originalHermesHome);
     restoreEnvVar('CODEXHOST_DATA_DIR', originalCodexHostData);
+    restoreEnvVar('MINIMAX_DATA_DIR', originalMinimaxData);
+    restoreEnvVar('MAVIS_DATA_DIR', originalMavisData);
     rmSync(home, { recursive: true, force: true });
   }
 });
