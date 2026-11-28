@@ -1131,7 +1131,7 @@ test('Round 2 fixes: edit file_path, skill presentation, snapshots symlink/EACCE
   const legUnits = legProv.discover({ lastCursor: () => null });
   assert.deepEqual(legUnits.map((u) => u.sessionId), [minimaxSessionId('mvs_legv')]);
   assert.equal(legUnits[0].meta.title, 'Legacy Title');
-  assert.equal(legUnits[0].meta.cwd, '/work/leg');
+  assert.equal(legUnits[0].meta.cwd, join('/', 'work', 'leg'));
 
   // 4. >10,000 messages in Case C preserves g0 tool output, exact message_count === COUNT(*), and acyclic parents
   const big10kRoot = makeTempDir('obelisk-minimax-10k-');
